@@ -80,13 +80,24 @@ to protocol behavior, lifecycle, and presentation do not remove original
 license obligations.
 
 The package licenses of egui and image are MIT OR Apache-2.0; winit is
-Apache-2.0. Other Rust dependencies, system API bindings, and tools remain
+Apache-2.0. The object crate (0.37.3, Apache-2.0 OR MIT) is used to read
+embedded plugin descriptors from native library files without executing them.
+Source: https://github.com/gimli-rs/object
+Other Rust dependencies, system API bindings, and tools remain
 subject to their own package licenses and copyright notices. Cargo.lock
 pins dependency versions but does not replace licenses, attribution, or
 provenance materials. The project does not grant rights in system
 frameworks or graphics drivers.
 
-5. Distribution and corresponding source
+5. External plugins
+
+This repository distributes the plugin SDK and the video-filter example.
+The client does not bundle third-party inference runtimes or model weights.
+Separately installed plugins, runtimes, and assets remain subject to their
+own copyright and license terms; the project's original-code restrictions
+do not replace those terms.
+
+6. Distribution and corresponding source
 
 LGPL components and their modifications must retain the applicable rights
 to use, modify, and redistribute them. Restrictions on original project

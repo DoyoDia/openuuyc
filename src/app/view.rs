@@ -17,9 +17,7 @@ const AMBER: Color32 = Color32::from_rgb(238, 190, 111);
 const RED: Color32 = Color32::from_rgb(241, 125, 132);
 
 fn singleline_input(value: &mut String) -> egui::TextEdit<'_> {
-    egui::TextEdit::singleline(value)
-        .vertical_align(Align::Center)
-        .margin(egui::Margin::symmetric(12, 8))
+    crate::ui::controls::singleline(value, crate::ui::controls::HEIGHT)
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -31,6 +29,7 @@ enum Page {
     Management,
     Settings,
     Logs,
+    Plugins,
     About,
 }
 impl Page {
@@ -42,6 +41,7 @@ impl Page {
             Self::Management => "全部设备",
             Self::Settings => "连接设置",
             Self::Logs => "日志设置",
+            Self::Plugins => "插件管理",
             Self::About => "关于",
         }
     }
@@ -56,6 +56,8 @@ pub(super) struct CenterUi {
     edit: Option<DeviceEdit>,
     legal_document: Option<about::LegalDocument>,
     logs: logs::LogUi,
+    #[cfg(windows)]
+    plugins: crate::plugins::Manager,
 }
 
 struct DeviceEdit {
@@ -92,6 +94,7 @@ enum Icon {
     Edit,
     Logout,
     Logs,
+    Plugins,
 }
 
 pub(super) fn configure_visuals(ctx: &egui::Context) {
@@ -106,26 +109,8 @@ pub(super) fn configure_visuals(ctx: &egui::Context) {
     style.visuals.selection.bg_fill = Color32::from_rgb(40, 70, 112);
     style.visuals.selection.stroke = Stroke::new(1.0, BLUE);
     style.visuals.window_corner_radius = 8.0.into();
-    for widgets in [
-        &mut style.visuals.widgets.inactive,
-        &mut style.visuals.widgets.open,
-    ] {
-        widgets.bg_fill = SURFACE;
-        widgets.weak_bg_fill = SURFACE;
-        widgets.bg_stroke = Stroke::new(1.0, LINE);
-        widgets.fg_stroke.color = TEXT;
-        widgets.corner_radius = 5.0.into();
-    }
-    style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(44, 54, 69);
-    style.visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(44, 54, 69);
-    style.visuals.widgets.hovered.fg_stroke.color = TEXT;
-    style.visuals.widgets.hovered.corner_radius = 5.0.into();
-    style.visuals.widgets.active.bg_fill = BLUE;
-    style.visuals.widgets.active.weak_bg_fill = Color32::from_rgb(36, 60, 92);
-    style.visuals.widgets.active.corner_radius = 5.0.into();
+    crate::ui::controls::configure(&mut style, crate::ui::controls::HEIGHT);
     style.spacing.item_spacing = vec2(8.0, 8.0);
-    style.spacing.button_padding = vec2(14.0, 8.0);
-    style.spacing.interact_size.y = 34.0;
     style
         .text_styles
         .insert(egui::TextStyle::Body, FontId::proportional(14.0));
@@ -144,6 +129,10 @@ fn paint_icon(p: &egui::Painter, rect: egui::Rect, icon: Icon, color: Color32) {
     let q = |x, y| c + vec2(x, y);
     let s = Stroke::new(1.5, color);
     match icon {
+        Icon::Plugins => {
+            #[cfg(windows)]
+            crate::plugins::paint_plugin_icon(p, rect, color);
+        }
         Icon::Logs => {
             p.rect_stroke(
                 egui::Rect::from_center_size(c, vec2(15.0, 19.0)),
@@ -250,8 +239,7 @@ fn paint_icon(p: &egui::Painter, rect: egui::Rect, icon: Icon, color: Color32) {
             ));
         }
         Icon::Close => {
-            p.line_segment([q(-4.5, -4.5), q(4.5, 4.5)], s);
-            p.line_segment([q(4.5, -4.5), q(-4.5, 4.5)], s);
+            crate::ui::controls::paint_close(p, rect, color);
         }
         Icon::Info => {
             p.circle_stroke(c, 8.0, s);
@@ -273,6 +261,9 @@ fn paint_icon(p: &egui::Painter, rect: egui::Rect, icon: Icon, color: Color32) {
 }
 
 fn icon_button(ui: &mut egui::Ui, icon: Icon, hint: &str) -> egui::Response {
+    if matches!(icon, Icon::Close) {
+        return crate::ui::controls::close_button(ui, hint, 32.0);
+    }
     let (rect, response) = ui.allocate_exact_size(vec2(32.0, 32.0), Sense::click());
     if response.hovered() && ui.is_enabled() {
         ui.painter().rect_filled(rect, 5.0, SURFACE);
@@ -291,10 +282,7 @@ fn icon_button(ui: &mut egui::Ui, icon: Icon, hint: &str) -> egui::Response {
 }
 
 fn primary(label: &str) -> egui::Button<'_> {
-    egui::Button::new(RichText::new(label).color(Color32::WHITE))
-        .fill(BLUE)
-        .stroke(Stroke::NONE)
-        .min_size(vec2(84.0, 34.0))
+    crate::ui::controls::primary(label).min_size(vec2(84.0, crate::ui::controls::HEIGHT))
 }
 
 fn login_button(label: &str) -> egui::Button<'_> {
@@ -746,6 +734,11 @@ impl DeviceCenterApp {
                     self.settings_page(ui);
                 } else if self.center_ui.page == Page::Logs {
                     self.logs_page(ui);
+                } else if self.center_ui.page == Page::Plugins {
+                    #[cfg(windows)]
+                    self.center_ui.plugins.show(ui);
+                    #[cfg(not(windows))]
+                    ui.label("此平台尚未适配插件宿主");
                 } else if self.center_ui.page == Page::About {
                     self.about_page(ui);
                 } else if self.center_ui.page == Page::Management {
@@ -864,6 +857,15 @@ impl DeviceCenterApp {
                     self.center_ui.page == Page::Settings,
                 ) {
                     self.center_ui.page = Page::Settings;
+                }
+                if nav_item(
+                    ui,
+                    Icon::Plugins,
+                    "插件管理",
+                    None,
+                    self.center_ui.page == Page::Plugins,
+                ) {
+                    self.center_ui.page = Page::Plugins;
                 }
                 if nav_item(
                     ui,
@@ -1514,23 +1516,6 @@ impl DeviceCenterApp {
                     self.local_display.refresh_hz
                 ));
                 ui.add_space(8.0);
-                egui::CollapsingHeader::new("账号中的虚拟设备").show(ui, |ui| {
-                    if let Some(device) = self
-                        .devices
-                        .as_ref()
-                        .map(|list| list.current_device.clone())
-                    {
-                        ui.label(display_alias(&device));
-                        ui.label(RichText::new(&device.device_id).monospace().color(MUTED));
-                        ui.label(
-                            RichText::new("已关闭本机被控接入（仅内部使用）")
-                                .small()
-                                .color(MUTED),
-                        );
-                    } else {
-                        ui.label(RichText::new("登录后可查看").color(MUTED));
-                    }
-                });
                 egui::CollapsingHeader::new("诊断信息").show(ui, |ui| {
                     for (label, value) in &self.diagnostics.rows {
                         ui.horizontal_wrapped(|ui| {
@@ -1866,30 +1851,110 @@ impl DeviceCenterApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(BG))
             .show(root, |ui| {
-                let center = ui.available_rect_before_wrap().center();
+                let bounds = ui.available_rect_before_wrap();
+                let center = bounds.center();
                 crate::ui::branding::paint(
                     ui.painter(),
-                    egui::Rect::from_center_size(center - vec2(0.0, 42.0), vec2(112.0, 112.0)),
+                    egui::Rect::from_center_size(center - vec2(0.0, 192.0), vec2(88.0, 88.0)),
                     &self.brand_texture,
                 );
                 ui.painter().text(
-                    center + vec2(0.0, 40.0),
+                    center - vec2(0.0, 128.0),
                     egui::Align2::CENTER_CENTER,
                     crate::APP_NAME,
                     FontId::proportional(24.0),
                     TEXT,
                 );
-                egui::Spinner::new().color(MUTED).paint_at(
-                    ui,
-                    egui::Rect::from_center_size(center + vec2(0.0, 83.0), vec2(18.0, 18.0)),
+                let width = (bounds.width() - 48.0).min(440.0);
+                let rect = egui::Rect::from_min_size(
+                    egui::pos2(center.x - width / 2.0, center.y - 88.0),
+                    vec2(width, 330.0),
                 );
-                ui.painter().text(
-                    center + vec2(0.0, 117.0),
-                    egui::Align2::CENTER_CENTER,
-                    "正在加载…",
-                    FontId::proportional(13.0),
-                    MUTED,
+                let mut content = ui.new_child(
+                    egui::UiBuilder::new()
+                        .id_salt("startup-progress")
+                        .max_rect(rect)
+                        .layout(egui::Layout::top_down(Align::Min)),
                 );
+                let current = self.startup_stage.index();
+                content.horizontal(|ui| {
+                    ui.strong(self.startup_stage.title());
+                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                        ui.weak(format!(
+                            "步骤 {} / {}",
+                            current + 1,
+                            StartupStage::ALL.len()
+                        ));
+                    });
+                });
+                let detail = if self.startup_stage == StartupStage::Devices
+                    && !ui.ctx().input(|i| i.focused)
+                {
+                    "窗口不在前台，设备清单刷新已暂停；返回窗口后继续加载。"
+                } else {
+                    self.startup_stage.detail()
+                };
+                content.add(egui::Label::new(RichText::new(detail).size(13.0).color(MUTED)).wrap());
+                content.add_space(6.0);
+                // Completed stages, not an estimate of remaining time.
+                content.add(
+                    egui::ProgressBar::new(current as f32 / StartupStage::ALL.len() as f32)
+                        .desired_width(width)
+                        .desired_height(7.0)
+                        .fill(BLUE),
+                );
+                content.add_space(12.0);
+                for (index, stage) in StartupStage::ALL.iter().enumerate() {
+                    let active = index == current;
+                    content.horizontal(|ui| {
+                        let (mark, _) = ui.allocate_exact_size(vec2(14.0, 14.0), Sense::hover());
+                        if index < current {
+                            let c = mark.center();
+                            ui.painter().line_segment(
+                                [c + vec2(-4.0, 0.0), c + vec2(-1.0, 3.0)],
+                                Stroke::new(1.5, GREEN),
+                            );
+                            ui.painter().line_segment(
+                                [c + vec2(-1.0, 3.0), c + vec2(5.0, -4.0)],
+                                Stroke::new(1.5, GREEN),
+                            );
+                        } else {
+                            ui.painter().circle_stroke(
+                                mark.center(),
+                                4.0,
+                                Stroke::new(1.3, if active { BLUE } else { LINE }),
+                            );
+                            if active {
+                                ui.painter().circle_filled(mark.center(), 2.0, BLUE);
+                            }
+                        }
+                        ui.label(RichText::new(stage.title()).size(13.0).color(if active {
+                            TEXT
+                        } else {
+                            MUTED
+                        }));
+                        ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                            let status = if index < current {
+                                "已完成".into()
+                            } else if active {
+                                let elapsed = self.startup_stage_since.elapsed().as_secs();
+                                if elapsed >= 3 {
+                                    format!("进行中 · {elapsed} 秒")
+                                } else {
+                                    "进行中".into()
+                                }
+                            } else {
+                                "等待".into()
+                            };
+                            ui.label(RichText::new(status).size(12.0).color(if active {
+                                BLUE
+                            } else {
+                                MUTED
+                            }));
+                        });
+                    });
+                }
+                ui.ctx().request_repaint_after(Duration::from_millis(200));
             });
     }
 

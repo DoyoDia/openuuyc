@@ -419,6 +419,7 @@ impl Router {
             let key = self.pending.pop_front().unwrap();
             let edge = key.edge;
             if key.route == Route::Local {
+                crate::plugins::hotkeys::key_event(0, edge.key, edge.down);
                 let i = usize::from(edge.key);
                 self.physical[i] = edge.down;
                 self.blocked[i] = edge.down;
@@ -527,10 +528,9 @@ impl Router {
                 self.drain_keys();
                 owned |= self.event(edge.key, edge.scan, edge.down, edge.injected);
                 if edge.down
-                    && self
-                        .target
-                        .as_ref()
-                        .is_some_and(|t| t.input.owner_holds_key(owner, edge.key))
+                    && self.target.as_ref().is_some_and(|t| {
+                        t.input.owner_holds_key(owner, edge.key) || self.consumed[i]
+                    })
                 {
                     self.routes[i] = Route::Window(owner);
                     self.observed[i] = true;
@@ -586,6 +586,10 @@ impl Router {
                 self.blocked[index] = false;
             }
             return was_consumed;
+        }
+        if crate::plugins::hotkeys::key_event(target.owner, vk, down) {
+            self.consumed[index] = down;
+            return true;
         }
         let generation = target.input.keyboard_generation();
         if generation != target.generation {

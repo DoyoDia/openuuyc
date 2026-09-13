@@ -19,6 +19,17 @@ pub enum MouseMode {
 
 #[derive(Clone, Debug)]
 pub(crate) enum InputEvent {
+    Correction {
+        x: i32,
+        y: i32,
+        lease: u64,
+        expires: std::time::Instant,
+    },
+    AssistButton {
+        down: bool,
+        lease: u64,
+        expires: std::time::Instant,
+    },
     Absolute {
         screen: i32,
         x: f64,
@@ -46,14 +57,30 @@ pub(crate) enum InputEvent {
 }
 
 impl InputEvent {
+    pub fn send_timeout(&self) -> std::time::Duration {
+        match self {
+            Self::Correction { expires, .. }
+            | Self::AssistButton {
+                expires,
+                down: true,
+                ..
+            } => expires
+                .saturating_duration_since(std::time::Instant::now())
+                .min(std::time::Duration::from_secs(1)),
+            _ => std::time::Duration::from_secs(1),
+        }
+    }
     pub(crate) fn encode(&self) -> Vec<u8> {
         let value = match *self {
             Self::Absolute { screen, x, y } => serde_json::json!({
                 "action":"mouse_move_absolute", "screen_id":screen, "abs_x":x, "abs_y":y }),
-            Self::Relative { x, y } => serde_json::json!({
+            Self::Relative { x, y } | Self::Correction { x, y, .. } => serde_json::json!({
                 "action":"mouse_move_relative", "delta_x":x, "delta_y":y, "mousetype":2 }),
             Self::Button { button, down } => serde_json::json!({
                 "action":if down { "mouse_press" } else { "mouse_release" }, "button":button }),
+            Self::AssistButton { down, .. } => {
+                serde_json::json!({"action":if down {"mouse_press"}else{"mouse_release"},"button":1})
+            }
             Self::Wheel { delta, horizontal } => serde_json::json!({
                 "action":"mouse_scroll", "delta_x":if horizontal {delta} else {0},
                 "delta_y":if horizontal {0} else {delta} }),
@@ -90,8 +117,22 @@ pub(crate) struct QueuedInputEvent {
     pub event: InputEvent,
 }
 
+pub(crate) struct CorrectionBasis {
+    pub physical: [i64; 2],
+    pub submitted_corrections: Option<[i64; 2]>,
+}
+
+type AssistOwner = (u64, Arc<dyn Fn() -> bool + Send + Sync>);
+
 #[derive(Default)]
 struct State {
+    assists: BTreeMap<u64, AssistOwner>,
+    assist_button_owner: Option<u64>,
+    assist_down: bool,
+    physical_motion: [i64; 2],
+    submitted_motion: [i64; 2],
+    submitted_corrections: [i64; 2],
+    in_flight_motion: bool,
     ready: bool,
     stopping: bool,
     mode: MouseMode,
@@ -110,7 +151,9 @@ struct State {
     keyboard_platform: i32,
     queue: VecDeque<InputEvent>,
     in_flight: bool,
+    in_flight_assist: Option<u64>,
     epoch: u64,
+    cancellation: tokio_util::sync::CancellationToken,
     error: Option<String>,
     recovering: bool,
     listeners: Vec<Weak<dyn Fn() + Send + Sync>>,
@@ -121,7 +164,6 @@ pub(crate) struct RemoteInput {
     state: Arc<Mutex<State>>,
     wake: Arc<Notify>,
     drained: Arc<Notify>,
-    epoch_changed: Arc<Notify>,
 }
 
 impl RemoteInput {
@@ -245,7 +287,7 @@ impl RemoteInput {
         let mut s = self.lock();
         let became_ready = ready && !s.ready && !s.stopping;
         if !ready {
-            s.epoch = s.epoch.wrapping_add(1);
+            Self::advance_epoch(&mut s);
             s.mode = MouseMode::View;
             s.owner = None;
             s.held = [false; 5];
@@ -253,6 +295,8 @@ impl RemoteInput {
             s.keyboard_generation = s.keyboard_generation.wrapping_add(1);
             s.queue.clear();
             s.in_flight = false;
+            s.in_flight_motion = false;
+            s.in_flight_assist = None;
         } else if !s.ready && !s.stopping {
             // A transport send can have accepted DOWN before a disconnect.
             // Retire that uncertainty with UP before any newly enabled input.
@@ -265,7 +309,6 @@ impl RemoteInput {
         }
         self.wake.notify_one();
         self.drained.notify_waiters();
-        self.epoch_changed.notify_waiters();
         self.repaint();
     }
 
@@ -285,7 +328,20 @@ impl RemoteInput {
         Ok(())
     }
 
+    fn advance_epoch(s: &mut State) {
+        s.epoch = s.epoch.wrapping_add(1);
+        s.cancellation.cancel();
+        s.cancellation = tokio_util::sync::CancellationToken::new();
+        s.in_flight = false;
+        s.in_flight_motion = false;
+        s.in_flight_assist = None;
+    }
+
     fn release_locked(s: &mut State) {
+        s.assists.clear();
+        s.assist_button_owner = None;
+        s.assist_down = false;
+        Self::advance_epoch(s);
         // Cancel unsent presses/motion. Preserve release obligations for events
         // already given to transport. Never replay an obsolete click on resume.
         s.queue.clear();
@@ -424,6 +480,8 @@ impl RemoteInput {
         if !s.relative || !Self::claim(&mut s, owner) {
             return;
         }
+        s.physical_motion[0] = s.physical_motion[0].saturating_add(i64::from(x));
+        s.physical_motion[1] = s.physical_motion[1].saturating_add(i64::from(y));
         if let Some(InputEvent::Relative { x: old_x, y: old_y }) = s.queue.back_mut()
             && let (Some(x), Some(y)) = (old_x.checked_add(x), old_y.checked_add(y))
         {
@@ -446,6 +504,24 @@ impl RemoteInput {
                 return;
             }
         } else if s.owner != Some(owner) || !s.held[index] {
+            return;
+        }
+        if index == 0 && down && s.assist_down {
+            s.assist_down = false;
+            s.assist_button_owner = None;
+            s.queue
+                .retain(|e| !matches!(e, InputEvent::AssistButton { .. }));
+            if s.remote_held[0] {
+                s.queue.push_back(InputEvent::Button {
+                    button: 1,
+                    down: false,
+                });
+            }
+        }
+        let combined_before = s.held[index] || (index == 0 && s.assist_down);
+        s.held[index] = down;
+        let combined_after = down || (index == 0 && s.assist_down);
+        if combined_before == combined_after {
             return;
         }
         // Do not collapse rapid DOWN/UP transitions to a frame's final state.
@@ -478,11 +554,26 @@ impl RemoteInput {
             {
                 let mut s = self.lock();
                 if let Some(event) = s.queue.pop_front() {
+                    if !Self::pending_current(&s, &event) {
+                        continue;
+                    }
                     s.in_flight = true;
+                    s.in_flight_motion = matches!(
+                        event,
+                        InputEvent::Relative { .. } | InputEvent::Correction { .. }
+                    );
+                    s.in_flight_assist = match event {
+                        InputEvent::Correction { lease, .. }
+                        | InputEvent::AssistButton { lease, .. } => Some(lease),
+                        _ => None,
+                    };
                     if let InputEvent::Button { button, down: true } = event
                         && let Some(index) = BUTTONS.iter().position(|b| *b == button)
                     {
                         s.remote_held[index] = true;
+                    }
+                    if matches!(event, InputEvent::AssistButton { down: true, .. }) {
+                        s.remote_held[0] = true;
                     }
                     if let InputEvent::Key {
                         key,
@@ -504,38 +595,248 @@ impl RemoteInput {
         }
     }
 
+    fn pending_current(s: &State, event: &InputEvent) -> bool {
+        match *event {
+            InputEvent::Correction { lease, expires, .. } => {
+                s.assists
+                    .get(&lease)
+                    .is_some_and(|(owner, guard)| s.owner == Some(*owner) && guard())
+                    && std::time::Instant::now() <= expires
+            }
+            InputEvent::AssistButton {
+                lease,
+                down,
+                expires,
+            } => s.assists.get(&lease).is_some_and(|(owner, guard)| {
+                s.owner == Some(*owner)
+                    && (!down || (guard() && std::time::Instant::now() <= expires))
+            }),
+            _ => true,
+        }
+    }
     pub fn is_current(&self, event: &QueuedInputEvent) -> bool {
         let s = self.lock();
-        s.ready && event.epoch == s.epoch
+        s.ready && event.epoch == s.epoch && Self::pending_current(&s, &event.event)
     }
 
     pub fn discard(&self, event: &QueuedInputEvent) {
         let mut s = self.lock();
         if event.epoch == s.epoch {
             s.in_flight = false;
+            s.in_flight_motion = false;
+            s.in_flight_assist = None;
         }
         drop(s);
         self.drained.notify_waiters();
     }
 
     pub async fn epoch_cancelled(&self, epoch: u64) {
-        loop {
-            let changed = self.epoch_changed.notified();
-            tokio::pin!(changed);
-            changed.as_mut().enable();
-            if self.lock().epoch != epoch {
+        let token = {
+            let state = self.lock();
+            if state.epoch != epoch {
                 return;
             }
-            changed.await;
+            state.cancellation.clone()
+        };
+        token.cancelled().await;
+    }
+    pub fn motion(&self) -> [i64; 2] {
+        self.lock().physical_motion
+    }
+    pub fn observation(&self) -> ([i64; 2], [i64; 2], [i64; 2], bool, bool) {
+        let s = self.lock();
+        (
+            s.physical_motion,
+            s.submitted_motion,
+            s.submitted_corrections,
+            s.in_flight_motion
+                || s.queue.iter().any(|e| {
+                    matches!(
+                        e,
+                        InputEvent::Relative { .. } | InputEvent::Correction { .. }
+                    )
+                }),
+            s.in_flight_assist.is_some()
+                || s.queue
+                    .iter()
+                    .any(|e| matches!(e, InputEvent::Correction { .. })),
+        )
+    }
+    pub fn begin_assist(
+        &self,
+        owner: u64,
+        lease: u64,
+        guard: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Result<()> {
+        let mut s = self.lock();
+        if !s.ready || s.stopping || s.mode == MouseMode::View || !s.relative {
+            bail!("请开启相对鼠标控制");
         }
+        if !guard() || !Self::claim(&mut s, owner) {
+            bail!("控制不可用");
+        }
+        if s.assists.len() >= 4 && !s.assists.contains_key(&lease) {
+            bail!("控制来源数量超限");
+        }
+        s.assists.insert(lease, (owner, guard));
+        Ok(())
+    }
+    pub fn assist_pending(&self, lease: u64) -> bool {
+        let s = self.lock();
+        s.in_flight_assist==Some(lease)||s.queue.iter().any(|e|matches!(e,InputEvent::Correction{lease:id,..}|InputEvent::AssistButton{lease:id,..} if *id==lease))
+    }
+    pub fn assist_active(&self, owner: u64, lease: u64) -> bool {
+        let s = self.lock();
+        s.ready
+            && !s.stopping
+            && s.mode != MouseMode::View
+            && s.relative
+            && s.owner == Some(owner)
+            && s.assists
+                .get(&lease)
+                .is_some_and(|(o, g)| *o == owner && g())
+    }
+    pub fn end_assist(&self, lease: u64) {
+        let mut s = self.lock();
+        if s.assists.remove(&lease).is_none() {
+            return;
+        }
+        let owns_button = s.assist_button_owner == Some(lease);
+        if owns_button {
+            s.assist_button_owner = None;
+            s.assist_down = false;
+        }
+        s.queue.retain(|e|!matches!(e,InputEvent::Correction{lease:id,..}|InputEvent::AssistButton{lease:id,..} if *id==lease));
+        if owns_button && !s.held[0] && s.remote_held[0] {
+            s.queue.push_back(InputEvent::Button {
+                button: 1,
+                down: false,
+            });
+        }
+        drop(s);
+        self.wake.notify_one();
+    }
+    pub fn assist_correction(
+        &self,
+        owner: u64,
+        lease: u64,
+        movement: [i32; 2],
+        basis: CorrectionBasis,
+        sampled_at: std::time::Instant,
+        weight: [f32; 2],
+    ) -> bool {
+        let mut s = self.lock();
+        if !s.ready
+            || s.stopping
+            || !s.relative
+            || s.mode == MouseMode::View
+            || s.owner != Some(owner)
+            || s.assists.get(&lease).is_none_or(|(o, _)| *o != owner)
+        {
+            return false;
+        }
+        // The image predictor stops at request dispatch. Account once for prior
+        // corrections committed while that request was being inferred. Pending
+        // corrections that will be replaced below were never committed.
+        let delta: [f64; 2] = std::array::from_fn(|i| {
+            s.physical_motion[i].saturating_sub(basis.physical[i]) as f64
+                + basis.submitted_corrections.map_or(0., |base| {
+                    s.submitted_corrections[i].saturating_sub(base[i]) as f64
+                })
+        });
+        if !weight
+            .iter()
+            .all(|v| v.is_finite() && (0.0..=1.0).contains(v))
+        {
+            return false;
+        }
+        let x = (f64::from(movement[0]) - delta[0] * f64::from(weight[0]))
+            .round()
+            .clamp(-512.0, 512.0) as i32;
+        let y = (f64::from(movement[1]) - delta[1] * f64::from(weight[1]))
+            .round()
+            .clamp(-512.0, 512.0) as i32;
+        // Keep only the newest correction; physical events retain their order.
+        s.queue
+            .retain(|e| !matches!(e,InputEvent::Correction{lease:id,..} if *id==lease));
+        let accepted = Self::push(
+            &mut s,
+            InputEvent::Correction {
+                x,
+                y,
+                lease,
+                expires: sampled_at + std::time::Duration::from_millis(120),
+            },
+        );
+        drop(s);
+        self.wake.notify_one();
+        accepted
+    }
+    pub fn assist_button(&self, owner: u64, lease: u64, down: bool) -> bool {
+        let mut s = self.lock();
+        if !s.ready
+            || s.stopping
+            || s.owner != Some(owner)
+            || s.assists.get(&lease).is_none_or(|(o, _)| *o != owner)
+        {
+            return false;
+        }
+        if down && (s.held[0] || s.assist_button_owner.is_some_and(|id| id != lease)) {
+            return true;
+        }
+        if !down && s.assist_button_owner != Some(lease) {
+            return true;
+        }
+        if down {
+            s.assist_button_owner = Some(lease);
+        }
+        let old = s.assist_down || s.held[0];
+        s.assist_down = down;
+        let new = down || s.held[0];
+        let accepted = old == new
+            || Self::push(
+                &mut s,
+                InputEvent::AssistButton {
+                    down: new,
+                    lease,
+                    expires: std::time::Instant::now() + std::time::Duration::from_millis(100),
+                },
+            );
+        drop(s);
+        self.wake.notify_one();
+        accepted
     }
 
     pub fn complete(&self, event: &QueuedInputEvent, result: Result<()>) {
+        if result.is_ok()
+            && let InputEvent::Relative { x, y } | InputEvent::Correction { x, y, .. } = event.event
+        {
+            let mut s = self.lock();
+            s.submitted_motion[0] = s.submitted_motion[0].saturating_add(i64::from(x));
+            s.submitted_motion[1] = s.submitted_motion[1].saturating_add(i64::from(y));
+            if matches!(event.event, InputEvent::Correction { .. }) {
+                s.submitted_corrections[0] =
+                    s.submitted_corrections[0].saturating_add(i64::from(x));
+                s.submitted_corrections[1] =
+                    s.submitted_corrections[1].saturating_add(i64::from(y));
+            }
+        }
+        if !self.is_current(event) {
+            self.discard(event);
+            return;
+        }
         let mut s = self.lock();
         if event.epoch != s.epoch {
             return;
         }
         s.in_flight = false;
+        s.in_flight_motion = false;
+        s.in_flight_assist = None;
+        if !Self::pending_current(&s, &event.event) {
+            drop(s);
+            self.drained.notify_waiters();
+            return;
+        }
         match result {
             Ok(()) => {
                 if let InputEvent::Key {
@@ -543,6 +844,15 @@ impl RemoteInput {
                 } = event.event
                 {
                     s.remote_keys.remove(&key);
+                }
+                if let InputEvent::AssistButton {
+                    down: false, lease, ..
+                } = event.event
+                {
+                    s.remote_held[0] = false;
+                    if s.assist_button_owner == Some(lease) && !s.assist_down {
+                        s.assist_button_owner = None;
+                    }
                 }
                 if let InputEvent::Button { button, down } = event.event {
                     tracing::trace!(button, down, "mouse button edge submitted to transport");
@@ -600,6 +910,8 @@ impl RemoteInput {
             if !s.ready {
                 s.queue.clear();
                 s.in_flight = false;
+                s.in_flight_motion = false;
+                s.in_flight_assist = None;
             }
         }
         self.wake.notify_one();

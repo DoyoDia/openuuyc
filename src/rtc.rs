@@ -500,12 +500,19 @@ async fn send_remote_input(
         let result = tokio::select! {
             biased;
             _ = mouse.epoch_cancelled(event.epoch) => Err(anyhow::anyhow!("鼠标连接代次已变更")),
-            result = tokio::time::timeout(Duration::from_secs(1),
-                send_control_message(&kcp, &channel, event.event.encode())) => result
+            result = tokio::time::timeout(event.event.send_timeout(),
+                async {
+                    let state=mouse.clone();let guarded=event.clone();
+                    let release=matches!(event.event,crate::remote_input::InputEvent::Button{down:false,..}|crate::remote_input::InputEvent::Key{down:false,..}|crate::remote_input::InputEvent::AssistButton{down:false,..});
+                    if kcp.is_negotiated(){kcp.send_input(channel.id(),event.event.encode(),Arc::new(move||state.is_current(&guarded)),release).await}
+                    else {send_control_message(&kcp,&channel,event.event.encode()).await}
+                }) => result
                 .map_err(|_| anyhow::anyhow!("鼠标输入发送超时"))
                 .and_then(|result| result.map(|_| ())),
         };
-        if let Err(error) = &result {
+        if let Err(error) = &result
+            && mouse.is_current(&event)
+        {
             tracing::warn!(target: "openuuyc::rtc::input", %error, "mouse input transport failed");
         }
         if !keyboard_submission_seen

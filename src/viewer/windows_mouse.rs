@@ -286,6 +286,17 @@ impl RawRouter {
             input.relative(target.owner(), mouse.lLastX, mouse.lLastY);
         }
         for (button, down) in button_edges(flags) {
+            let key = match button {
+                1 => 1,
+                2 => 2,
+                16 => 4,
+                32 => 5,
+                64 => 6,
+                _ => 0,
+            };
+            if key != 0 {
+                crate::plugins::hotkeys::key_event(target.owner(), key, down);
+            }
             // UP is routed even outside the video, but the shared owner ledger
             // rejects releases for keys this window did not press.
             if !down || accepted {

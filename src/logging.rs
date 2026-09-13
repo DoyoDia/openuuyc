@@ -83,6 +83,7 @@ modules! {
     ("mouse", "鼠标与光标", false, ["openuuyc::viewer::windows_mouse", "openuuyc::viewer::windows_cursor", "openuuyc::remote_cursor"]),
     ("input", "控制发送", false, ["openuuyc::remote_input", "openuuyc::rtc::input"]),
     ("performance", "性能与网络统计", false, ["openuuyc::performance", "openuuyc::network_control", "openuuyc::timing", "openuuyc::rtcp_timing", "openuuyc::rtc::clock"]),
+    ("plugins", "插件宿主", false, ["openuuyc::plugins"]),
     ("ui", "界面渲染", false, ["openuuyc::ui", "openuuyc::ui_timing"]),
     ("capture", "RTP 捕获", false, ["openuuyc::rtp_capture"]),
     ("webrtc", "WebRTC", true, ["webrtc", "webrtc_data", "webrtc_util", "interceptor"]),

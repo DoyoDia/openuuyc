@@ -67,6 +67,9 @@ enum Icon {
 }
 
 fn icon_button(ui: &mut egui::Ui, icon: Icon, hint: &str) -> egui::Response {
+    if matches!(icon, Icon::Close) {
+        return crate::ui::controls::close_button(ui, hint, crate::ui::controls::COMPACT_HEIGHT);
+    }
     let (rect, response) = ui.allocate_exact_size(vec2(26.0, 26.0), Sense::click());
     if response.hovered() && ui.is_enabled() {
         ui.painter().rect_filled(rect, 4.0, HOVER);
@@ -81,12 +84,7 @@ fn icon_button(ui: &mut egui::Ui, icon: Icon, hint: &str) -> egui::Response {
             ui.painter()
                 .line_segment([point(-2.5, 0.0), point(2.5, 5.0)], stroke);
         }
-        Icon::Close => {
-            ui.painter()
-                .line_segment([point(-3.5, -3.5), point(3.5, 3.5)], stroke);
-            ui.painter()
-                .line_segment([point(3.5, -3.5), point(-3.5, 3.5)], stroke);
-        }
+        Icon::Close => crate::ui::controls::paint_close(ui.painter(), rect, stroke.color),
         Icon::Info => {
             ui.painter().circle_stroke(center, 6.0, stroke);
             ui.painter()
@@ -558,7 +556,7 @@ fn budget_status(
     }
 }
 
-fn menu_style(ui: &mut egui::Ui) {
+pub(super) fn menu_style(ui: &mut egui::Ui) {
     let style = ui.style_mut();
     style.override_text_style = Some(egui::TextStyle::Body);
     style
@@ -568,20 +566,7 @@ fn menu_style(ui: &mut egui::Ui) {
         .text_styles
         .insert(egui::TextStyle::Button, FontId::proportional(13.0));
     style.spacing.item_spacing = vec2(6.0, ROW_GAP);
-    style.spacing.button_padding = vec2(10.0, 4.0);
-    style.spacing.interact_size.y = ROW_HEIGHT;
-    style.visuals.override_text_color = Some(TEXT);
-    style.visuals.selection.bg_fill = ACCENT;
-    style.visuals.widgets.inactive.bg_fill = HOVER;
-    style.visuals.widgets.inactive.weak_bg_fill = HOVER;
-    style.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, LINE);
-    style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(47, 56, 70);
-    style.visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(47, 56, 70);
-    style.visuals.widgets.active.bg_fill = ACCENT;
-    style.visuals.widgets.active.weak_bg_fill = Color32::from_rgb(31, 47, 67);
-    style.visuals.widgets.inactive.corner_radius = 4.0.into();
-    style.visuals.widgets.hovered.corner_radius = 4.0.into();
-    style.visuals.widgets.active.corner_radius = 4.0.into();
+    crate::ui::controls::configure(style, ROW_HEIGHT);
     style.interaction.selectable_labels = false;
 }
 

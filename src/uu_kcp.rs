@@ -56,10 +56,14 @@ struct ControlState {
     task: Option<tokio::task::JoinHandle<()>>,
 }
 
+type SendGuard = Arc<dyn Fn() -> bool + Send + Sync>;
+
 enum WorkerCommand {
     Send {
         stream_id: u16,
         payload: Vec<u8>,
+        guard: Option<SendGuard>,
+        release: bool,
         result: oneshot::Sender<std::result::Result<usize, String>>,
     },
 }
@@ -160,6 +164,25 @@ impl UuKcpControl {
     }
 
     pub(crate) async fn send(&self, stream_id: u16, payload: Vec<u8>) -> Result<usize> {
+        self.send_inner(stream_id, payload, None, false).await
+    }
+    pub(crate) async fn send_input(
+        &self,
+        stream_id: u16,
+        payload: Vec<u8>,
+        guard: SendGuard,
+        release: bool,
+    ) -> Result<usize> {
+        self.send_inner(stream_id, payload, Some(guard), release)
+            .await
+    }
+    async fn send_inner(
+        &self,
+        stream_id: u16,
+        payload: Vec<u8>,
+        guard: Option<SendGuard>,
+        release: bool,
+    ) -> Result<usize> {
         ensure!(
             payload.len() <= MAX_CONTROL_MESSAGE,
             "UU CONTROL message exceeds the official mixed-KCP limit"
@@ -173,6 +196,8 @@ impl UuKcpControl {
             .send(WorkerCommand::Send {
                 stream_id,
                 payload,
+                guard,
+                release,
                 result: result_tx,
             })
             .map_err(|_| anyhow!("UU mixed-KCP worker is closed"))?;
@@ -315,7 +340,10 @@ async fn run_worker(
             command = commands.recv() => {
                 let Some(command) = command else { break; };
                 match command {
-                    WorkerCommand::Send { stream_id, payload, result } => {
+                    WorkerCommand::Send { stream_id, payload, guard, release, result } => {
+                        // This is the final admission point before assigning KCP sequence numbers.
+                        if result.is_closed() || guard.as_ref().is_some_and(|valid|!valid()) {let _=result.send(Err("control request cancelled before transmission".into()));continue;}
+                        if guard.is_some() && !release && worker.kcp.wait_snd()>32 {let _=result.send(Err("control transport backlog exceeded".into()));continue;}
                         let sent = worker.send_message(stream_id, &payload);
                         let outcome = match sent {
                             Ok(bytes) => worker.flush_output(&endpoint).await.map(|()| bytes),

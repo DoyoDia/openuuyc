@@ -21,3 +21,12 @@ vendor/**/.cargo_vcs_info.json
 .env.*
 !.env.example
 secrets.json
+
+# Publish only the plugin SDK and the video-filter example.
+/plugins/*
+!/plugins/README.md
+!/plugins/sdk/
+!/plugins/effects/
+!/plugins/examples/
+/plugins/examples/*
+!/plugins/examples/filters.graph.json

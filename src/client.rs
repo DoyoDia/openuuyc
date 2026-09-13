@@ -25,6 +25,13 @@ impl std::error::Error for NoSavedSession {}
 
 mod assist;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RestorationStage {
+    Device,
+    Account,
+    Ready,
+}
+
 pub struct AuthenticatedClient {
     api: Mutex<Option<NrdApi>>,
     session: LoginSession,
@@ -34,6 +41,7 @@ pub struct AuthenticatedClient {
     ended: CancellationToken,
     validated: tokio::sync::Mutex<RestoreState>,
     restore_trigger: RestoreTrigger,
+    restore_progress: tokio::sync::watch::Sender<RestorationStage>,
     account_name: Mutex<String>,
 }
 
@@ -113,6 +121,12 @@ impl AuthenticatedClient {
                 failure: None,
             }),
             restore_trigger,
+            restore_progress: tokio::sync::watch::channel(if inherited {
+                RestorationStage::Ready
+            } else {
+                RestorationStage::Device
+            })
+            .0,
             account_name,
         })
     }
@@ -148,6 +162,10 @@ impl AuthenticatedClient {
     pub fn clear_saved_generation(&self) -> Result<()> {
         self.session_store.clear_if_matches(&self.session)?;
         Ok(())
+    }
+
+    pub(crate) fn restoration_stage(&self) -> RestorationStage {
+        *self.restore_progress.borrow()
     }
 
     async fn validate_saved_session(&self) -> Result<()> {
@@ -190,6 +208,8 @@ impl AuthenticatedClient {
             .clone()
             .context("account session has ended")?;
         api.set_identity(identity.client_identity()?);
+        self.restore_progress
+            .send_replace(RestorationStage::Account);
         let response = tokio::select! {
             biased;
             _ = self.ended.cancelled() => bail!("account session has ended"),
@@ -216,6 +236,7 @@ impl AuthenticatedClient {
         }
         *active_api = Some(api);
         validated.ready = true;
+        self.restore_progress.send_replace(RestorationStage::Ready);
         Ok(())
     }
 

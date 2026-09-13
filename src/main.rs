@@ -31,6 +31,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    #[cfg(windows)]
+    #[command(hide = true)]
+    PluginVideoHost,
+    #[cfg(windows)]
+    #[command(hide = true)]
+    PluginHost { manifest: PathBuf },
     /// 打开完整图形设备中心
     Gui {
         /// 自动刷新设备列表的间隔秒数（最小 2 秒）
@@ -107,9 +113,17 @@ enum Commands {
 }
 
 fn main() -> Result<()> {
+    let parsed = Cli::try_parse();
     #[cfg(windows)]
-    attach_parent_console();
-    let cli = Cli::parse();
+    if !parsed.as_ref().is_ok_and(|cli| {
+        matches!(
+            &cli.command,
+            Some(Commands::PluginHost { .. } | Commands::PluginVideoHost)
+        )
+    }) {
+        attach_parent_console();
+    }
+    let cli = parsed.unwrap_or_else(|error| error.exit());
     let command = cli.command.unwrap_or(Commands::Gui {
         refresh_seconds: 5,
         fps: media::FrameRateChoice::Auto,
@@ -131,6 +145,10 @@ fn main() -> Result<()> {
     tracing::info!(target: "openuuyc", version = env!("CARGO_PKG_VERSION"), "application started");
 
     let result = match command {
+        #[cfg(windows)]
+        Commands::PluginVideoHost => openuuyc::plugins::video::host(),
+        #[cfg(windows)]
+        Commands::PluginHost { manifest } => openuuyc::plugins::host(&manifest),
         Commands::Gui {
             refresh_seconds,
             fps,
@@ -246,7 +264,7 @@ fn main() -> Result<()> {
 fn attach_parent_console() {
     use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
 
-    // Run before clap/stdout initialization. Explorer has no parent console;
+    // Attach before printing clap output. Explorer has no parent console;
     // inherited STARTF_USESTDHANDLES pipes/files remain redirected on attach.
     // Never allocate a console just for launching the device center or viewer.
     let _ = unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };

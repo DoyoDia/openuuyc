@@ -85,6 +85,52 @@ pub fn run(options: GuiOptions) -> Result<()> {
     )
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum StartupStage {
+    #[default]
+    Identity,
+    Credentials,
+    Device,
+    Account,
+    Devices,
+}
+impl StartupStage {
+    const ALL: [Self; 5] = [
+        Self::Identity,
+        Self::Credentials,
+        Self::Device,
+        Self::Account,
+        Self::Devices,
+    ];
+    fn index(self) -> usize {
+        match self {
+            Self::Identity => 0,
+            Self::Credentials => 1,
+            Self::Device => 2,
+            Self::Account => 3,
+            Self::Devices => 4,
+        }
+    }
+    fn title(self) -> &'static str {
+        match self {
+            Self::Identity => "读取本机身份",
+            Self::Credentials => "读取登录凭据",
+            Self::Device => "初始化设备会话",
+            Self::Account => "校验账号登录状态",
+            Self::Devices => "获取设备清单",
+        }
+    }
+    fn detail(self) -> &'static str {
+        match self {
+            Self::Identity => "正在读取系统凭据库中的本机身份并启动会话服务。",
+            Self::Credentials => "正在读取已保存的账号凭据，准备恢复上次登录。",
+            Self::Device => "正在与 UU 服务同步本机身份，建立设备会话。",
+            Self::Account => "正在向 UU 服务验证已保存的登录凭据并读取账号信息。",
+            Self::Devices => "正在获取账号设备列表和在线状态，首批设备就绪后进入主界面。",
+        }
+    }
+}
+
 struct DeviceCenterApp {
     brand_texture: egui::TextureHandle,
     updates: updates::UpdateCheck,
@@ -118,6 +164,8 @@ struct DeviceCenterApp {
     qr_running: bool,
     phone: PhoneForm,
     login_restoring: bool,
+    startup_stage: StartupStage,
+    startup_stage_since: Instant,
     login_running: bool,
     login_status: String,
     login_qr: Option<egui::TextureHandle>,
@@ -167,6 +215,8 @@ impl DeviceCenterApp {
             qr_running: false,
             phone: PhoneForm::default(),
             login_restoring: true,
+            startup_stage: StartupStage::Identity,
+            startup_stage_since: Instant::now(),
             login_running: false,
             login_status: String::new(),
             login_qr: None,
@@ -179,6 +229,16 @@ impl DeviceCenterApp {
         self.diagnostics.poll();
         while let Ok(event) = self.worker.events.try_recv() {
             match event {
+                GuiEvent::Startup(generation, stage) => {
+                    if generation == self.login_generation
+                        && self.login_restoring
+                        && !self.logout_pending
+                        && self.startup_stage != stage
+                    {
+                        self.startup_stage = stage;
+                        self.startup_stage_since = Instant::now();
+                    }
+                }
                 GuiEvent::Presence(presence) => self.presence = presence,
                 GuiEvent::Devices(generation, devices) => {
                     if generation != self.login_generation
@@ -340,6 +400,8 @@ impl DeviceCenterApp {
                             self.login_qr = None;
                             self.phone.clear_private();
                             self.login_restoring = true;
+                            self.startup_stage = StartupStage::Device;
+                            self.startup_stage_since = Instant::now();
                             self.login_status = "登录成功，正在加载设备…".to_owned();
                             self.status = StatusMessage::success("登录成功，正在加载设备");
                             self.refresh_pending = true;
@@ -977,6 +1039,7 @@ enum DeviceMutation {
 }
 
 enum GuiEvent {
+    Startup(u64, StartupStage),
     Presence(PresenceState),
     AssistLists(u64, std::result::Result<crate::assist::SavedLists, String>),
     AssistOperation(u64, u64, std::result::Result<AssistResult, String>),
@@ -1063,6 +1126,8 @@ async fn gui_worker_loop(
             return;
         }
     };
+    let _ = events.send(GuiEvent::Startup(0, StartupStage::Credentials));
+    let mut startup_last = None;
     let mut client: Option<Arc<AuthenticatedClient>> = None;
     let mut allow_load = true;
     let mut next_refresh = Instant::now();
@@ -1646,6 +1711,10 @@ async fn gui_worker_loop(
             && logout_task.is_none()
             && Instant::now() >= next_refresh
         {
+            let _ = events.send(GuiEvent::Startup(
+                catalog_generation,
+                StartupStage::Credentials,
+            ));
             match AuthenticatedClient::from_saved_session_with_device(device_runtime.handle()) {
                 Ok(loaded) => {
                     client = Some(Arc::new(loaded));
@@ -1666,6 +1735,15 @@ async fn gui_worker_loop(
             }
         }
         if let Some(active_client) = &client {
+            let stage = match active_client.restoration_stage() {
+                crate::client::RestorationStage::Device => StartupStage::Device,
+                crate::client::RestorationStage::Account => StartupStage::Account,
+                crate::client::RestorationStage::Ready => StartupStage::Devices,
+            };
+            if startup_last != Some((catalog_generation, stage)) {
+                startup_last = Some((catalog_generation, stage));
+                let _ = events.send(GuiEvent::Startup(catalog_generation, stage));
+            }
             let refresh_active = *foreground.borrow();
             if refresh_active
                 && assist_lists_task.is_none()

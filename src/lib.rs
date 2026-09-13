@@ -26,6 +26,8 @@ mod network_control;
 mod nrd_http;
 pub mod official_receiver;
 pub mod performance;
+#[cfg(windows)]
+pub mod plugins;
 mod presence;
 mod remote_cursor;
 mod remote_input;

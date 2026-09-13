@@ -48,6 +48,10 @@ use super::{
     show_stream_control_window, take_next_frame,
 };
 
+#[path = "plugin_capture.rs"]
+mod plugin_capture;
+#[path = "plugin_video.rs"]
+mod plugin_video;
 #[path = "screen_windows.rs"]
 mod screen_windows;
 use screen_windows::{ScreenTabBar, ScreenWindows};
@@ -642,6 +646,7 @@ struct PlayerTitleBar<'a> {
     performance: &'a PerformanceMonitor,
     stream_control: &'a StreamControlHandle,
     stream_control_ui: &'a mut StreamControlUi,
+    plugin_menu_open: &'a mut bool,
     move_state: Option<&'a mut WindowMoveState>,
 }
 
@@ -654,7 +659,7 @@ fn player_title_bar(ui: &mut egui::Ui, mut bar: PlayerTitleBar<'_>) -> PlayerChr
         egui::vec2(ui.available_width(), 36.0),
     );
     const WINDOW_CONTROLS_WIDTH: f32 = 106.0;
-    const VIEW_ACTIONS_WIDTH: f32 = 110.0;
+    const VIEW_ACTIONS_WIDTH: f32 = 144.0;
     let identity_width = (rect.width() * 0.22).clamp(170.0, 210.0);
     let controls_rect = egui::Rect::from_min_max(
         egui::pos2(rect.max.x - WINDOW_CONTROLS_WIDTH, rect.min.y),
@@ -785,6 +790,22 @@ fn player_title_bar(ui: &mut egui::Ui, mut bar: PlayerTitleBar<'_>) -> PlayerChr
     }
     if quality_button.clicked() {
         bar.stream_control_ui.open = !bar.stream_control_ui.open;
+        if bar.stream_control_ui.open {
+            *bar.plugin_menu_open = false;
+        }
+    }
+    if title_icon_button(
+        &mut actions,
+        TitleIcon::Plugins,
+        *bar.plugin_menu_open,
+        "插件",
+    )
+    .clicked()
+    {
+        *bar.plugin_menu_open = !*bar.plugin_menu_open;
+        if *bar.plugin_menu_open {
+            bar.stream_control_ui.open = false;
+        }
     }
     action.one_to_one = actions
         .add_enabled_ui(
@@ -855,6 +876,7 @@ struct PlayerChromeAction {
 
 #[derive(Clone, Copy)]
 enum TitleIcon {
+    Plugins,
     OneToOne,
     Mouse,
     Quality,
@@ -901,6 +923,7 @@ fn paint_title_icon(
     let center = rect.center();
     let stroke = egui::Stroke::new(1.35, color);
     match icon {
+        TitleIcon::Plugins => crate::plugins::paint_plugin_icon(painter, rect, color),
         TitleIcon::OneToOne => {
             for (x, y) in [(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
                 let corner = center + egui::vec2(x * 7.0, y * 6.0);
@@ -1525,6 +1548,7 @@ enum RenderCommand {
 }
 
 struct RenderWorker {
+    plugins: crate::plugins::Controller,
     frame_wake: super::FrameWake,
     commands: std_mpsc::Sender<RenderCommand>,
     wake: std::thread::Thread,
@@ -1537,7 +1561,10 @@ impl RenderWorker {
         hwnd: isize,
         mut size: PhysicalSize<u32>,
         session: &NativeViewerSession,
+        context: &egui::Context,
     ) -> Result<Self> {
+        let plugins = crate::plugins::Controller::new(context.clone());
+        let plugin_state = plugins.shared.clone();
         let frame_queue = Arc::clone(&session.frame_queue);
         let performance = session.performance.clone();
         let worker_shutdown = Arc::clone(&session.shutdown);
@@ -1576,6 +1603,12 @@ impl RenderWorker {
                     }
                     if occluded || size.width == 0 || size.height == 0 {
                         current_frame = None;
+                        if let Some(p) = presenter.as_mut() {
+                            if let Some(effects) = p.effects.as_mut() {
+                                effects.clear_history();
+                            }
+                            p.captures = plugin_video::Captures::default();
+                        }
                         let dropped = {
                             let mut queue = mutex_lock(&frame_queue);
                             let count = queue.len();
@@ -1590,6 +1623,10 @@ impl RenderWorker {
                         std::thread::park();
                         continue;
                     }
+                    let chain_changed = presenter.as_ref().is_some_and(|p| {
+                        p.effect_revision != plugin_state.revision.load(Ordering::Acquire)
+                    });
+                    redraw |= chain_changed;
                     let replacement = take_next_frame(&mut mutex_lock(&frame_queue), &performance);
                     let is_new_submission = replacement.is_some();
                     if (redraw || is_new_submission)
@@ -1613,6 +1650,13 @@ impl RenderWorker {
                                 tracing::info!("initialized native video presentation pipeline");
                             }
                             let p = presenter.as_mut().expect("presenter initialized");
+                            p.plugin_state = Some(plugin_state.clone());
+                            if p.effect_revision != plugin_state.revision.load(Ordering::Acquire) {
+                                let fps = performance.snapshot().receive_fps;
+                                p.nominal_fps = if fps >= 15.0 { fps } else { 60.0 };
+                            }
+                            p.analysis_at = frame.received_at;
+                            p.analysis_new = is_new_submission || chain_changed;
                             p.resize(size).map_err(VideoRenderError::prepare)?;
                             render_thread_frame(p, frame, &performance, is_new_submission)
                         })();
@@ -1644,7 +1688,18 @@ impl RenderWorker {
                     }
                     redraw = false;
                     if mutex_lock(&frame_queue).is_empty() {
-                        std::thread::park();
+                        if let Some(due) = presenter
+                            .as_ref()
+                            .and_then(|p| p.effects.as_ref())
+                            .and_then(|e| e.next_due())
+                        {
+                            std::thread::park_timeout(
+                                due.saturating_duration_since(Instant::now()),
+                            );
+                            redraw = true;
+                        } else {
+                            std::thread::park();
+                        }
                     }
                 }
                 // GPU resources and retained samples go away before the child HWND.
@@ -1655,9 +1710,11 @@ impl RenderWorker {
             })
             .context("create Video Render thread")?;
         let wake = thread.thread().clone();
+        *mutex_lock(&plugins.shared.wake) = Some(wake.clone());
         session.frame_wake.install_render_thread(wake.clone());
         wake.unpark();
         Ok(Self {
+            plugins,
             frame_wake: session.frame_wake.clone(),
             commands,
             wake,
@@ -1714,50 +1771,72 @@ fn render_thread_frame(
     performance: &PerformanceMonitor,
     is_new_submission: bool,
 ) -> std::result::Result<(), VideoRenderError> {
-    let render_queue_delay = frame.decoded_at.elapsed();
-    let present_wait_delay = presenter.begin_frame().map_err(VideoRenderError::prepare)?;
-    let video_started = Instant::now();
-    match &frame.surface {
-        RenderSurface::D3D11(surface) => presenter.draw_video(
-            surface,
-            frame.width,
-            frame.height,
-            frame.rotation,
-            frame.color,
-        ),
-        RenderSurface::CpuRgba8(pixels) => {
-            presenter.draw_cpu_video(pixels, frame.width, frame.height, frame.rotation)
-        }
-    }
-    .map_err(VideoRenderError::prepare)?;
-    let surface_transfer_delay = video_started.elapsed();
-    presenter.present().map_err(|error| {
-        let release_resources = is_device_lost(&error);
-        VideoRenderError {
-            error,
-            release_resources,
-        }
-    })?;
-    if is_new_submission {
-        performance.record_rendered_frame(RenderedFrameTiming {
+    presenter.submission_wait = Duration::ZERO;
+    let wait = Duration::ZERO;
+    let started = Instant::now();
+    presenter.drew = false;
+    presenter.effect_output = None;
+    presenter.effect_generated = false;
+    presenter.effect_input = is_new_submission.then_some(plugin_video::Metadata {
+        received_at: frame.received_at,
+        timing: RenderedFrameTiming {
             is_new_picture: frame.is_new_picture,
             width: frame.width,
             height: frame.height,
             decoded_at: frame.decoded_at,
-            local: frame.received_at.elapsed(),
+            local: Duration::ZERO,
             assembly: frame.assembly_delay,
             input_queue: frame.input_queue_delay,
             decode_pipeline: frame.decode_pipeline_delay,
-            surface_transfer: surface_transfer_delay,
-            present_wait: present_wait_delay,
-            render_queue: render_queue_delay,
+            surface_transfer: Duration::ZERO,
+            present_wait: wait,
+            render_queue: frame.decoded_at.elapsed(),
             sender_capture_at: frame.sender_timing.capture_at,
             sender_capture: frame.sender_timing.capture_delay,
             sender_encode: frame.sender_timing.encode_delay,
             sender_pacer: frame.sender_timing.pacer_delay,
             sender_total: frame.sender_timing.sending_delay,
             transport: frame.sender_timing.transport_delay,
-        });
+        },
+    });
+    let result = if !presenter.analysis_new && presenter.effects.is_some() {
+        presenter.draw_effect_output(frame.color, true)
+    } else {
+        match &frame.surface {
+            RenderSurface::D3D11(surface) => presenter.draw_video(
+                surface,
+                frame.width,
+                frame.height,
+                frame.rotation,
+                frame.color,
+            ),
+            RenderSurface::CpuRgba8(pixels) => {
+                presenter.draw_cpu_video(pixels, frame.width, frame.height, frame.rotation)
+            }
+        }
+    };
+    result.map_err(VideoRenderError::prepare)?;
+    if !presenter.drew {
+        presenter.release_active_input_sync();
+        return Ok(());
+    }
+    let wait = presenter.submission_wait;
+    let transfer = started.elapsed().saturating_sub(wait);
+    presenter.present().map_err(|error| VideoRenderError {
+        release_resources: is_device_lost(&error),
+        error,
+    })?;
+    if presenter.effect_generated {
+        if let Some(state) = &presenter.plugin_state {
+            state.generated.fetch_add(1, Ordering::Relaxed);
+        }
+    } else if let Some(mut metadata) = presenter.effect_output {
+        metadata.timing.local = metadata.received_at.elapsed();
+        metadata.timing.surface_transfer = transfer;
+        metadata.timing.present_wait = wait;
+        metadata.timing.render_queue =
+            started.saturating_duration_since(metadata.timing.decoded_at);
+        performance.record_rendered_frame(metadata.timing);
     }
     Ok(())
 }
@@ -1795,6 +1874,7 @@ struct ThreadedWindowsApp {
     performance: PerformanceMonitor,
     stream_control: StreamControlHandle,
     stream_control_ui: StreamControlUi,
+    plugin_menu_open: bool,
     shutdown: Arc<AtomicBool>,
     fatal_error: Arc<Mutex<Option<String>>>,
     egui_context: egui::Context,
@@ -1832,7 +1912,12 @@ impl ThreadedWindowsApp {
         self.renderer.stop();
         self.performance.pause_presentation();
         let size = self.video_window.resize(window, window.inner_size())?;
-        self.renderer = RenderWorker::spawn(self.video_window.handle(), size, &session)?;
+        self.renderer = RenderWorker::spawn(
+            self.video_window.handle(),
+            size,
+            &session,
+            &self.egui_context,
+        )?;
         self.title = session.title.clone();
         self.performance = session.performance.clone();
         self.stream_control = session.stream_control.clone();
@@ -1856,7 +1941,12 @@ impl ThreadedWindowsApp {
         let fatal_error = Arc::clone(&session.fatal_error);
         let video_window = VideoWindow::new(window)?;
         let size = video_window.resize(window, window.inner_size())?;
-        let renderer = RenderWorker::spawn(video_window.handle(), size, &session)?;
+        let renderer = RenderWorker::spawn(
+            video_window.handle(),
+            size,
+            &session,
+            &connecting.egui_context,
+        )?;
         Ok(Self {
             mouse: super::windows_mouse::WindowMouse::new(
                 window,
@@ -1871,6 +1961,7 @@ impl ThreadedWindowsApp {
             performance,
             stream_control,
             stream_control_ui: StreamControlUi::default(),
+            plugin_menu_open: false,
             shutdown,
             fatal_error,
             egui_context: connecting.egui_context,
@@ -1922,6 +2013,7 @@ impl ThreadedWindowsApp {
             event,
             WindowEvent::Focused(false) | WindowEvent::Occluded(true)
         ) {
+            self.renderer.plugins.disarm();
             self.mouse.release(window);
         }
         if matches!(event, WindowEvent::Focused(false)) {
@@ -1950,6 +2042,7 @@ impl ThreadedWindowsApp {
     }
 
     fn apply_shortcut(&mut self, window: &Window, shortcut: ViewerShortcut) -> Result<()> {
+        self.renderer.plugins.disarm();
         match shortcut {
             ViewerShortcut::ReleaseMouse => {
                 self.mouse.release(window);
@@ -1996,6 +2089,7 @@ impl ThreadedWindowsApp {
             self.stream_control.mouse().fail(error.to_string());
         }
         if self.close_requested {
+            self.renderer.plugins.disarm();
             self.mouse.release(window);
             return;
         }
@@ -2013,13 +2107,24 @@ impl ThreadedWindowsApp {
             window.request_redraw();
         }
         self.last_mouse_mode = mode;
+        self.renderer.plugins.input_context(
+            self.stream_control.mouse().clone(),
+            window_hwnd(window).map_or(0, |h| h.0 as u64),
+            window.has_focus()
+                && !window.is_minimized().unwrap_or(false)
+                && !self.plugin_menu_open
+                && !self.stream_control_ui.open
+                && !self.screen_tabs.is_pending()
+                && !self.egui_context.any_popup_open()
+                && !self.egui_context.text_edit_focused(),
+        );
         self.mouse.refresh(
             window,
             &self.egui_context,
             &self.stream_control,
             self._session.track_index,
             &self.renderer.current_video_size,
-            self.stream_control_ui.open || self.screen_tabs.is_pending(),
+            self.stream_control_ui.open || self.plugin_menu_open || self.screen_tabs.is_pending(),
             event_loop,
         );
     }
@@ -2034,6 +2139,7 @@ impl ThreadedWindowsApp {
         let mut chrome_action = PlayerChromeAction::default();
         let fullscreen = window.fullscreen().is_some();
         if fullscreen {
+            self.plugin_menu_open = false;
             self.stream_control_ui.open = false;
         }
         let mut resize = None;
@@ -2041,6 +2147,7 @@ impl ThreadedWindowsApp {
             .aspect_locked
             .then(|| self.current_video_size())
             .flatten();
+        let plugin_video_size = self.current_video_size();
         let output = self.egui_context.run_ui(input, |ui| {
             if ui.ctx().input(|input| input.key_pressed(egui::Key::F3)) {
                 view.performance_mode = view.performance_mode.next();
@@ -2061,6 +2168,7 @@ impl ThreadedWindowsApp {
                                 performance: &self.performance,
                                 stream_control: &self.stream_control,
                                 stream_control_ui: &mut self.stream_control_ui,
+                                plugin_menu_open: &mut self.plugin_menu_open,
                                 move_state: Some(&mut self.window_move),
                             },
                         );
@@ -2072,6 +2180,29 @@ impl ThreadedWindowsApp {
                 &mut self.stream_control_ui,
                 &mut view,
             );
+            self.renderer.plugins.window(
+                &ctx,
+                &mut self.plugin_menu_open,
+                super::stream_menu::menu_style,
+                &self.stream_control,
+            );
+            let size = window.inner_size();
+            let top = title_bar_height_pixels(window);
+            if let Some((w, h)) = plugin_video_size {
+                let r = fit_rect(w, h, size.width, size.height.saturating_sub(top));
+                let scale = ctx.pixels_per_point();
+                self.renderer.plugins.paint(
+                    &ctx,
+                    size.width as f32 / scale,
+                    size.height as f32 / scale,
+                    [
+                        r.left as f32 / scale,
+                        (r.top as f32 + top as f32) / scale,
+                        r.right as f32 / scale,
+                        (r.bottom as f32 + top as f32) / scale,
+                    ],
+                );
+            }
             super::show_performance_overlay(
                 &ctx,
                 &self.performance,
@@ -2213,6 +2344,19 @@ impl Drop for ThreadedWindowsApp {
 }
 
 struct D3D11Presenter {
+    captures: plugin_video::Captures,
+    plugin_state: Option<Arc<crate::plugins::ChainShared>>,
+    effects: Option<plugin_video::Engine>,
+    effect_revision: u64,
+    effects_cache_revision: u64,
+    nominal_fps: f64,
+    effect_input: Option<plugin_video::Metadata>,
+    effect_output: Option<plugin_video::Metadata>,
+    effect_generated: bool,
+    drew: bool,
+    submission_wait: Duration,
+    analysis_at: Instant,
+    analysis_new: bool,
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     swap_chain: IDXGISwapChain1,
@@ -2366,6 +2510,7 @@ struct VideoColorTransform {
 const OFFICIAL_SHARED_TEXTURE_CACHE_SIZE: usize = 32;
 const OFFICIAL_TEXTURE_SYNC_TIMEOUT_MS: u32 = 100;
 
+#[derive(Clone, Copy)]
 struct VideoTextureView {
     color: RenderColor,
     array_slice: u32,
@@ -2490,6 +2635,10 @@ impl VideoShaderRenderer {
         output_size: PhysicalSize<u32>,
         content_top: u32,
     ) -> Result<()> {
+        // A former render target must be unbound before it becomes an input.
+        unsafe {
+            context.OMSetRenderTargets(None, None);
+        }
         let (plane_0, plane_1) = self.shader_views(device, texture, &view)?;
         let geometry_key = VideoGeometryKey {
             visible_x: view.visible_x,
@@ -2625,6 +2774,7 @@ impl VideoShaderRenderer {
             DXGI_FORMAT_NV12 => (DXGI_FORMAT_R8_UNORM, Some(DXGI_FORMAT_R8G8_UNORM)),
             DXGI_FORMAT_P010 => (DXGI_FORMAT_R16_UNORM, Some(DXGI_FORMAT_R16G16_UNORM)),
             DXGI_FORMAT_R8G8B8A8_UNORM => (DXGI_FORMAT_R8G8B8A8_UNORM, None),
+            DXGI_FORMAT_R16G16B16A16_FLOAT => (DXGI_FORMAT_R16G16B16A16_FLOAT, None),
             format => bail!("unsupported D3D11 shader input format {format:?}"),
         };
         let plane_0 =
@@ -2862,6 +3012,19 @@ impl D3D11Presenter {
             size,
             content_top: 0,
             display_audit: DisplayAudit::from_environment(),
+            captures: plugin_video::Captures::default(),
+            plugin_state: None,
+            effects: None,
+            effect_revision: 0,
+            effects_cache_revision: 0,
+            nominal_fps: 60.0,
+            effect_input: None,
+            effect_output: None,
+            effect_generated: false,
+            drew: false,
+            submission_wait: Duration::ZERO,
+            analysis_at: Instant::now(),
+            analysis_new: false,
         })
     }
 
@@ -3107,6 +3270,90 @@ impl D3D11Presenter {
     }
 
     fn draw_texture(&mut self, texture: &ID3D11Texture2D, view: VideoTextureView) -> Result<()> {
+        let state = self.plugin_state.clone();
+        if let Some(state) = &state {
+            let graph = state.graph.try_lock().ok().map(|g| g.clone());
+            if let Some(graph) = graph
+                && graph.revision != self.effect_revision
+            {
+                self.effect_revision = graph.revision;
+                let candidate = if graph.nodes.is_empty() {
+                    Ok(None)
+                } else {
+                    plugin_video::Engine::new(&self.device, &graph, self.nominal_fps).map(Some)
+                };
+                match candidate {
+                    Ok(engine) => {
+                        self.effects = engine;
+                        self.effects_cache_revision = 0;
+                        self.video_renderer.reset_input_cache();
+                        state.video_failed.store(0, Ordering::Release);
+                        state
+                            .applied_revision
+                            .store(graph.revision, Ordering::Release);
+                    }
+                    Err(error) => {
+                        *mutex_lock(&state.error) = Some(format!("GPU节点准备失败：{error}"));
+                        state
+                            .failed_revision
+                            .store(graph.revision, Ordering::Release);
+                    }
+                }
+            }
+        }
+        let taps = state
+            .as_ref()
+            .and_then(|s| {
+                s.taps.try_lock().ok().map(|t| {
+                    t.iter()
+                        .filter(|t| {
+                            t.revision == s.applied_revision.load(Ordering::Acquire)
+                                && (t.source == 0
+                                    || s.video_failed.load(Ordering::Acquire) != t.revision)
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
+            })
+            .unwrap_or_default();
+        if self.analysis_new {
+            self.captures.feed(
+                0,
+                &self.device,
+                &self.context,
+                texture,
+                view,
+                &taps,
+                self.analysis_at,
+                true,
+            );
+        }
+        if let Some(engine) = self.effects.as_mut() {
+            let result = if self.analysis_new {
+                engine.process(
+                    &self.device,
+                    &self.context,
+                    texture,
+                    view,
+                    self.analysis_at,
+                    self.effect_input,
+                    &mut self.captures,
+                    &taps,
+                )
+            } else {
+                Ok(())
+            };
+            if let Err(error) = result {
+                if let Some(state) = &state {
+                    state.fail(format!("视频链已停止：{error}"));
+                }
+                self.effects = None;
+                self.video_renderer.reset_input_cache();
+            } else {
+                return self.draw_effect_output(view.color, !self.analysis_new);
+            }
+        }
+        self.submission_wait = self.begin_frame()?;
         self.video_renderer.draw(
             &self.device,
             &self.context,
@@ -3117,7 +3364,45 @@ impl D3D11Presenter {
             view,
             self.size,
             self.content_top,
-        )
+        )?;
+        self.drew = true;
+        self.effect_output = self.effect_input;
+        Ok(())
+    }
+    fn draw_effect_output(&mut self, color: RenderColor, redraw: bool) -> Result<()> {
+        let Some(engine) = self.effects.as_mut() else {
+            return Ok(());
+        };
+        let Some(state) = &self.plugin_state else {
+            return Ok(());
+        };
+        if engine.cache_revision != self.effects_cache_revision {
+            self.video_renderer.reset_input_cache();
+            self.effects_cache_revision = engine.cache_revision;
+        }
+        let due = engine.take_due(&state.skipped);
+        let fresh = due.is_some();
+        let picture = due.or_else(|| if redraw { engine.last() } else { None });
+        if let Some(picture) = picture {
+            self.submission_wait = self.begin_frame()?;
+            self.video_renderer.draw(
+                &self.device,
+                &self.context,
+                self.render_target
+                    .as_ref()
+                    .context("effect presentation target")?,
+                &picture.target.texture,
+                plugin_video::view(&picture.target, color),
+                self.size,
+                self.content_top,
+            )?;
+            self.drew = true;
+            if fresh {
+                self.effect_output = picture.metadata;
+                self.effect_generated = picture.generated;
+            }
+        }
+        Ok(())
     }
 
     fn present(&mut self) -> Result<()> {
