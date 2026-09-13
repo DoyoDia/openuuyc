@@ -4,7 +4,7 @@
     reason = "The executable uses the OpenUUYC product name."
 )]
 
-use std::{path::PathBuf, time::Duration};
+use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -39,13 +39,6 @@ enum Commands {
     PluginHost { manifest: PathBuf },
     /// 打开完整图形设备中心
     Gui {
-        /// 自动刷新设备列表的间隔秒数（最小 2 秒）
-        #[arg(
-            long,
-            default_value_t = 5,
-            value_parser = clap::value_parser!(u64).range(2..)
-        )]
-        refresh_seconds: u64,
         /// 初始码流帧率：auto、144、90、60 或 30
         #[arg(long, default_value = "auto")]
         fps: media::FrameRateChoice,
@@ -125,7 +118,6 @@ fn main() -> Result<()> {
     }
     let cli = parsed.unwrap_or_else(|error| error.exit());
     let command = cli.command.unwrap_or(Commands::Gui {
-        refresh_seconds: 5,
         fps: media::FrameRateChoice::Auto,
         codec: media::CodecPreference::Auto,
         hardware_decode: true,
@@ -150,13 +142,11 @@ fn main() -> Result<()> {
         #[cfg(windows)]
         Commands::PluginHost { manifest } => openuuyc::plugins::host(&manifest),
         Commands::Gui {
-            refresh_seconds,
             fps,
             codec,
             hardware_decode,
             transport,
         } => app::run(app::GuiOptions {
-            refresh_interval: Duration::from_secs(refresh_seconds),
             media: media::ConnectionMediaOptions {
                 muted: false,
                 frame_rate: fps,

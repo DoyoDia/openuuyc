@@ -24,6 +24,7 @@ impl std::fmt::Display for NoSavedSession {
 impl std::error::Error for NoSavedSession {}
 
 mod assist;
+mod wallpaper;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RestorationStage {
@@ -43,6 +44,7 @@ pub struct AuthenticatedClient {
     restore_trigger: RestoreTrigger,
     restore_progress: tokio::sync::watch::Sender<RestorationStage>,
     account_name: Mutex<String>,
+    wallpaper: Mutex<wallpaper::Sync>,
 }
 
 #[derive(Default)]
@@ -128,6 +130,7 @@ impl AuthenticatedClient {
             })
             .0,
             account_name,
+            wallpaper: Mutex::new(wallpaper::Sync::default()),
         })
     }
 
@@ -311,8 +314,11 @@ impl AuthenticatedClient {
     }
 
     pub async fn list_devices(&self) -> Result<DeviceList> {
-        self.request(|api| async move { api.list_devices().await })
-            .await
+        let list = self
+            .request(|api| async move { api.list_devices().await })
+            .await?;
+        self.schedule_wallpaper(&list);
+        Ok(list)
     }
 
     pub async fn device_groups(&self) -> Result<crate::api::DeviceGroups> {
@@ -359,7 +365,11 @@ impl AuthenticatedClient {
         self.device.identity().suggested_name()
     }
 
-    pub(crate) async fn rename_owned_device(&self, id: &str, alias: &str) -> Result<String> {
+    pub(crate) async fn rename_owned_device(
+        &self,
+        id: &str,
+        alias: &str,
+    ) -> Result<(String, String)> {
         let groups = self.device_groups().await?;
         if !groups.entries().any(|(_, d)| d.device_id == id) {
             bail!("设备已不在本账号绑定列表中，未发送改名请求");
@@ -398,11 +408,14 @@ impl AuthenticatedClient {
         };
         if id == self.device_id()
             && let AccountDevice::Managed(device) = &self.device
-            && let Err(error) = device.set_name(id.into(), actual).await
+            && let Err(error) = device.set_name(id.into(), actual.clone()).await
         {
-            return Ok(format!("服务端已改名，但本地注册名称保存失败：{error:#}"));
+            return Ok((
+                actual,
+                format!("服务端已改名，但本地注册名称保存失败：{error:#}"),
+            ));
         }
-        Ok("设备名称已更新".into())
+        Ok((actual, "设备名称已更新".into()))
     }
 
     pub(crate) async fn remove_account_device(&self, id: &str) -> Result<String> {
@@ -433,6 +446,55 @@ impl AuthenticatedClient {
             }
         }
         Ok("设备已移除".into())
+    }
+
+    pub(crate) async fn power_owned_device(
+        &self,
+        expected: &crate::api::DeviceInfo,
+        action: crate::power::PowerAction,
+        on_send: impl FnOnce(),
+    ) -> Result<crate::power::PowerReceipt> {
+        let id = expected.validated_device_id()?;
+        let groups = self.device_groups().await?;
+        if id == self.device_id() || id == groups.current_device_id {
+            bail!("本机观看身份不支持电源操作，未发送请求");
+        }
+        let device = groups
+            .desktop_devices
+            .iter()
+            .find(|d| d.device_id == id)
+            .context("设备或所有权已变化，未发送电源请求，请刷新列表")?;
+        if device.alias != expected.alias || device.platform != expected.platform {
+            bail!("设备名称或平台已变化，请刷新后重新确认目标");
+        }
+        if device.participant_count() > expected.participant_count() {
+            bail!("该设备新增了远控连接，请刷新后重新确认影响");
+        }
+        action.check(device)?;
+        let detail = self
+            .device_detail(id)
+            .await
+            .context("无法核实设备类型，未发送电源请求")?;
+        if crate::virtual_hardware::matches(
+            detail.details.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+        ) {
+            bail!("虚拟观看身份不支持电源操作，未发送请求");
+        }
+        // The envelope, unlike request(), distinguishes a preflight error from
+        // a power request whose acknowledgement may have been lost. Never replay.
+        on_send();
+        let result = self
+            .request_envelope(|api| async move { api.device_power(id, action).await })
+            .await;
+        match result {
+            Ok(response) => response
+                .into_data()
+                .with_context(|| format!("{}请求被服务端拒绝", action.label())),
+            Err(error) => bail!(
+                "{}结果未确认，未自动重试；请先检查设备状态：{error:#}",
+                action.label()
+            ),
+        }
     }
 
     pub async fn join_device(&self, device_id: &str, force_join: bool) -> Result<RoomSession> {

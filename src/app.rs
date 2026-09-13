@@ -21,21 +21,22 @@ use crate::viewer_owner::ViewerOwner;
 
 mod assist;
 mod catalog;
+mod device_sync;
 mod diagnostics;
 #[cfg(windows)]
 pub mod instance;
 mod phone;
+mod power;
 mod updates;
 mod view;
+mod wallpaper;
 use assist::{AssistOperation, AssistResult, AssistUi};
 use phone::{LoginMethod, PhoneForm};
 use view::{CenterUi, configure_visuals};
 
-const MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const WORKER_TICK: Duration = Duration::from_millis(250);
 
 pub struct GuiOptions {
-    pub refresh_interval: Duration,
     pub media: ConnectionMediaOptions,
 }
 
@@ -55,12 +56,11 @@ pub fn run(options: GuiOptions) -> Result<()> {
         .resolve(local_display)
         .context("invalid initial GUI media options")?;
 
-    let refresh_interval = options.refresh_interval.max(MIN_REFRESH_INTERVAL);
     let viewport = egui::ViewportBuilder::default()
         .with_title(format!("{} · 控制中心", crate::APP_NAME))
         .with_icon(crate::ui::branding::icon())
         .with_inner_size([1180.0, 760.0])
-        .with_min_inner_size([900.0, 620.0]);
+        .with_min_inner_size([1024.0, 720.0]);
     crate::ui::run(
         crate::ui::WindowConfig {
             viewport,
@@ -70,13 +70,7 @@ pub fn run(options: GuiOptions) -> Result<()> {
             crate::viewer::install_system_cjk_font(ctx);
             configure_visuals(ctx);
             ctx.request_repaint();
-            let mut app = DeviceCenterApp::new(
-                ctx,
-                refresh_interval,
-                local_display,
-                options.media,
-                display_warning,
-            );
+            let mut app = DeviceCenterApp::new(ctx, local_display, options.media, display_warning);
             if let Some(graphics) = graphics {
                 app.diagnostics.graphics.push(graphics);
             }
@@ -147,6 +141,8 @@ struct DeviceCenterApp {
     diagnostics: diagnostics::LocalDiagnostics,
     mutation_pending: bool,
     queued_mutation: Option<DeviceMutation>,
+    power_progress: std::collections::BTreeMap<String, power::PowerProgress>,
+    pending_power: Option<power::PendingPower>,
     selected_device_id: Option<String>,
     local_display: LocalDisplayInfo,
     media: ConnectionMediaOptions,
@@ -175,7 +171,6 @@ struct DeviceCenterApp {
 impl DeviceCenterApp {
     fn new(
         ctx: &egui::Context,
-        refresh_interval: Duration,
         local_display: LocalDisplayInfo,
         media: ConnectionMediaOptions,
         display_warning: Option<String>,
@@ -185,7 +180,7 @@ impl DeviceCenterApp {
             updates: updates::UpdateCheck::start(ctx),
             center_ui: CenterUi::default(),
             assist: AssistUi::default(),
-            worker: GuiWorker::spawn(refresh_interval),
+            worker: GuiWorker::spawn(),
             devices: None,
             catalog: None,
             catalog_error: None,
@@ -195,6 +190,8 @@ impl DeviceCenterApp {
             diagnostics: diagnostics::LocalDiagnostics::start(),
             mutation_pending: false,
             queued_mutation: None,
+            power_progress: Default::default(),
+            pending_power: None,
             selected_device_id: None,
             local_display,
             media,
@@ -240,6 +237,18 @@ impl DeviceCenterApp {
                     }
                 }
                 GuiEvent::Presence(presence) => self.presence = presence,
+                GuiEvent::PowerDispatched(generation, id, action) => {
+                    if generation == self.login_generation
+                        && self.mutation_pending
+                        && !self.logout_pending
+                    {
+                        self.pending_power = Some(power::PendingPower {
+                            id,
+                            action,
+                            saw_offline: false,
+                        });
+                    }
+                }
                 GuiEvent::Devices(generation, devices) => {
                     if generation != self.login_generation
                         || self.logout_pending
@@ -247,6 +256,7 @@ impl DeviceCenterApp {
                     {
                         continue;
                     }
+                    self.observe_power(&devices);
                     self.devices = Some(devices);
                     self.normalize_selection();
                     self.refreshed_at = Some(Instant::now());
@@ -266,6 +276,15 @@ impl DeviceCenterApp {
                     self.account_name = account_name;
                     match result {
                         Ok(catalog) => {
+                            // The worker owns hardware freshness and has already merged deltas.
+                            self.extra_details.retain(|id, _| {
+                                !catalog.groups.entries().any(|(_, d)| &d.device_id == id)
+                            });
+                            if self.detail_pending.as_ref().is_some_and(|id| {
+                                !catalog.groups.entries().any(|(_, d)| &d.device_id == id)
+                            }) {
+                                self.detail_pending = None;
+                            }
                             self.catalog = Some(catalog);
                             self.catalog_error = None;
                             self.login_restoring = false;
@@ -273,14 +292,26 @@ impl DeviceCenterApp {
                         Err(error) => self.catalog_error = Some(error),
                     }
                 }
-                GuiEvent::MutationFinished(result) => {
-                    self.extra_details.clear();
+                GuiEvent::MutationFinished(generation, result) => {
+                    if generation != self.login_generation
+                        || self.logout_pending
+                        || self.login_running
+                    {
+                        continue;
+                    }
                     self.mutation_pending = false;
                     self.status = match result {
-                        Ok(message) => StatusMessage::success(message),
+                        Ok(MutationOutcome::Changed { message, .. }) => {
+                            StatusMessage::success(message)
+                        }
+                        Ok(MutationOutcome::Power(accepted)) => {
+                            self.accept_power(*accepted);
+                            StatusMessage::info("电源请求已受理，正在观察设备状态")
+                        }
                         Err(message) => StatusMessage::warning(message),
                     };
-                    self.center_ui.close_details();
+                    self.center_ui.finish_device_operation();
+                    self.pending_power = None;
                 }
                 GuiEvent::Detail(generation, id, result) => {
                     if generation == self.login_generation
@@ -703,10 +734,13 @@ impl DeviceCenterApp {
     }
 
     fn clear_catalog(&mut self) {
+        self.center_ui.clear_wallpapers();
         self.assist = AssistUi::default();
         self.extra_details.clear();
         self.detail_pending = None;
         self.queued_mutation = None;
+        self.power_progress.clear();
+        self.pending_power = None;
         self.mutation_pending = false;
         self.catalog = None;
         self.catalog_error = None;
@@ -738,7 +772,7 @@ impl DeviceCenterApp {
 
     fn open_details(&mut self, id: String) {
         self.selected_device_id = Some(id.clone());
-        self.center_ui.open_details();
+        self.center_ui.open_details(id.clone());
         if self
             .catalog
             .as_ref()
@@ -757,11 +791,29 @@ impl DeviceCenterApp {
         if self.mutation_pending || self.logout_pending {
             return;
         }
-        self.mutation_pending = true;
-        if matches!(&change, DeviceMutation::Remove { id, .. } if self.active_session.as_ref().is_some_and(|s| s.device_id.as_ref().is_none_or(|target| target == id)))
+        if let DeviceMutation::Power { device, action } = &change
+            && let Err(error) = self.power_available(device, *action)
         {
+            self.status = StatusMessage::warning(error.to_string());
+            return;
+        }
+        self.mutation_pending = true;
+        let close_target = match &change {
+            DeviceMutation::Remove { id } => Some(id),
+            DeviceMutation::Power { device, action }
+                if *action != crate::power::PowerAction::Wake =>
+            {
+                Some(&device.device_id)
+            }
+            _ => None,
+        };
+        if close_target.is_some_and(|id| {
+            self.active_session
+                .as_ref()
+                .is_some_and(|s| s.device_id.as_ref().is_none_or(|target| target == id))
+        }) {
             self.stop_viewer();
-            self.status = StatusMessage::info("正在正常结束观看，随后移除该设备");
+            self.status = StatusMessage::info("正在正常结束观看，随后执行已确认的设备操作");
             self.queued_mutation = Some(change);
         } else {
             self.send_mutation(change);
@@ -769,21 +821,25 @@ impl DeviceCenterApp {
     }
 
     fn send_mutation(&mut self, change: DeviceMutation) {
+        self.pending_power = None;
         if self
             .worker
             .commands
-            .send(GuiCommand::Mutate(change))
+            .send(GuiCommand::Mutate {
+                generation: self.login_generation,
+                change,
+            })
             .is_err()
         {
             self.mutation_pending = false;
             self.status = StatusMessage::error("后台服务已停止，未发送设备操作");
+            self.pending_power = None;
         } else {
             self.status = StatusMessage::info("正在处理设备操作…");
         }
     }
 
     fn request_refresh(&mut self) {
-        self.extra_details.clear();
         if self.worker.commands.send(GuiCommand::Refresh).is_ok() {
             self.refresh_pending = true;
             self.status = StatusMessage::info("正在刷新设备状态");
@@ -936,6 +992,7 @@ impl crate::ui::App for DeviceCenterApp {
     fn ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         self.drain_events(&ctx);
+        self.tick_power();
         self.draw_center(ui);
         self.draw_dialogs(&ctx);
         ui.ctx().request_repaint_after(WORKER_TICK);
@@ -960,7 +1017,7 @@ struct GuiWorker {
 }
 
 impl GuiWorker {
-    fn spawn(refresh_interval: Duration) -> Self {
+    fn spawn() -> Self {
         let (commands, command_receiver) = mpsc::unbounded_channel();
         let (focus, foreground) = watch::channel(false);
         let (event_sender, events) = std::sync::mpsc::channel();
@@ -973,12 +1030,7 @@ impl GuiWorker {
                     return;
                 }
             };
-            runtime.block_on(gui_worker_loop(
-                refresh_interval,
-                command_receiver,
-                event_sender,
-                foreground,
-            ));
+            runtime.block_on(gui_worker_loop(command_receiver, event_sender, foreground));
         });
         Self {
             commands,
@@ -1022,7 +1074,10 @@ enum GuiCommand {
     CancelLogin(u64),
     Logout,
     Shutdown,
-    Mutate(DeviceMutation),
+    Mutate {
+        generation: u64,
+        change: DeviceMutation,
+    },
     Detail(String),
     RefreshAssist,
     CancelAssistCheck,
@@ -1034,18 +1089,36 @@ enum GuiCommand {
 }
 
 enum DeviceMutation {
-    Rename { id: String, alias: String },
-    Remove { id: String },
+    Rename {
+        id: String,
+        alias: String,
+    },
+    Remove {
+        id: String,
+    },
+    Power {
+        device: DeviceInfo,
+        action: crate::power::PowerAction,
+    },
+}
+
+enum MutationOutcome {
+    Changed {
+        message: String,
+        change: crate::device_change::DeviceChange,
+    },
+    Power(Box<power::AcceptedPower>),
 }
 
 enum GuiEvent {
+    PowerDispatched(u64, String, crate::power::PowerAction),
     Startup(u64, StartupStage),
     Presence(PresenceState),
     AssistLists(u64, std::result::Result<crate::assist::SavedLists, String>),
     AssistOperation(u64, u64, std::result::Result<AssistResult, String>),
     Devices(u64, DeviceList),
     Catalog(u64, std::result::Result<catalog::Catalog, String>, String),
-    MutationFinished(std::result::Result<String, String>),
+    MutationFinished(u64, std::result::Result<MutationOutcome, String>),
     Detail(
         u64,
         String,
@@ -1091,10 +1164,6 @@ async fn cancel_sms_task(task: &mut Option<ActiveSmsCode>) {
     }
 }
 
-enum GuiOperation {
-    Devices(Box<DeviceList>),
-}
-
 async fn cancel_login_task(task: &mut Option<ActiveLogin>) {
     if let Some(login) = task.take() {
         login.task.abort();
@@ -1112,7 +1181,6 @@ async fn cancel_operation<T>(task: &mut Option<JoinHandle<T>>) {
 }
 
 async fn gui_worker_loop(
-    refresh_interval: Duration,
     mut commands: mpsc::UnboundedReceiver<GuiCommand>,
     events: Sender<GuiEvent>,
     mut foreground: watch::Receiver<bool>,
@@ -1130,27 +1198,24 @@ async fn gui_worker_loop(
     let mut startup_last = None;
     let mut client: Option<Arc<AuthenticatedClient>> = None;
     let mut allow_load = true;
-    let mut next_refresh = Instant::now();
+    let mut device_sync = device_sync::DeviceSync::default();
+    let mut presence_online = false;
+    let mut mutation_is_power = false;
     let mut login_task: Option<ActiveLogin> = None;
     let mut sms_login_task: Option<ActiveLogin> = None;
     let mut commit_gate = login::LoginCommitGate::default();
     let mut sms_task: Option<ActiveSmsCode> = None;
     let mut sms_gate = login::sms::SmsGate::default();
-    let mut api_task: Option<JoinHandle<Result<GuiOperation>>> = None;
-    let mut catalog_task: Option<JoinHandle<(Result<catalog::Catalog>, String)>> = None;
-    let mut catalog_cache = None;
-    let mut next_catalog = Instant::now();
-    let mut force_catalog = false;
     let mut catalog_generation = 0;
-    let mut mutation_task: Option<JoinHandle<Result<String>>> = None;
-    let mut detail_task: Option<JoinHandle<(String, Result<crate::api::DeviceDetail>)>> = None;
+    let mut mutation_task: Option<JoinHandle<Result<MutationOutcome>>> = None;
+    let mut mutation_generation = 0;
     let mut logout_task: Option<JoinHandle<crate::client::LogoutOutcome>> = None;
     let mut assist_lists_task: Option<JoinHandle<(u64, Result<crate::assist::SavedLists>)>> = None;
     let mut assist_operation_task: Option<JoinHandle<(u64, u64, Result<AssistResult>)>> = None;
     let mut assist_operation_is_query = false;
     let mut assist_operation_context = (0_u64, 0_u64);
     let mut assist_lists_generation = 0_u64;
-    let mut next_assist_refresh = Instant::now();
+    let mut next_assist_refresh = Some(Instant::now());
     let mut tick = tokio::time::interval(WORKER_TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut host_signal: Option<ActivePresence> = None;
@@ -1173,7 +1238,7 @@ async fn gui_worker_loop(
             match command {
                 GuiCommand::RefreshAssist => {
                     if assist_lists_task.is_none() {
-                        next_assist_refresh = Instant::now();
+                        next_assist_refresh = Some(Instant::now());
                     }
                 }
                 GuiCommand::CancelAssistCheck => {
@@ -1248,10 +1313,9 @@ async fn gui_worker_loop(
                         }
                     };
                     catalog_generation = generation;
-                    cancel_operation(&mut detail_task).await;
-                    cancel_operation(&mut catalog_task).await;
-                    catalog_cache = None;
-                    cancel_operation(&mut api_task).await;
+
+                    device_sync.reset().await;
+                    presence_online = false;
                     stop_active_signal(&mut host_signal).await;
                     client = None;
                     allow_load = false;
@@ -1320,29 +1384,57 @@ async fn gui_worker_loop(
                     });
                 }
                 GuiCommand::Detail(id) => {
-                    cancel_operation(&mut detail_task).await;
-                    if let Some(client) = &client {
-                        let client = Arc::clone(client);
-                        detail_task = Some(tokio::spawn(async move {
-                            let result = client.device_detail(&id).await;
-                            (id, result)
-                        }));
-                    }
+                    device_sync.detail(id);
                 }
-                GuiCommand::Mutate(change) => {
-                    if mutation_task.is_some() || logout_task.is_some() || client.is_none() {
-                        let _ = events.send(GuiEvent::MutationFinished(Err(
-                            "当前无法执行设备操作，未发送请求".into(),
-                        )));
+                GuiCommand::Mutate { generation, change } => {
+                    if generation != catalog_generation
+                        || mutation_task.is_some()
+                        || logout_task.is_some()
+                        || client.is_none()
+                    {
+                        let _ = events.send(GuiEvent::MutationFinished(
+                            generation,
+                            Err("当前无法执行设备操作，未发送请求".into()),
+                        ));
                     } else if let Some(client) = &client {
                         let client = Arc::clone(client);
+                        mutation_generation = generation;
+                        mutation_is_power = matches!(&change, DeviceMutation::Power { .. });
+                        let report = events.clone();
                         mutation_task = Some(tokio::spawn(async move {
                             match change {
                                 DeviceMutation::Rename { id, alias } => {
-                                    client.rename_owned_device(&id, &alias).await
+                                    let (actual, message) =
+                                        client.rename_owned_device(&id, &alias).await?;
+                                    Ok(MutationOutcome::Changed {
+                                        message,
+                                        change: crate::device_change::DeviceChange::renamed(
+                                            id, actual,
+                                        ),
+                                    })
                                 }
                                 DeviceMutation::Remove { id } => {
-                                    client.remove_account_device(&id).await
+                                    let message = client.remove_account_device(&id).await?;
+                                    Ok(MutationOutcome::Changed {
+                                        message,
+                                        change: crate::device_change::DeviceChange::removed(id),
+                                    })
+                                }
+                                DeviceMutation::Power { device, action } => {
+                                    let receipt = client
+                                        .power_owned_device(&device, action, || {
+                                            let _ = report.send(GuiEvent::PowerDispatched(
+                                                generation,
+                                                device.device_id.clone(),
+                                                action,
+                                            ));
+                                        })
+                                        .await?;
+                                    Ok(MutationOutcome::Power(Box::new(power::AcceptedPower {
+                                        device,
+                                        action,
+                                        receipt,
+                                    })))
                                 }
                             }
                         }));
@@ -1350,10 +1442,8 @@ async fn gui_worker_loop(
                 }
                 GuiCommand::Shutdown => break,
                 GuiCommand::Refresh => {
-                    next_catalog = Instant::now();
-                    force_catalog = true;
+                    device_sync.refresh(false);
                     allow_load = true;
-                    next_refresh = Instant::now();
                 }
                 GuiCommand::Login {
                     generation,
@@ -1361,13 +1451,12 @@ async fn gui_worker_loop(
                 } if logout_task.is_none() && generation == catalog_generation => {
                     cancel_operation(&mut assist_lists_task).await;
                     cancel_operation(&mut assist_operation_task).await;
-                    cancel_operation(&mut detail_task).await;
+
                     catalog_generation = generation;
-                    cancel_operation(&mut catalog_task).await;
-                    catalog_cache = None;
-                    next_catalog = Instant::now();
+
                     cancel_login_task(&mut login_task).await;
-                    cancel_operation(&mut api_task).await;
+                    device_sync.reset().await;
+                    presence_online = false;
                     stop_active_signal(&mut host_signal).await;
                     client = None;
                     allow_load = false;
@@ -1411,13 +1500,12 @@ async fn gui_worker_loop(
                     cancel_operation(&mut assist_operation_task).await;
                     cancel_sms_task(&mut sms_task).await;
                     sms_gate.cancel();
-                    cancel_operation(&mut detail_task).await;
-                    cancel_operation(&mut catalog_task).await;
-                    catalog_cache = None;
+
                     cancel_login_task(&mut login_task).await;
                     cancel_login_task(&mut sms_login_task).await;
                     commit_gate = login::LoginCommitGate::default();
-                    cancel_operation(&mut api_task).await;
+                    device_sync.reset().await;
+                    presence_online = false;
                     allow_load = false;
                     if let Some(client) = client.take() {
                         logout_task = Some(tokio::spawn(async move { client.logout().await }));
@@ -1503,7 +1591,7 @@ async fn gui_worker_loop(
                 catalog_generation = catalog_generation.wrapping_add(1);
                 commit_gate = login::LoginCommitGate::default();
                 allow_load = true;
-                next_refresh = Instant::now();
+                device_sync.refresh(false);
             }
             let _ = events.send(GuiEvent::LoginFinished(
                 method,
@@ -1526,7 +1614,7 @@ async fn gui_worker_loop(
                 Ok((generation, sequence, result)) => {
                     if !query {
                         cancel_operation(&mut assist_lists_task).await;
-                        next_assist_refresh = Instant::now();
+                        next_assist_refresh = Some(Instant::now());
                     }
                     let _ = events.send(GuiEvent::AssistOperation(
                         generation,
@@ -1585,14 +1673,23 @@ async fn gui_worker_loop(
             while let Ok(event) = signal.events.try_recv() {
                 match event {
                     PresenceEvent::State(state) => {
+                        let online = matches!(state, PresenceState::Online);
+                        if online && !presence_online {
+                            device_sync.refresh(true);
+                            next_assist_refresh = Some(Instant::now());
+                        }
+                        presence_online = online;
                         let _ = events.send(GuiEvent::Presence(state));
                     }
                     PresenceEvent::Warning(message) => {
                         let _ = events.send(GuiEvent::Warning(message));
                     }
-                    PresenceEvent::DeviceChanged => {
-                        next_refresh = Instant::now();
-                        next_catalog = Instant::now();
+                    PresenceEvent::DeviceChanged(change) => {
+                        let name = client
+                            .as_ref()
+                            .map(|c| c.account_name())
+                            .unwrap_or_default();
+                        device_sync.change(change, &events, catalog_generation, &name);
                     }
                     PresenceEvent::AccountEnded => {}
                 }
@@ -1606,11 +1703,11 @@ async fn gui_worker_loop(
             cancel_login_task(&mut sms_login_task).await;
             commit_gate = login::LoginCommitGate::default();
             sms_gate.cancel();
-            cancel_operation(&mut detail_task).await;
+
             cancel_operation(&mut mutation_task).await;
-            cancel_operation(&mut catalog_task).await;
-            catalog_cache = None;
-            cancel_operation(&mut api_task).await;
+
+            device_sync.reset().await;
+            presence_online = false;
             client = None;
             allow_load = false;
             let _ = events.send(GuiEvent::AccountEnded(
@@ -1619,77 +1716,24 @@ async fn gui_worker_loop(
             stop_active_signal(&mut host_signal).await;
         }
 
-        if detail_task.as_ref().is_some_and(JoinHandle::is_finished)
-            && let Ok((id, result)) = detail_task.take().expect("finished detail").await
-        {
-            let _ = events.send(GuiEvent::Detail(
-                catalog_generation,
-                id,
-                result.map_err(|e| format!("{e:#}")),
-            ));
-        }
-
         if mutation_task.as_ref().is_some_and(JoinHandle::is_finished) {
-            let result = mutation_task.take().expect("finished mutation").await;
-            let result = result
+            let result = mutation_task
+                .take()
+                .expect("finished mutation")
+                .await
                 .unwrap_or_else(|e| Err(e.into()))
                 .map_err(|e| format!("{e:#}"));
-            // Discard a metadata query submitted before the write; refresh both
-            // lists even on an unknown result. Do not repeat the write.
-            cancel_operation(&mut api_task).await;
-            cancel_operation(&mut catalog_task).await;
-            cancel_operation(&mut detail_task).await;
-            next_refresh = Instant::now();
-            next_catalog = Instant::now();
-            force_catalog = true;
-            let _ = events.send(GuiEvent::MutationFinished(result));
-        }
-
-        if catalog_task.as_ref().is_some_and(JoinHandle::is_finished) {
-            match catalog_task.take().expect("finished catalog").await {
-                Ok((result, name)) => {
-                    if let Ok(catalog) = &result {
-                        catalog_cache = Some(catalog.clone());
-                    }
-                    let _ = events.send(GuiEvent::Catalog(
-                        catalog_generation,
-                        result.map_err(|e| format!("{e:#}")),
-                        name,
-                    ));
-                }
-                Err(error) => {
-                    let _ = events.send(GuiEvent::Catalog(
-                        catalog_generation,
-                        Err(format!("{error}")),
-                        String::new(),
-                    ));
-                }
+            if let Ok(MutationOutcome::Changed { change, .. }) = &result {
+                let name = client
+                    .as_ref()
+                    .map(|c| c.account_name())
+                    .unwrap_or_default();
+                device_sync.change(change.clone(), &events, catalog_generation, &name);
+            } else if result.is_err() && mutation_is_power {
+                // Observe once after an uncertain power result; never replay the command.
+                device_sync.refresh_status();
             }
-        }
-
-        if api_task.as_ref().is_some_and(JoinHandle::is_finished) {
-            let result = api_task.take().expect("finished API operation").await;
-            match result {
-                Ok(Ok(GuiOperation::Devices(devices))) => {
-                    let _ = events.send(GuiEvent::Devices(catalog_generation, *devices));
-                }
-                Ok(Err(error)) => {
-                    if let Some(active) = &client
-                        && active.restoration_failed().await
-                    {
-                        allow_load = false;
-                        client = None;
-                        let _ = events.send(GuiEvent::SessionUnavailable(format!(
-                            "登录恢复未完成，凭据已保留，可点击登录重试：{error:#}"
-                        )));
-                    } else {
-                        let _ = events.send(GuiEvent::Warning(format!("设备请求失败：{error:#}")));
-                    }
-                }
-                Err(error) => {
-                    let _ = events.send(GuiEvent::Error(format!("设备请求任务异常：{error}")));
-                }
-            }
+            let _ = events.send(GuiEvent::MutationFinished(mutation_generation, result));
         }
 
         if let Some(signal) = host_signal.as_ref()
@@ -1709,7 +1753,6 @@ async fn gui_worker_loop(
             && sms_login_task.is_none()
             && sms_task.is_none()
             && logout_task.is_none()
-            && Instant::now() >= next_refresh
         {
             let _ = events.send(GuiEvent::Startup(
                 catalog_generation,
@@ -1747,7 +1790,7 @@ async fn gui_worker_loop(
             let refresh_active = *foreground.borrow();
             if refresh_active
                 && assist_lists_task.is_none()
-                && Instant::now() >= next_assist_refresh
+                && next_assist_refresh.is_some()
                 && logout_task.is_none()
                 && (assist_operation_task.is_none() || assist_operation_is_query)
             {
@@ -1757,45 +1800,25 @@ async fn gui_worker_loop(
                 assist_lists_task = Some(tokio::spawn(async move {
                     (generation, client.assist_lists().await)
                 }));
-                next_assist_refresh = Instant::now() + Duration::from_secs(30);
+                next_assist_refresh = None;
             }
-            if refresh_active && catalog_task.is_none() && Instant::now() >= next_catalog {
-                let client = Arc::clone(active_client);
-                let previous = catalog_cache.clone();
-                let force = std::mem::take(&mut force_catalog);
-                let progress = events.clone();
-                let generation = catalog_generation;
-                let foreground = foreground.clone();
-                catalog_task = Some(tokio::spawn(async move {
-                    let result = catalog::Catalog::load(
-                        Arc::clone(&client),
-                        previous,
-                        force,
-                        foreground,
-                        |catalog| {
-                            let _ = progress.send(GuiEvent::Catalog(
-                                generation,
-                                Ok(catalog.clone()),
-                                client.account_name(),
-                            ));
-                        },
-                    )
-                    .await;
-                    (result, client.account_name())
-                }));
-                next_catalog = Instant::now() + Duration::from_secs(30);
-            }
-            if refresh_active && api_task.is_none() && Instant::now() >= next_refresh {
-                let client = Arc::clone(active_client);
-                let _ = events.send(GuiEvent::Working("正在刷新设备状态".into()));
-                api_task = Some(tokio::spawn(async move {
-                    client
-                        .list_devices()
-                        .await
-                        .map(Box::new)
-                        .map(GuiOperation::Devices)
-                }));
-                next_refresh = Instant::now() + refresh_interval;
+            if let Some(error) = device_sync
+                .poll(active_client, refresh_active, &events, catalog_generation)
+                .await
+            {
+                if active_client.restoration_failed().await {
+                    allow_load = false;
+                    let _ = events.send(GuiEvent::SessionUnavailable(format!(
+                        "登录恢复未完成，凭据已保留，可点击登录重试：{error:#}"
+                    )));
+                    device_sync.reset().await;
+                    client = None;
+                    stop_active_signal(&mut host_signal).await;
+                    continue;
+                }
+                let _ = events.send(GuiEvent::Warning(format!(
+                    "设备同步失败：{error:#}；可手动刷新重试"
+                )));
             }
             if host_signal.is_none() && !presence_stopped {
                 host_signal = Some(ActivePresence::start(Arc::clone(active_client)));
@@ -1807,9 +1830,8 @@ async fn gui_worker_loop(
     cancel_operation(&mut assist_lists_task).await;
     cancel_operation(&mut assist_operation_task).await;
     cancel_sms_task(&mut sms_task).await;
-    cancel_operation(&mut api_task).await;
-    cancel_operation(&mut catalog_task).await;
-    cancel_operation(&mut detail_task).await;
+    device_sync.reset().await;
+
     // A user-confirmed mutation may already have reached the service. Let its
     // acknowledgement/reconciliation and own-name persistence finish on exit.
     if let Some(task) = mutation_task {

@@ -1,6 +1,6 @@
 [package]
 name = "openuuyc"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "Third-party Rust client for UU Remote protocol interoperability"
 license-file = "LICENSE"
@@ -29,7 +29,7 @@ flate2 = "1.1"
 futures-util = "0.3.34"
 hmac = "0.12.1"
 hyper = { version = "1.10.1", default-features = false }
-image = { version = "0.25.10", default-features = false, features = ["png"] }
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 keyring = "4.1.6"
 kcp = { path = "vendor/kcp" }
 mediaway-common = "=0.1.8"

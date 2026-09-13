@@ -7,6 +7,7 @@
 use crate::{
     api::ApiFailure,
     client::AuthenticatedClient,
+    device_change::{ChangeKind, DeviceChange},
     signal::{SignalFailure, SignalPushHandler, SignalRole, SignalSession, SocketState},
 };
 use anyhow::Result;
@@ -31,7 +32,7 @@ pub(crate) enum PresenceState {
 pub(crate) enum PresenceEvent {
     State(PresenceState),
     Warning(String),
-    DeviceChanged,
+    DeviceChanged(DeviceChange),
     AccountEnded,
 }
 
@@ -137,31 +138,21 @@ async fn run_presence(
             if push_cancel.is_cancelled() || !push_client.is_active() {
                 return;
             }
-            let Some(kind) = push.get("type").and_then(serde_json::Value::as_str) else {
-                tracing::warn!("discarded push without string type");
-                return;
+            let change = match DeviceChange::parse(push) {
+                Ok(Some(change)) => change,
+                Ok(None) => return,
+                Err(_) => {
+                    tracing::warn!("discarded malformed device push");
+                    return;
+                }
             };
-            if !matches!(
-                kind,
-                "device_unbind" | "device_binded" | "device_info_changed"
-            ) {
-                return;
-            }
-            let Some(id) = push
-                .get("data")
-                .and_then(|data| data.get("device_id"))
-                .and_then(serde_json::Value::as_str)
-            else {
-                tracing::warn!(kind, "discarded device push without string device_id");
-                return;
-            };
-            if kind == "device_unbind" && id == push_client.device_id() {
+            if change.kind == ChangeKind::Removed && change.id == push_client.device_id() {
                 // Server 398A50 -> 3B5540: exact current-device match.
                 // No credential I/O on the Socket.IO input worker.
                 tracing::info!("current virtual device was unbound; retiring account generation");
                 push_client.retire();
             } else {
-                let _ = push_events.send(PresenceEvent::DeviceChanged);
+                let _ = push_events.send(PresenceEvent::DeviceChanged(change));
             }
         });
         let session =

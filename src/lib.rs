@@ -17,6 +17,7 @@ pub mod controller;
 mod decoder;
 mod decoder_pool;
 mod decoder_result;
+mod device_change;
 mod device_session;
 mod flexfec;
 pub mod logging;
@@ -28,6 +29,7 @@ pub mod official_receiver;
 pub mod performance;
 #[cfg(windows)]
 pub mod plugins;
+mod power;
 mod presence;
 mod remote_cursor;
 mod remote_input;

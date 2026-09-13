@@ -37,6 +37,8 @@ enum IdentityScope {
 
 type HmacSha256 = Hmac<Sha256>;
 mod assist;
+mod power;
+pub(crate) mod wallpaper;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Method {
@@ -969,7 +971,9 @@ impl NrdApi {
                     && contract != DEVICE_UNBIND
                     && contract != LOGIN_SMS_CODE
                     && contract != LOGIN_BY_MOBILE
-                    && !assist::is_write(contract),
+                    && !assist::is_write(contract)
+                    && !power::is_write(contract)
+                    && contract != wallpaper::BIND,
             )
             .await?;
         let envelope: ApiEnvelope<serde_json::Value> = serde_json::from_slice(&bytes)
@@ -987,6 +991,8 @@ impl NrdApi {
             if contract == LOGIN_SMS_CODE
                 || contract == LOGIN_BY_MOBILE
                 || assist::is_sensitive(contract)
+                || contract == wallpaper::TOKEN
+                || contract == wallpaper::BIND
             {
                 // A service error may echo the phone or OTP. Never log its text.
                 tracing::debug!(path, %status, code, "NRD phone login request failed");

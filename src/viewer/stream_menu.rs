@@ -1,5 +1,5 @@
 //! Viewer-only stream settings UI. Protocol and budget decisions stay in stream_control.
-use egui::{Align, Color32, FontId, RichText, Sense, Stroke, vec2};
+use egui::{Align, FontId, RichText, Sense, Stroke, vec2};
 
 use crate::media::FrameRateChoice;
 use crate::stream_control::{
@@ -8,14 +8,10 @@ use crate::stream_control::{
 };
 
 const WIDTH: f32 = 280.0;
-const ROW_HEIGHT: f32 = 28.0;
+const ROW_HEIGHT: f32 = crate::ui::theme::MENU_HEIGHT;
 const ROW_GAP: f32 = 2.0;
 const SECTION_GAP: f32 = 4.0;
-const TEXT: Color32 = Color32::from_rgb(222, 225, 231);
-const MUTED: Color32 = Color32::from_rgb(142, 150, 164);
-const ACCENT: Color32 = Color32::from_rgb(79, 139, 230);
-const LINE: Color32 = Color32::from_rgb(45, 51, 61);
-const HOVER: Color32 = Color32::from_rgb(37, 43, 53);
+use crate::ui::theme::{ACCENT, HOVER, LINE, MUTED, TEXT};
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum Page {
@@ -144,7 +140,7 @@ fn menu_row(
             rect,
             4.0,
             if selected == Some(true) {
-                Color32::from_rgb(31, 47, 67)
+                crate::ui::theme::SELECTED
             } else {
                 HOVER
             },
@@ -153,7 +149,7 @@ fn menu_row(
     let color = if enabled {
         TEXT
     } else {
-        Color32::from_gray(89)
+        crate::ui::theme::DISABLED
     };
     if selected == Some(true) {
         let origin = rect.left_center() + vec2(13.0, 0.0);
@@ -167,18 +163,18 @@ fn menu_row(
         rect.left_center() + vec2(if selected.is_some() { 28.0 } else { 10.0 }, 0.0),
         egui::Align2::LEFT_CENTER,
         label,
-        FontId::proportional(13.0),
+        FontId::proportional(crate::ui::theme::COMPACT_TEXT),
         color,
     );
     ui.painter().text(
         rect.right_center() - vec2(if more { 26.0 } else { 10.0 }, 0.0),
         egui::Align2::RIGHT_CENTER,
         detail,
-        FontId::proportional(11.5),
+        FontId::proportional(crate::ui::theme::SMALL),
         if enabled {
             MUTED
         } else {
-            Color32::from_gray(78)
+            crate::ui::theme::DISABLED
         },
     );
     if more {
@@ -210,11 +206,11 @@ fn switch_row(ui: &mut egui::Ui, label: &str, value: &mut bool) -> egui::Respons
         row.left_center() + vec2(10.0, 0.0),
         egui::Align2::LEFT_CENTER,
         label,
-        FontId::proportional(13.0),
+        FontId::proportional(crate::ui::theme::COMPACT_TEXT),
         if enabled {
             TEXT
         } else {
-            Color32::from_gray(89)
+            crate::ui::theme::DISABLED
         },
     );
     let rect = egui::Rect::from_center_size(row.right_center() - vec2(25.0, 0.0), vec2(34.0, 20.0));
@@ -224,7 +220,7 @@ fn switch_row(ui: &mut egui::Ui, label: &str, value: &mut bool) -> egui::Respons
         if *value && enabled {
             ACCENT
         } else {
-            Color32::from_rgb(65, 73, 86)
+            crate::ui::theme::LINE
         },
     );
     let center = egui::pos2(
@@ -236,7 +232,7 @@ fn switch_row(ui: &mut egui::Ui, label: &str, value: &mut bool) -> egui::Respons
         rect.center().y,
     );
     ui.painter()
-        .circle_filled(center, 7.0, Color32::from_rgb(234, 237, 243));
+        .circle_filled(center, 7.0, crate::ui::theme::TEXT);
     response
 }
 
@@ -367,14 +363,13 @@ fn volume_bar(
         });
         let rect = response.rect;
         // Keep the full row as the hit target, but draw only a slim rail.
-        ui.painter()
-            .rect_filled(rect, 0.0, Color32::from_rgb(24, 28, 35));
+        ui.painter().rect_filled(rect, 0.0, crate::ui::theme::BG);
         let track = egui::Rect::from_center_size(rect.center(), vec2(rect.width(), 6.0));
         ui.painter()
-            .rect_filled(track, 3.0, Color32::from_rgb(16, 20, 26));
+            .rect_filled(track, 3.0, crate::ui::theme::SIDEBAR);
         for (level, color) in [
-            (levels[0], Color32::from_rgb(105, 115, 129)),
-            (levels[1], Color32::from_rgb(70, 171, 119)),
+            (levels[0], crate::ui::theme::MUTED),
+            (levels[1], crate::ui::theme::GREEN),
         ] {
             if level > 0.0 {
                 let fill = egui::Rect::from_min_max(
@@ -430,7 +425,11 @@ fn bitrate_editor(ui: &mut egui::Ui, value: &mut u32, adaptive: bool, multi_scre
             },
         );
         ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-            ui.label(RichText::new("Mbps").size(11.0).color(MUTED));
+            ui.label(
+                RichText::new("Mbps")
+                    .size(crate::ui::theme::TINY)
+                    .color(MUTED),
+            );
             changed |= ui
                 .add_sized(
                     [60.0, 30.0],
@@ -458,11 +457,15 @@ fn bitrate_editor(ui: &mut egui::Ui, value: &mut u32, adaptive: bool, multi_scre
         })
         .inner;
     ui.horizontal(|ui| {
-        ui.label(RichText::new("1").size(10.0).color(MUTED));
+        ui.label(
+            RichText::new("1")
+                .size(crate::ui::theme::MICRO)
+                .color(MUTED),
+        );
         ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
             ui.label(
                 RichText::new(MAX_CUSTOM_BITRATE_MBPS.to_string())
-                    .size(10.0)
+                    .size(crate::ui::theme::MICRO)
                     .color(MUTED),
             );
         });
@@ -480,7 +483,7 @@ fn budget_status(
     if let Some(cap) = budget.pending_mbps {
         ui.label(
             RichText::new(format!("正在调整至 {cap} Mbps…"))
-                .size(12.0)
+                .size(crate::ui::theme::SMALL)
                 .color(MUTED),
         );
         return;
@@ -488,7 +491,7 @@ fn budget_status(
     if budget.phase == BudgetPhase::Suspended {
         ui.label(
             RichText::new("自动调整已暂停")
-                .size(12.0)
+                .size(crate::ui::theme::SMALL)
                 .color(super::warning_color()),
         )
         .on_hover_text(budget.message);
@@ -496,7 +499,7 @@ fn budget_status(
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new(format!("网络拥堵，建议 {cap} Mbps"))
-                    .size(12.0)
+                    .size(crate::ui::theme::SMALL)
                     .color(super::warning_color()),
             )
             .on_hover_text(budget.reference_video_mbps.map_or_else(
@@ -519,7 +522,7 @@ fn budget_status(
     } else if budget.phase == BudgetPhase::Congested {
         ui.label(
             RichText::new("网络拥堵，建议降低上限")
-                .size(12.0)
+                .size(crate::ui::theme::SMALL)
                 .color(super::warning_color()),
         )
         .on_hover_text(budget.message);
@@ -530,7 +533,7 @@ fn budget_status(
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new(format!("当前限制  {cap} Mbps"))
-                    .size(12.0)
+                    .size(crate::ui::theme::SMALL)
                     .color(MUTED),
             );
             ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
@@ -559,12 +562,6 @@ fn budget_status(
 pub(super) fn menu_style(ui: &mut egui::Ui) {
     let style = ui.style_mut();
     style.override_text_style = Some(egui::TextStyle::Body);
-    style
-        .text_styles
-        .insert(egui::TextStyle::Body, FontId::proportional(13.0));
-    style
-        .text_styles
-        .insert(egui::TextStyle::Button, FontId::proportional(13.0));
     style.spacing.item_spacing = vec2(6.0, ROW_GAP);
     crate::ui::controls::configure(style, ROW_HEIGHT);
     style.interaction.selectable_labels = false;
@@ -618,9 +615,9 @@ pub(super) fn show_stream_control_window(
         .default_width(WIDTH + 24.0)
         .frame(
             egui::Frame::new()
-                .fill(Color32::from_rgb(24, 28, 35))
+                .fill(crate::ui::theme::BG)
                 .stroke(Stroke::new(1.0, LINE))
-                .corner_radius(6.0)
+                .corner_radius(crate::ui::theme::PANEL_RADIUS)
                 .inner_margin(egui::Margin::symmetric(12, 6)),
         )
         .show(ctx, |ui| {
@@ -636,7 +633,11 @@ pub(super) fn show_stream_control_window(
                 } else {
                     state.page.title().to_owned()
                 };
-                ui.label(RichText::new(title).size(13.0).strong());
+                ui.label(
+                    RichText::new(title)
+                        .size(crate::ui::theme::COMPACT_TEXT)
+                        .strong(),
+                );
                 ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                     close = icon_button(ui, Icon::Close, "关闭").clicked();
                 });
@@ -697,15 +698,23 @@ pub(super) fn show_stream_control_window(
                         }
                         section_separator(ui);
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new("帧率").size(11.0).color(MUTED))
-                                .on_hover_text(
-                                    snapshot
-                                        .last_notice
-                                        .as_deref()
-                                        .unwrap_or("实际帧率受被控端刷新率和画面内容影响"),
-                                );
+                            ui.label(
+                                RichText::new("帧率")
+                                    .size(crate::ui::theme::TINY)
+                                    .color(MUTED),
+                            )
+                            .on_hover_text(
+                                snapshot
+                                    .last_notice
+                                    .as_deref()
+                                    .unwrap_or("实际帧率受被控端刷新率和画面内容影响"),
+                            );
                             ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                                ui.label(RichText::new("FPS").size(10.0).color(MUTED));
+                                ui.label(
+                                    RichText::new("FPS")
+                                        .size(crate::ui::theme::MICRO)
+                                        .color(MUTED),
+                                );
                             });
                         });
                         ui.add_space(ROW_GAP);
@@ -813,7 +822,7 @@ pub(super) fn show_stream_control_window(
                         audio.set_settings(audio_settings);
                         if let Some(error) = audio_status.error {
                             ui.horizontal_wrapped(|ui| {
-                                ui.colored_label(Color32::from_rgb(224, 174, 99), error);
+                                ui.colored_label(crate::ui::theme::AMBER, error);
                                 if ui.small_button("重试").clicked() {
                                     audio.retry();
                                 }
@@ -822,10 +831,18 @@ pub(super) fn show_stream_control_window(
                         if snapshot.network.pending {
                             ui.horizontal(|ui| {
                                 ui.spinner();
-                                ui.label(RichText::new("正在切换线路…").size(11.0).color(MUTED));
+                                ui.label(
+                                    RichText::new("正在切换线路…")
+                                        .size(crate::ui::theme::TINY)
+                                        .color(MUTED),
+                                );
                             });
                         } else if let Some(notice) = snapshot.network.notice {
-                            ui.label(RichText::new(notice).size(11.0).color(MUTED));
+                            ui.label(
+                                RichText::new(notice)
+                                    .size(crate::ui::theme::TINY)
+                                    .color(MUTED),
+                            );
                         }
                     }
                     Page::Mouse => {
@@ -865,7 +882,9 @@ pub(super) fn show_stream_control_window(
                             }
                             ui.add(
                                 egui::Label::new(
-                                    RichText::new(description).size(11.0).color(MUTED),
+                                    RichText::new(description)
+                                        .size(crate::ui::theme::TINY)
+                                        .color(MUTED),
                                 )
                                 .wrap(),
                             );
@@ -875,7 +894,7 @@ pub(super) fn show_stream_control_window(
                         ui.add_space(7.0);
                         ui.label(
                             RichText::new("按 Ctrl+Shift+Alt+Z 退出控制。")
-                                .size(11.0)
+                                .size(crate::ui::theme::TINY)
                                 .color(MUTED),
                         );
                     }
@@ -901,7 +920,7 @@ pub(super) fn show_stream_control_window(
                                     } else {
                                         "仅提醒，不自动调整"
                                     })
-                                    .size(11.0)
+                                    .size(crate::ui::theme::TINY)
                                     .color(MUTED),
                                 );
                             }
@@ -912,7 +931,7 @@ pub(super) fn show_stream_control_window(
                             ui.horizontal(|ui| {
                                 ui.label(
                                     RichText::new(if state.dirty { "尚未应用" } else { "" })
-                                        .size(11.0)
+                                        .size(crate::ui::theme::TINY)
                                         .color(MUTED),
                                 );
                                 ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
@@ -958,7 +977,7 @@ pub(super) fn show_stream_control_window(
                     ui.add_space(9.0);
                     ui.add(egui::Label::new(
                         RichText::new("设置未生效")
-                            .size(11.0)
+                            .size(crate::ui::theme::TINY)
                             .color(super::bad_color()),
                     ))
                     .on_hover_text(error);
@@ -966,17 +985,25 @@ pub(super) fn show_stream_control_window(
                     ui.add_space(9.0);
                     ui.label(
                         RichText::new("设置未保存")
-                            .size(11.0)
+                            .size(crate::ui::theme::TINY)
                             .color(super::bad_color()),
                     )
                     .on_hover_text(error);
                 } else if let Some(waiting) = snapshot.waiting_for {
                     ui.add_space(9.0);
-                    ui.label(RichText::new("等待串流就绪…").size(11.0).color(MUTED))
-                        .on_hover_text(waiting);
+                    ui.label(
+                        RichText::new("等待串流就绪…")
+                            .size(crate::ui::theme::TINY)
+                            .color(MUTED),
+                    )
+                    .on_hover_text(waiting);
                 } else if snapshot.pending_sequence.is_some() && state.page != Page::Adaptive {
                     ui.add_space(9.0);
-                    ui.label(RichText::new("正在应用…").size(11.0).color(MUTED));
+                    ui.label(
+                        RichText::new("正在应用…")
+                            .size(crate::ui::theme::TINY)
+                            .color(MUTED),
+                    );
                 }
             });
         });

@@ -8,6 +8,8 @@ mod wires;
 pub(crate) struct Editor {
     catalog: Option<Catalog>,
     document: Option<Document>,
+    baseline: Option<serde_json::Value>,
+    pending_switch: Option<DocumentSwitch>,
     saved: Vec<Document>,
     selected: BTreeSet<String>,
     undo: Vec<Document>,
@@ -22,6 +24,10 @@ pub(crate) struct Editor {
     parameter_edit: Option<egui::Id>,
     wire_routes: wires::Cache,
     reroute_selection: Option<(String, usize)>,
+}
+enum DocumentSwitch {
+    New,
+    Open(Box<Document>),
 }
 struct LibraryDrag {
     graph_id: String,
@@ -64,29 +70,29 @@ fn node_name<'a>(node: &'a Node, catalog: &'a Catalog) -> &'a str {
 // Node purpose is distinct from the data types carried by its ports.
 fn node_accent(type_id: &str, ty: Option<&NodeType>) -> Color32 {
     match type_id {
-        RAW => Color32::from_rgb(77, 190, 178),
-        VIDEO => Color32::from_rgb(101, 161, 240),
-        OVERLAY => Color32::from_rgb(183, 136, 235),
-        INPUT => Color32::from_rgb(232, 128, 137),
+        RAW => crate::ui::theme::graph::SOURCE,
+        VIDEO => crate::ui::theme::graph::VIDEO,
+        OVERLAY => crate::ui::theme::graph::OVERLAY,
+        INPUT => crate::ui::theme::graph::INPUT,
         _ => match ty.map(|t| &t.definition.implementation) {
-            Some(sdk::NodeImplementation::VideoShader) => Color32::from_rgb(101, 161, 240),
-            Some(sdk::NodeImplementation::FrameAnalysis) => Color32::from_rgb(225, 180, 91),
+            Some(sdk::NodeImplementation::VideoShader) => crate::ui::theme::graph::VIDEO,
+            Some(sdk::NodeImplementation::FrameAnalysis) => crate::ui::theme::graph::ANALYSIS,
             Some(sdk::NodeImplementation::Overlay | sdk::NodeImplementation::SceneSource) => {
-                Color32::from_rgb(183, 136, 235)
+                crate::ui::theme::graph::OVERLAY
             }
-            Some(sdk::NodeImplementation::DetectionControl) => Color32::from_rgb(232, 128, 137),
-            None => Color32::from_gray(145),
+            Some(sdk::NodeImplementation::DetectionControl) => crate::ui::theme::graph::INPUT,
+            None => crate::ui::theme::MUTED,
         },
     }
 }
 fn color(kind: &sdk::PortType) -> Color32 {
     match kind {
-        sdk::PortType::Frame => Color32::from_rgb(90, 160, 255),
-        sdk::PortType::DrawList => Color32::from_rgb(100, 215, 150),
-        sdk::PortType::Layer => Color32::from_rgb(205, 145, 255),
-        sdk::PortType::Detections => Color32::from_rgb(240, 185, 80),
-        sdk::PortType::InputCommands => Color32::from_rgb(240, 110, 110),
-        sdk::PortType::Activation => Color32::from_rgb(240, 210, 110),
+        sdk::PortType::Frame => crate::ui::theme::graph::PORT_FRAME,
+        sdk::PortType::DrawList => crate::ui::theme::graph::PORT_DRAW,
+        sdk::PortType::Layer => crate::ui::theme::graph::PORT_LAYER,
+        sdk::PortType::Detections => crate::ui::theme::graph::PORT_DETECTIONS,
+        sdk::PortType::InputCommands => crate::ui::theme::graph::PORT_INPUT,
+        sdk::PortType::Activation => crate::ui::theme::graph::PORT_ACTIVATION,
     }
 }
 impl Editor {
@@ -113,6 +119,7 @@ impl Editor {
         if let Some(catalog) = &self.catalog {
             match Document::new(catalog) {
                 Ok(doc) => {
+                    self.baseline = serde_json::to_value(&doc).ok();
                     self.document = Some(doc);
                     self.undo.clear();
                     self.redo.clear();
@@ -137,9 +144,9 @@ impl Editor {
         let mut load = None;
         let mut create = false;
         egui::Frame::new()
-            .fill(Color32::from_rgb(21, 27, 36))
-            .stroke(Stroke::new(1.0, Color32::from_rgb(42, 50, 63)))
-            .corner_radius(6.0)
+            .fill(crate::ui::theme::BG)
+            .stroke(Stroke::new(1.0, crate::ui::theme::LINE))
+            .corner_radius(crate::ui::theme::PANEL_RADIUS)
             .inner_margin(10)
             .show(ui, |ui| {
                 crate::ui::controls::configure(ui.style_mut(), crate::ui::controls::HEIGHT);
@@ -301,20 +308,19 @@ impl Editor {
                     });
                 });
             });
-        if create {
-            self.new_document();
-        }
-        if let Some(doc) = load {
-            self.document = Some(doc);
-            self.selected.clear();
-            self.wire = None;
-            self.reroute_selection = None;
-            self.undo.clear();
-            self.redo.clear();
-            self.pan = Vec2::ZERO;
-            self.zoom = 1.0;
-            self.fit_pending = true;
-            self.message.clear();
+        if create || load.is_some() {
+            let next = load.map_or(DocumentSwitch::New, |doc| {
+                DocumentSwitch::Open(Box::new(doc))
+            });
+            let current = self
+                .document
+                .as_ref()
+                .and_then(|doc| serde_json::to_value(doc).ok());
+            if current != self.baseline {
+                self.pending_switch = Some(next);
+            } else {
+                self.switch_document(next);
+            }
         }
         if !self.message.is_empty() {
             ui.label(&self.message);
@@ -335,6 +341,55 @@ impl Editor {
             let (rect, response) = ui.allocate_exact_size(size, Sense::click_and_drag());
             self.canvas(ui, rect, response);
         });
+        self.switch_confirmation(ui.ctx());
+    }
+    fn switch_document(&mut self, next: DocumentSwitch) {
+        match next {
+            DocumentSwitch::New => self.new_document(),
+            DocumentSwitch::Open(doc) => {
+                self.baseline = serde_json::to_value(&doc).ok();
+                self.document = Some(*doc);
+                self.selected.clear();
+                self.wire = None;
+                self.reroute_selection = None;
+                self.undo.clear();
+                self.redo.clear();
+                self.pan = Vec2::ZERO;
+                self.zoom = 1.0;
+                self.fit_pending = true;
+                self.message.clear();
+            }
+        }
+        self.parameter_edit = None;
+    }
+    fn switch_confirmation(&mut self, ctx: &egui::Context) {
+        let Some(next) = self.pending_switch.take() else {
+            return;
+        };
+        let mut discard = false;
+        let mut cancel = false;
+        let response = egui::Modal::new(egui::Id::new("graph-unsaved-changes"))
+            .frame(crate::ui::controls::dialog_frame())
+            .show(ctx, |ui| {
+                ui.set_width(360.0);
+                ui.label(
+                    egui::RichText::new("节点图尚未保存")
+                        .size(crate::ui::theme::DIALOG_TITLE)
+                        .strong(),
+                );
+                ui.add_space(12.0);
+                ui.label("切换会丢弃当前修改。可以先继续编辑并保存，再切换节点图。");
+                ui.add_space(18.0);
+                ui.horizontal(|ui| {
+                    cancel = ui.add(crate::ui::controls::primary("继续编辑")).clicked();
+                    discard = ui.button("放弃修改并切换").clicked();
+                });
+            });
+        if discard {
+            self.switch_document(next);
+        } else if !cancel && !response.should_close() {
+            self.pending_switch = Some(next);
+        }
     }
     fn save(&mut self, apply: bool) {
         let Some(doc) = &self.document else {
@@ -353,6 +408,7 @@ impl Editor {
                     "已保存草稿"
                 }
                 .into();
+                self.baseline = serde_json::to_value(doc).ok();
                 self.saved = list().unwrap_or_default();
             }
             Err(e) => self.message = format!("{e:#}"),
@@ -481,13 +537,13 @@ impl Editor {
                                             )
                                             .sense(Sense::click_and_drag())
                                             .fill(
-                                                Color32::from_rgb(26, 33, 43)
+                                                crate::ui::theme::SURFACE
                                                     .lerp_to_gamma(accent, 0.10),
                                             )
                                             .stroke(
                                                 Stroke::new(
                                                     1.0,
-                                                    Color32::from_rgb(42, 49, 60)
+                                                    crate::ui::theme::LINE
                                                         .lerp_to_gamma(accent, 0.30),
                                                 ),
                                             ),
@@ -619,35 +675,38 @@ impl Editor {
             let size = node_size(&payload.node, catalog, &[]) * transform.scaling;
             let rect = Rect::from_min_size(transform * position, size);
             let painter = painter.with_clip_rect(canvas);
-            painter.rect_filled(rect, 5.0, Color32::from_rgba_unmultiplied(26, 33, 43, 210));
+            painter.rect_filled(rect, 5.0, crate::ui::theme::SURFACE.gamma_multiply(0.82));
             painter.rect_stroke(
                 rect,
                 5.0,
-                Stroke::new(1.5, if valid { accent } else { Color32::LIGHT_RED }),
+                Stroke::new(1.5, if valid { accent } else { crate::ui::theme::RED }),
                 egui::StrokeKind::Inside,
             );
             let header = Rect::from_min_size(rect.min, Vec2::new(size.x, 30.0 * transform.scaling));
             painter.rect_filled(
                 header,
                 4.0,
-                Color32::from_rgb(26, 33, 43).lerp_to_gamma(accent, 0.42),
+                crate::ui::theme::SURFACE.lerp_to_gamma(accent, 0.42),
             );
             painter.text(
                 header.left_center() + Vec2::new(9.0 * transform.scaling, 0.0),
                 egui::Align2::LEFT_CENTER,
                 node_name(&payload.node, catalog),
-                egui::FontId::proportional(13.0 * transform.scaling),
+                egui::FontId::proportional(crate::ui::theme::COMPACT_TEXT * transform.scaling),
                 Color32::WHITE,
             );
         } else {
             let text = node_name(&payload.node, catalog);
-            let galley =
-                painter.layout_no_wrap(text.into(), egui::FontId::proportional(13.0), accent);
+            let galley = painter.layout_no_wrap(
+                text.into(),
+                egui::FontId::proportional(crate::ui::theme::COMPACT_TEXT),
+                accent,
+            );
             let badge = Rect::from_min_size(
                 pointer + Vec2::splat(14.0),
                 galley.size() + Vec2::new(20.0, 12.0),
             );
-            painter.rect_filled(badge, 5.0, Color32::from_rgb(26, 33, 43));
+            painter.rect_filled(badge, 5.0, crate::ui::theme::SURFACE);
             painter.galley(badge.min + Vec2::new(10.0, 6.0), galley, accent);
         }
     }
@@ -692,7 +751,7 @@ impl Editor {
             }
         }
         let painter = ui.painter().with_clip_rect(rect);
-        painter.rect_filled(rect, 4.0, Color32::from_rgb(13, 17, 23));
+        painter.rect_filled(rect, 4.0, crate::ui::theme::SIDEBAR);
         let pointer = ui.input(|i| i.pointer.hover_pos());
         if pointer.is_some_and(|p| rect.contains(p))
             && !ui.ctx().egui_wants_keyboard_input()
@@ -728,7 +787,8 @@ impl Editor {
                 .max_rect(world_rect),
         );
         world.set_clip_rect(world_rect);
-        world.style_mut().override_font_id = Some(egui::FontId::proportional(12.0));
+        world.style_mut().override_font_id =
+            Some(egui::FontId::proportional(crate::ui::theme::SMALL));
         world.spacing_mut().item_spacing = Vec2::ZERO;
         let response = world.interact(
             world_rect,
@@ -750,12 +810,20 @@ impl Editor {
         let gap = 32.0;
         let mut x = rect.left() - rect.left().rem_euclid(gap);
         while x < rect.right() {
-            painter.vline(x, rect.y_range(), Stroke::new(0.5, Color32::from_gray(28)));
+            painter.vline(
+                x,
+                rect.y_range(),
+                Stroke::new(0.5, crate::ui::theme::LINE.gamma_multiply(0.55)),
+            );
             x += gap;
         }
         let mut y = rect.top() - rect.top().rem_euclid(gap);
         while y < rect.bottom() {
-            painter.hline(rect.x_range(), y, Stroke::new(0.5, Color32::from_gray(28)));
+            painter.hline(
+                rect.x_range(),
+                y,
+                Stroke::new(0.5, crate::ui::theme::LINE.gamma_multiply(0.55)),
+            );
             y += gap;
         }
         let doc = self.document.as_ref().expect("document").clone();
@@ -874,9 +942,9 @@ impl Editor {
             let accent = if node.enabled {
                 accent
             } else {
-                accent.lerp_to_gamma(Color32::from_gray(95), 0.85)
+                accent.lerp_to_gamma(crate::ui::theme::DISABLED, 0.85)
             };
-            let base = Color32::from_rgb(26, 33, 43);
+            let base = crate::ui::theme::SURFACE;
             let body = ui.interact(
                 r.intersect(rect),
                 ui.id().with((&node.id, "body")),
@@ -892,7 +960,7 @@ impl Editor {
                 if node.enabled {
                     base.lerp_to_gamma(accent, 0.06)
                 } else {
-                    Color32::from_rgb(26, 29, 34)
+                    crate::ui::theme::BG
                 },
             );
             painter.rect_stroke(
@@ -905,9 +973,9 @@ impl Editor {
                         1.0
                     },
                     if !known {
-                        Color32::LIGHT_RED
+                        crate::ui::theme::RED
                     } else if self.selected.contains(&node.id) {
-                        Color32::from_rgb(225, 235, 249)
+                        crate::ui::theme::TEXT
                     } else {
                         base.lerp_to_gamma(accent, 0.35)
                     },
@@ -929,11 +997,11 @@ impl Editor {
                 header.left_center() + Vec2::new(9.0, 0.0),
                 egui::Align2::LEFT_CENTER,
                 node_name(node, &catalog),
-                egui::FontId::proportional(13.0),
+                egui::FontId::proportional(crate::ui::theme::COMPACT_TEXT),
                 if node.enabled {
                     Color32::WHITE
                 } else {
-                    Color32::from_gray(155)
+                    crate::ui::theme::MUTED
                 },
             );
             let nr = ui.interact(
@@ -994,13 +1062,13 @@ impl Editor {
             );
             let galley = painter.layout(
                 description.into(),
-                egui::FontId::proportional(11.0),
-                Color32::from_gray(165),
+                egui::FontId::proportional(crate::ui::theme::TINY),
+                crate::ui::theme::MUTED,
                 description_rect.width(),
             );
             painter
                 .with_clip_rect(description_rect.intersect(rect))
-                .galley(description_rect.min, galley, Color32::from_gray(165));
+                .galley(description_rect.min, galley, crate::ui::theme::MUTED);
             ui.interact(
                 description_rect.intersect(rect),
                 ui.id().with((&node.id, "description")),
@@ -1014,7 +1082,7 @@ impl Editor {
                     painter.hline(
                         r.left() + 12.0..=r.right() - 12.0,
                         top - 4.0,
-                        Stroke::new(1.0, Color32::from_gray(55)),
+                        Stroke::new(1.0, crate::ui::theme::LINE),
                     );
                     let mut fields = ui.new_child(
                         egui::UiBuilder::new()
@@ -1153,8 +1221,8 @@ impl Editor {
                             egui::Align2::LEFT_CENTER
                         },
                         &port.name,
-                        egui::FontId::proportional(12.0),
-                        Color32::from_gray(210),
+                        egui::FontId::proportional(crate::ui::theme::SMALL),
+                        crate::ui::theme::TEXT,
                     );
                 }
             }
@@ -1380,7 +1448,7 @@ impl Editor {
             painter.rect_stroke(
                 selection,
                 0.0,
-                Stroke::new(1.0, Color32::LIGHT_BLUE),
+                Stroke::new(1.0, crate::ui::theme::ACCENT),
                 egui::StrokeKind::Inside,
             );
             if ui.input(|i| i.pointer.any_released()) {

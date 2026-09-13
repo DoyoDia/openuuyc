@@ -313,9 +313,9 @@ impl Controller {
             .anchor(egui::Align2::RIGHT_TOP, [-148.0, 52.0])
             .frame(
                 egui::Frame::new()
-                    .fill(egui::Color32::from_rgb(24, 28, 35))
-                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(45, 51, 61)))
-                    .corner_radius(6.0)
+                    .fill(crate::ui::theme::BG)
+                    .stroke(egui::Stroke::new(1.0, crate::ui::theme::LINE))
+                    .corner_radius(crate::ui::theme::PANEL_RADIUS)
                     .inner_margin(12),
             )
             .show(ctx, |ui| {
@@ -333,7 +333,7 @@ impl Controller {
                     });
                 });
                 egui::ScrollArea::vertical()
-                    .max_height(530.0)
+                    .max_height((ctx.content_rect().height() - 120.0).clamp(100.0, 530.0))
                     .show(ui, |ui| self.menu(ui));
             });
         if close {

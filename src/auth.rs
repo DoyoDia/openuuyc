@@ -316,6 +316,21 @@ impl KeyringIdentityStore {
         self.load_or_create_unlocked()
     }
 
+    /// Verification must never create a replacement identity as a side effect.
+    pub(crate) fn load_existing(&self) -> Result<Option<NativeIdentity>> {
+        let _lock = credential_store_lock("identity.lock")?;
+        match self.entry.get_secret() {
+            Ok(bytes) => {
+                let identity: NativeIdentity =
+                    serde_json::from_slice(&bytes).context("saved native identity is invalid")?;
+                identity.validate_schema()?;
+                Ok(Some(identity))
+            }
+            Err(KeyringError::NoEntry) => Ok(None),
+            Err(error) => Err(error).context("failed to read native identity"),
+        }
+    }
+
     fn load_or_create_unlocked(&self) -> Result<NativeIdentity> {
         match self.entry.get_secret() {
             Ok(bytes) => {

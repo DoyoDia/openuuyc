@@ -39,7 +39,11 @@ impl DeviceCenterApp {
             state.baseline = Some(snapshot.settings.clone());
         }
         ui.horizontal(|ui| {
-            ui.label(RichText::new("日志设置").size(25.0).strong());
+            ui.label(
+                RichText::new("日志设置")
+                    .size(crate::ui::theme::TITLE)
+                    .strong(),
+            );
             ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                 if ui
                     .button("打开日志文件夹")

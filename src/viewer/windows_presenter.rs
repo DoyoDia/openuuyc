@@ -605,9 +605,9 @@ impl WindowsConnectionApp {
 
 fn title_bar_frame() -> egui::Frame {
     egui::Frame::new()
-        .fill(egui::Color32::from_rgb(12, 16, 22))
+        .fill(crate::ui::theme::SIDEBAR)
         .inner_margin(egui::Margin::symmetric(10, 3))
-        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(28, 35, 46)))
+        .stroke(egui::Stroke::new(1.0, crate::ui::theme::LINE))
 }
 
 fn connection_title_bar(ui: &mut egui::Ui, window: &Window, alias: &str) -> bool {
@@ -623,9 +623,9 @@ fn connection_title_bar(ui: &mut egui::Ui, window: &Window, alias: &str) -> bool
                     paint_brand_logo(ui);
                     ui.label(
                         egui::RichText::new(format!("正在连接  {alias}"))
-                            .size(12.0)
+                            .size(crate::ui::theme::SMALL)
                             .strong()
-                            .color(egui::Color32::from_rgb(221, 228, 239)),
+                            .color(crate::ui::theme::TEXT),
                     );
                 },
             )
@@ -714,9 +714,9 @@ fn player_title_bar(ui: &mut egui::Ui, mut bar: PlayerTitleBar<'_>) -> PlayerChr
     identity.add(
         egui::Label::new(
             egui::RichText::new(bar.title.trim_start_matches(crate::VIEWER_TITLE_PREFIX))
-                .size(13.5)
+                .size(crate::ui::theme::BODY)
                 .strong()
-                .color(egui::Color32::from_rgb(235, 240, 248)),
+                .color(crate::ui::theme::TEXT),
         )
         .truncate(),
     );
@@ -759,8 +759,8 @@ fn player_title_bar(ui: &mut egui::Ui, mut bar: PlayerTitleBar<'_>) -> PlayerChr
         .add(
             egui::Label::new(
                 egui::RichText::new(parameters)
-                    .size(10.5)
-                    .color(egui::Color32::from_rgb(135, 150, 172)),
+                    .size(crate::ui::theme::TINY)
+                    .color(crate::ui::theme::MUTED),
             )
             .truncate(),
         )
@@ -860,7 +860,7 @@ fn player_title_bar(ui: &mut egui::Ui, mut bar: PlayerTitleBar<'_>) -> PlayerChr
             egui::pos2(controls_rect.min.x, rect.min.y + 8.0),
             egui::pos2(controls_rect.min.x, rect.max.y - 8.0),
         ],
-        egui::Stroke::new(1.0, egui::Color32::from_rgb(42, 50, 64)),
+        egui::Stroke::new(1.0, crate::ui::theme::LINE),
     );
     ui.advance_cursor_after_rect(rect);
     action
@@ -894,9 +894,9 @@ fn title_icon_button(
 ) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::click());
     let fill = if matches!(icon, TitleIcon::Close) && response.hovered() {
-        egui::Color32::from_rgb(196, 43, 52)
+        crate::ui::theme::DANGER_FILL
     } else if selected {
-        egui::Color32::from_rgba_premultiplied(62, 126, 236, 72)
+        crate::ui::theme::SELECTED
     } else if response.hovered() {
         egui::Color32::from_white_alpha(18)
     } else {
@@ -904,11 +904,11 @@ fn title_icon_button(
     };
     ui.painter().rect_filled(rect, 6.0, fill);
     let color = if selected {
-        egui::Color32::from_rgb(106, 162, 255)
+        crate::ui::theme::ACCENT
     } else if response.hovered() {
         egui::Color32::WHITE
     } else {
-        egui::Color32::from_rgb(178, 189, 205)
+        crate::ui::theme::MUTED
     };
     paint_title_icon(ui.painter(), rect, icon, color);
     response.on_hover_text(tooltip)
@@ -997,7 +997,7 @@ fn paint_title_icon(
             );
             let front = back.translate(egui::vec2(-2.5, 2.5));
             painter.rect_stroke(back, 0.5, stroke, egui::StrokeKind::Inside);
-            painter.rect_filled(front, 0.0, egui::Color32::from_rgb(12, 16, 22));
+            painter.rect_filled(front, 0.0, crate::ui::theme::SIDEBAR);
             painter.rect_stroke(front, 0.5, stroke, egui::StrokeKind::Inside);
         }
         TitleIcon::Close => {

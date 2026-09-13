@@ -1,43 +1,26 @@
-//! Account-device metadata. No room creation or remote control is involved.
-use crate::{
-    api::{DeviceDetail, DeviceGroups},
-    client::AuthenticatedClient,
-};
-use std::{
-    collections::HashMap,
-    sync::Arc,
-    time::{Duration, Instant},
-};
-
+//! Account metadata; stable hardware is invalidated by device version/platform.
+use crate::api::{DeviceDetail, DeviceGroups};
+use std::collections::HashMap;
 #[derive(Clone)]
 pub(super) struct CachedDetail {
     pub value: std::result::Result<DeviceDetail, String>,
-    alias: String,
+    pub refresh_error: Option<String>,
     version: String,
-    loaded_at: Instant,
+    platform: i32,
 }
-
 #[derive(Clone)]
 pub(super) struct Catalog {
     pub groups: DeviceGroups,
     pub details: HashMap<String, CachedDetail>,
     pub suggested_name: String,
 }
-
 impl Catalog {
-    pub async fn load(
-        client: Arc<AuthenticatedClient>,
+    pub fn from_groups(
+        groups: DeviceGroups,
         previous: Option<Self>,
-        force: bool,
-        mut foreground: tokio::sync::watch::Receiver<bool>,
-        progress: impl Fn(&Self),
-    ) -> anyhow::Result<Self> {
-        foreground.wait_for(|focused| *focused).await?;
-        let groups = client.device_groups().await?;
-        crate::api::validate_device_id(&groups.current_device_id)?;
-        let mut details = previous.map(|c| c.details).unwrap_or_default();
-        details.retain(|id, _| groups.entries().any(|(_, d)| &d.device_id == id));
-        let mut suggested_name = client.suggested_device_name();
+        mut suggested_name: String,
+    ) -> Self {
+        let details = previous.map(|c| c.details).unwrap_or_default();
         if groups
             .entries()
             .any(|(_, d)| d.device_id != groups.current_device_id && d.alias == suggested_name)
@@ -45,70 +28,51 @@ impl Catalog {
             suggested_name.push('-');
             suggested_name.push_str(&groups.current_device_id[12..]);
         }
-        progress(&Self {
-            groups: groups.clone(),
-            details: details.clone(),
-            suggested_name: suggested_name.clone(),
-        });
-        for (_, device) in groups.entries() {
-            let fresh = details.get(&device.device_id).is_some_and(|d| {
-                !force
-                    && d.alias == device.alias
-                    && d.version == device.version_name
-                    && d.loaded_at.elapsed()
-                        < if d.value.is_ok() {
-                            Duration::from_secs(300)
-                        } else {
-                            Duration::from_secs(30)
-                        }
-            });
-            if fresh {
-                continue;
-            }
-            // Finish the current request on blur, but do not start more items
-            // in this batch until the control center has focus again.
-            foreground.wait_for(|focused| *focused).await?;
-            let value = client
-                .device_detail(device.validated_device_id()?)
-                .await
-                .map_err(|e| format!("{e:#}"));
-            if !client.is_active() {
-                anyhow::bail!("account session has ended");
-            }
-            details.insert(
-                device.device_id.clone(),
-                CachedDetail {
-                    value,
-                    alias: device.alias.clone(),
-                    version: device.version_name.clone(),
-                    loaded_at: Instant::now(),
-                },
-            );
-            progress(&Self {
-                groups: groups.clone(),
-                details: details.clone(),
-                suggested_name: suggested_name.clone(),
-            });
-        }
-        Ok(Self {
+        let mut catalog = Self {
             groups,
             details,
             suggested_name,
-        })
+        };
+        catalog.prune_details();
+        catalog
     }
-
+    pub fn prune_details(&mut self) {
+        self.details.retain(|id, cached| {
+            self.groups.entries().any(|(_, d)| {
+                &d.device_id == id
+                    && cached.version == d.version_name
+                    && cached.platform == d.platform
+            })
+        });
+    }
+    pub fn store_detail(&mut self, id: &str, value: std::result::Result<DeviceDetail, String>) {
+        if let Err(error) = &value
+            && let Some(cached) = self.details.get_mut(id)
+            && cached.value.is_ok()
+        {
+            cached.refresh_error = Some(error.clone());
+            return;
+        }
+        if let Some((_, d)) = self.groups.entries().find(|(_, d)| d.device_id == id) {
+            self.details.insert(
+                id.into(),
+                CachedDetail {
+                    value,
+                    refresh_error: None,
+                    version: d.version_name.clone(),
+                    platform: d.platform,
+                },
+            );
+        }
+    }
     pub fn virtual_status(&self, id: &str) -> Option<bool> {
         let detail = self.details.get(id)?.value.as_ref().ok()?;
         (!detail.details.is_empty()).then(|| {
             crate::virtual_hardware::matches(
-                detail
-                    .details
-                    .iter()
-                    .map(|(key, value)| (key.as_str(), value.as_str())),
+                detail.details.iter().map(|(k, v)| (k.as_str(), v.as_str())),
             )
         })
     }
-
     pub fn is_virtual(&self, id: &str) -> bool {
         self.virtual_status(id) == Some(true)
     }

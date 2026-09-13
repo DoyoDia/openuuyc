@@ -20,13 +20,22 @@ impl DeviceCenterApp {
                 } else {
                     "远程协助"
                 })
-                .size(25.0)
+                .size(crate::ui::theme::TITLE)
                 .strong(),
             );
             ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                 if ui
                     .add_enabled_ui(!self.assist.loading, |ui| {
-                        icon_button(ui, Icon::Refresh, "刷新记录")
+                        if self.assist.loading {
+                            let (rect, response) =
+                                ui.allocate_exact_size(vec2(32.0, 32.0), Sense::hover());
+                            egui::Spinner::new()
+                                .size(18.0)
+                                .paint_at(ui, rect.shrink(7.0));
+                            response.on_hover_text("正在刷新记录…")
+                        } else {
+                            icon_button(ui, Icon::Refresh, "刷新记录")
+                        }
                     })
                     .inner
                     .clicked()
@@ -56,7 +65,7 @@ impl DeviceCenterApp {
             egui::Frame::new()
                 .fill(SURFACE)
                 .stroke(Stroke::new(1.0, LINE))
-                .corner_radius(8.0)
+                .corner_radius(crate::ui::theme::PANEL_RADIUS)
                 .inner_margin(20)
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
@@ -111,10 +120,10 @@ impl DeviceCenterApp {
             ui.add_space(12.0);
             ui.label(RichText::new(message).color(AMBER));
         }
-        if !self.assist.message.is_empty() || self.assist.loading {
+        if !self.assist.message.is_empty() || self.assist.querying {
             ui.add_space(12.0);
             ui.horizontal_wrapped(|ui| {
-                if self.assist.busy || self.assist.loading {
+                if self.assist.busy {
                     ui.spinner();
                 }
                 ui.label(RichText::new(&self.assist.message).color(MUTED));
@@ -131,7 +140,7 @@ impl DeviceCenterApp {
                 } else {
                     "最近连接"
                 })
-                .size(16.0)
+                .size(crate::ui::theme::SECTION)
                 .strong(),
             );
             ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
@@ -184,8 +193,10 @@ impl DeviceCenterApp {
         });
         if items.is_empty() {
             ui.label(
-                RichText::new(if self.assist.lists.is_none() {
+                RichText::new(if self.assist.loading && self.assist.lists.is_none() {
                     "正在读取记录…"
+                } else if self.assist.lists.is_none() && self.assist.last_list_error.is_some() {
+                    "记录读取失败，请点击右上角刷新重试"
                 } else if favorites {
                     "暂无收藏"
                 } else {
@@ -195,7 +206,7 @@ impl DeviceCenterApp {
             );
         }
         egui::ScrollArea::vertical()
-            .id_salt("assist-saved-list")
+            .id_salt(("assist-saved-list", favorites))
             .show(ui, |ui| {
                 for item in &items {
                     ui.push_id(&item.publisher_device_id, |ui| {
@@ -213,7 +224,8 @@ impl DeviceCenterApp {
                                         |ui| {
                                             ui.add(
                                                 egui::Label::new(
-                                                    RichText::new(item.title()).size(15.0),
+                                                    RichText::new(item.title())
+                                                        .size(crate::ui::theme::BODY),
                                                 )
                                                 .truncate(),
                                             )
@@ -232,7 +244,11 @@ impl DeviceCenterApp {
                                             } else {
                                                 item.connect_id.clone()
                                             };
-                                            ui.label(RichText::new(detail).size(12.0).color(MUTED));
+                                            ui.label(
+                                                RichText::new(detail)
+                                                    .size(crate::ui::theme::SMALL)
+                                                    .color(MUTED),
+                                            );
                                         },
                                     );
                                     ui.with_layout(
@@ -344,7 +360,11 @@ impl DeviceCenterApp {
                 .frame(dialog_frame())
                 .show(ctx, |ui| {
                     ui.set_width(400.0);
-                    ui.label(RichText::new("操作未完成").size(21.0).strong());
+                    ui.label(
+                        RichText::new("操作未完成")
+                            .size(crate::ui::theme::DIALOG_TITLE)
+                            .strong(),
+                    );
                     ui.add_space(16.0);
                     ui.add(egui::Label::new(message).wrap());
                     ui.add_space(20.0);
@@ -364,7 +384,11 @@ impl DeviceCenterApp {
                 .frame(dialog_frame())
                 .show(ctx, |ui| {
                     ui.set_width(360.0);
-                    ui.label(RichText::new("设备验证码").size(21.0).strong());
+                    ui.label(
+                        RichText::new("设备验证码")
+                            .size(crate::ui::theme::DIALOG_TITLE)
+                            .strong(),
+                    );
                     ui.label(RichText::new(&pending.id).color(MUTED));
                     ui.add_space(18.0);
                     let input = ui.add_sized(
@@ -416,7 +440,7 @@ impl DeviceCenterApp {
                         } else {
                             "添加收藏"
                         })
-                        .size(21.0)
+                        .size(crate::ui::theme::DIALOG_TITLE)
                         .strong(),
                     );
                     ui.add_space(16.0);
@@ -481,7 +505,11 @@ impl DeviceCenterApp {
                         DeletePrompt::Device(SavedKind::Recent, _) => "移除这条记录？",
                         DeletePrompt::Device(SavedKind::Favorites, _) => "取消收藏？",
                     };
-                    ui.label(RichText::new(title).size(21.0).strong());
+                    ui.label(
+                        RichText::new(title)
+                            .size(crate::ui::theme::DIALOG_TITLE)
+                            .strong(),
+                    );
                     ui.add_space(14.0);
                     if let DeletePrompt::Device(_, item) = &prompt {
                         ui.label(item.title());
@@ -492,7 +520,7 @@ impl DeviceCenterApp {
                         submit = ui
                             .add_enabled(
                                 !self.assist.busy,
-                                login_button("确认").fill(Color32::from_rgb(161, 56, 67)),
+                                login_button("确认").fill(crate::ui::theme::DANGER_FILL),
                             )
                             .clicked();
                         cancel = ui.button("取消").clicked();

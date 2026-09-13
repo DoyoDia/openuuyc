@@ -9,6 +9,7 @@ mod windows;
 mod app;
 pub(crate) mod branding;
 pub(crate) mod controls;
+pub(crate) mod theme;
 use app::AppFactory;
 #[cfg(windows)]
 use app::AppSession;

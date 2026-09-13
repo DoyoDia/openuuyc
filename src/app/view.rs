@@ -3,18 +3,15 @@ use super::*;
 use egui::{Align, Color32, FontId, RichText, Sense, Stroke, vec2};
 mod about;
 mod assist;
+mod device_details;
+mod device_visuals;
+mod devices;
 mod logs;
+mod power;
 
-const BG: Color32 = Color32::from_rgb(22, 26, 33);
-const SIDEBAR: Color32 = Color32::from_rgb(16, 20, 26);
-const SURFACE: Color32 = Color32::from_rgb(31, 37, 47);
-const LINE: Color32 = Color32::from_rgb(45, 53, 66);
-const TEXT: Color32 = Color32::from_rgb(231, 235, 242);
-const MUTED: Color32 = Color32::from_rgb(156, 167, 184);
-const BLUE: Color32 = Color32::from_rgb(75, 136, 235);
-const GREEN: Color32 = Color32::from_rgb(102, 207, 156);
-const AMBER: Color32 = Color32::from_rgb(238, 190, 111);
-const RED: Color32 = Color32::from_rgb(241, 125, 132);
+use crate::ui::theme::{
+    self, ACCENT as BLUE, AMBER, BG, GREEN, LINE, MUTED, RED, SIDEBAR, SURFACE, TEXT,
+};
 
 fn singleline_input(value: &mut String) -> egui::TextEdit<'_> {
     crate::ui::controls::singleline(value, crate::ui::controls::HEIGHT)
@@ -27,6 +24,7 @@ enum Page {
     Assist,
     Favorites,
     Management,
+    DeviceDetails,
     Settings,
     Logs,
     Plugins,
@@ -39,6 +37,7 @@ impl Page {
             Self::Assist => "远程协助",
             Self::Favorites => "收藏设备",
             Self::Management => "全部设备",
+            Self::DeviceDetails => "设备详情",
             Self::Settings => "连接设置",
             Self::Logs => "日志设置",
             Self::Plugins => "插件管理",
@@ -50,10 +49,12 @@ impl Page {
 #[derive(Default)]
 pub(super) struct CenterUi {
     page: Page,
-    search: String,
-    online_only: bool,
-    details_open: bool,
+    device_lists: [devices::ListUi; 2],
+    detail_id: Option<String>,
+    detail_parent: Page,
+    wallpapers: super::wallpaper::Wallpapers,
     edit: Option<DeviceEdit>,
+    power: Option<power::PowerConfirmation>,
     legal_document: Option<about::LegalDocument>,
     logs: logs::LogUi,
     #[cfg(windows)]
@@ -71,20 +72,33 @@ enum EditAction {
 }
 
 impl CenterUi {
-    pub(super) fn open_details(&mut self) {
-        self.details_open = true;
+    pub(super) fn open_details(&mut self, id: String) {
+        if self.page != Page::DeviceDetails {
+            self.detail_parent = self.page;
+        }
+        self.detail_id = Some(id);
+        self.page = Page::DeviceDetails;
     }
     pub(super) fn close_details(&mut self) {
-        self.details_open = false;
+        if self.page == Page::DeviceDetails {
+            self.page = self.detail_parent;
+        }
+        self.detail_id = None;
         self.edit = None;
+        self.power = None;
+    }
+    pub(super) fn finish_device_operation(&mut self) {
+        self.edit = None;
+        self.power = None;
+    }
+    pub(super) fn clear_wallpapers(&mut self) {
+        self.wallpapers.clear();
     }
 }
 
 #[derive(Clone, Copy)]
 enum Icon {
     Monitor,
-    Virtual,
-    Tablet,
     Settings,
     Refresh,
     Close,
@@ -98,30 +112,7 @@ enum Icon {
 }
 
 pub(super) fn configure_visuals(ctx: &egui::Context) {
-    ctx.set_theme(egui::ThemePreference::Dark);
-    let mut style = (*ctx.style_of(egui::Theme::Dark)).clone();
-    style.visuals = egui::Visuals::dark();
-    style.visuals.panel_fill = BG;
-    style.visuals.window_fill = BG;
-    style.visuals.extreme_bg_color = SIDEBAR;
-    style.visuals.override_text_color = Some(TEXT);
-    style.visuals.weak_text_color = Some(MUTED);
-    style.visuals.selection.bg_fill = Color32::from_rgb(40, 70, 112);
-    style.visuals.selection.stroke = Stroke::new(1.0, BLUE);
-    style.visuals.window_corner_radius = 8.0.into();
-    crate::ui::controls::configure(&mut style, crate::ui::controls::HEIGHT);
-    style.spacing.item_spacing = vec2(8.0, 8.0);
-    style
-        .text_styles
-        .insert(egui::TextStyle::Body, FontId::proportional(14.0));
-    style
-        .text_styles
-        .insert(egui::TextStyle::Button, FontId::proportional(14.0));
-    style
-        .text_styles
-        .insert(egui::TextStyle::Small, FontId::proportional(12.0));
-    style.interaction.selectable_labels = false;
-    ctx.set_style_of(egui::Theme::Dark, style);
+    theme::configure(ctx);
 }
 
 fn paint_icon(p: &egui::Painter, rect: egui::Rect, icon: Icon, color: Color32) {
@@ -185,29 +176,6 @@ fn paint_icon(p: &egui::Painter, rect: egui::Rect, icon: Icon, color: Color32) {
                 s,
             ));
         }
-        Icon::Virtual => {
-            let top = q(0.0, -10.0);
-            let left = q(-9.0, -5.0);
-            let right = q(9.0, -5.0);
-            let middle = q(0.0, 0.0);
-            let bottom = q(0.0, 10.0);
-            p.add(egui::Shape::closed_line(
-                vec![top, right, q(9.0, 5.0), bottom, q(-9.0, 5.0), left],
-                s,
-            ));
-            for edge in [[left, middle], [middle, right], [middle, bottom]] {
-                p.line_segment(edge, s);
-            }
-        }
-        Icon::Tablet => {
-            p.rect_stroke(
-                egui::Rect::from_center_size(c, vec2(14.0, 20.0)),
-                2.0,
-                s,
-                egui::StrokeKind::Inside,
-            );
-            p.circle_filled(q(0.0, 6.5), 1.0, color);
-        }
         Icon::Monitor => {
             p.rect_stroke(
                 egui::Rect::from_center_size(q(0.0, -2.0), vec2(20.0, 14.0)),
@@ -265,7 +233,9 @@ fn icon_button(ui: &mut egui::Ui, icon: Icon, hint: &str) -> egui::Response {
         return crate::ui::controls::close_button(ui, hint, 32.0);
     }
     let (rect, response) = ui.allocate_exact_size(vec2(32.0, 32.0), Sense::click());
-    if response.hovered() && ui.is_enabled() {
+    response
+        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), hint));
+    if (response.hovered() || response.has_focus()) && ui.is_enabled() {
         ui.painter().rect_filled(rect, 5.0, SURFACE);
     }
     paint_icon(
@@ -275,7 +245,7 @@ fn icon_button(ui: &mut egui::Ui, icon: Icon, hint: &str) -> egui::Response {
         if ui.is_enabled() {
             MUTED
         } else {
-            Color32::from_gray(90)
+            crate::ui::theme::DISABLED
         },
     );
     response.on_hover_text(hint)
@@ -291,11 +261,7 @@ fn login_button(label: &str) -> egui::Button<'_> {
 }
 
 fn dialog_frame() -> egui::Frame {
-    egui::Frame::new()
-        .fill(BG)
-        .stroke(Stroke::new(1.0, LINE))
-        .corner_radius(8.0)
-        .inner_margin(egui::Margin::same(20))
+    crate::ui::controls::dialog_frame()
 }
 
 fn nav_item(
@@ -305,16 +271,28 @@ fn nav_item(
     count: Option<usize>,
     selected: bool,
 ) -> bool {
-    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 36.0), Sense::click());
-    if selected || response.hovered() {
-        ui.painter().rect_filled(
+    let (rect, response) = ui.allocate_exact_size(
+        vec2(ui.available_width(), theme::NAV_HEIGHT),
+        Sense::click(),
+    );
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::SelectableLabel,
+            ui.is_enabled(),
+            selected,
+            title,
+        )
+    });
+    if selected || response.hovered() || response.has_focus() {
+        ui.painter()
+            .rect_filled(rect, 5.0, if selected { theme::SELECTED } else { SURFACE });
+    }
+    if response.has_focus() {
+        ui.painter().rect_stroke(
             rect,
-            5.0,
-            if selected {
-                Color32::from_rgb(33, 51, 77)
-            } else {
-                SURFACE
-            },
+            theme::CONTROL_RADIUS,
+            Stroke::new(1.0, theme::BORDER_FOCUS),
+            egui::StrokeKind::Inside,
         );
     }
     paint_icon(
@@ -327,7 +305,7 @@ fn nav_item(
         rect.left_center() + vec2(42.0, 0.0),
         egui::Align2::LEFT_CENTER,
         title,
-        FontId::proportional(14.0),
+        FontId::proportional(crate::ui::theme::BODY),
         TEXT,
     );
     if let Some(count) = count {
@@ -335,7 +313,7 @@ fn nav_item(
             rect.right_center() - vec2(12.0, 0.0),
             egui::Align2::RIGHT_CENTER,
             count.to_string(),
-            FontId::proportional(12.0),
+            FontId::proportional(crate::ui::theme::SMALL),
             MUTED,
         );
     }
@@ -351,154 +329,6 @@ fn presence_text(state: &PresenceState) -> (&'static str, Color32) {
     }
 }
 
-fn device_status(device: &DeviceInfo) -> (&str, Color32) {
-    if !device.is_connected() {
-        ("离线", MUTED)
-    } else if device.participant_count() > 0 {
-        ("使用中", AMBER)
-    } else if !device.controllable || !device.controlled_support {
-        ("未开放连接", AMBER)
-    } else {
-        ("在线", GREEN)
-    }
-}
-
-enum RowAction {
-    Details,
-    Connect,
-}
-
-fn table_columns(rect: egui::Rect) -> (f32, f32, f32) {
-    (
-        rect.right() - 408.0,
-        rect.right() - 294.0,
-        rect.right() - 164.0,
-    )
-}
-
-fn device_row(
-    ui: &mut egui::Ui,
-    group: &str,
-    device: &DeviceInfo,
-    selected: bool,
-    own_session: bool,
-    connect_issue: Option<&str>,
-    viewing: bool,
-) -> Option<RowAction> {
-    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 72.0), Sense::click());
-    if response.hovered() || selected {
-        ui.painter().rect_filled(
-            rect,
-            5.0,
-            if selected {
-                Color32::from_rgb(30, 44, 63)
-            } else {
-                Color32::from_rgb(29, 35, 44)
-            },
-        );
-    }
-    let (platform_x, status_x, actions_x) = table_columns(rect);
-    paint_icon(
-        ui.painter(),
-        egui::Rect::from_center_size(rect.left_center() + vec2(24.0, 0.0), vec2(28.0, 28.0)),
-        if group.starts_with("虚拟设备") {
-            Icon::Virtual
-        } else if matches!(device.platform, 2 | 3) {
-            Icon::Tablet
-        } else {
-            Icon::Monitor
-        },
-        if device.is_connected() { TEXT } else { MUTED },
-    );
-    let mut name = ui.new_child(
-        egui::UiBuilder::new()
-            .max_rect(egui::Rect::from_min_max(
-                rect.left_top() + vec2(54.0, 14.0),
-                egui::pos2(platform_x - 18.0, rect.bottom()),
-            ))
-            .layout(egui::Layout::top_down(Align::Min)),
-    );
-    name.add(egui::Label::new(RichText::new(display_alias(device)).size(15.0).strong()).truncate())
-        .on_hover_text(display_alias(device));
-    name.label(RichText::new(group).size(12.0).color(MUTED));
-    ui.painter().text(
-        egui::pos2(platform_x, rect.top() + 25.0),
-        egui::Align2::LEFT_CENTER,
-        device.platform_label(),
-        FontId::proportional(13.0),
-        TEXT,
-    );
-    ui.painter().text(
-        egui::pos2(platform_x, rect.top() + 47.0),
-        egui::Align2::LEFT_CENTER,
-        if device.version_name.is_empty() {
-            "版本未知"
-        } else {
-            &device.version_name
-        },
-        FontId::proportional(11.5),
-        MUTED,
-    );
-    let (status, color) = if !viewing {
-        (
-            device.status_label(),
-            if device.is_connected() { GREEN } else { MUTED },
-        )
-    } else if own_session {
-        ("窗口已打开", BLUE)
-    } else {
-        device_status(device)
-    };
-    ui.painter().text(
-        egui::pos2(status_x, rect.center().y),
-        egui::Align2::LEFT_CENTER,
-        status,
-        FontId::proportional(13.0),
-        color,
-    );
-    let mut action = None;
-    let mut buttons = ui.new_child(
-        egui::UiBuilder::new()
-            .max_rect(egui::Rect::from_min_max(
-                egui::pos2(actions_x, rect.top()),
-                rect.right_bottom() - vec2(8.0, 0.0),
-            ))
-            .layout(egui::Layout::right_to_left(Align::Center)),
-    );
-    if viewing {
-        let connect = buttons.add_enabled(
-            connect_issue.is_none(),
-            egui::Button::new(if own_session { "已打开" } else { "连接" })
-                .fill(if selected && connect_issue.is_none() {
-                    BLUE
-                } else {
-                    SURFACE
-                })
-                .min_size(vec2(76.0, 32.0)),
-        );
-        if connect.clicked() {
-            action = Some(RowAction::Connect);
-        }
-        if let Some(issue) = connect_issue {
-            connect.on_hover_text(issue);
-        }
-    }
-    if buttons
-        .add(egui::Button::new("详情").frame(false))
-        .clicked()
-    {
-        action = Some(RowAction::Details);
-    }
-    ui.painter().line_segment(
-        [
-            rect.left_bottom() + vec2(10.0, 0.0),
-            rect.right_bottom() - vec2(10.0, 0.0),
-        ],
-        Stroke::new(1.0, LINE),
-    );
-    action.or_else(|| response.clicked().then_some(RowAction::Details))
-}
-
 fn form_row(ui: &mut egui::Ui, label: &str, hint: &str, content: impl FnOnce(&mut egui::Ui)) {
     ui.horizontal(|ui| {
         let label_width = (ui.available_width() - 258.0).max(160.0);
@@ -506,9 +336,13 @@ fn form_row(ui: &mut egui::Ui, label: &str, hint: &str, content: impl FnOnce(&mu
             vec2(label_width, 52.0),
             egui::Layout::top_down(Align::Min),
             |ui| {
-                ui.label(RichText::new(label).size(14.0));
+                ui.label(RichText::new(label).size(crate::ui::theme::BODY));
                 if !hint.is_empty() {
-                    ui.label(RichText::new(hint).size(12.0).color(MUTED));
+                    ui.label(
+                        RichText::new(hint)
+                            .size(crate::ui::theme::SMALL)
+                            .color(MUTED),
+                    );
                 }
             },
         );
@@ -519,13 +353,17 @@ fn form_row(ui: &mut egui::Ui, label: &str, hint: &str, content: impl FnOnce(&mu
 
 fn section(ui: &mut egui::Ui, title: &str) {
     ui.add_space(20.0);
-    ui.label(RichText::new(title).size(16.0).strong());
+    ui.label(
+        RichText::new(title)
+            .size(crate::ui::theme::SECTION)
+            .strong(),
+    );
     ui.add_space(8.0);
 }
 
 fn login_scan_placeholder(p: &egui::Painter, rect: egui::Rect) {
     let c = rect.center();
-    let corner = Stroke::new(2.0, Color32::from_rgb(75, 106, 147));
+    let corner = Stroke::new(2.0, crate::ui::theme::BORDER_FOCUS);
     for (x, y) in [(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
         let edge = c + vec2(x * 48.0, y * 48.0);
         p.add(egui::Shape::line(
@@ -565,7 +403,7 @@ fn login_qr_area(
         );
     } else {
         ui.painter()
-            .rect_filled(rect, 8.0, Color32::from_rgb(20, 26, 35));
+            .rect_filled(rect, 8.0, crate::ui::theme::SIDEBAR);
         ui.painter()
             .rect_stroke(rect, 8.0, Stroke::new(1.0, LINE), egui::StrokeKind::Inside);
         if loading {
@@ -602,10 +440,13 @@ fn login_surface(
                 14.0,
                 Color32::from_black_alpha(28),
             );
-            painter.rect_filled(card, 14.0, Color32::from_rgb(27, 33, 43));
+            painter.rect_filled(card, 14.0, crate::ui::theme::SURFACE);
             painter.rect_stroke(card, 14.0, Stroke::new(1.0, LINE), egui::StrokeKind::Inside);
-            let title =
-                painter.layout_no_wrap(crate::APP_NAME.into(), FontId::proportional(25.0), TEXT);
+            let title = painter.layout_no_wrap(
+                crate::APP_NAME.into(),
+                FontId::proportional(crate::ui::theme::TITLE),
+                TEXT,
+            );
             let brand_width = 36.0 + 12.0 + title.size().x;
             let brand = egui::Rect::from_min_size(
                 egui::pos2(card.center().x - brand_width * 0.5, card.top() + 34.0),
@@ -637,7 +478,11 @@ fn login_surface(
                         .layout(egui::Layout::top_down(Align::Center)),
                     |ui| {
                         ui.spacing_mut().item_spacing.y = 6.0;
-                        ui.label(RichText::new(heading).size(18.0).strong());
+                        ui.label(
+                            RichText::new(heading)
+                                .size(crate::ui::theme::SECTION)
+                                .strong(),
+                        );
                         ui.add_space(18.0);
                         content(ui, method);
                     },
@@ -670,11 +515,11 @@ fn qr_form(
     };
     let response = ui.add_sized(
         [320.0, 20.0],
-        egui::Label::new(RichText::new(message).size(13.0).color(if error.is_some() {
-            AMBER
-        } else {
-            MUTED
-        }))
+        egui::Label::new(
+            RichText::new(message)
+                .size(crate::ui::theme::COMPACT_TEXT)
+                .color(if error.is_some() { AMBER } else { MUTED }),
+        )
         .truncate(),
     );
     if let Some(error) = error {
@@ -703,12 +548,17 @@ impl DeviceCenterApp {
     }
 
     pub(super) fn draw_center(&mut self, ui: &mut egui::Ui) {
+        self.center_ui.wallpapers.poll(ui.ctx());
         if self.needs_login() {
             if self.center_ui.page == Page::Logs {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::new().fill(BG).inner_margin(24))
                     .show(ui, |ui| {
-                        if ui.link("返回登录").clicked() {
+                        if crate::ui::controls::back_button(ui, "返回登录").clicked()
+                            || ui.input_mut(|i| {
+                                i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)
+                            })
+                        {
                             self.center_ui.page = Page::Mine;
                         }
                         self.logs_page(ui);
@@ -722,15 +572,28 @@ impl DeviceCenterApp {
             }
             return;
         }
+        let previous_page = self.center_ui.page;
         self.draw_navigation(ui);
+        if self.center_ui.page != previous_page
+            && matches!(self.center_ui.page, Page::Assist | Page::Favorites)
+        {
+            self.request_assist_refresh();
+        }
+        if self.center_ui.page != Page::DeviceDetails {
+            self.center_ui.detail_id = None;
+        }
         egui::CentralPanel::default()
-            .frame(
-                egui::Frame::new()
-                    .fill(BG)
-                    .inner_margin(egui::Margin::symmetric(28, 24)),
-            )
+            .frame(egui::Frame::new().fill(BG).inner_margin(
+                if self.center_ui.page == Page::DeviceDetails {
+                    egui::Margin::ZERO
+                } else {
+                    egui::Margin::symmetric(28, 24)
+                },
+            ))
             .show(ui, |ui| {
-                if self.center_ui.page == Page::Settings {
+                if self.center_ui.page == Page::DeviceDetails {
+                    self.device_details_page(ui);
+                } else if self.center_ui.page == Page::Settings {
                     self.settings_page(ui);
                 } else if self.center_ui.page == Page::Logs {
                     self.logs_page(ui);
@@ -754,7 +617,7 @@ impl DeviceCenterApp {
     fn draw_navigation(&mut self, ui: &mut egui::Ui) {
         egui::Panel::left("center-navigation")
             .resizable(false)
-            .default_size(188.0)
+            .default_size(theme::SIDEBAR_WIDTH)
             .frame(
                 egui::Frame::new()
                     .fill(SIDEBAR)
@@ -781,7 +644,7 @@ impl DeviceCenterApp {
                 }
                 let title = ui.painter().layout_no_wrap(
                     crate::APP_NAME.into(),
-                    FontId::proportional(17.0),
+                    FontId::proportional(crate::ui::theme::BRAND),
                     title_color,
                 );
                 let width = 30.0 + 8.0 + title.size().x;
@@ -811,7 +674,9 @@ impl DeviceCenterApp {
                     Icon::Monitor,
                     "我的设备",
                     Some(count),
-                    self.center_ui.page == Page::Mine,
+                    self.center_ui.page == Page::Mine
+                        || (self.center_ui.page == Page::DeviceDetails
+                            && self.center_ui.detail_parent == Page::Mine),
                 ) {
                     self.center_ui.page = Page::Mine;
                 }
@@ -820,7 +685,9 @@ impl DeviceCenterApp {
                     Icon::Monitor,
                     "全部设备",
                     self.catalog.as_ref().map(|c| c.groups.entries().count()),
-                    self.center_ui.page == Page::Management,
+                    self.center_ui.page == Page::Management
+                        || (self.center_ui.page == Page::DeviceDetails
+                            && self.center_ui.detail_parent == Page::Management),
                 ) {
                     self.center_ui.page = Page::Management;
                 }
@@ -915,8 +782,15 @@ impl DeviceCenterApp {
                 .max_rect(account_row)
                 .layout(egui::Layout::left_to_right(Align::Center)),
             |ui| {
-                ui.add(egui::Label::new(RichText::new(account).size(14.0).color(TEXT)).truncate())
-                    .on_hover_text(account);
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(account)
+                            .size(crate::ui::theme::BODY)
+                            .color(TEXT),
+                    )
+                    .truncate(),
+                )
+                .on_hover_text(account);
             },
         );
 
@@ -956,7 +830,7 @@ impl DeviceCenterApp {
             egui::pos2(left + 13.0, baseline),
             egui::Align2::LEFT_CENTER,
             presence,
-            FontId::proportional(11.0),
+            FontId::proportional(crate::ui::theme::TINY),
             MUTED,
         );
         self.draw_version(
@@ -1021,7 +895,11 @@ impl DeviceCenterApp {
         }
         let text_size = ui
             .painter()
-            .layout_no_wrap(label.clone(), FontId::proportional(11.0), color)
+            .layout_no_wrap(
+                label.clone(),
+                FontId::proportional(crate::ui::theme::TINY),
+                color,
+            )
             .size();
         let hit_rect = egui::Rect::from_min_size(
             rect.right_center() - vec2(text_size.x, text_size.y * 0.5),
@@ -1055,7 +933,7 @@ impl DeviceCenterApp {
                 rect.right_center(),
                 egui::Align2::RIGHT_CENTER,
                 label,
-                FontId::proportional(11.0),
+                FontId::proportional(crate::ui::theme::TINY),
                 if enabled && response.hovered() {
                     BLUE
                 } else {
@@ -1072,6 +950,7 @@ impl DeviceCenterApp {
     }
 
     fn alert(&mut self, ui: &mut egui::Ui) {
+        self.power_results(ui);
         if !self.status.kind.is_alert() {
             return;
         }
@@ -1082,7 +961,7 @@ impl DeviceCenterApp {
         };
         let mut dismiss = false;
         egui::Frame::new()
-            .fill(Color32::from_rgb(42, 35, 33))
+            .fill(crate::ui::theme::WARNING_BG)
             .corner_radius(5.0)
             .inner_margin(egui::Margin::symmetric(12, 8))
             .show(ui, |ui| {
@@ -1091,8 +970,12 @@ impl DeviceCenterApp {
                     paint_icon(ui.painter(), rect, Icon::Info, color);
                     ui.add_sized(
                         [ui.available_width() - 40.0, 26.0],
-                        egui::Label::new(RichText::new(&self.status.text).size(13.0).color(TEXT))
-                            .truncate(),
+                        egui::Label::new(
+                            RichText::new(&self.status.text)
+                                .size(crate::ui::theme::COMPACT_TEXT)
+                                .color(TEXT),
+                        )
+                        .truncate(),
                     )
                     .on_hover_text(&self.status.text);
                     dismiss = icon_button(ui, Icon::Close, "关闭提示").clicked();
@@ -1130,178 +1013,22 @@ impl DeviceCenterApp {
         ui.add_space(10.0);
     }
 
-    fn devices_page(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(self.center_ui.page.title())
-                    .size(25.0)
-                    .strong(),
-            );
-            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                ui.add_enabled_ui(!self.refresh_pending && !self.logout_pending, |ui| {
-                    let hint = self.refreshed_at.map_or_else(
-                        || "刷新设备".to_owned(),
-                        |at| format!("刷新设备 · 上次更新 {} 秒前", at.elapsed().as_secs()),
-                    );
-                    if icon_button(ui, Icon::Refresh, &hint).clicked() {
-                        self.request_refresh();
-                    }
-                });
-                ui.add_sized(
-                    [248.0, 34.0],
-                    singleline_input(&mut self.center_ui.search)
-                        .hint_text("搜索设备名称或系统")
-                        .desired_width(248.0),
-                );
-            });
-        });
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            let count = self
-                .devices
-                .as_ref()
-                .map(|list| {
-                    all_devices(list)
-                        .filter(|(_, d)| self.show_in_watching_list(d))
-                        .count()
-                })
-                .unwrap_or(0);
-            ui.label(RichText::new(format!("共 {count} 台设备")).color(MUTED));
-            if self.refresh_pending {
-                ui.spinner();
-            }
-            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                ui.checkbox(&mut self.center_ui.online_only, "仅在线");
-            });
-        });
-        ui.add_space(18.0);
-        self.alert(ui);
-        self.active_view(ui);
-        let Some(list) = &self.devices else {
-            self.empty_state(
-                ui,
-                if self.refresh_pending {
-                    "正在读取设备…"
-                } else {
-                    "暂时无法加载设备"
-                },
-                if self.refresh_pending {
-                    "正在恢复账号并获取设备列表"
-                } else {
-                    "点击刷新重试"
-                },
-            );
-            return;
-        };
-        let query = self.center_ui.search.trim().to_lowercase();
-        let mut rows = all_devices(list)
-            .filter(|(_, device)| {
-                self.show_in_watching_list(device)
-                    && (!self.center_ui.online_only || device.is_connected())
-                    && (query.is_empty()
-                        || display_alias(device).to_lowercase().contains(&query)
-                        || device.platform_label().to_lowercase().contains(&query))
-            })
-            .collect::<Vec<_>>();
-        rows.sort_by(|(_, a), (_, b)| {
-            b.is_connected()
-                .cmp(&a.is_connected())
-                .then_with(|| a.alias.to_lowercase().cmp(&b.alias.to_lowercase()))
-                .then_with(|| a.device_id.cmp(&b.device_id))
-        });
-        if rows.is_empty() {
-            self.empty_state(
-                ui,
-                if !query.is_empty() {
-                    "没有找到匹配的设备"
-                } else if self.center_ui.online_only {
-                    "暂无在线设备"
-                } else {
-                    "暂无设备"
-                },
-                if !query.is_empty() {
-                    "换一个名称试试，或清空搜索条件"
-                } else {
-                    "设备上线后会自动显示在这里"
-                },
-            );
-            if (!query.is_empty() || self.center_ui.online_only) && ui.button("清除筛选").clicked()
-            {
-                self.center_ui.search.clear();
-                self.center_ui.online_only = false;
-            }
-            return;
-        }
-        let mut picked = None;
-        egui::ScrollArea::vertical()
-            .id_salt("center-devices-scroll")
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                let (header, _) =
-                    ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::hover());
-                let (platform, status, action) = table_columns(header);
-                for (x, label) in [
-                    (header.left() + 54.0, "设备名称"),
-                    (platform, "系统 / 版本"),
-                    (status, "状态"),
-                    (action + 80.0, "操作"),
-                ] {
-                    ui.painter().text(
-                        egui::pos2(x, header.center().y),
-                        egui::Align2::LEFT_CENTER,
-                        label,
-                        FontId::proportional(12.0),
-                        MUTED,
-                    );
-                }
-                for (group, device) in rows {
-                    let own = self.active_session.as_ref().is_some_and(|session| {
-                        session.device_id.as_deref() == Some(device.device_id.as_str())
-                    });
-                    let issue = if self.logout_pending {
-                        Some("正在退出账号".to_owned())
-                    } else if self.active_session.is_some() {
-                        Some("请先关闭当前观看窗口".to_owned())
-                    } else {
-                        connectability_error(device).err()
-                    };
-                    let action = ui
-                        .push_id(&device.device_id, |ui| {
-                            device_row(
-                                ui,
-                                group,
-                                device,
-                                self.selected_device_id.as_deref() == Some(&device.device_id),
-                                own,
-                                issue.as_deref(),
-                                self.is_viewing_target(&device.device_id),
-                            )
-                        })
-                        .inner;
-                    if let Some(action) = action {
-                        picked = Some((device.device_id.clone(), action));
-                    }
-                }
-            });
-        if let Some((id, action)) = picked {
-            self.selected_device_id = Some(id);
-            match action {
-                RowAction::Details => {
-                    self.open_details(self.selected_device_id.clone().expect("selected row"))
-                }
-                RowAction::Connect => self.start_viewer(),
-            }
-        }
-    }
-
     fn empty_state(&mut self, ui: &mut egui::Ui, title: &str, detail: &str) {
         ui.add_space(56.0);
         ui.vertical_centered(|ui| {
             let (rect, _) = ui.allocate_exact_size(vec2(48.0, 48.0), Sense::hover());
             paint_icon(ui.painter(), rect, Icon::Monitor, MUTED);
             ui.add_space(10.0);
-            ui.label(RichText::new(title).size(20.0).strong());
-            ui.label(RichText::new(detail).size(14.0).color(MUTED));
+            ui.label(
+                RichText::new(title)
+                    .size(crate::ui::theme::DIALOG_TITLE)
+                    .strong(),
+            );
+            ui.label(
+                RichText::new(detail)
+                    .size(crate::ui::theme::BODY)
+                    .color(MUTED),
+            );
             if self.devices.is_none() && !self.refresh_pending {
                 ui.add_space(16.0);
                 if ui
@@ -1319,111 +1046,12 @@ impl DeviceCenterApp {
         });
     }
 
-    fn management_page(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("全部设备").size(25.0).strong());
-            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                if icon_button(ui, Icon::Refresh, "刷新列表及硬件详情").clicked() {
-                    self.request_refresh();
-                }
-                ui.add_sized(
-                    [248.0, 34.0],
-                    singleline_input(&mut self.center_ui.search).hint_text("搜索设备名称或系统"),
-                );
-            });
-        });
-        ui.add_space(18.0);
-        self.alert(ui);
-        if let Some(error) = &self.catalog_error {
-            ui.colored_label(AMBER, "完整设备清单读取失败，点击刷新重试")
-                .on_hover_text(error);
-        }
-        let Some(catalog) = &self.catalog else {
-            self.empty_state(
-                ui,
-                if self.devices.is_some() {
-                    "正在读取完整清单…"
-                } else {
-                    "登录后查看全部设备"
-                },
-                "",
-            );
-            return;
-        };
-        let query = self.center_ui.search.trim().to_lowercase();
-        let mut picked = None;
-        let (mut desktops, mut virtuals, mut pending) = (Vec::new(), Vec::new(), Vec::new());
-        for device in &catalog.groups.desktop_devices {
-            match catalog.virtual_status(&device.device_id) {
-                Some(true) => virtuals.push(device),
-                Some(false) => desktops.push(device),
-                None => pending.push(device),
-            }
-        }
-        egui::ScrollArea::vertical()
-            .id_salt("account-catalog")
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                for (group, devices) in [
-                    ("电脑", desktops),
-                    ("虚拟设备", virtuals),
-                    (
-                        "手机 / 平板",
-                        catalog.groups.mobile_devices.iter().collect(),
-                    ),
-                    ("电视", catalog.groups.tv_devices.iter().collect()),
-                    ("待识别", pending),
-                ] {
-                    if devices.is_empty() {
-                        continue;
-                    }
-                    ui.add_space(12.0);
-                    ui.label(
-                        RichText::new(format!("{group}  {}", devices.len()))
-                            .size(16.0)
-                            .strong(),
-                    );
-                    ui.add_space(6.0);
-                    for device in devices {
-                        if !query.is_empty()
-                            && !device.alias.to_lowercase().contains(&query)
-                            && !device.platform_label().to_lowercase().contains(&query)
-                        {
-                            continue;
-                        }
-                        let note = if device.device_id == catalog.groups.current_device_id {
-                            format!("{group} · 本机")
-                        } else {
-                            group.to_owned()
-                        };
-                        if ui
-                            .push_id(&device.device_id, |ui| {
-                                device_row(
-                                    ui,
-                                    &note,
-                                    device,
-                                    self.selected_device_id.as_deref()
-                                        == Some(device.device_id.as_str()),
-                                    false,
-                                    None,
-                                    false,
-                                )
-                            })
-                            .inner
-                            .is_some()
-                        {
-                            picked = Some(device.device_id.clone());
-                        }
-                    }
-                }
-            });
-        if let Some(id) = picked {
-            self.open_details(id);
-        }
-    }
-
     fn settings_page(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("连接设置").size(25.0).strong());
+        ui.label(
+            RichText::new("连接设置")
+                .size(crate::ui::theme::TITLE)
+                .strong(),
+        );
         ui.add_space(18.0);
         self.alert(ui);
         egui::ScrollArea::vertical()
@@ -1582,180 +1210,20 @@ impl DeviceCenterApp {
             self.logout_confirmation = false;
             return;
         }
-        if self.center_ui.edit.is_some() {
+        if self.center_ui.power.is_some() {
+            self.power_confirmation(ctx);
+        } else if self.center_ui.edit.is_some() {
             self.device_edit_dialog(ctx);
-        } else if self.center_ui.details_open {
-            self.device_details(ctx);
         }
         if self.logout_confirmation {
             self.logout_dialog(ctx);
         }
         if self.center_ui.edit.is_none()
-            && !self.center_ui.details_open
+            && self.center_ui.power.is_none()
+            && self.center_ui.page != Page::DeviceDetails
             && !self.logout_confirmation
         {
             self.assist_dialogs(ctx);
-        }
-    }
-
-    fn device_details(&mut self, ctx: &egui::Context) {
-        let Some(device) = self.selected_device().cloned() else {
-            self.center_ui.details_open = false;
-            return;
-        };
-        let mut close = false;
-        let mut connect = false;
-        let mut edit = None;
-        let mut exit_account = false;
-        let current = self
-            .devices
-            .as_ref()
-            .is_some_and(|g| g.current_device.device_id == device.device_id);
-        let owned = self.catalog.as_ref().is_some_and(|c| {
-            c.groups
-                .entries()
-                .any(|(_, d)| d.device_id == device.device_id)
-        });
-        let response = egui::Modal::new(egui::Id::new("center-device-details"))
-            .frame(dialog_frame())
-            .show(ctx, |ui| {
-                ui.set_width(500.0_f32.min(ctx.content_rect().width() - 60.0));
-                ui.horizontal(|ui| {
-                    ui.add_sized(
-                        [ui.available_width() - 40.0, 32.0],
-                        egui::Label::new(RichText::new(display_alias(&device)).size(21.0).strong())
-                            .truncate(),
-                    )
-                    .on_hover_text(display_alias(&device));
-                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                        close = icon_button(ui, Icon::Close, "关闭").clicked();
-                    });
-                });
-                ui.add_space(16.0);
-                egui::Grid::new("center-device-detail-grid")
-                    .num_columns(2)
-                    .min_row_height(24.0)
-                    .spacing([30.0, 10.0])
-                    .show(ui, |ui| {
-                        for (label, value) in [
-                            ("状态", device.status_label().to_owned()),
-                            ("系统", device.platform_label()),
-                            (
-                                "版本",
-                                if device.version_name.is_empty() {
-                                    "未知".into()
-                                } else {
-                                    device.version_name.clone()
-                                },
-                            ),
-                            ("设备 ID", device.device_id.clone()),
-                        ] {
-                            ui.label(RichText::new(label).color(MUTED));
-                            ui.label(value);
-                            ui.end_row();
-                        }
-                    });
-                ui.add_space(20.0);
-                ui.separator();
-                ui.label(RichText::new("硬件").color(MUTED));
-                egui::ScrollArea::vertical()
-                    .id_salt("hardware-detail-scroll")
-                    .max_height((ctx.content_rect().height() - 390.0).clamp(100.0, 340.0))
-                    .show(ui, |ui| {
-                        match self.extra_details.get(&device.device_id).or_else(|| {
-                            self.catalog
-                                .as_ref()
-                                .and_then(|c| c.details.get(&device.device_id))
-                                .map(|d| &d.value)
-                        }) {
-                            Some(value) => match value {
-                                Ok(detail) if !detail.details.is_empty() => {
-                                    for (label, value) in &detail.details {
-                                        if label == "名称" && value == &device.alias {
-                                            continue;
-                                        }
-                                        ui.label(RichText::new(label).small().color(MUTED));
-                                        ui.add(
-                                            egui::Label::new(if value.trim().is_empty() {
-                                                "未提供"
-                                            } else {
-                                                value
-                                            })
-                                            .wrap(),
-                                        );
-                                        ui.add_space(4.0);
-                                    }
-                                }
-                                Ok(_) => {
-                                    ui.label("暂无信息");
-                                }
-                                Err(error) => {
-                                    ui.colored_label(AMBER, "详情读取失败，可刷新重试")
-                                        .on_hover_text(error);
-                                }
-                            },
-                            None => {
-                                ui.label("正在读取硬件详情…");
-                            }
-                        }
-                    });
-                ui.add_space(12.0);
-                ui.add_enabled_ui(!self.mutation_pending && !self.logout_pending, |ui| {
-                    ui.horizontal(|ui| {
-                        if owned && ui.button("重命名").clicked() {
-                            edit = Some(EditAction::Rename);
-                        }
-                        if current {
-                            if ui.button("退出本机账号").clicked() {
-                                exit_account = true;
-                            }
-                        } else if owned
-                            && ui.button(RichText::new("从账号移除").color(RED)).clicked()
-                        {
-                            edit = Some(EditAction::Remove);
-                        }
-                    });
-                });
-                if self.mutation_pending {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label("正在处理设备操作…");
-                    });
-                }
-                let issue = if self.active_session.is_some() {
-                    Some("请先关闭当前观看窗口".into())
-                } else {
-                    connectability_error(&device).err()
-                };
-                if self.is_viewing_target(&device.device_id)
-                    && let Some(issue) = &issue
-                {
-                    ui.label(RichText::new(issue).color(MUTED));
-                }
-                if self.is_viewing_target(&device.device_id) {
-                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                        connect = ui
-                            .add_enabled(!self.logout_pending && issue.is_none(), primary("连接"))
-                            .clicked();
-                    });
-                }
-            });
-        if connect {
-            self.start_viewer();
-            self.center_ui.details_open = false;
-        } else if close || response.should_close() {
-            self.center_ui.details_open = false;
-        }
-        if let Some(action) = edit {
-            self.center_ui.edit = Some(DeviceEdit {
-                alias: device.alias.clone(),
-                device,
-                action,
-            });
-        }
-        if exit_account {
-            self.center_ui.close_details();
-            self.logout();
         }
     }
 
@@ -1776,11 +1244,11 @@ impl DeviceCenterApp {
                     } else {
                         "从账号移除设备？"
                     })
-                    .size(21.0)
+                    .size(crate::ui::theme::DIALOG_TITLE)
                     .strong(),
                 );
                 ui.add_space(12.0);
-                ui.label(display_alias(&edit.device));
+                ui.add(egui::Label::new(display_alias(&edit.device)).wrap());
                 ui.label(
                     RichText::new(&edit.device.device_id)
                         .monospace()
@@ -1790,9 +1258,12 @@ impl DeviceCenterApp {
                 ui.add_space(12.0);
                 if rename {
                     ui.add_sized(
-                        [ui.available_width(), 36.0],
+                        [ui.available_width(), theme::CONTROL_HEIGHT],
                         singleline_input(&mut edit.alias).hint_text("设备名称"),
                     );
+                    if edit.alias.chars().any(char::is_control) {
+                        ui.colored_label(AMBER, "名称不能包含换行或控制字符");
+                    }
                     if let Some(catalog) = &self.catalog
                         && edit.device.device_id == catalog.groups.current_device_id
                         && ui
@@ -1823,7 +1294,7 @@ impl DeviceCenterApp {
                                 primary("保存名称")
                             } else {
                                 egui::Button::new(RichText::new("确认移除").color(Color32::WHITE))
-                                    .fill(Color32::from_rgb(161, 56, 67))
+                                    .fill(crate::ui::theme::DANGER_FILL)
                             },
                         )
                         .clicked();
@@ -1840,7 +1311,6 @@ impl DeviceCenterApp {
                     id: edit.device.device_id,
                 },
             };
-            self.center_ui.details_open = false;
             self.queue_mutation(change);
         } else if !cancel && !response.should_close() {
             self.center_ui.edit = Some(edit);
@@ -1862,7 +1332,7 @@ impl DeviceCenterApp {
                     center - vec2(0.0, 128.0),
                     egui::Align2::CENTER_CENTER,
                     crate::APP_NAME,
-                    FontId::proportional(24.0),
+                    FontId::proportional(crate::ui::theme::TITLE),
                     TEXT,
                 );
                 let width = (bounds.width() - 48.0).min(440.0);
@@ -1894,7 +1364,14 @@ impl DeviceCenterApp {
                 } else {
                     self.startup_stage.detail()
                 };
-                content.add(egui::Label::new(RichText::new(detail).size(13.0).color(MUTED)).wrap());
+                content.add(
+                    egui::Label::new(
+                        RichText::new(detail)
+                            .size(crate::ui::theme::COMPACT_TEXT)
+                            .color(MUTED),
+                    )
+                    .wrap(),
+                );
                 content.add_space(6.0);
                 // Completed stages, not an estimate of remaining time.
                 content.add(
@@ -1928,11 +1405,11 @@ impl DeviceCenterApp {
                                 ui.painter().circle_filled(mark.center(), 2.0, BLUE);
                             }
                         }
-                        ui.label(RichText::new(stage.title()).size(13.0).color(if active {
-                            TEXT
-                        } else {
-                            MUTED
-                        }));
+                        ui.label(
+                            RichText::new(stage.title())
+                                .size(crate::ui::theme::COMPACT_TEXT)
+                                .color(if active { TEXT } else { MUTED }),
+                        );
                         ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                             let status = if index < current {
                                 "已完成".into()
@@ -1946,11 +1423,11 @@ impl DeviceCenterApp {
                             } else {
                                 "等待".into()
                             };
-                            ui.label(RichText::new(status).size(12.0).color(if active {
-                                BLUE
-                            } else {
-                                MUTED
-                            }));
+                            ui.label(
+                                RichText::new(status)
+                                    .size(crate::ui::theme::SMALL)
+                                    .color(if active { BLUE } else { MUTED }),
+                            );
                         });
                     });
                 }
@@ -2085,12 +1562,15 @@ fn phone_form(
                 ui.spacing_mut().interact_size.y = 20.0;
                 ui.checkbox(
                     &mut phone.agreed,
-                    RichText::new("我已阅读并同意").size(12.0),
+                    RichText::new("我已阅读并同意").size(crate::ui::theme::SMALL),
                 );
-                ui.hyperlink_to(RichText::new("用户协议").size(12.0), login::sms::TERMS_URL);
-                ui.label(RichText::new("和").size(12.0));
                 ui.hyperlink_to(
-                    RichText::new("隐私政策").size(12.0),
+                    RichText::new("用户协议").size(crate::ui::theme::SMALL),
+                    login::sms::TERMS_URL,
+                );
+                ui.label(RichText::new("和").size(crate::ui::theme::SMALL));
+                ui.hyperlink_to(
+                    RichText::new("隐私政策").size(crate::ui::theme::SMALL),
                     login::sms::PRIVACY_URL,
                 );
             });
@@ -2120,7 +1600,7 @@ fn phone_form(
         let response = ui.add(
             egui::Label::new(
                 RichText::new(message)
-                    .size(13.0)
+                    .size(crate::ui::theme::COMPACT_TEXT)
                     .color(if phone.error.is_some() { AMBER } else { MUTED }),
             )
             .truncate(),
@@ -2146,7 +1626,11 @@ impl DeviceCenterApp {
             .frame(dialog_frame())
             .show(ctx, |ui| {
                 ui.set_width(410.0);
-                ui.label(RichText::new("退出登录？").size(21.0).strong());
+                ui.label(
+                    RichText::new("退出登录？")
+                        .size(crate::ui::theme::DIALOG_TITLE)
+                        .strong(),
+                );
                 ui.add_space(14.0);
                 ui.label("当前观看将结束，本虚拟设备也会从账号中移除。");
                 ui.add_space(24.0);
@@ -2154,7 +1638,7 @@ impl DeviceCenterApp {
                     confirm = ui
                         .add(
                             egui::Button::new(RichText::new("退出登录").color(Color32::WHITE))
-                                .fill(Color32::from_rgb(170, 62, 72))
+                                .fill(crate::ui::theme::DANGER_FILL)
                                 .min_size(vec2(100.0, 34.0)),
                         )
                         .clicked();

@@ -89,21 +89,7 @@ impl ConnectionProgress {
 }
 
 fn configure_viewer_visuals(ctx: &egui::Context) {
-    let mut visuals = egui::Visuals::dark();
-    visuals.panel_fill = egui::Color32::from_rgb(11, 15, 22);
-    visuals.window_fill = egui::Color32::from_rgb(17, 22, 31);
-    visuals.extreme_bg_color = egui::Color32::from_rgb(7, 10, 15);
-    visuals.selection.bg_fill = egui::Color32::from_rgb(55, 124, 255);
-    visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(25, 32, 44);
-    visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(34, 44, 59);
-    visuals.widgets.active.bg_fill = egui::Color32::from_rgb(55, 124, 255);
-    visuals.window_corner_radius = 14.0.into();
-    ctx.set_visuals(visuals);
-    let mut style = (*ctx.style_of(egui::Theme::Dark)).clone();
-    style.spacing.item_spacing = egui::vec2(10.0, 10.0);
-    style.spacing.button_padding = egui::vec2(14.0, 8.0);
-    style.interaction.selectable_labels = false;
-    ctx.set_style_of(egui::Theme::Dark, style);
+    crate::ui::theme::configure(ctx);
 }
 
 pub(crate) fn run_connecting_viewer_window(
@@ -209,22 +195,22 @@ impl ConnectionProgressApp {
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
-                    .fill(egui::Color32::from_rgb(11, 15, 22))
+                    .fill(crate::ui::theme::BG)
                     .inner_margin(egui::Margin::same(28)),
             )
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
                         egui::RichText::new(crate::APP_NAME)
-                            .size(22.0)
+                            .size(crate::ui::theme::DIALOG_TITLE)
                             .strong()
                             .color(egui::Color32::WHITE),
                     );
                     ui.add_space(8.0);
                     ui.label(
                         egui::RichText::new(&self.alias)
-                            .size(15.0)
-                            .color(egui::Color32::from_rgb(145, 174, 220)),
+                            .size(crate::ui::theme::BODY)
+                            .color(crate::ui::theme::MUTED),
                     );
                 });
                 ui.add_space(24.0);
@@ -232,8 +218,8 @@ impl ConnectionProgressApp {
                     columns[0].set_width(310.0);
                     columns[0].label(
                         egui::RichText::new("连接进度")
-                            .size(13.0)
-                            .color(egui::Color32::from_rgb(130, 143, 162)),
+                            .size(crate::ui::theme::COMPACT_TEXT)
+                            .color(crate::ui::theme::MUTED),
                     );
                     columns[0].add_space(12.0);
                     for step in &self.steps {
@@ -241,13 +227,13 @@ impl ConnectionProgressApp {
                             || matches!(step.state, ConnectionProgressState::Ready);
                         let active = step.step == self.current.step;
                         let color = if matches!(step.state, ConnectionProgressState::Failed) {
-                            egui::Color32::from_rgb(255, 105, 105)
+                            crate::ui::theme::RED
                         } else if complete {
-                            egui::Color32::from_rgb(80, 216, 151)
+                            crate::ui::theme::GREEN
                         } else if active {
-                            egui::Color32::from_rgb(83, 145, 255)
+                            crate::ui::theme::ACCENT
                         } else {
-                            egui::Color32::from_rgb(91, 102, 119)
+                            crate::ui::theme::DISABLED
                         };
                         columns[0].horizontal(|ui| {
                             ui.colored_label(color, if complete { "●" } else { "○" });
@@ -265,26 +251,22 @@ impl ConnectionProgressApp {
                             ui.spinner();
                         }
                         let accent = match self.current.state {
-                            ConnectionProgressState::Working => {
-                                egui::Color32::from_rgb(83, 145, 255)
-                            }
-                            ConnectionProgressState::Ready => egui::Color32::from_rgb(80, 216, 151),
-                            ConnectionProgressState::Failed => {
-                                egui::Color32::from_rgb(255, 105, 105)
-                            }
+                            ConnectionProgressState::Working => crate::ui::theme::ACCENT,
+                            ConnectionProgressState::Ready => crate::ui::theme::GREEN,
+                            ConnectionProgressState::Failed => crate::ui::theme::RED,
                         };
                         ui.add_space(14.0);
                         ui.label(
                             egui::RichText::new(&self.current.title)
-                                .size(26.0)
+                                .size(crate::ui::theme::TITLE)
                                 .strong()
                                 .color(accent),
                         );
                         ui.add_space(10.0);
                         ui.label(
                             egui::RichText::new(&self.current.detail)
-                                .size(14.0)
-                                .color(egui::Color32::from_rgb(185, 195, 210)),
+                                .size(crate::ui::theme::BODY)
+                                .color(crate::ui::theme::MUTED),
                         );
                         ui.add_space(24.0);
                         ui.add(
@@ -304,9 +286,9 @@ impl ConnectionProgressApp {
                         ui.horizontal(|ui| {
                             ui.label(
                                 egui::RichText::new("实时连接诊断")
-                                    .size(13.0)
+                                    .size(crate::ui::theme::COMPACT_TEXT)
                                     .strong()
-                                    .color(egui::Color32::from_rgb(218, 226, 238)),
+                                    .color(crate::ui::theme::TEXT),
                             );
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
@@ -316,8 +298,8 @@ impl ConnectionProgressApp {
                                             "{:.1} 秒",
                                             self.started_at.elapsed().as_secs_f64()
                                         ))
-                                        .size(11.0)
-                                        .color(egui::Color32::from_rgb(105, 118, 136)),
+                                        .size(crate::ui::theme::TINY)
+                                        .color(crate::ui::theme::MUTED),
                                     );
                                 },
                             );
@@ -334,20 +316,20 @@ impl ConnectionProgressApp {
                                                 elapsed.as_secs_f64()
                                             ))
                                             .monospace()
-                                            .size(10.0)
-                                            .color(egui::Color32::from_rgb(92, 106, 126)),
+                                            .size(crate::ui::theme::MICRO)
+                                            .color(crate::ui::theme::DISABLED),
                                         );
                                         ui.vertical(|ui| {
                                             ui.label(
                                                 egui::RichText::new(&event.title)
-                                                    .size(11.0)
+                                                    .size(crate::ui::theme::TINY)
                                                     .strong()
-                                                    .color(egui::Color32::from_rgb(196, 207, 223)),
+                                                    .color(crate::ui::theme::TEXT),
                                             );
                                             ui.label(
                                                 egui::RichText::new(&event.detail)
-                                                    .size(10.0)
-                                                    .color(egui::Color32::from_rgb(121, 135, 155)),
+                                                    .size(crate::ui::theme::MICRO)
+                                                    .color(crate::ui::theme::MUTED),
                                             );
                                         });
                                     });
@@ -1646,7 +1628,7 @@ fn compact_audio_meter(ui: &mut egui::Ui, audio: &crate::audio::AudioPlayback, h
     );
     response.on_hover_text("L / R · dBFS");
     let painter = ui.painter();
-    let ink = egui::Color32::from_gray(150);
+    let ink = crate::ui::theme::MUTED;
     let font = egui::FontId::monospace(7.5);
     let top = rect.top() + 12.0;
     let bottom = rect.bottom() - 4.0;
@@ -1664,9 +1646,9 @@ fn compact_audio_meter(ui: &mut egui::Ui, audio: &crate::audio::AudioPlayback, h
         for segment in 0..24 {
             let color = if fill[channel] * 24.0 > segment as f32 {
                 match segment {
-                    22.. => egui::Color32::from_rgb(228, 101, 94),
-                    17..=21 => egui::Color32::from_rgb(223, 187, 92),
-                    _ => egui::Color32::from_rgb(91, 192, 143),
+                    22.. => crate::ui::theme::RED,
+                    17..=21 => crate::ui::theme::AMBER,
+                    _ => crate::ui::theme::GREEN,
                 }
             } else {
                 egui::Color32::from_white_alpha(24)
@@ -1684,7 +1666,7 @@ fn compact_audio_meter(ui: &mut egui::Ui, audio: &crate::audio::AudioPlayback, h
             let y = y_at(peaks[channel].0);
             painter.line_segment(
                 [egui::pos2(left, y), egui::pos2(left + 5.0, y)],
-                egui::Stroke::new(1.0, egui::Color32::from_gray(220)),
+                egui::Stroke::new(1.0, crate::ui::theme::TEXT),
             );
         }
     }
@@ -1702,7 +1684,7 @@ fn compact_audio_meter(ui: &mut egui::Ui, audio: &crate::audio::AudioPlayback, h
                 egui::pos2(rect.left() + 16.0, y),
                 egui::pos2(rect.left() + 18.0, y),
             ],
-            egui::Stroke::new(1.0, egui::Color32::from_gray(85)),
+            egui::Stroke::new(1.0, crate::ui::theme::DISABLED),
         );
         painter.text(
             egui::pos2(rect.right(), y),
@@ -1737,7 +1719,7 @@ fn show_detailed_performance(
             });
             ui.add_space(8.0);
             egui::ScrollArea::vertical()
-                .max_height(560.0)
+                .max_height((ctx.content_rect().height() - 120.0).clamp(100.0, 560.0))
                 .show(ui, |ui| {
                     egui::Grid::new((grid_id, "metrics"))
                         .num_columns(2)
@@ -1751,7 +1733,7 @@ fn performance_frame() -> egui::Frame {
     egui::Frame::new()
         .fill(egui::Color32::from_black_alpha(225))
         .stroke(egui::Stroke::new(1.0, egui::Color32::from_white_alpha(30)))
-        .corner_radius(10.0)
+        .corner_radius(crate::ui::theme::PANEL_RADIUS)
         .inner_margin(egui::Margin::same(10))
 }
 
@@ -1768,7 +1750,7 @@ fn compact_hud_line(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
         egui::Label::new(
             egui::RichText::new(text)
                 .monospace()
-                .size(10.0)
+                .size(crate::ui::theme::MICRO)
                 .color(color.gamma_multiply(0.78)),
         )
         .truncate(),
@@ -2229,15 +2211,15 @@ fn threshold_color(value: f64, good_max: f64, warning_max: f64) -> egui::Color32
 }
 
 fn good_color() -> egui::Color32 {
-    egui::Color32::from_rgb(105, 220, 140)
+    crate::ui::theme::GREEN
 }
 
 fn warning_color() -> egui::Color32 {
-    egui::Color32::from_rgb(255, 200, 90)
+    crate::ui::theme::AMBER
 }
 
 fn bad_color() -> egui::Color32 {
-    egui::Color32::from_rgb(255, 105, 105)
+    crate::ui::theme::RED
 }
 
 fn format_optional_ms(value: Option<f64>) -> String {

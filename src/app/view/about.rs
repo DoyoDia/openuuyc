@@ -13,7 +13,7 @@ impl DeviceCenterApp {
             self.legal_document(ui);
             return;
         }
-        ui.label(RichText::new("关于").size(25.0).strong());
+        ui.label(RichText::new("关于").size(crate::ui::theme::TITLE).strong());
         ui.add_space(28.0);
         egui::ScrollArea::vertical()
             .id_salt("about-page")
@@ -25,10 +25,14 @@ impl DeviceCenterApp {
                     ui.add_space(16.0);
                     ui.vertical(|ui| {
                         ui.add_space(5.0);
-                        ui.label(RichText::new(crate::APP_NAME).size(30.0).strong());
+                        ui.label(
+                            RichText::new(crate::APP_NAME)
+                                .size(crate::ui::theme::TITLE)
+                                .strong(),
+                        );
                         ui.label(
                             RichText::new("兼容 UU 远程协议的独立第三方 Rust 客户端")
-                                .size(14.0)
+                                .size(crate::ui::theme::BODY)
                                 .color(MUTED),
                         );
                         ui.label(
@@ -43,7 +47,7 @@ impl DeviceCenterApp {
                                 },
                                 std::env::consts::ARCH
                             ))
-                            .size(12.0)
+                            .size(crate::ui::theme::SMALL)
                             .color(MUTED),
                         );
                     });
@@ -57,7 +61,11 @@ impl DeviceCenterApp {
                 ui.separator();
                 ui.add_space(20.0);
 
-                ui.label(RichText::new("项目链接").size(16.0).strong());
+                ui.label(
+                    RichText::new("项目链接")
+                        .size(crate::ui::theme::SECTION)
+                        .strong(),
+                );
                 ui.add_space(6.0);
                 ui.horizontal_wrapped(|ui| {
                     ui.hyperlink_to("GitHub 项目", "https://github.com/djkcyl/openuuyc");
@@ -66,18 +74,22 @@ impl DeviceCenterApp {
                 });
 
                 ui.add_space(28.0);
-                ui.label(RichText::new("著作权、协议与许可").size(16.0).strong());
+                ui.label(
+                    RichText::new("著作权、协议与许可")
+                        .size(crate::ui::theme::SECTION)
+                        .strong(),
+                );
                 ui.add_space(6.0);
                 ui.label(
                     RichText::new("本项目不代表网易，不主张拥有 UU 的协议、软件或标识权益。")
-                        .size(13.0)
+                        .size(crate::ui::theme::COMPACT_TEXT)
                         .color(MUTED),
                 );
                 ui.label(
                     RichText::new(
                         "包含 FFmpeg 派生组件（LGPL-2.1-or-later）；第三方署名与许可独立适用。",
                     )
-                    .size(13.0)
+                    .size(crate::ui::theme::COMPACT_TEXT)
                     .color(MUTED),
                 );
                 ui.horizontal_wrapped(|ui| {
@@ -110,13 +122,9 @@ impl DeviceCenterApp {
                 ),
             ),
         };
-        let mut back = false;
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(title).size(25.0).strong());
-            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                back = ui.link("返回关于").clicked();
-            });
-        });
+        let back = crate::ui::controls::back_button(ui, "返回关于").clicked();
+        ui.add_space(12.0);
+        ui.label(RichText::new(title).size(theme::DIALOG_TITLE).strong());
         if back || ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
         {
             self.center_ui.legal_document = None;
@@ -131,7 +139,7 @@ impl DeviceCenterApp {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.add(
-                    egui::Label::new(RichText::new(text).monospace().size(14.0))
+                    egui::Label::new(RichText::new(text).monospace().size(crate::ui::theme::BODY))
                         .wrap()
                         .selectable(true),
                 );
@@ -160,24 +168,26 @@ impl DeviceCenterApp {
             "检查更新"
         };
         let mut clicked = false;
-        ui.horizontal(|ui| {
-            ui.allocate_ui_with_layout(
-                vec2((ui.available_width() - 128.0).max(120.0), 56.0),
-                egui::Layout::top_down(Align::Min),
-                |ui| {
-                    ui.label(RichText::new("软件更新").size(16.0).strong());
-                    ui.add(
-                        egui::Label::new(RichText::new(&message).size(13.0).color(color))
-                            .truncate(),
-                    )
-                    .on_hover_text(&message);
-                },
-            );
+        let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 56.0), Sense::hover());
+        let mut row_ui = ui.new_child(egui::UiBuilder::new().max_rect(row));
+        row_ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
             let response = ui.add_enabled(enabled, primary(button));
             clicked = response.clicked();
             if !enabled && !checking {
                 response.on_disabled_hover_text(format!("{wait} 秒后可重新检查"));
             }
+            ui.with_layout(egui::Layout::top_down(Align::Min), |ui| {
+                ui.label(RichText::new("软件更新").size(theme::SECTION).strong());
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(&message)
+                            .size(theme::COMPACT_TEXT)
+                            .color(color),
+                    )
+                    .truncate(),
+                )
+                .on_hover_text(&message);
+            });
         });
         if clicked {
             if let Some(url) = destination {

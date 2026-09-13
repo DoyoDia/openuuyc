@@ -131,7 +131,11 @@ impl Manager {
     }
     pub fn show(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("插件管理").size(25.0).strong());
+            ui.label(
+                egui::RichText::new("插件管理")
+                    .size(crate::ui::theme::TITLE)
+                    .strong(),
+            );
             if !self.graphs {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("插件文件夹").clicked()
@@ -162,7 +166,7 @@ impl Manager {
             self.refresh();
         }
         if let Some(error) = &self.error {
-            ui.colored_label(egui::Color32::from_rgb(241, 125, 132), error);
+            ui.colored_label(crate::ui::theme::RED, error);
         }
         if let Some(notice) = &self.notice {
             ui.weak(notice);
@@ -249,8 +253,8 @@ impl Manager {
                         header.left_top() + egui::vec2(offset, 8.0),
                         egui::Align2::LEFT_CENTER,
                         label,
-                        egui::FontId::proportional(12.0),
-                        egui::Color32::from_gray(150),
+                        egui::FontId::proportional(crate::ui::theme::SMALL),
+                        crate::ui::theme::MUTED,
                     );
                 }
                 if visible.is_empty() {
@@ -271,20 +275,15 @@ impl Manager {
                             egui::Sense::hover(),
                         );
                         if expanded || response.hovered() {
-                            ui.painter()
-                                .rect_filled(row, 5.0, egui::Color32::from_rgb(29, 37, 48));
+                            ui.painter().rect_filled(row, 5.0, crate::ui::theme::HOVER);
                         }
                         let icon = egui::Rect::from_center_size(
                             egui::pos2(row.left() + 28.0, row.center().y),
                             egui::vec2(32.0, 32.0),
                         );
                         ui.painter()
-                            .rect_filled(icon, 6.0, egui::Color32::from_rgb(32, 48, 69));
-                        super::paint_plugin_icon(
-                            ui.painter(),
-                            icon,
-                            egui::Color32::from_rgb(115, 165, 240),
-                        );
+                            .rect_filled(icon, 6.0, crate::ui::theme::SELECTED);
+                        super::paint_plugin_icon(ui.painter(), icon, crate::ui::theme::ACCENT);
                         let title = entry.manifest.as_ref().map_or_else(
                             || {
                                 entry
@@ -315,15 +314,18 @@ impl Manager {
                                 ui.vertical(|ui| {
                                     ui.spacing_mut().item_spacing.y = 3.0;
                                     ui.add(
-                                        egui::Label::new(egui::RichText::new(&title).size(15.0))
-                                            .truncate(),
+                                        egui::Label::new(
+                                            egui::RichText::new(&title)
+                                                .size(crate::ui::theme::BODY),
+                                        )
+                                        .truncate(),
                                     )
                                     .on_hover_text(&title);
                                     ui.add(
                                         egui::Label::new(
                                             egui::RichText::new(&subtitle)
-                                                .size(11.0)
-                                                .color(egui::Color32::from_gray(150)),
+                                                .size(crate::ui::theme::TINY)
+                                                .color(crate::ui::theme::MUTED),
                                         )
                                         .truncate(),
                                     )
@@ -345,8 +347,7 @@ impl Manager {
                                     entry.manifest.as_ref().map_or("—", |m| m.version.as_str());
                                 ui.add(
                                     egui::Label::new(
-                                        egui::RichText::new(version)
-                                            .color(egui::Color32::from_gray(160)),
+                                        egui::RichText::new(version).color(crate::ui::theme::MUTED),
                                     )
                                     .truncate(),
                                 )
@@ -355,9 +356,9 @@ impl Manager {
                         }
                         cell(ui, row, columns[3], columns[4] - columns[3] - 4.0, |ui| {
                             let color = if entry.error.is_some() || !entry.node_errors.is_empty() {
-                                egui::Color32::from_rgb(237, 180, 104)
+                                crate::ui::theme::AMBER
                             } else {
-                                egui::Color32::from_rgb(99, 202, 157)
+                                crate::ui::theme::GREEN
                             };
                             let (dot, _) =
                                 ui.allocate_exact_size(egui::vec2(6.0, 6.0), egui::Sense::hover());
@@ -424,14 +425,11 @@ impl Manager {
                                     top: 8,
                                     bottom: 14,
                                 })
-                                .fill(egui::Color32::from_rgb(22, 29, 38))
+                                .fill(crate::ui::theme::BG)
                                 .show(ui, |ui| {
                                     ui.set_width(ui.available_width());
                                     if let Some(error) = &entry.error {
-                                        ui.colored_label(
-                                            egui::Color32::from_rgb(237, 180, 104),
-                                            error,
-                                        );
+                                        ui.colored_label(crate::ui::theme::AMBER, error);
                                     }
                                     if let Some(m) = &entry.manifest {
                                         if !m.dependencies.is_empty() {
@@ -452,7 +450,7 @@ impl Manager {
                                                 entry.node_errors.get(&node.type_id)
                                             {
                                                 ui.colored_label(
-                                                    egui::Color32::from_rgb(237, 180, 104),
+                                                    crate::ui::theme::AMBER,
                                                     format!("{}：{error}", node.name),
                                                 );
                                             }
@@ -469,7 +467,7 @@ impl Manager {
                                                         .unwrap_or_default()
                                                         .to_string_lossy(),
                                                 )
-                                                .size(12.0)
+                                                .size(crate::ui::theme::SMALL)
                                                 .weak(),
                                             )
                                             .truncate(),
@@ -484,7 +482,7 @@ impl Manager {
                                     ui.add(
                                         egui::Label::new(
                                             egui::RichText::new(entry.path.display().to_string())
-                                                .size(11.0)
+                                                .size(crate::ui::theme::TINY)
                                                 .weak(),
                                         )
                                         .truncate(),
@@ -495,7 +493,7 @@ impl Manager {
                         ui.painter().hline(
                             row.left() + 12.0..=row.right() - 12.0,
                             ui.cursor().top(),
-                            egui::Stroke::new(1.0, egui::Color32::from_rgb(42, 49, 60)),
+                            egui::Stroke::new(1.0, crate::ui::theme::LINE),
                         );
                     });
                 }
@@ -533,7 +531,8 @@ impl Manager {
     fn edit_ui(&mut self, ui: &mut egui::Ui) {
         let edit = self.edit.as_mut().expect("editing");
         let mut save = false;
-        let mut cancel = false;
+        let mut cancel =
+            ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             ui.label(
@@ -543,7 +542,7 @@ impl Manager {
                         .and_then(|v| v.as_str())
                         .unwrap_or("模块配置"),
                 )
-                .size(19.0)
+                .size(crate::ui::theme::DIALOG_TITLE)
                 .strong(),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -553,7 +552,7 @@ impl Manager {
                         crate::ui::controls::primary("保存"),
                     )
                     .clicked();
-                cancel = ui
+                cancel |= ui
                     .add_sized(
                         [72.0, crate::ui::controls::HEIGHT],
                         egui::Button::new("取消"),
@@ -573,8 +572,8 @@ impl Manager {
             .show(ui, |ui| {
                 let width = (ui.available_width() - 32.0).min(680.0);
                 egui::Frame::new()
-                    .fill(egui::Color32::from_rgb(26, 33, 43))
-                    .corner_radius(6.0)
+                    .fill(crate::ui::theme::SURFACE)
+                    .corner_radius(crate::ui::theme::PANEL_RADIUS)
                     .inner_margin(16)
                     .show(ui, |ui| {
                         ui.set_width(width);
