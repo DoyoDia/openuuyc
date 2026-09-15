@@ -39,12 +39,7 @@ impl DeviceCenterApp {
                             RichText::new(format!(
                                 "v{}  ·  {} {}",
                                 env!("CARGO_PKG_VERSION"),
-                                match std::env::consts::OS {
-                                    "windows" => "Windows",
-                                    "macos" => "macOS",
-                                    "linux" => "Linux",
-                                    other => other,
-                                },
+                                "Windows",
                                 std::env::consts::ARCH
                             ))
                             .size(crate::ui::theme::SMALL)
@@ -153,7 +148,7 @@ impl DeviceCenterApp {
             State::Ahead => ("当前版本高于已发布的最新正式版".into(), MUTED, None),
             State::NoRelease => ("暂无公开正式版本".into(), MUTED, None),
             State::Failed(error) => (format!("检查失败：{error}"), AMBER, None),
-            State::Available { version, url } => {
+            State::Available { version, url, .. } => {
                 (format!("发现新版本 v{version}"), BLUE, Some(url.clone()))
             }
         };
@@ -190,8 +185,8 @@ impl DeviceCenterApp {
             });
         });
         if clicked {
-            if let Some(url) = destination {
-                ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+            if destination.is_some() {
+                self.updates.dialog_open = true;
             } else {
                 self.updates.request(ui.ctx());
             }

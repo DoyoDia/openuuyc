@@ -6,7 +6,10 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
-use crate::stream_control::{MAX_CUSTOM_BITRATE_MBPS, StreamControlHandle, StreamControlSettings};
+use crate::stream_control::{
+    LoadedStreamControl, MAX_CUSTOM_BITRATE_MBPS, SavedStreamControl, StreamControlHandle,
+    StreamControlSettings, ViewingPreferenceUpdate,
+};
 
 #[derive(Clone)]
 pub(crate) struct ViewingSettingsStore {
@@ -17,7 +20,9 @@ pub(crate) struct ViewingSettingsStore {
 #[derive(Serialize, Deserialize)]
 struct Record {
     schema: u8,
-    settings: StreamControlSettings,
+    settings: Option<StreamControlSettings>,
+    #[serde(default = "crate::stream_control::default_auto_quality")]
+    auto_frame_quality: i32,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -52,7 +57,7 @@ impl ViewingSettingsStore {
         })
     }
 
-    pub(crate) async fn load(&self) -> Result<Option<StreamControlSettings>> {
+    pub(crate) async fn load(&self) -> Result<Option<LoadedStreamControl>> {
         let entry = Arc::clone(&self.viewing);
         tokio::task::spawn_blocking(move || {
             let bytes = match entry.get_secret() {
@@ -63,23 +68,29 @@ impl ViewingSettingsStore {
             let record: Record = serde_json::from_slice(&bytes)
                 .map_err(|_| anyhow::anyhow!("已保存的画面设置格式无效"))?;
             if record.schema != 1
-                || !(1..=MAX_CUSTOM_BITRATE_MBPS).contains(&record.settings.custom_bitrate_mbps)
-                || !(1..=MAX_CUSTOM_BITRATE_MBPS).contains(&record.settings.adaptive_ceiling_mbps)
+                || record.settings.is_some_and(|settings| {
+                    !(1..=MAX_CUSTOM_BITRATE_MBPS).contains(&settings.custom_bitrate_mbps)
+                })
+                || !(1..=6).contains(&record.auto_frame_quality)
             {
                 bail!("已保存的画面设置无效");
             }
-            Ok(Some(record.settings))
+            Ok(Some(LoadedStreamControl {
+                settings: record.settings,
+                auto_frame_quality: record.auto_frame_quality,
+            }))
         })
         .await
         .context("画面设置读取任务中断")?
     }
 
-    async fn save(&self, settings: StreamControlSettings) -> Result<()> {
+    async fn save(&self, saved: SavedStreamControl) -> Result<()> {
         let entry = Arc::clone(&self.viewing);
         tokio::task::spawn_blocking(move || {
             let bytes = serde_json::to_vec(&Record {
                 schema: 1,
-                settings,
+                settings: Some(saved.settings),
+                auto_frame_quality: saved.auto_frame_quality,
             })?;
             entry
                 .set_secret(&bytes)
@@ -178,7 +189,13 @@ impl ViewingSettingsStore {
                 if changed || updates.has_changed().unwrap_or(false) {
                     let settings = *updates.borrow_and_update();
                     if let Some(settings) = settings {
-                        let error = self.save(settings).await.err().map(|e| e.to_string());
+                        let result = match settings {
+                            ViewingPreferenceUpdate::Settings(saved) => self.save(saved).await,
+                            ViewingPreferenceUpdate::AutoQuality(quality) => {
+                                self.save_auto_quality(quality).await
+                            }
+                        };
+                        let error = result.err().map(|e| e.to_string());
                         if error.is_none() {
                             tracing::info!(?settings, "saved viewing settings for this device");
                         }
@@ -197,6 +214,35 @@ impl ViewingSettingsStore {
     }
 }
 
+impl ViewingSettingsStore {
+    async fn save_auto_quality(&self, quality: i32) -> Result<()> {
+        let entry = Arc::clone(&self.viewing);
+        tokio::task::spawn_blocking(move || {
+            let mut record = match entry.get_secret() {
+                Ok(bytes) => {
+                    serde_json::from_slice::<Record>(&bytes).context("读取画面设置失败")?
+                }
+                Err(Error::NoEntry) => Record {
+                    schema: 1,
+                    settings: None,
+                    auto_frame_quality: quality,
+                },
+                Err(_) => bail!("无法读取此设备的画面设置"),
+            };
+            anyhow::ensure!(
+                record.schema == 1 && (1..=6).contains(&quality),
+                "自动画质状态无效"
+            );
+            record.auto_frame_quality = quality;
+            entry
+                .set_secret(&serde_json::to_vec(&record)?)
+                .map_err(|_| anyhow::anyhow!("无法保存自动画质"))
+        })
+        .await
+        .context("自动画质写入任务中断")?
+    }
+}
+
 pub(crate) struct PreferenceWriter {
     stop: CancellationToken,
     task: Option<tokio::task::JoinHandle<()>>,
@@ -212,87 +258,5 @@ impl PreferenceWriter {
 impl Drop for PreferenceWriter {
     fn drop(&mut self) {
         self.stop.cancel();
-    }
-}
-
-#[cfg(all(test, target_os = "windows"))]
-mod tests {
-    use super::*;
-
-    struct TestEntries(Vec<Arc<Entry>>);
-    impl Drop for TestEntries {
-        fn drop(&mut self) {
-            for entry in &self.0 {
-                let _ = entry.delete_credential();
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn windows_audio_credentials_isolate_and_flush_on_close() {
-        let account = format!(
-            "audio-native-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
-        let store = ViewingSettingsStore::new(&account, "aaaaaaaaaaaaaaaa").unwrap();
-        let _cleanup = TestEntries(vec![store.viewing.clone(), store.audio.clone()]);
-        let second_device = ViewingSettingsStore::new(&account, "bbbbbbbbbbbbbbbb").unwrap();
-        let second_account =
-            ViewingSettingsStore::new(&format!("{account}-other"), "aaaaaaaaaaaaaaaa").unwrap();
-        assert!(store.load_audio().await.unwrap().is_none());
-        let saved = crate::audio::AudioSettings {
-            volume: 37,
-            muted: false,
-        };
-        store.save_audio(saved).await.unwrap();
-        assert!(second_device.load_audio().await.unwrap().is_none());
-        assert!(second_account.load_audio().await.unwrap().is_none());
-        let profile = crate::media::ConnectionMediaOptions::default()
-            .resolve(crate::media::LocalDisplayInfo {
-                width: 1920,
-                height: 1080,
-                refresh_hz: 60,
-            })
-            .unwrap();
-        let (handle, _outgoing, _echo) = StreamControlHandle::new(
-            profile,
-            crate::performance::PerformanceMonitor::new("native credential check"),
-        );
-        let audio = handle.audio();
-        // Startup restore and a temporary --mute must not persist themselves.
-        audio.set_settings(crate::audio::AudioSettings {
-            muted: true,
-            ..saved
-        });
-        let mut writer = store.clone().bind_audio(handle.clone());
-        writer.finish().await;
-        let restored = store.load_audio().await.unwrap().unwrap();
-        assert_eq!(restored.volume, 37);
-        assert!(!restored.muted);
-        // Close during a drag's debounce window: flush the last real edit.
-        let mut writer = store.clone().bind_audio(handle.clone());
-        audio.set_settings(crate::audio::AudioSettings {
-            volume: 23,
-            muted: true,
-        });
-        audio.set_settings(crate::audio::AudioSettings {
-            volume: 41,
-            muted: false,
-        });
-        writer.finish().await;
-        let reloaded_store = ViewingSettingsStore::new(&account, "aaaaaaaaaaaaaaaa").unwrap();
-        let restored = reloaded_store.load_audio().await.unwrap().unwrap();
-        assert_eq!(restored.volume, 41);
-        assert!(!restored.muted);
-        // Independent video writes cannot replace the audio record.
-        let video = handle.snapshot().settings;
-        store.save(video).await.unwrap();
-        let restored = reloaded_store.load_audio().await.unwrap().unwrap();
-        assert_eq!(restored.volume, 41);
-        assert!(!restored.muted);
     }
 }

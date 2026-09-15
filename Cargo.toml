@@ -1,6 +1,6 @@
 [package]
 name = "openuuyc"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 description = "Third-party Rust client for UU Remote protocol interoperability"
 license-file = "LICENSE"
@@ -57,7 +57,7 @@ uuid = { version = "1.25.0", features = ["v4"] }
 webrtc = { path = "vendor/webrtc" }
 webrtc-srtp = "0.17.2"
 yuv = "0.8.17"
-object = { version = "0.37.3", default-features = false, features = ["read_core", "std", "pe", "elf", "macho"] }
+object = { version = "0.37.3", default-features = false, features = ["read_core", "std", "pe"] }
 
 [build-dependencies]
 cc = "1.2"
@@ -73,6 +73,7 @@ egui-directx11 = { path = "vendor/egui-directx11" }
 egui-winit = { version = "0.36.1", default-features = false, features = ["clipboard", "links"] }
 winit = { version = "0.30.13", default-features = false, features = ["rwh_06"] }
 windows = { version = "0.62.2", default-features = false, features = [
+    "Win32_Devices_Display",
     "Win32_Foundation",
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D11",
@@ -92,28 +93,6 @@ windows = { version = "0.62.2", default-features = false, features = [
     "Win32_UI_Input_Ime",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
-] }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-gpu-video = { version = "0.4.0", default-features = false }
-cros-libva = "0.0.13"
-smallvec = { version = "1.15", default-features = false, features = ["const_generics"] }
-
-[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
-iso-bmff = "0.1.1"
-objc2-core-foundation = { version = "0.3", default-features = false, features = [
-    "CFString", "CFDictionary", "CFNumber", "CFPropertyList",
-] }
-objc2-core-media = { version = "0.3", default-features = false, features = [
-    "CMBase", "CMFormatDescription", "CMSampleBuffer",
-    "CMTaggedBufferGroup", "CMTime", "CMTimeRange", "CMBlockBuffer",
-] }
-objc2-core-video = { version = "0.3", default-features = false, features = [
-    "CVBase", "CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVReturn",
-] }
-objc2-video-toolbox = { version = "0.3", default-features = false, features = [
-    "VTDecompressionSession", "VTDecompressionProperties", "VTErrors", "VTSession",
-    "objc2-core-media", "objc2-core-video",
 ] }
 
 [patch.crates-io]
@@ -139,16 +118,6 @@ panic = "unwind"
 [profile.release.package.openuuyc]
 # Optimize application glue for size without changing decoder/DSP dependencies.
 opt-level = "s"
-
-[profile.dev.package.gpu-video]
-opt-level = 3
-debug-assertions = false
-overflow-checks = false
-
-[profile.dev.package.h264-reader]
-opt-level = 3
-debug-assertions = false
-overflow-checks = false
 
 [profile.dev.package.yuv]
 opt-level = 3

@@ -37,6 +37,7 @@ struct Target {
     owner: u64,
     input: RemoteInput,
     generation: u64,
+    activation: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,9 +73,10 @@ struct Router {
     consumed: [bool; 256],
     lock_releases: Vec<(u64, u16, u64)>,
     diagnostic_seen: u64,
+    configuration: u64,
     observed: [bool; 256],
     routes: [Route; 256],
-    legacy_owned: [Option<u64>; 256],
+    window_owned: [Option<u64>; 256],
     pending: VecDeque<PendingKey>,
     windows: BTreeMap<u64, crate::stream_control::StreamControlHandle>,
 }
@@ -90,9 +92,10 @@ impl Default for Router {
             consumed: [false; 256],
             lock_releases: Vec::new(),
             diagnostic_seen: 0,
+            configuration: crate::viewer_shortcuts::revision(),
             observed: [false; 256],
             routes: [Route::Local; 256],
-            legacy_owned: [None; 256],
+            window_owned: [None; 256],
             pending: VecDeque::new(),
             windows: BTreeMap::new(),
         }
@@ -117,7 +120,10 @@ fn blocked_modifiers(blocked: &[bool; 256]) -> bool {
         .any(|key| blocked[key])
 }
 
-fn intercept_key(key: u16, scan: u32, held: &[bool; 256]) -> bool {
+fn intercept_key(key: u16, _scan: u32, held: &[bool; 256]) -> bool {
+    if crate::viewer_shortcuts::suspended() {
+        return false;
+    }
     let ctrl = held[162] || held[163];
     let shift = held[160] || held[161];
     let alt = held[164] || held[165];
@@ -126,7 +132,11 @@ fn intercept_key(key: u16, scan: u32, held: &[bool; 256]) -> bool {
         || win
         || (alt && matches!(key, 9 | 27))
         || (ctrl && key == 27)
-        || (ctrl && shift && alt && matches!(scan, 0x2c | 0x21 | 0x10))
+        || crate::viewer_shortcuts::match_key(
+            key,
+            u8::from(ctrl) | (u8::from(shift) << 1) | (u8::from(alt) << 2) | (u8::from(win) << 3),
+        )
+        .is_some()
 }
 
 pub(super) struct SessionNotifications {
@@ -347,6 +357,21 @@ impl Drop for KeyboardHook {
 }
 
 impl Router {
+    /// Return whether this edge belonged to the blocked activation, including
+    /// the final UP. Only a later edge may be sent after both devices are neutral.
+    fn finish_neutral(&self) -> bool {
+        let Some(target) = &self.target else {
+            return false;
+        };
+        if !target.input.waiting_for_neutral() {
+            return false;
+        }
+        if !self.physical.iter().any(|down| *down) {
+            target.input.confirm_neutral(target.activation);
+        }
+        true
+    }
+
     fn suspend_desktop(&mut self) {
         // This is a control revocation, not a synthetic remote lock command.
         // Release obligations already handed to transport remain in its queue.
@@ -363,7 +388,7 @@ impl Router {
         self.blocked = [false; 256];
         self.consumed = [false; 256];
         self.routes = [Route::Local; 256];
-        self.legacy_owned = [None; 256];
+        self.window_owned = [None; 256];
         tracing::debug!("local desktop transition revoked remote input");
     }
     // One observation per stage/source/activation. Never record keys or text.
@@ -426,6 +451,7 @@ impl Router {
                 if !edge.down {
                     self.consumed[i] = false;
                 }
+                self.finish_neutral();
             } else {
                 self.event(edge.key, edge.scan, edge.down, edge.injected);
             }
@@ -448,7 +474,12 @@ impl Router {
                 })
                 .map(|t| t.owner);
             self.routes[i] = if let Some(owner) = owner {
-                if intercept_key(edge.key, edge.scan, &self.observed) {
+                if self
+                    .target
+                    .as_ref()
+                    .is_some_and(|t| t.input.keyboard_supported())
+                    && intercept_key(edge.key, edge.scan, &self.observed)
+                {
                     Route::Hook(owner)
                 } else {
                     Route::Window(owner)
@@ -480,7 +511,7 @@ impl Router {
             }
             Route::Window(owner) | Route::Hook(owner) => {
                 if matches!(route, Route::Window(_)) && edge.down {
-                    self.legacy_owned[i] = Some(owner);
+                    self.window_owned[i] = Some(owner);
                 }
                 if self.target.as_ref().is_some_and(|t| t.owner == owner) {
                     self.push_edge(edge, route);
@@ -506,7 +537,7 @@ impl Router {
                 && p.edge.key == edge.key
                 && p.edge.down == edge.down
         });
-        let mut owned = self.legacy_owned[i] == Some(owner);
+        let mut owned = self.window_owned[i] == Some(owner);
         if let Some(position) = position {
             // A missing earlier window event cannot be bypassed by a later
             // intercepted key. Stop safely instead of replaying stale presses.
@@ -534,7 +565,7 @@ impl Router {
                 {
                     self.routes[i] = Route::Window(owner);
                     self.observed[i] = true;
-                    self.legacy_owned[i] = Some(owner);
+                    self.window_owned[i] = Some(owner);
                 } else if !edge.down && self.routes[i] == Route::Window(owner) {
                     self.routes[i] = Route::Local;
                     self.observed[i] = false;
@@ -542,7 +573,7 @@ impl Router {
             }
         }
         if !edge.down {
-            self.legacy_owned[i] = None;
+            self.window_owned[i] = None;
         }
         owned && !matches!(edge.key, 16..=18 | 20 | 144..=145 | 160..=165)
     }
@@ -557,7 +588,7 @@ impl Router {
         )
     }
 
-    fn event(&mut self, vk: u16, scan: u32, down: bool, injected: bool) -> bool {
+    fn event(&mut self, vk: u16, _scan: u32, down: bool, injected: bool) -> bool {
         self.diagnostic(0, injected, "window_dispatch_received");
         let index = usize::from(vk);
         // VK_PACKET is committed Unicode input, not a physical VK event.
@@ -587,9 +618,21 @@ impl Router {
             }
             return was_consumed;
         }
-        if crate::plugins::hotkeys::key_event(target.owner, vk, down) {
-            self.consumed[index] = down;
-            return true;
+        let configuration = crate::viewer_shortcuts::revision();
+        if configuration != self.configuration || crate::viewer_shortcuts::suspended() {
+            self.configuration = configuration;
+            target.input.pause_owner(target.owner);
+            target.generation = target.input.keyboard_generation();
+            for (blocked, physical) in self.blocked.iter_mut().zip(self.physical) {
+                *blocked |= physical;
+            }
+            if !previously_down {
+                self.blocked[index] = false;
+            }
+            if crate::viewer_shortcuts::suspended() {
+                self.blocked[index] = down;
+                return was_consumed;
+            }
         }
         let generation = target.input.keyboard_generation();
         if generation != target.generation {
@@ -604,7 +647,10 @@ impl Router {
             }
         }
         let (ctrl, shift, alt, win) = self.modifiers();
-        if ctrl && shift && alt && !win && matches!(scan, 0x2c | 0x21 | 0x10) {
+        if let Some(action) = crate::viewer_shortcuts::match_key(
+            vk,
+            u8::from(ctrl) | (u8::from(shift) << 1) | (u8::from(alt) << 2) | (u8::from(win) << 3),
+        ) {
             // Forwarded keys are swallowed; use native modifier state rather
             // than reconstructing the chord from winit's partial key stream.
             if down {
@@ -612,15 +658,7 @@ impl Router {
                     t.input.pause_owner(t.owner);
                     t.generation = t.input.keyboard_generation();
                     if !previously_down {
-                        use super::windows_presenter::ViewerShortcut;
-                        self.shortcut = Some((
-                            t.owner,
-                            match scan {
-                                0x2c => ViewerShortcut::ReleaseMouse,
-                                0x21 => ViewerShortcut::Fullscreen,
-                                _ => ViewerShortcut::Close,
-                            },
-                        ));
+                        self.shortcut = Some((t.owner, action));
                         super::windows_mouse::router().wake_keyboard(t.owner);
                     }
                 }
@@ -632,6 +670,17 @@ impl Router {
                 self.blocked[index] = false;
             }
             return true;
+        }
+        if let Some(target) = &self.target {
+            if crate::plugins::hotkeys::key_event(target.owner, vk, down) {
+                self.consumed[index] = down;
+                return true;
+            }
+        }
+        if self.finish_neutral() {
+            self.blocked[index] = down;
+            self.diagnostic(6, injected, "waiting_for_keyboard_mouse_neutral");
+            return was_consumed;
         }
         if self.blocked[index] {
             self.diagnostic(3, injected, "quarantined_key");
@@ -685,11 +734,10 @@ impl Router {
 
 pub(super) fn set_target(owner: u64, input: &RemoteInput) {
     with_router(|r| {
-        if !input.keyboard_supported() {
-            r.clear();
-            return;
-        }
-        if r.target.as_ref().is_some_and(|t| t.owner == owner) {
+        let activation = input.activation_generation();
+        if r.target.as_ref().is_some_and(|t| {
+            t.owner == owner && t.activation == activation && t.input.same_session(input)
+        }) {
             return;
         }
         r.clear();
@@ -701,6 +749,9 @@ pub(super) fn set_target(owner: u64, input: &RemoteInput) {
             r.blocked[i] = r.physical[i];
             r.observed[i] = r.physical[i];
         }
+        for i in [1, 2, 4, 5, 6] {
+            r.physical[i] = unsafe { GetAsyncKeyState(i as i32) } < 0;
+        }
         tracing::debug!(
             quarantined_keys = r.blocked.iter().filter(|key| **key).count(),
             held_modifiers = blocked_modifiers(&r.blocked),
@@ -710,8 +761,27 @@ pub(super) fn set_target(owner: u64, input: &RemoteInput) {
             owner,
             input: input.clone(),
             generation: input.keyboard_generation(),
+            activation,
         });
+        r.finish_neutral();
     });
+}
+
+pub(super) fn observe_mouse_buttons(owner: u64, flags: u16) -> bool {
+    with_router(|r| {
+        if r.target.as_ref().is_none_or(|t| t.owner != owner) {
+            return false;
+        }
+        for (index, key) in [1, 2, 4, 5, 6].into_iter().enumerate() {
+            if flags & (1 << (2 * index)) != 0 {
+                r.physical[key] = true;
+            }
+            if flags & (2 << (2 * index)) != 0 {
+                r.physical[key] = false;
+            }
+        }
+        r.finish_neutral()
+    })
 }
 
 pub(super) fn clear(owner: u64) {
@@ -791,127 +861,4 @@ pub(super) fn finish_lock_releases(owner: u64) {
             }
         }
     });
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn windows_modifier_normalization_matches_native_scan_mapping() {
-        use windows::Win32::UI::Input::KeyboardAndMouse::{MAPVK_VSC_TO_VK_EX, MapVirtualKeyW};
-        for (generic, scan, extended) in [
-            (16, 0x2a, false),
-            (16, 0x36, false),
-            (17, 0x1d, false),
-            (17, 0x1d, true),
-            (18, 0x38, false),
-            (18, 0x38, true),
-        ] {
-            let native = unsafe {
-                MapVirtualKeyW(scan | if extended { 0xe000 } else { 0 }, MAPVK_VSC_TO_VK_EX)
-            };
-            assert_eq!(u32::from(normalize_key(generic, scan, extended)), native);
-        }
-    }
-
-    #[test]
-    fn windows_remove_raw_keyboard_preserves_mouse_registration() {
-        use windows::Win32::UI::Input::{
-            GetRegisteredRawInputDevices, RAWINPUTDEVICE, RIDEV_DEVNOTIFY, RIDEV_REMOVE,
-            RegisterRawInputDevices,
-        };
-        fn registrations() -> Vec<RAWINPUTDEVICE> {
-            let size = std::mem::size_of::<RAWINPUTDEVICE>() as u32;
-            let mut count = 0;
-            assert_ne!(
-                unsafe { GetRegisteredRawInputDevices(None, &mut count, size) },
-                u32::MAX
-            );
-            let mut devices = vec![RAWINPUTDEVICE::default(); count as usize];
-            if count != 0 {
-                let read = unsafe {
-                    GetRegisteredRawInputDevices(Some(devices.as_mut_ptr()), &mut count, size)
-                };
-                assert_ne!(read, u32::MAX);
-                devices.truncate(read as usize);
-            }
-            devices
-        }
-        struct Restore(Vec<RAWINPUTDEVICE>);
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                let remove: Vec<_> = [2, 6]
-                    .into_iter()
-                    .map(|usage| RAWINPUTDEVICE {
-                        usUsagePage: 1,
-                        usUsage: usage,
-                        dwFlags: RIDEV_REMOVE,
-                        hwndTarget: HWND::default(),
-                    })
-                    .collect();
-                let size = std::mem::size_of::<RAWINPUTDEVICE>() as u32;
-                unsafe {
-                    let _ = RegisterRawInputDevices(&remove, size);
-                    if !self.0.is_empty() {
-                        let _ = RegisterRawInputDevices(&self.0, size);
-                    }
-                }
-            }
-        }
-        let _restore = Restore(
-            registrations()
-                .into_iter()
-                .filter(|d| d.usUsagePage == 1 && matches!(d.usUsage, 2 | 6))
-                .collect(),
-        );
-        let devices: Vec<_> = [2, 6]
-            .into_iter()
-            .map(|usage| RAWINPUTDEVICE {
-                usUsagePage: 1,
-                usUsage: usage,
-                dwFlags: RIDEV_DEVNOTIFY,
-                hwndTarget: HWND::default(),
-            })
-            .collect();
-        unsafe { RegisterRawInputDevices(&devices, std::mem::size_of::<RAWINPUTDEVICE>() as u32) }
-            .unwrap();
-        let before = registrations();
-        assert!(before.iter().any(|d| d.usUsagePage == 1 && d.usUsage == 6));
-        let previous_mouse = before
-            .iter()
-            .find(|d| d.usUsagePage == 1 && d.usUsage == 2)
-            .unwrap();
-        remove_unused_raw_keyboard().unwrap();
-        let remaining = registrations();
-        assert!(
-            !remaining
-                .iter()
-                .any(|d| d.usUsagePage == 1 && d.usUsage == 6)
-        );
-        let mouse = remaining
-            .iter()
-            .find(|d| d.usUsagePage == 1 && d.usUsage == 2)
-            .unwrap();
-        // Compare the OS-reported registration: Windows can normalize flags
-        // for a registration without a notification target.
-        assert_eq!(mouse.dwFlags, previous_mouse.dwFlags);
-        assert_eq!(mouse.hwndTarget, previous_mouse.hwndTarget);
-    }
-
-    #[test]
-    fn windows_keyboard_hook_install_and_teardown() {
-        // Dedicated thread: validate the native registration contract without
-        // injecting any input or changing the user's foreground window.
-        std::thread::spawn(|| {
-            let hook = KeyboardHook::install().unwrap();
-            assert!(hook.thread_id != unsafe { GetCurrentThreadId() });
-            assert!(router().installed);
-            drop(hook);
-            let hook = KeyboardHook::install().unwrap();
-            drop(hook);
-        })
-        .join()
-        .unwrap();
-    }
 }

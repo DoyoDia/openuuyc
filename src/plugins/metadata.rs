@@ -43,10 +43,7 @@ pub fn read(path: &Path) -> Result<Option<Vec<u8>>> {
         budget: &budget,
     })
     .context("无法读取动态库结构")?;
-    let Some(section) = object
-        .section_by_name(".oumeta")
-        .or_else(|| object.section_by_name("__oumeta"))
-    else {
+    let Some(section) = object.section_by_name(".oumeta") else {
         return Ok(None);
     };
     ensure!(section.size() <= 128 * 1024, "插件内嵌清单段过大");
@@ -84,7 +81,7 @@ pub fn candidates(root: &Path) -> Result<Vec<PathBuf>> {
             if !path.is_file()
                 || !path.extension().is_some_and(|e| {
                     let e = e.to_string_lossy();
-                    e.eq_ignore_ascii_case("dll") || e == "so" || e == "dylib"
+                    e.eq_ignore_ascii_case("dll")
                 })
             {
                 continue;

@@ -4,7 +4,7 @@ mod neteq;
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -46,6 +46,7 @@ struct Shared {
     stopped: AtomicBool,
     retry: AtomicBool,
     receiving: AtomicBool,
+    output_thread: OnceLock<std::thread::Thread>,
     status: Mutex<(String, Option<String>)>,
     output_samples: AtomicU64,
     concealed: AtomicU64,
@@ -57,6 +58,12 @@ struct Shared {
 }
 
 impl Shared {
+    fn notify_output(&self) {
+        if let Some(thread) = self.output_thread.get() {
+            thread.unpark();
+        }
+    }
+
     fn clear_levels(&self) {
         self.input_level.clear();
         self.output_level.clear();
@@ -133,6 +140,7 @@ impl AudioPlayback {
                 stopped: AtomicBool::new(false),
                 retry: AtomicBool::new(false),
                 receiving: AtomicBool::new(false),
+                output_thread: OnceLock::new(),
                 status: Mutex::new((String::new(), None)),
                 output_samples: AtomicU64::new(0),
                 concealed: AtomicU64::new(0),
@@ -208,6 +216,7 @@ impl AudioPlayback {
     pub fn retry(&self) {
         let _ = self.start();
         self.0.shared.retry.store(true, Ordering::Release);
+        self.0.shared.notify_output();
     }
 
     pub fn select_source(&self, codec: &str, rate: u32, channels: u16) -> Option<u64> {
@@ -219,8 +228,10 @@ impl AudioPlayback {
             lock(&shared.status).1 = Some(format!(
                 "暂不支持音频格式：{codec} / {rate} Hz / {channels} 声道"
             ));
+            shared.notify_output();
             return None;
         }
+        shared.notify_output();
         Some(generation)
     }
 
@@ -239,7 +250,7 @@ impl AudioPlayback {
         if data.len() > MAX_PACKET || !(BLOCK..=MAX_SAMPLES).contains(&samples) {
             return;
         }
-        shared.receiving.store(true, Ordering::Relaxed);
+        let first_packet = !shared.receiving.swap(true, Ordering::AcqRel);
         // No pre-player backlog, and no unbounded queue while an output device is absent.
         if shared.started.load(Ordering::Acquire) {
             shared.packets.force_push(Packet {
@@ -248,6 +259,9 @@ impl AudioPlayback {
                 sequence,
                 generation,
             });
+        }
+        if first_packet {
+            shared.notify_output();
         }
     }
 
@@ -497,6 +511,7 @@ fn build_stream<T: cpal::SizedSample + cpal::FromSample<f32>>(
                     } else {
                         renderer.next().unwrap_or_else(|_| {
                             decode_failed.store(true, Ordering::Release);
+                            shared.notify_output();
                             [0.0; 2]
                         })
                     };
@@ -528,6 +543,7 @@ fn build_stream<T: cpal::SizedSample + cpal::FromSample<f32>>(
                 lock(&errors.status).1 = Some(format!("音频输出中断：{error}"));
                 errors.clear_levels();
                 failed.store(true, Ordering::Release);
+                errors.notify_output();
             },
             None,
         )
@@ -558,6 +574,10 @@ fn open_output(
 }
 
 fn output_worker(shared: Arc<Shared>) {
+    // CPAL's WASAPI default-device monitor delivers StreamInvalidated /
+    // DeviceNotAvailable to the error callback. Wake this owner immediately;
+    // the periodic check is only a fallback while no stream can report events.
+    let _ = shared.output_thread.set(std::thread::current());
     let host = cpal::default_host();
     let failed = Arc::new(AtomicBool::new(false));
     let mut stream = None;
@@ -599,6 +619,11 @@ fn output_worker(shared: Arc<Shared>) {
                     |device| open_output(device, Arc::clone(&shared), Arc::clone(&failed)),
                 ) {
                     Ok(output) => {
+                        // Recovery succeeded. A later stream interruption is a
+                        // new incident, not another failure of this attempt.
+                        // UU's WasapiRenderer handles each restart event; its
+                        // three-attempt limit is local to device reselection.
+                        failures = 0;
                         stream = Some(output);
                         let name = device
                             .as_ref()

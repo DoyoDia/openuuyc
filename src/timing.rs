@@ -1,4 +1,4 @@
-//! UU 4.38 receive-stream timing. The model belongs to the receiver, not a decoder.
+//! Receive-stream timing. The model belongs to the receiver, not a decoder.
 //! Evidence/configuration reachability: docs/official-playout-timing-2026-09-06.md.
 
 use std::collections::{BTreeMap, VecDeque};

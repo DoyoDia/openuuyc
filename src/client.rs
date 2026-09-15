@@ -45,6 +45,7 @@ pub struct AuthenticatedClient {
     restore_progress: tokio::sync::watch::Sender<RestorationStage>,
     account_name: Mutex<String>,
     wallpaper: Mutex<wallpaper::Sync>,
+    features: crate::feature_ability::FeatureCatalog,
 }
 
 #[derive(Default)]
@@ -131,6 +132,7 @@ impl AuthenticatedClient {
             .0,
             account_name,
             wallpaper: Mutex::new(wallpaper::Sync::default()),
+            features: crate::feature_ability::FeatureCatalog::default(),
         })
     }
 
@@ -251,6 +253,7 @@ impl AuthenticatedClient {
 
     /// Finish process-owned initialization work without logging out the account.
     pub async fn close(&self) {
+        self.features.close().await;
         self.close_device_owner().await;
     }
 
@@ -313,11 +316,54 @@ impl AuthenticatedClient {
         Ok(response)
     }
 
+    pub(crate) async fn international_bitrate_limit(&self) -> Result<Option<u32>> {
+        let mut configs = self
+            .request(|api| async move {
+                api.query_configures(&[("custom_bitrate_limit".into(), String::new())])
+                    .await
+            })
+            .await?;
+        let Some(entry) = configs
+            .remove("custom_bitrate_limit")
+            .filter(|v| v.status == 0)
+        else {
+            return Ok(None);
+        };
+        let Some(value) = entry.data else {
+            return Ok(None);
+        };
+        let value = if let serde_json::Value::String(text) = value {
+            serde_json::from_str(&text)?
+        } else {
+            value
+        };
+        if value.get("enable").and_then(|v| v.as_bool()) != Some(true) {
+            return Ok(None);
+        }
+        Ok(value
+            .get("bitrate_limit")
+            .and_then(|v| v.as_u64())
+            .filter(|v| *v > 0)
+            .map(|v| {
+                let n = v.min(500) as u32;
+                if n <= 20 {
+                    n
+                } else if n <= 100 {
+                    20 + (n - 20) / 5 * 5
+                } else if n <= 200 {
+                    100 + (n - 100) / 10 * 10
+                } else {
+                    200 + (n - 200) / 50 * 50
+                }
+            }))
+    }
+
     pub async fn list_devices(&self) -> Result<DeviceList> {
         let list = self
             .request(|api| async move { api.list_devices().await })
             .await?;
         self.schedule_wallpaper(&list);
+        self.schedule_feature_refresh(false);
         Ok(list)
     }
 
@@ -332,8 +378,22 @@ impl AuthenticatedClient {
     }
 
     pub async fn account_info(&self) -> Result<serde_json::Value> {
-        self.request(|api| async move { api.get_user_info().await })
-            .await
+        let info = self
+            .request(|api| async move { api.get_user_info().await })
+            .await?;
+        self.schedule_feature_refresh(false);
+        Ok(info)
+    }
+
+    pub(crate) fn feature_catalog(&self) -> crate::feature_ability::FeatureCatalog {
+        self.features.clone()
+    }
+
+    pub(crate) fn schedule_feature_refresh(&self, session_create: bool) {
+        if let Some(api) = self.api.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+            self.features
+                .refresh(api, self.ended.clone(), session_create);
+        }
     }
 
     pub(crate) fn account_name(&self) -> String {
@@ -470,7 +530,7 @@ impl AuthenticatedClient {
         if device.participant_count() > expected.participant_count() {
             bail!("该设备新增了远控连接，请刷新后重新确认影响");
         }
-        action.check(device)?;
+        action.check(device, &self.features)?;
         let detail = self
             .device_detail(id)
             .await
@@ -503,6 +563,45 @@ impl AuthenticatedClient {
             .await?;
         room.validate()?;
         Ok(room)
+    }
+
+    pub(crate) async fn update_owned_device(&self, device_id: &str, immediate: bool) -> Result<()> {
+        crate::api::validate_device_id(device_id)?;
+        let devices = self.list_devices().await?;
+        if device_id == devices.current_device.device_id {
+            bail!("不能通过远端更新入口更新本机观看身份");
+        }
+        let device = devices
+            .my_binded_devices
+            .iter()
+            .find(|device| device.device_id == device_id)
+            .context("设备已不在当前账号中，未发送更新请求")?;
+        if device.platform != 1
+            || !device.is_connected()
+            || !device.controlled_support
+            || !device.controllable
+            || !self
+                .features
+                .policy(device.platform, &device.version_name)
+                .supports(crate::feature_ability::Feature::ControlledUpdate)
+        {
+            bail!("当前设备不支持远端更新，未发送请求");
+        }
+        // One user choice produces one request. Do not retry an unknown result.
+        let response = self
+            .request_envelope(|api| async move {
+                api.trigger_controlled_update(device_id, immediate).await
+            })
+            .await
+            .context("更新请求结果未确认，请先检查被控端状态")?;
+        if response.code != 0 {
+            return Err(crate::api::ApiFailure {
+                code: response.code,
+                message: response.msg,
+            }
+            .into());
+        }
+        Ok(())
     }
 
     pub async fn create_host_room(&self, last_controlled_interval: i64) -> Result<RoomSession> {

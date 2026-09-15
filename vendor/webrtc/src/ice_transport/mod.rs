@@ -95,6 +95,14 @@ impl RTCIceTransport {
         None
     }
 
+    pub(crate) async fn selected_pair_rtt(&self) -> Option<std::time::Duration> {
+        self.gatherer
+            .get_agent()
+            .await?
+            .get_selected_candidate_pair()?
+            .rtt_estimate()
+    }
+
     /// Start incoming connectivity checks based on its configured role.
     pub async fn start(&self, params: &RTCIceParameters, role: Option<RTCIceRole>) -> Result<()> {
         if self.state() != RTCIceTransportState::New {

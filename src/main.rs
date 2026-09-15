@@ -1,4 +1,4 @@
-#![cfg_attr(windows, windows_subsystem = "windows")]
+#![windows_subsystem = "windows"]
 #![allow(
     non_snake_case,
     reason = "The executable uses the OpenUUYC product name."
@@ -31,10 +31,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    #[cfg(windows)]
     #[command(hide = true)]
     PluginVideoHost,
-    #[cfg(windows)]
+
     #[command(hide = true)]
     PluginHost { manifest: PathBuf },
     /// 打开完整图形设备中心
@@ -107,7 +106,7 @@ enum Commands {
 
 fn main() -> Result<()> {
     let parsed = Cli::try_parse();
-    #[cfg(windows)]
+
     if !parsed.as_ref().is_ok_and(|cli| {
         matches!(
             &cli.command,
@@ -124,7 +123,6 @@ fn main() -> Result<()> {
         transport: media::TransportChoice::Auto,
     });
 
-    #[cfg(windows)]
     let _instance = if matches!(command, Commands::Gui { .. }) {
         match app::instance::acquire()? {
             Some(instance) => Some(instance),
@@ -137,9 +135,8 @@ fn main() -> Result<()> {
     tracing::info!(target: "openuuyc", version = env!("CARGO_PKG_VERSION"), "application started");
 
     let result = match command {
-        #[cfg(windows)]
         Commands::PluginVideoHost => openuuyc::plugins::video::host(),
-        #[cfg(windows)]
+
         Commands::PluginHost { manifest } => openuuyc::plugins::host(&manifest),
         Commands::Gui {
             fps,
@@ -163,9 +160,7 @@ fn main() -> Result<()> {
             println!(
                 "media: decrypted RTP -> complete Annex-B frames -> native platform decode -> Rust GUI"
             );
-            println!(
-                "decode backends: Windows Rust DXVA11 / Rust H.264 software, macOS VideoToolbox, Linux VA-API"
-            );
+            println!("decode backends: Windows Rust DXVA11 / Rust H.264 software");
             println!("signal events: {}", signal::KNOWN_EVENTS.join(", "));
             println!(
                 "signal headers: {}, {}, {}",
@@ -250,7 +245,6 @@ fn main() -> Result<()> {
     result
 }
 
-#[cfg(windows)]
 fn attach_parent_console() {
     use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
 

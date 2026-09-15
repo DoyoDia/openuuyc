@@ -1,6 +1,6 @@
 //! UU device_capability intersection and ordinary-viewer selection.
 //!
-//! streamer 9AEA90/9ABEF0 and GameViewer 16293C0/16297F0, 4.38.3.9325.
+//! Contract evidence: docs/official-440-controller-route.md.
 //! Capability quality numbers are NOT CaptureSetting protobuf quality numbers.
 
 use serde::{Deserialize, Serialize};

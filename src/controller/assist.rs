@@ -42,6 +42,17 @@ impl AssistConnection {
             if reply.share_id.is_empty() {
                 reply.share_id = previous.share_id.clone();
             }
+            // Refresh the room while retaining
+            // its established device model. An omitted metadata field in
+            // this response must not erase the previously verified platform
+            // or version; a fresh connection still treats missing platform
+            // as unknown and fails validation.
+            if reply.publisher_platform == 0 {
+                reply.publisher_platform = previous.publisher_platform;
+            }
+            if reply.publisher_version_name.is_empty() {
+                reply.publisher_version_name = previous.publisher_version_name.clone();
+            }
             reply
         } else {
             authorize(client, &self.request, reporter, cancel).await?
@@ -123,6 +134,9 @@ pub(super) async fn resolve(
         preferences: None,
         audio_preferences: None,
         target_platform: 0,
+        target_version: String::new(),
+        refresh_after_upgrade: false,
+        background: None,
     })
 }
 

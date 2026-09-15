@@ -19,8 +19,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::Sha256;
 
 pub const BASE_URL: &str = crate::nrd_http::PRIMARY;
-pub const PROTOCOL_VERSION: &str = "4.38.3.9325";
-pub const PROTOCOL_VERSION_CODE: &str = "9325";
+pub const PROTOCOL_VERSION: &str = crate::official_version::CLIENT;
 pub const DEFAULT_CHANNEL: &str = "gwqd";
 
 const SIGNING_KEY: &[u8] = b"alWiSzXZTLu3WfFnw13uBru3";
@@ -97,6 +96,21 @@ pub const USER_INFO: Contract = Contract {
     timeout: REQUEST_TIMEOUT,
     json_content_type: false,
 };
+
+pub(crate) const CONFIGURES_WITH_VERSION: Contract = Contract {
+    method: Method::Post,
+    path: "/api/v1/tool/configures_with_version",
+    identity: IdentityScope::AccountDevice,
+    timeout: REQUEST_TIMEOUT,
+    json_content_type: true,
+};
+
+#[derive(Clone, Deserialize)]
+pub(crate) struct VersionedConfigure {
+    pub version: String,
+    pub status: i32,
+    pub data: Option<serde_json::Value>,
+}
 
 pub const USER_LOGOUT: Contract = Contract {
     method: Method::Post,
@@ -281,9 +295,7 @@ impl<T> ApiEnvelope<T> {
 
 #[derive(Clone, Deserialize, Eq, PartialEq)]
 pub struct LoginQrCode {
-    #[serde(alias = "jump_url")]
     pub qrcode_jump_url: String,
-    #[serde(alias = "qrcode_id")]
     pub token: String,
     #[serde(default)]
     pub status_query_ticket: Option<String>,
@@ -295,12 +307,14 @@ impl LoginQrCode {
             || self.token.is_empty()
             || self.status_ticket().is_empty()
         {
-            bail!("QR response did not contain jump URL and both required tickets");
+            bail!("QR response did not contain a valid jump URL and login/status ticket");
         }
         Ok(())
     }
 
     pub fn status_ticket(&self) -> &str {
+        // The QR response supplies URL + token. Use a distinct status
+        // ticket when the service supplies one; an explicitly empty one fails validation.
         self.status_query_ticket.as_deref().unwrap_or(&self.token)
     }
 }
@@ -629,6 +643,8 @@ pub struct CreateRoomRequest {
 
 #[derive(Clone, Deserialize)]
 pub struct RoomSession {
+    #[serde(default)]
+    pub(crate) international_connect: bool,
     token: String,
     pub ws_connect_timeout_ms: i32,
     pub streamer_retry_delta_ms: i32,
@@ -642,6 +658,7 @@ pub struct RoomSession {
 impl RoomSession {
     pub(crate) fn from_assist(reply: &crate::assist::JoinReply) -> Self {
         Self {
+            international_connect: reply.international_connect,
             token: reply.token.clone(),
             ws_connect_timeout_ms: reply.ws_connect_timeout_ms,
             streamer_retry_delta_ms: reply.streamer_retry_delta_ms,
@@ -755,6 +772,52 @@ impl NrdApi {
     pub async fn generate_login_qr(&self) -> Result<ApiEnvelope<LoginQrCode>> {
         self.send(LOGIN_QR_GENERATE, LOGIN_QR_GENERATE.path, Vec::new())
             .await
+    }
+
+    pub(crate) async fn query_configures(
+        &self,
+        versions: &[(String, String)],
+    ) -> Result<ApiEnvelope<std::collections::BTreeMap<String, VersionedConfigure>>> {
+        if versions.is_empty() || versions.len() > 30 {
+            bail!("configuration query requires 1..=30 names");
+        }
+        let configures = versions
+            .iter()
+            .map(|(name, version)| serde_json::json!({"name": name, "version": version}))
+            .collect::<Vec<_>>();
+        self.post_json(
+            CONFIGURES_WITH_VERSION,
+            CONFIGURES_WITH_VERSION.path,
+            &serde_json::json!({"configures": configures}),
+        )
+        .await
+    }
+
+    pub(crate) async fn trigger_controlled_update(
+        &self,
+        device_id: &str,
+        immediate: bool,
+    ) -> Result<ApiEnvelope<serde_json::Value>> {
+        validate_device_id(device_id)?;
+        let contract = Contract {
+            method: Method::Post,
+            path: "/api/v1/release/trigger",
+            identity: IdentityScope::AccountDevice,
+            timeout: REQUEST_TIMEOUT,
+            json_content_type: true,
+        };
+        // Official 4.40.1 sendRealseTrigger: extra is JSON encoded as a string.
+        // The feature-unavailable dialog uses scene=function for both buttons.
+        self.post_json(
+            contract,
+            &format!("{}/{device_id}/update", contract.path),
+            &serde_json::json!({
+                "type": 1,
+                "scene": "function",
+                "extra": serde_json::json!({"updateType": if immediate {1} else {2}}).to_string(),
+            }),
+        )
+        .await
     }
 
     pub async fn get_login_qr_status(
@@ -1051,7 +1114,15 @@ impl NrdApi {
         let mut pairs = vec![
             ("X-Param-PLAT".into(), "1".into()),
             ("X-Param-VN".into(), self.version_name.clone()),
-            ("X-Param-VC".into(), PROTOCOL_VERSION_CODE.into()),
+            // VC is the last component of the version name sent in VN.
+            (
+                "X-Param-VC".into(),
+                self.version_name
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or_default()
+                    .into(),
+            ),
             ("X-Param-PKGN".into(), PACKAGE_NAME.into()),
             ("X-Param-CHN".into(), self.channel.clone()),
             ("X-Param-LANG".into(), "zh-CN".into()),

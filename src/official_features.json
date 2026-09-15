@@ -1,0 +1,87 @@
+[
+  {
+    "platform": 1,
+    "abilitys": [
+      {
+        "feature": "controlled_update",
+        "original_version": "2.5.0",
+        "final_version": ""
+      },
+      {
+        "feature": "custom_bitrate",
+        "final_version": "",
+        "original_version": "3.4.1"
+      },
+      {
+        "feature": "screen_chroma",
+        "original_version": "2.4.0",
+        "final_version": ""
+      },
+      {
+        "feature": "multi_screen",
+        "final_version": "",
+        "original_version": "4.0.0"
+      },
+      {
+        "feature": "device_reboot",
+        "final_version": "",
+        "original_version": "1.0.0"
+      },
+      {
+        "feature": "device_shutdown",
+        "final_version": "",
+        "original_version": "1.0.0"
+      },
+      {
+        "feature": "smart_mouse",
+        "final_version": "",
+        "original_version": "3.2.1"
+      },
+      {
+        "feature": "manual_transfer",
+        "final_version": "",
+        "original_version": "4.9.0"
+      },
+      {
+        "feature": "manual_super_screen",
+        "final_version": "",
+        "original_version": "4.27.0"
+      },
+      {
+        "feature": "fps_super_screen",
+        "final_version": "",
+        "original_version": "4.27.0"
+      }
+    ]
+  },
+  {
+    "platform": 4,
+    "abilitys": [
+      {
+        "feature": "manual_transfer",
+        "final_version": "",
+        "original_version": "4.9.0"
+      },
+      {
+        "feature": "smart_mouse",
+        "final_version": "",
+        "original_version": "4.18.0"
+      },
+      {
+        "feature": "multi_screen",
+        "final_version": "",
+        "original_version": "4.31.0"
+      },
+      {
+        "feature": "device_shutdown",
+        "final_version": "",
+        "original_version": "4.38.0"
+      },
+      {
+        "feature": "device_reboot",
+        "final_version": "",
+        "original_version": "4.38.0"
+      }
+    ]
+  }
+]

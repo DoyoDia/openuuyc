@@ -180,6 +180,7 @@ impl DeviceSync {
         generation: u64,
         name: &str,
         suggested: &str,
+        features: crate::feature_ability::FeatureCatalog,
     ) -> Option<anyhow::Error> {
         let mut failure = None;
         let mut list_changed = false;
@@ -223,6 +224,7 @@ impl DeviceSync {
                             groups,
                             self.catalog.take(),
                             suggested.to_owned(),
+                            features.clone(),
                         ));
                         self.queue_missing();
                         catalog_changed = true;
@@ -287,6 +289,7 @@ impl DeviceSync {
                 generation,
                 &client.account_name(),
                 &client.suggested_device_name(),
+                client.feature_catalog(),
             )
             .await;
         if foreground {

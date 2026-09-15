@@ -95,6 +95,7 @@ pub(crate) struct HandshakeConfig {
     pub(crate) server_cert_verifier: Arc<dyn ServerCertVerifier>,
     pub(crate) client_cert_verifier: Option<Arc<dyn ClientCertVerifier>>,
     pub(crate) retransmit_interval: tokio::time::Duration,
+    pub(crate) retransmit_interval_max: Option<tokio::time::Duration>,
     pub(crate) initial_epoch: u16,
     //log           logging.LeveledLogger
     //mu sync.Mutex
@@ -137,6 +138,7 @@ impl Default for HandshakeConfig {
             .unwrap(),
             client_cert_verifier: None,
             retransmit_interval: tokio::time::Duration::from_secs(0),
+            retransmit_interval_max: None,
             initial_epoch: 0,
         }
     }
@@ -245,6 +247,9 @@ impl DTLSConn {
 
     async fn prepare(&mut self) -> Result<HandshakeState> {
         self.flights = None;
+        // The peer advanced the handshake flight. UU's DTLS timer stop/start
+        // path (DE2510 -> DE2410 -> 3A1272) resets its initial interval here.
+        self.current_retransmit_interval = self.cfg.retransmit_interval;
 
         // Prepare flights
         self.retransmit = self.current_flight.has_retransmit();
@@ -325,7 +330,7 @@ impl DTLSConn {
         }
     }
     async fn wait(&mut self) -> Result<HandshakeState> {
-        let retransmit_timer = tokio::time::sleep(self.cfg.retransmit_interval);
+        let retransmit_timer = tokio::time::sleep(self.current_retransmit_interval);
         tokio::pin!(retransmit_timer);
 
         loop {
@@ -377,6 +382,10 @@ impl DTLSConn {
 
                     if !self.retransmit {
                         return Ok(HandshakeState::Waiting);
+                    }
+                    if let Some(maximum) = self.cfg.retransmit_interval_max {
+                        self.current_retransmit_interval = self.current_retransmit_interval
+                            .saturating_mul(2).min(maximum);
                     }
                     return Ok(HandshakeState::Sending);
                 }

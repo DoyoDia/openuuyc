@@ -122,6 +122,7 @@ fn run_player(config: ConnectingWindowsRunConfig, needs_display: bool) -> Result
         .ok();
     let mut runner = ConnectingWindowsRunner {
         attributes: WindowAttributes::default()
+            .with_visible(false)
             .with_title(format!("{}{}", crate::VIEWER_TITLE_PREFIX, config.alias))
             .with_window_icon(Some(crate::ui::branding::window_icon()))
             .with_decorations(false)
@@ -412,9 +413,16 @@ impl ConnectingWindowsRunner {
             match event {
                 ViewerWindowEvent::Close => self.close_requested = true,
                 ViewerWindowEvent::Playing(session) => self.start_playing(*session)?,
-                ViewerWindowEvent::Reconnect { progress, display } => {
+                ViewerWindowEvent::Reconnect {
+                    alias,
+                    window: preferred,
+                    progress,
+                    display,
+                } => {
+                    self.alias = alias;
                     if let Some(mut screens) = self.screens.take() {
-                        self.window = screens.take_window();
+                        self.preferences = screens.viewer_preferences(preferred);
+                        self.window = screens.take_window(preferred);
                     }
                     // Keep the OS window, but join and discard the old room's
                     // render/decoder owners before attaching a new media peer.
@@ -433,6 +441,7 @@ impl ConnectingWindowsRunner {
                         .window
                         .as_ref()
                         .context("player window closed during reconnect")?;
+                    window.set_title(&format!("{}{}", crate::VIEWER_TITLE_PREFIX, self.alias));
                     let (mut app, new_display) = WindowsConnectionApp::new(
                         window,
                         self.alias.clone(),
@@ -562,11 +571,9 @@ impl WindowsConnectionApp {
         let mut resize = None;
         let output = self.egui_context.run_ui(input, |ui| {
             resize = borderless_resize(ui, window, None);
-            egui::Panel::top("connection-window-chrome")
-                .frame(title_bar_frame())
-                .show(ui, |ui| {
-                    self.close_requested |= connection_title_bar(ui, window, &self.progress.alias);
-                });
+            title_bar_panel(ui, "connection-window-chrome", title_bar_height(), |ui| {
+                self.close_requested |= connection_title_bar(ui, window, &self.progress.alias);
+            });
             self.progress.draw(ui);
         });
         let (renderer_output, platform_output, viewports) = egui_directx11::split_output(output);
@@ -587,6 +594,9 @@ impl WindowsConnectionApp {
         let presented = self
             .presenter
             .render(&self.egui_context, renderer_output, false)?;
+        if presented && window.is_visible() == Some(false) {
+            window.set_visible(true);
+        }
         if let Some(audit) = UiTimingAudit::active(&mut self.timing_audit, started) {
             audit.record(
                 started,
@@ -606,37 +616,90 @@ impl WindowsConnectionApp {
 fn title_bar_frame() -> egui::Frame {
     egui::Frame::new()
         .fill(crate::ui::theme::SIDEBAR)
-        .inner_margin(egui::Margin::symmetric(10, 3))
-        .stroke(egui::Stroke::new(1.0, crate::ui::theme::LINE))
+        .inner_margin(crate::ui::theme::VIEWER_TITLE_MARGIN)
+        .stroke(egui::Stroke::new(
+            crate::ui::theme::VIEWER_TITLE_STROKE,
+            crate::ui::theme::LINE,
+        ))
+}
+
+fn title_bar_height() -> f32 {
+    crate::ui::theme::VIEWER_TITLE_CONTENT_HEIGHT + title_bar_frame().total_margin().sum().y
+}
+
+fn title_bar_panel<R>(
+    ui: &mut egui::Ui,
+    id: &'static str,
+    height: f32,
+    contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::InnerResponse<R> {
+    let clip = ui.clip_rect();
+    let bottom = ui.available_rect_before_wrap().top() + height;
+    // The native video child starts exactly at this boundary. Frame-edge
+    // antialiasing must not escape into its first row at fractional DPI.
+    ui.set_clip_rect(clip.intersect(egui::Rect::from_min_max(
+        clip.min,
+        egui::pos2(clip.right(), bottom),
+    )));
+    let result = egui::Panel::top(id)
+        .frame(title_bar_frame())
+        .exact_size(height)
+        .show(ui, contents);
+    ui.set_clip_rect(clip);
+    result
 }
 
 fn connection_title_bar(ui: &mut egui::Ui, window: &Window, alias: &str) -> bool {
-    ui.set_min_height(36.0);
-    let mut close = false;
-    ui.horizontal_centered(|ui| {
-        let available = (ui.available_width() - 112.0).max(180.0);
-        let drag = ui
-            .allocate_ui_with_layout(
-                egui::vec2(available, 34.0),
-                egui::Layout::left_to_right(egui::Align::Center),
-                |ui| {
-                    paint_brand_logo(ui);
-                    ui.label(
-                        egui::RichText::new(format!("正在连接  {alias}"))
-                            .size(crate::ui::theme::SMALL)
-                            .strong()
-                            .color(crate::ui::theme::TEXT),
-                    );
-                },
-            )
-            .response
-            .interact(egui::Sense::click_and_drag());
-        if handle_title_drag(window, &drag) {
-            let _ = window.drag_window();
-        }
-        close = window_buttons(ui, window);
-    });
+    ui.set_min_height(crate::ui::theme::VIEWER_TITLE_CONTENT_HEIGHT);
+    let rect = egui::Rect::from_min_size(
+        ui.available_rect_before_wrap().min,
+        egui::vec2(
+            ui.available_width(),
+            crate::ui::theme::VIEWER_TITLE_CONTENT_HEIGHT,
+        ),
+    );
+    let (caption_rect, controls_rect) = connection_title_regions(rect);
+    let drag = ui.interact(
+        caption_rect,
+        ui.id().with("connection-title-drag"),
+        egui::Sense::click_and_drag(),
+    );
+    if handle_title_drag(window, &drag) {
+        let _ = window.drag_window();
+    }
+    let mut caption = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(caption_rect)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    caption.set_clip_rect(caption_rect);
+    paint_brand_logo(&mut caption);
+    caption.add(
+        egui::Label::new(
+            egui::RichText::new(alias)
+                .size(crate::ui::theme::SMALL)
+                .color(crate::ui::theme::TEXT),
+        )
+        .truncate(),
+    );
+    let mut controls = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(controls_rect.shrink2(egui::vec2(4.0, 0.0)))
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    controls.spacing_mut().item_spacing.x = 4.0;
+    let close = window_buttons(&mut controls, window);
+    ui.allocate_rect(rect, egui::Sense::hover());
     close
+}
+
+fn connection_title_regions(rect: egui::Rect) -> (egui::Rect, egui::Rect) {
+    let controls_left =
+        (rect.right() - crate::ui::theme::VIEWER_WINDOW_CONTROLS_WIDTH).max(rect.left());
+    (
+        egui::Rect::from_min_max(rect.min, egui::pos2(controls_left, rect.bottom())),
+        egui::Rect::from_min_max(egui::pos2(controls_left, rect.top()), rect.max),
+    )
 }
 
 struct PlayerTitleBar<'a> {
@@ -651,18 +714,38 @@ struct PlayerTitleBar<'a> {
 }
 
 fn player_title_bar(ui: &mut egui::Ui, mut bar: PlayerTitleBar<'_>) -> PlayerChromeAction {
-    ui.set_min_height(36.0);
+    ui.set_min_height(crate::ui::theme::VIEWER_TITLE_CONTENT_HEIGHT);
     let mut action = PlayerChromeAction::default();
     let stats = bar.performance.snapshot();
     let rect = egui::Rect::from_min_size(
         ui.available_rect_before_wrap().min,
-        egui::vec2(ui.available_width(), 36.0),
+        egui::vec2(
+            ui.available_width(),
+            crate::ui::theme::VIEWER_TITLE_CONTENT_HEIGHT,
+        ),
     );
-    const WINDOW_CONTROLS_WIDTH: f32 = 106.0;
-    const VIEW_ACTIONS_WIDTH: f32 = 144.0;
-    let identity_width = (rect.width() * 0.22).clamp(170.0, 210.0);
+    const VIEW_ACTIONS_WIDTH: f32 = 180.0;
+    let title = bar.title.trim_start_matches(crate::VIEWER_TITLE_PREFIX);
+    let title_width = if bar.screens.device_switch.is_some() {
+        crate::ui::controls::viewer_device_button_width(ui, title)
+    } else {
+        ui.painter()
+            .layout_no_wrap(
+                title.into(),
+                egui::FontId::proportional(crate::ui::theme::BODY),
+                crate::ui::theme::TEXT,
+            )
+            .size()
+            .x
+    };
+    let identity_width =
+        (crate::ui::theme::VIEWER_LOGO_SIZE + ui.spacing().item_spacing.x + title_width)
+            .min(crate::ui::theme::VIEWER_IDENTITY_MAX_WIDTH);
     let controls_rect = egui::Rect::from_min_max(
-        egui::pos2(rect.max.x - WINDOW_CONTROLS_WIDTH, rect.min.y),
+        egui::pos2(
+            rect.max.x - crate::ui::theme::VIEWER_WINDOW_CONTROLS_WIDTH,
+            rect.min.y,
+        ),
         rect.max,
     );
     let actions_rect = egui::Rect::from_min_max(
@@ -672,12 +755,15 @@ fn player_title_bar(ui: &mut egui::Ui, mut bar: PlayerTitleBar<'_>) -> PlayerChr
     let identity_rect = egui::Rect::from_min_size(
         rect.min,
         egui::vec2(
-            identity_width.min(actions_rect.min.x - rect.min.x),
+            identity_width.min((actions_rect.min.x - rect.min.x).max(0.0)),
             rect.height(),
         ),
     );
     let content_rect = egui::Rect::from_min_max(
-        egui::pos2(identity_rect.max.x, rect.min.y),
+        egui::pos2(
+            identity_rect.max.x + crate::ui::theme::VIEWER_IDENTITY_GAP,
+            rect.min.y,
+        ),
         egui::pos2(actions_rect.min.x, rect.max.y),
     );
     let metrics_rect = egui::Rect::from_min_max(
@@ -694,7 +780,17 @@ fn player_title_bar(ui: &mut egui::Ui, mut bar: PlayerTitleBar<'_>) -> PlayerChr
     // take priority for detach gestures; unused tab space and stream metrics
     // remain part of the draggable caption. Keep action buttons outside it.
     let drag = ui.interact(
-        egui::Rect::from_min_max(rect.min, metrics_rect.max),
+        egui::Rect::from_min_max(
+            egui::pos2(
+                if bar.screens.device_switch.is_some() {
+                    identity_rect.max.x
+                } else {
+                    rect.min.x
+                },
+                rect.min.y,
+            ),
+            metrics_rect.max,
+        ),
         ui.id().with("player-title-drag"),
         egui::Sense::click_and_drag(),
     );
@@ -711,14 +807,30 @@ fn player_title_bar(ui: &mut egui::Ui, mut bar: PlayerTitleBar<'_>) -> PlayerChr
     );
     identity.set_clip_rect(identity_rect);
     paint_brand_logo(&mut identity);
-    identity.add(
-        egui::Label::new(
-            egui::RichText::new(bar.title.trim_start_matches(crate::VIEWER_TITLE_PREFIX))
-                .size(crate::ui::theme::BODY)
-                .strong()
-                .color(crate::ui::theme::TEXT),
-        )
-        .truncate(),
+    if let Some(switcher) = &bar.screens.device_switch {
+        let response = crate::ui::controls::viewer_device_button(
+            &mut identity,
+            bar.title.trim_start_matches(crate::VIEWER_TITLE_PREFIX),
+        );
+        switcher.menu(&response, bar.window.id());
+    } else {
+        identity.add(
+            egui::Label::new(
+                egui::RichText::new(bar.title.trim_start_matches(crate::VIEWER_TITLE_PREFIX))
+                    .size(crate::ui::theme::BODY)
+                    .strong()
+                    .color(crate::ui::theme::TEXT),
+            )
+            .truncate(),
+        );
+    }
+
+    crate::ui::controls::viewer_caption_separator(
+        ui,
+        egui::pos2(
+            identity_rect.right() + crate::ui::theme::VIEWER_IDENTITY_GAP / 2.0,
+            rect.center().y,
+        ),
     );
 
     if !bar.screens.tabs.is_empty() {
@@ -728,7 +840,7 @@ fn player_title_bar(ui: &mut egui::Ui, mut bar: PlayerTitleBar<'_>) -> PlayerChr
                 .layout(egui::Layout::left_to_right(egui::Align::Center)),
         );
         tabs.set_clip_rect(tabs_rect);
-        bar.screens.draw(&mut tabs, bar.window);
+        bar.screens.draw(&mut tabs, bar.window, bar.stream_control);
     }
     let codec_info = if stats.video_format.contains("264") || stats.video_format.contains("265") {
         &stats.video_format
@@ -776,18 +888,8 @@ fn player_title_bar(ui: &mut egui::Ui, mut bar: PlayerTitleBar<'_>) -> PlayerChr
         &mut actions,
         TitleIcon::Quality,
         bar.stream_control_ui.open,
-        bar.stream_control_ui
-            .budget_notice
-            .as_deref()
-            .unwrap_or("画质与串流设置"),
+        "画质与串流设置",
     );
-    if bar.stream_control_ui.budget_notice.is_some() {
-        actions.painter().circle_filled(
-            quality_button.rect.right_top() + egui::vec2(-4.0, 4.0),
-            2.5,
-            super::warning_color(),
-        );
-    }
     if quality_button.clicked() {
         bar.stream_control_ui.open = !bar.stream_control_ui.open;
         if bar.stream_control_ui.open {
@@ -807,6 +909,26 @@ fn player_title_bar(ui: &mut egui::Ui, mut bar: PlayerTitleBar<'_>) -> PlayerChr
             bar.stream_control_ui.open = false;
         }
     }
+    let annotation = bar.stream_control.annotation_snapshot();
+    action.toggle_annotation = actions
+        .add_enabled_ui(
+            !annotation.toggling
+                && (annotation.enabled
+                    || annotation.supported
+                    || bar.stream_control.snapshot().ready
+                        && bar.stream_control.remote_upgrade().is_some()),
+            |ui| {
+                crate::ui::controls::annotation_button(
+                    ui,
+                    crate::ui::controls::AnnotationIcon::Pen,
+                    annotation.enabled,
+                    "批注",
+                )
+            },
+        )
+        .inner
+        .on_disabled_hover_text("当前设备暂不支持批注，或仍在连接中")
+        .clicked();
     action.one_to_one = actions
         .add_enabled_ui(
             !bar.window.is_maximized() && bar.window.fullscreen().is_none(),
@@ -826,25 +948,27 @@ fn player_title_bar(ui: &mut egui::Ui, mut bar: PlayerTitleBar<'_>) -> PlayerChr
     let enabled =
         control.mouse_mode != crate::remote_input::MouseMode::View || control.mouse_pending;
     action.toggle_mouse = actions
-        .add_enabled_ui(
-            enabled || (control.ready && control.pending_count == 0),
-            |ui| {
-                title_icon_button(
-                    ui,
-                    TitleIcon::Mouse,
-                    enabled,
-                    if enabled {
-                        "退出控制（Ctrl+Shift+Alt+Z）"
-                    } else {
-                        if bar.stream_control.mouse().keyboard_supported() {
-                            "开启键鼠控制"
-                        } else {
-                            "开启鼠标控制（此平台暂未适配键盘）"
-                        }
-                    },
+        .add_enabled_ui(enabled || control.ready, |ui| {
+            let hint = if bar.stream_control.mouse().waiting_for_neutral() {
+                format!(
+                    "等待松开全部键鼠；退出控制快捷键：{}",
+                    crate::viewer_shortcuts::label(ViewerShortcut::ReleaseMouse)
                 )
-            },
-        )
+            } else if enabled {
+                format!(
+                    "退出控制（{}）",
+                    crate::viewer_shortcuts::label(ViewerShortcut::ReleaseMouse)
+                )
+            } else {
+                if bar.stream_control.mouse().keyboard_supported() {
+                    "开启键鼠控制".into()
+                } else {
+                    "开启鼠标控制（此平台暂未适配键盘）".into()
+                }
+            };
+
+            title_icon_button(ui, TitleIcon::Mouse, enabled, &hint)
+        })
         .inner
         .clicked();
 
@@ -871,6 +995,7 @@ struct PlayerChromeAction {
     close: bool,
     one_to_one: bool,
     toggle_mouse: bool,
+    toggle_annotation: bool,
     drag_window: bool,
 }
 
@@ -1027,7 +1152,10 @@ fn paint_brand_logo(ui: &mut egui::Ui) {
                 .data_mut(|data| data.insert_temp(key, texture.clone()));
             texture
         });
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(
+        egui::Vec2::splat(crate::ui::theme::VIEWER_LOGO_SIZE),
+        egui::Sense::hover(),
+    );
     crate::ui::branding::paint(ui.painter(), rect, &texture);
 }
 
@@ -1136,11 +1264,20 @@ pub(super) fn title_bar_height_pixels(window: &Window) -> u32 {
     if window.fullscreen().is_some() {
         0
     } else {
-        (42.0 * window.scale_factor()).round().max(1.0) as u32
+        // Include the egui frame's padding and stroke. Round outward so a
+        // fractional-DPI border cannot paint over the first video row.
+        title_bar_height_at_scale(window.scale_factor())
     }
 }
 
+fn title_bar_height_at_scale(scale: f64) -> u32 {
+    (f64::from(title_bar_height()) * scale).ceil().max(1.0) as u32
+}
+
 fn configure_dwm_window(window: &Window) {
+    if let Err(error) = super::windows_ui::prepare_window_background(window) {
+        tracing::warn!(%error, "prepare player background");
+    }
     let Ok(hwnd) = window_hwnd(window) else {
         return;
     };
@@ -1554,6 +1691,7 @@ struct RenderWorker {
     wake: std::thread::Thread,
     thread: Option<std::thread::JoinHandle<()>>,
     current_video_size: Arc<Mutex<Option<(u32, u32, u16)>>>,
+    first_presented: Arc<AtomicBool>,
 }
 
 impl RenderWorker {
@@ -1562,7 +1700,11 @@ impl RenderWorker {
         mut size: PhysicalSize<u32>,
         session: &NativeViewerSession,
         context: &egui::Context,
+        cpu_device: Arc<Mutex<Option<(ID3D11Device, ID3D11DeviceContext)>>>,
     ) -> Result<Self> {
+        let started = Instant::now();
+        let screen_id = session.screen_id();
+        let stream_control = session.stream_control.clone();
         let plugins = crate::plugins::Controller::new(context.clone());
         let plugin_state = plugins.shared.clone();
         let frame_queue = Arc::clone(&session.frame_queue);
@@ -1571,6 +1713,9 @@ impl RenderWorker {
         let (commands, command_receiver) = std_mpsc::channel();
         let current_video_size = Arc::new(Mutex::new(None));
         let worker_video_size = Arc::clone(&current_video_size);
+        let first_presented = Arc::new(AtomicBool::new(false));
+        let worker_first_presented = Arc::clone(&first_presented);
+        let first_frame_repaint = context.clone();
         let thread = std::thread::Builder::new()
             .name("Video Render".to_owned())
             .spawn(move || {
@@ -1579,6 +1724,7 @@ impl RenderWorker {
                 {
                     tracing::warn!(%error, "set video render thread priority");
                 }
+                let mut first_present = true;
                 let mut presenter = None::<D3D11Presenter>;
                 let mut current_frame = None::<DecodedVideoFrame>;
                 let mut redraw = false;
@@ -1644,7 +1790,7 @@ impl RenderWorker {
                         let result = (|| {
                             if presenter.is_none() {
                                 presenter = Some(
-                                    D3D11Presenter::for_frame(hwnd, size, frame)
+                                    D3D11Presenter::for_frame(hwnd, size, frame, &cpu_device)
                                         .map_err(VideoRenderError::prepare)?,
                                 );
                                 tracing::info!("initialized native video presentation pipeline");
@@ -1662,6 +1808,20 @@ impl RenderWorker {
                         })();
                         match result {
                             Ok(()) => {
+                                if is_new_submission && presenter.as_ref().is_some_and(|p| p.drew) {
+                                    stream_control
+                                        .topology_frame_presented(screen_id, frame.received_at);
+                                }
+                                if first_present && presenter.as_ref().is_some_and(|p| p.drew) {
+                                    first_present = false;
+                                    worker_first_presented.store(true, Ordering::Release);
+                                    first_frame_repaint.request_repaint();
+                                    tracing::debug!(
+                                        screen_id,
+                                        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+                                        "screen renderer first frame presented"
+                                    );
+                                }
                                 if let Some(frame) = replacement {
                                     *mutex_lock(&worker_video_size) =
                                         Some((frame.width, frame.height, frame.rotation));
@@ -1705,6 +1865,12 @@ impl RenderWorker {
                 // GPU resources and retained samples go away before the child HWND.
                 drop(presenter);
                 drop(current_frame);
+                if let Some((_, context)) = mutex_lock(&cpu_device).as_ref() {
+                    // Release bindings held by the retained context before another track uses it.
+                    unsafe {
+                        context.ClearState();
+                    }
+                }
                 mutex_lock(&frame_queue).clear();
                 performance.set_presentation_queue_frames(0);
             })
@@ -1720,6 +1886,7 @@ impl RenderWorker {
             wake,
             thread: Some(thread),
             current_video_size,
+            first_presented,
         })
     }
 
@@ -1841,30 +2008,22 @@ fn render_thread_frame(
     Ok(())
 }
 
-#[derive(Clone, Copy)]
-pub(super) enum ViewerShortcut {
-    ReleaseMouse,
-    Fullscreen,
-    Close,
-}
-
+pub(super) use crate::viewer_shortcuts::Action as ViewerShortcut;
 fn viewer_shortcut(
     modifiers: winit::keyboard::ModifiersState,
     key: winit::keyboard::PhysicalKey,
 ) -> Option<ViewerShortcut> {
-    use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
-    if modifiers != (ModifiersState::CONTROL | ModifiersState::SHIFT | ModifiersState::ALT) {
+    if crate::viewer_shortcuts::suspended() {
         return None;
     }
-    match key {
-        PhysicalKey::Code(KeyCode::KeyZ) => Some(ViewerShortcut::ReleaseMouse),
-        PhysicalKey::Code(KeyCode::KeyF) => Some(ViewerShortcut::Fullscreen),
-        PhysicalKey::Code(KeyCode::KeyQ) => Some(ViewerShortcut::Close),
-        _ => None,
-    }
+    crate::viewer_shortcuts::match_key(
+        crate::viewer_shortcuts::physical_key(key)?,
+        crate::viewer_shortcuts::modifiers(modifiers),
+    )
 }
 
 struct ThreadedWindowsApp {
+    annotation: super::annotation::AnnotationUi,
     modifiers: winit::keyboard::ModifiersState,
     mouse: super::windows_mouse::WindowMouse,
     last_mouse_mode: crate::remote_input::MouseMode,
@@ -1875,11 +2034,14 @@ struct ThreadedWindowsApp {
     stream_control: StreamControlHandle,
     stream_control_ui: StreamControlUi,
     plugin_menu_open: bool,
+    display_transition_visible: bool,
+    bound_screen: u64,
     shutdown: Arc<AtomicBool>,
     fatal_error: Arc<Mutex<Option<String>>>,
     egui_context: egui::Context,
     egui_winit: egui_winit::State,
     performance_mode: PerformancePanelMode,
+    startup_backdrop: Option<ConnectionProgressApp>,
     aspect_locked: bool,
     last_window_size: PhysicalSize<u32>,
     pending_aspect_size: Option<PhysicalSize<u32>>,
@@ -1892,6 +2054,8 @@ struct ThreadedWindowsApp {
     _session: Arc<NativeViewerSession>,
     video_window: VideoWindow,
     ui_presenter: UiPresenter,
+    // Only successive video workers use this context; each previous worker is joined first.
+    cpu_device: Arc<Mutex<Option<(ID3D11Device, ID3D11DeviceContext)>>>,
 }
 
 impl ThreadedWindowsApp {
@@ -1902,6 +2066,10 @@ impl ThreadedWindowsApp {
     ) -> Result<()> {
         // One composition target per HWND. Keep UI composition and the video
         // child window; retire the old swap chain before attaching a new track.
+        self.stream_control
+            .cancel_display_change(self.bound_screen as u32 as i32);
+        self.annotation.bind(session.stream_control.clone());
+        self.stream_control_ui = StreamControlUi::default();
         self.mouse.release(window);
         self.mouse = super::windows_mouse::WindowMouse::new(
             window,
@@ -1917,12 +2085,14 @@ impl ThreadedWindowsApp {
             size,
             &session,
             &self.egui_context,
+            Arc::clone(&self.cpu_device),
         )?;
         self.title = session.title.clone();
         self.performance = session.performance.clone();
         self.stream_control = session.stream_control.clone();
         self.shutdown = Arc::clone(&session.shutdown);
         self.fatal_error = Arc::clone(&session.fatal_error);
+        self.bound_screen = session.screen_binding();
         self._session = session;
         self.last_aspect_video_size = None;
         Ok(())
@@ -1941,13 +2111,19 @@ impl ThreadedWindowsApp {
         let fatal_error = Arc::clone(&session.fatal_error);
         let video_window = VideoWindow::new(window)?;
         let size = video_window.resize(window, window.inner_size())?;
+        let cpu_device = Arc::new(Mutex::new(None));
         let renderer = RenderWorker::spawn(
             video_window.handle(),
             size,
             &session,
             &connecting.egui_context,
+            Arc::clone(&cpu_device),
         )?;
         Ok(Self {
+            annotation: super::annotation::AnnotationUi::new(
+                stream_control.clone(),
+                window_hwnd(window)?.0 as u64,
+            ),
             mouse: super::windows_mouse::WindowMouse::new(
                 window,
                 &stream_control,
@@ -1962,11 +2138,14 @@ impl ThreadedWindowsApp {
             stream_control,
             stream_control_ui: StreamControlUi::default(),
             plugin_menu_open: false,
+            display_transition_visible: false,
+            bound_screen: session.screen_binding(),
             shutdown,
             fatal_error,
             egui_context: connecting.egui_context,
             egui_winit: connecting.egui_winit,
             performance_mode: preferences.performance_mode,
+            startup_backdrop: Some(connecting.progress),
             aspect_locked: preferences.aspect_locked,
             last_window_size: window.inner_size(),
             pending_aspect_size: None,
@@ -1978,6 +2157,7 @@ impl ThreadedWindowsApp {
             _session: session,
             video_window,
             ui_presenter: connecting.presenter,
+            cpu_device,
         })
     }
 
@@ -1996,6 +2176,7 @@ impl ThreadedWindowsApp {
             ..
         } = event
             && window.has_focus()
+            && !self.egui_context.text_edit_focused()
             && key.state == winit::event::ElementState::Pressed
             && let Some(shortcut) = viewer_shortcut(self.modifiers, key.physical_key)
         {
@@ -2013,11 +2194,15 @@ impl ThreadedWindowsApp {
             event,
             WindowEvent::Focused(false) | WindowEvent::Occluded(true)
         ) {
+            self.annotation.finish();
             self.renderer.plugins.disarm();
             self.mouse.release(window);
         }
         if matches!(event, WindowEvent::Focused(false)) {
             self.modifiers = winit::keyboard::ModifiersState::empty();
+            if let Ok(hwnd) = window_hwnd(window) {
+                crate::viewer_shortcuts::set_text_owner(hwnd.0 as u64, false);
+            }
         }
         if response.repaint && !matches!(event, WindowEvent::RedrawRequested) {
             window.request_redraw();
@@ -2072,6 +2257,9 @@ impl ThreadedWindowsApp {
                 self.mouse.release(window);
                 self.close_requested = true;
             }
+            ViewerShortcut::Performance => {
+                self.performance_mode = self.performance_mode.next();
+            }
         }
         window.request_redraw();
         Ok(())
@@ -2107,6 +2295,25 @@ impl ThreadedWindowsApp {
             window.request_redraw();
         }
         self.last_mouse_mode = mode;
+        // The visible transition owns the obscured desktop, like a local menu.
+        // Release held input while it is shown; the title bar remains interactive.
+        let display_transition = self.stream_control.annotation_snapshot().enabled
+            || self
+                .stream_control
+                .remote_upgrade()
+                .is_some_and(|upgrade| upgrade.owns_input(window.id()))
+            || self.startup_backdrop.is_some()
+            || self.display_transition_visible
+            || super::stream_menu::topology_menu::owns_input(&self.egui_context)
+            || self.egui_context.memory(|m| m.top_modal_layer().is_some())
+            || self.bound_screen != self._session.screen_binding()
+            || self
+                .stream_control
+                .display_input_blocked(self._session.track_index, self.bound_screen)
+            || self
+                .stream_control
+                .pending_display_resolution(self._session.screen_id())
+                .is_some();
         self.renderer.plugins.input_context(
             self.stream_control.mouse().clone(),
             window_hwnd(window).map_or(0, |h| h.0 as u64),
@@ -2114,6 +2321,7 @@ impl ThreadedWindowsApp {
                 && !window.is_minimized().unwrap_or(false)
                 && !self.plugin_menu_open
                 && !self.stream_control_ui.open
+                && !display_transition
                 && !self.screen_tabs.is_pending()
                 && !self.egui_context.any_popup_open()
                 && !self.egui_context.text_edit_focused(),
@@ -2124,12 +2332,21 @@ impl ThreadedWindowsApp {
             &self.stream_control,
             self._session.track_index,
             &self.renderer.current_video_size,
-            self.stream_control_ui.open || self.plugin_menu_open || self.screen_tabs.is_pending(),
+            self.stream_control_ui.open
+                || self.plugin_menu_open
+                || self.screen_tabs.is_pending()
+                || display_transition,
             event_loop,
         );
     }
 
     fn draw_ui(&mut self, window: &Window) -> Result<()> {
+        crate::viewer_shortcuts::refresh();
+        self.egui_context
+            .request_repaint_after(Duration::from_millis(500));
+        if self.renderer.first_presented.load(Ordering::Acquire) {
+            self.startup_backdrop = None;
+        }
         let started = Instant::now();
         let input = self.egui_winit.take_egui_input(window);
         let mut view = super::stream_menu::LocalViewSettings {
@@ -2149,16 +2366,15 @@ impl ThreadedWindowsApp {
             .flatten();
         let plugin_video_size = self.current_video_size();
         let output = self.egui_context.run_ui(input, |ui| {
-            if ui.ctx().input(|input| input.key_pressed(egui::Key::F3)) {
-                view.performance_mode = view.performance_mode.next();
-            }
             let ctx = ui.ctx().clone();
             if !fullscreen {
                 resize =
                     borderless_resize(ui, window, Some((&mut self.window_resize, resize_aspect)));
-                egui::Panel::top("viewer-toolbar")
-                    .frame(title_bar_frame())
-                    .show(ui, |ui| {
+                title_bar_panel(
+                    ui,
+                    "viewer-toolbar",
+                    title_bar_height_pixels(window) as f32 / ctx.pixels_per_point(),
+                    |ui| {
                         chrome_action = player_title_bar(
                             ui,
                             PlayerTitleBar {
@@ -2172,13 +2388,28 @@ impl ThreadedWindowsApp {
                                 move_state: Some(&mut self.window_move),
                             },
                         );
-                    });
+                    },
+                );
             }
+            if let Some(loading) = &mut self.startup_backdrop {
+                loading.draw(ui);
+                return;
+            }
+            self.display_transition_visible = super::display_transition::show(
+                &ctx,
+                &self.stream_control,
+                self._session.screen_id(),
+                ui.available_rect_before_wrap(),
+            );
             show_stream_control_window(
                 &ctx,
                 &self.stream_control,
                 &mut self.stream_control_ui,
                 &mut view,
+                self._session.screen_id(),
+                window
+                    .current_monitor()
+                    .map(|m| (m.size().width, m.size().height)),
             );
             self.renderer.plugins.window(
                 &ctx,
@@ -2203,6 +2434,30 @@ impl ThreadedWindowsApp {
                     ],
                 );
             }
+            let annotation_rect = plugin_video_size.map(|(w, h)| {
+                let r = fit_rect(w, h, size.width, size.height.saturating_sub(top));
+                let scale = ctx.pixels_per_point();
+                egui::Rect::from_min_max(
+                    egui::pos2(r.left as f32 / scale, (r.top as f32 + top as f32) / scale),
+                    egui::pos2(
+                        r.right as f32 / scale,
+                        (r.bottom as f32 + top as f32) / scale,
+                    ),
+                )
+            });
+            self.annotation.draw(
+                ui,
+                self._session.screen_id(),
+                annotation_rect,
+                self.display_transition_visible
+                    || self.screen_tabs.is_pending()
+                    || self.stream_control_ui.open
+                    || self.plugin_menu_open
+                    || self
+                        .stream_control
+                        .display_input_blocked(self._session.track_index, self.bound_screen),
+                window.has_focus(),
+            );
             super::show_performance_overlay(
                 &ctx,
                 &self.performance,
@@ -2210,8 +2465,18 @@ impl ThreadedWindowsApp {
                 view.performance_mode,
                 "performance-grid-d3d11",
             );
+            if let Some(upgrade) = self.stream_control.remote_upgrade() {
+                upgrade.show(&ctx, window.id(), &self.stream_control);
+            }
         });
         self.performance_mode = view.performance_mode;
+        if let Ok(hwnd) = window_hwnd(window) {
+            crate::viewer_shortcuts::set_text_owner(
+                hwnd.0 as u64,
+                self.egui_context.text_edit_focused()
+                    || crate::plugins::capturing_shortcut(&self.egui_context),
+            );
+        }
         let (renderer_output, platform_output, viewports) = egui_directx11::split_output(output);
         let immediate = viewports
             .get(&egui::ViewportId::ROOT)
@@ -2253,6 +2518,21 @@ impl ThreadedWindowsApp {
         if chrome_action.close {
             self.mouse.release(window);
             self.close_requested = true;
+        }
+        if chrome_action.toggle_annotation {
+            self.mouse.release(window);
+            self.renderer.plugins.disarm();
+            self.stream_control_ui.open = false;
+            self.plugin_menu_open = false;
+            if !self.stream_control.annotation_snapshot().supported
+                && !self.stream_control.annotation_snapshot().enabled
+                && let Some(upgrade) = self.stream_control.remote_upgrade()
+            {
+                upgrade.prompt(window.id(), "批注");
+            } else {
+                self.annotation.toggle();
+            }
+            window.request_redraw();
         }
         if chrome_action.toggle_mouse {
             let state = self.stream_control.snapshot();
@@ -2338,12 +2618,21 @@ impl ThreadedWindowsApp {
 
 impl Drop for ThreadedWindowsApp {
     fn drop(&mut self) {
+        self.stream_control
+            .cancel_display_change(self.bound_screen as u32 as i32);
         self.renderer.stop();
         self.performance.pause_presentation();
     }
 }
 
 struct D3D11Presenter {
+    hwnd: HWND,
+    hdr_output: bool,
+    input_hdr: bool,
+    hdr_output_unavailable: bool,
+    output_monitor: isize,
+    output_monitor_hdr: bool,
+    output_hdr_checked: Option<Instant>,
     captures: plugin_video::Captures,
     plugin_state: Option<Arc<crate::plugins::ChainShared>>,
     effects: Option<plugin_video::Engine>,
@@ -2458,11 +2747,15 @@ struct VideoShaderRenderer {
     vertex_shader: ID3D11VertexShader,
     yuv_pixel_shader: ID3D11PixelShader,
     yuv_array_pixel_shader: ID3D11PixelShader,
+    ayuv_pixel_shader: ID3D11PixelShader,
+    ayuv_array_pixel_shader: ID3D11PixelShader,
+    y410_pixel_shader: ID3D11PixelShader,
+    y410_array_pixel_shader: ID3D11PixelShader,
     rgba_pixel_shader: ID3D11PixelShader,
     sampler: ID3D11SamplerState,
     point_sampler: ID3D11SamplerState,
     rasterizer: ID3D11RasterizerState,
-    color_buffer: Option<(RenderColor, u8, ID3D11Buffer)>,
+    color_buffer: Option<(RenderColor, u8, bool, ID3D11Buffer)>,
     geometry: Option<VideoShaderGeometry>,
     views: VecDeque<CachedVideoShaderViews>,
 }
@@ -2505,6 +2798,7 @@ struct VideoVertex {
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct VideoColorTransform {
     rows: [[f32; 4]; 3],
+    hdr: [f32; 4],
 }
 
 const OFFICIAL_SHARED_TEXTURE_CACHE_SIZE: usize = 32;
@@ -2550,11 +2844,35 @@ impl VideoShaderRenderer {
         let mut vertex_shader = None;
         let mut yuv_pixel_shader = None;
         let mut yuv_array_pixel_shader = None;
+        let mut ayuv_pixel_shader = None;
+        let mut ayuv_array_pixel_shader = None;
+        let mut y410_pixel_shader = None;
+        let mut y410_array_pixel_shader = None;
         let mut rgba_pixel_shader = None;
         let mut sampler = None;
         let mut point_sampler = None;
         let mut rasterizer = None;
         unsafe {
+            device.CreatePixelShader(
+                include_bytes!("shaders/video_ayuv_ps.cso"),
+                None,
+                Some(&mut ayuv_pixel_shader),
+            )?;
+            device.CreatePixelShader(
+                include_bytes!("shaders/video_ayuv_array_ps.cso"),
+                None,
+                Some(&mut ayuv_array_pixel_shader),
+            )?;
+            device.CreatePixelShader(
+                include_bytes!("shaders/video_y410_ps.cso"),
+                None,
+                Some(&mut y410_pixel_shader),
+            )?;
+            device.CreatePixelShader(
+                include_bytes!("shaders/video_y410_array_ps.cso"),
+                None,
+                Some(&mut y410_array_pixel_shader),
+            )?;
             device.CreateInputLayout(
                 &input_elements,
                 Self::VERTEX_SHADER,
@@ -2613,6 +2931,12 @@ impl VideoShaderRenderer {
                 .context("D3D11 did not return the YUV pixel shader")?,
             yuv_array_pixel_shader: yuv_array_pixel_shader
                 .context("D3D11 did not return the YUV array pixel shader")?,
+            ayuv_pixel_shader: ayuv_pixel_shader.context("missing AYUV shader")?,
+            ayuv_array_pixel_shader: ayuv_array_pixel_shader
+                .context("missing AYUV array shader")?,
+            y410_pixel_shader: y410_pixel_shader.context("missing Y410 shader")?,
+            y410_array_pixel_shader: y410_array_pixel_shader
+                .context("missing Y410 array shader")?,
             rgba_pixel_shader: rgba_pixel_shader
                 .context("D3D11 did not return the RGBA pixel shader")?,
             sampler: sampler.context("D3D11 did not return the video sampler")?,
@@ -2667,39 +2991,68 @@ impl VideoShaderRenderer {
             .geometry
             .as_ref()
             .context("video shader geometry was not created")?;
-        let yuv = plane_1.is_some();
+        let yuv =
+            plane_1.is_some() || matches!(view.input_format, DXGI_FORMAT_AYUV | DXGI_FORMAT_Y410);
         let mut desc = D3D11_TEXTURE2D_DESC::default();
         unsafe { texture.GetDesc(&raw mut desc) };
-        let pixel_shader = if yuv && desc.ArraySize > 1 {
+        let pixel_shader = if view.input_format == DXGI_FORMAT_AYUV {
+            if desc.ArraySize > 1 {
+                &self.ayuv_array_pixel_shader
+            } else {
+                &self.ayuv_pixel_shader
+            }
+        } else if view.input_format == DXGI_FORMAT_Y410 {
+            if desc.ArraySize > 1 {
+                &self.y410_array_pixel_shader
+            } else {
+                &self.y410_pixel_shader
+            }
+        } else if yuv && desc.ArraySize > 1 {
             &self.yuv_array_pixel_shader
         } else if yuv {
             &self.yuv_pixel_shader
         } else {
             &self.rgba_pixel_shader
         };
-        let color_buffer = if yuv {
-            let bit_depth = if view.input_format == DXGI_FORMAT_P010 {
+        let color_buffer = if yuv || view.color.hdr_peak_nits.is_some() {
+            let bit_depth = if matches!(view.input_format, DXGI_FORMAT_P010 | DXGI_FORMAT_Y410) {
                 10
             } else {
                 8
             };
+            let target_texture: ID3D11Texture2D = unsafe { render_target.GetResource() }?.cast()?;
+            let mut target_desc = D3D11_TEXTURE2D_DESC::default();
+            unsafe {
+                target_texture.GetDesc(&mut target_desc);
+            }
+            let hdr_output = target_desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT;
             if self
                 .color_buffer
                 .as_ref()
-                .is_none_or(|(color, depth, _)| *color != view.color || *depth != bit_depth)
+                .is_none_or(|(color, depth, output, _)| {
+                    *color != view.color || *depth != bit_depth || *output != hdr_output
+                })
             {
                 let buffer = create_video_constant_buffer(
                     device,
                     VideoColorTransform {
                         rows: view.color.transform(bit_depth),
+                        hdr: [
+                            view.color
+                                .hdr_peak_nits
+                                .map_or(0.0, |_| if hdr_output { 1.0 } else { 2.0 }),
+                            view.color.hdr_peak_nits.unwrap_or(1000) as f32,
+                            0.0,
+                            0.0,
+                        ],
                     },
                 )?;
                 tracing::info!(color = ?view.color, bit_depth, "updated video YUV color transform");
-                self.color_buffer = Some((view.color, bit_depth, buffer));
+                self.color_buffer = Some((view.color, bit_depth, hdr_output, buffer));
             }
             self.color_buffer
                 .as_ref()
-                .map(|(_, _, buffer)| buffer.clone())
+                .map(|(_, _, _, buffer)| buffer.clone())
         } else {
             None
         };
@@ -2756,30 +3109,29 @@ impl VideoShaderRenderer {
         texture: &ID3D11Texture2D,
         view: &VideoTextureView,
     ) -> Result<(ID3D11ShaderResourceView, Option<ID3D11ShaderResourceView>)> {
-        let texture_key = Interface::as_raw(texture) as usize;
+        let texture_key = texture.as_raw() as usize;
         if let Some(index) = self.views.iter().position(|cached| {
             cached.texture_key == texture_key
                 && cached.array_slice == view.array_slice
                 && cached.format == view.input_format
         }) {
-            let cached = self
-                .views
-                .remove(index)
-                .expect("cached video SRV index was checked");
+            let cached = self.views.remove(index).expect("checked SRV cache index");
             let result = (cached.plane_0.clone(), cached.plane_1.clone());
             self.views.push_back(cached);
             return Ok(result);
         }
-        let (plane_0_format, plane_1_format) = match view.input_format {
+        let (y_format, uv_format) = match view.input_format {
             DXGI_FORMAT_NV12 => (DXGI_FORMAT_R8_UNORM, Some(DXGI_FORMAT_R8G8_UNORM)),
             DXGI_FORMAT_P010 => (DXGI_FORMAT_R16_UNORM, Some(DXGI_FORMAT_R16G16_UNORM)),
+            DXGI_FORMAT_AYUV => (DXGI_FORMAT_R8G8B8A8_UNORM, None),
+            DXGI_FORMAT_Y410 => (DXGI_FORMAT_R10G10B10A2_UNORM, None),
             DXGI_FORMAT_R8G8B8A8_UNORM => (DXGI_FORMAT_R8G8B8A8_UNORM, None),
             DXGI_FORMAT_R16G16B16A16_FLOAT => (DXGI_FORMAT_R16G16B16A16_FLOAT, None),
             format => bail!("unsupported D3D11 shader input format {format:?}"),
         };
         let plane_0 =
-            create_video_shader_resource_view(device, texture, plane_0_format, view.array_slice)?;
-        let plane_1 = plane_1_format
+            create_video_shader_resource_view(device, texture, y_format, view.array_slice)?;
+        let plane_1 = uv_format
             .map(|format| {
                 create_video_shader_resource_view(device, texture, format, view.array_slice)
             })
@@ -2955,15 +3307,32 @@ impl D3D11Presenter {
         surface.belongs_to_device(&self.device)
     }
 
-    fn for_frame(hwnd: isize, size: PhysicalSize<u32>, frame: &DecodedVideoFrame) -> Result<Self> {
+    fn for_frame(
+        hwnd: isize,
+        size: PhysicalSize<u32>,
+        frame: &DecodedVideoFrame,
+        cpu_device: &Mutex<Option<(ID3D11Device, ID3D11DeviceContext)>>,
+    ) -> Result<Self> {
         let (device, context) = match &frame.surface {
             RenderSurface::D3D11(surface) if surface.shared_handle().is_none() => {
                 (surface.device().clone(), surface.context().clone())
             }
             RenderSurface::D3D11(surface) => surface.create_renderer_device()?,
             RenderSurface::CpuRgba8(_) => {
-                crate::decoder::windows_surface::D3D11SurfaceWriter::new()?
-                    .create_renderer_device()?
+                let mut cached = mutex_lock(cpu_device);
+                if cached
+                    .as_ref()
+                    .is_some_and(|(device, _)| unsafe { device.GetDeviceRemovedReason().is_err() })
+                {
+                    cached.take();
+                }
+                if cached.is_none() {
+                    *cached = Some(
+                        crate::decoder::windows_surface::D3D11SurfaceWriter::new()?
+                            .create_renderer_device()?,
+                    );
+                }
+                cached.as_ref().expect("CPU presentation device").clone()
             }
         };
         Self::from_device_for_window(HWND(hwnd as *mut std::ffi::c_void), size, device, context)
@@ -2996,6 +3365,13 @@ impl D3D11Presenter {
         };
         let video_renderer = VideoShaderRenderer::new(&device)?;
         Ok(Self {
+            hwnd,
+            hdr_output: false,
+            input_hdr: false,
+            hdr_output_unavailable: false,
+            output_monitor: 0,
+            output_monitor_hdr: false,
+            output_hdr_checked: None,
             device,
             context,
             swap_chain,
@@ -3115,6 +3491,10 @@ impl D3D11Presenter {
     ) -> Result<(ID3D11Texture2D, u32)> {
         self.release_active_input_sync();
         if self.accepts_surface(surface) {
+            self.active_input_sync = crate::decoder::windows_surface::acquire_owned_texture_sync(
+                surface.texture(),
+                OFFICIAL_TEXTURE_SYNC_TIMEOUT_MS,
+            )?;
             return Ok((surface.texture().clone(), surface.subresource()));
         }
         let handle = surface
@@ -3270,6 +3650,17 @@ impl D3D11Presenter {
     }
 
     fn draw_texture(&mut self, texture: &ID3D11Texture2D, view: VideoTextureView) -> Result<()> {
+        let hdr = view.color.hdr_peak_nits.is_some();
+        self.ensure_output_color(hdr)?;
+        if self.input_hdr != hdr {
+            // Effect/history surfaces carry different transfer functions across
+            // SDR/HDR. Never present an old gamma frame as linear HDR, or vice versa.
+            self.effects = None;
+            self.effect_revision = u64::MAX;
+            self.effects_cache_revision = 0;
+            self.captures = plugin_video::Captures::default();
+            self.input_hdr = hdr;
+        }
         let state = self.plugin_state.clone();
         if let Some(state) = &state {
             let graph = state.graph.try_lock().ok().map(|g| g.clone());
@@ -3437,6 +3828,98 @@ impl D3D11Presenter {
         if size == self.size {
             return Ok(());
         }
+        self.resize_backbuffer(
+            size,
+            if self.hdr_output {
+                DXGI_FORMAT_R16G16B16A16_FLOAT
+            } else {
+                DXGI_FORMAT_B8G8R8A8_UNORM
+            },
+        )?;
+        if self.hdr_output {
+            unsafe {
+                self.swap_chain
+                    .cast::<IDXGISwapChain3>()?
+                    .SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709)
+            }
+            .context("preserve scRGB color space after resizing")?;
+        }
+        Ok(())
+    }
+
+    fn ensure_output_color(&mut self, hdr_source: bool) -> Result<()> {
+        if hdr_source {
+            let monitor =
+                unsafe { MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONEAREST) }.0 as isize;
+            if monitor != self.output_monitor
+                || self
+                    .output_hdr_checked
+                    .is_none_or(|checked| checked.elapsed() >= Duration::from_secs(1))
+            {
+                // Capability polling is independent of decoding; also refresh
+                // immediately when the window moves to a different monitor.
+                let enabled = crate::display_hdr::monitor_is_hdr(monitor);
+                if monitor != self.output_monitor || enabled != self.output_monitor_hdr {
+                    self.hdr_output_unavailable = false;
+                }
+                self.output_monitor = monitor;
+                self.output_monitor_hdr = enabled;
+                self.output_hdr_checked = Some(Instant::now());
+            }
+        }
+        let requested = hdr_source && self.output_monitor_hdr && !self.hdr_output_unavailable;
+        if requested == self.hdr_output {
+            return Ok(());
+        }
+        let chain = self.swap_chain.cast::<IDXGISwapChain3>().ok();
+        if requested {
+            if chain.is_none() {
+                self.hdr_output_unavailable = true;
+                return Ok(());
+            }
+            let result = self
+                .resize_backbuffer(self.size, DXGI_FORMAT_R16G16B16A16_FLOAT)
+                .and_then(|_| {
+                    let chain = chain.as_ref().unwrap();
+                    let flags = unsafe {
+                        chain.CheckColorSpaceSupport(DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709)
+                    }?;
+                    anyhow::ensure!(
+                        flags & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT.0 as u32 != 0,
+                        "swap chain does not support scRGB presentation"
+                    );
+                    unsafe { chain.SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709) }
+                        .context("select scRGB HDR color space")
+                });
+            if let Err(error) = result {
+                if is_device_lost(&error) {
+                    return Err(error);
+                }
+                self.hdr_output_unavailable = true;
+                self.resize_backbuffer(self.size, DXGI_FORMAT_B8G8R8A8_UNORM)?;
+                if let Some(chain) = &chain {
+                    unsafe { chain.SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709) }?;
+                }
+                tracing::warn!(%error,"HDR swap chain unavailable; using SDR tone mapping");
+                return Ok(());
+            }
+        } else {
+            self.resize_backbuffer(self.size, DXGI_FORMAT_B8G8R8A8_UNORM)?;
+            if let Some(chain) = &chain {
+                unsafe { chain.SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709) }
+                    .context("restore SDR color space")?;
+            }
+        }
+        self.hdr_output = requested;
+        tracing::info!(
+            hdr_output = self.hdr_output,
+            hdr_source,
+            "updated native display color output"
+        );
+        Ok(())
+    }
+
+    fn resize_backbuffer(&mut self, size: PhysicalSize<u32>, format: DXGI_FORMAT) -> Result<()> {
         self.video_renderer.reset_geometry();
         // ResizeBuffers requires every immediate-context reference to the old
         // backbuffer/output view to be released. The video renderer
@@ -3453,7 +3936,7 @@ impl D3D11Presenter {
                 self.buffer_count,
                 buffer_size.width,
                 buffer_size.height,
-                DXGI_FORMAT_B8G8R8A8_UNORM,
+                format,
                 self.swap_chain_flags,
             )
         }
@@ -3461,6 +3944,12 @@ impl D3D11Presenter {
         let (backbuffer, target) = create_backbuffer(&self.device, &self.swap_chain)?;
         self.backbuffer = Some(backbuffer);
         self.render_target = Some(target);
+        if let Some(target) = &self.render_target {
+            unsafe {
+                self.context
+                    .ClearRenderTargetView(target, &[0.0, 0.0, 0.0, 1.0]);
+            }
+        }
         self.size = size;
         Ok(())
     }

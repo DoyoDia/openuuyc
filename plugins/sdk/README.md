@@ -56,7 +56,7 @@ SDK 定义清单格式、节点类型、C ABI 和数据结构。完整声明见 
 openuuyc_plugin_api::embed_manifest!(include_bytes!("../manifest.json"));
 ```
 
-宏把清单放入只读段 `.oumeta`；macOS 的段名为 `__oumeta`。宿主读取该段时不执行 DLL。清单容器版本与执行 ABI 分别检查，JSON 大小上限为 64 KiB。源码中的 JSON 不需要随 DLL 分发。
+宏把清单放入 Windows DLL 的只读段 `.oumeta`。宿主读取该段时不执行 DLL。清单容器版本与执行 ABI 分别检查，JSON 大小上限为 64 KiB。源码中的 JSON 不需要随 DLL 分发。
 
 ## 3. 参数和依赖
 

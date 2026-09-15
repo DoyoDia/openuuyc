@@ -1,4 +1,4 @@
-//! Rust D3D11 decoding for all Windows hardware playback.
+//! Rust D3D11 decoding for Windows 4:2:0 / HEVC 4:4:4 hardware playback.
 //! Hardware preparation never calls the native video bridge.
 mod avc;
 pub(super) mod dxva;
@@ -57,6 +57,7 @@ impl Session {
         w: u32,
         h: u32,
         depth: u8,
+        chroma: u8,
     ) -> bool {
         let GpuDeviceHandle::DirectX11(handle) = handle else {
             return false;
@@ -70,7 +71,7 @@ impl Session {
             CodecKind::Hevc => dxva::Codec::Hevc,
             _ => return false,
         };
-        dxva::Pool::probe(device, codec, w, h, depth).is_ok()
+        dxva::Pool::probe(device, codec, w, h, depth, chroma).is_ok()
     }
     pub(super) fn push(
         &mut self,

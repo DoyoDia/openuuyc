@@ -215,7 +215,7 @@ impl Avc {
         {
             ensure!(self.refs.is_empty(), "pool resize requires reference reset");
             self.pool = Some(
-                Pool::new(self.device.clone(), Codec::H264, width, height, 8, count)
+                Pool::new(self.device.clone(), Codec::H264, width, height, 8, 1, count)
                     .map_err(|e| e.context(Failure::HardwareFailure))?,
             );
         }

@@ -66,6 +66,8 @@ pub(crate) struct ControlMode {
 #[derive(Clone, Default, Deserialize)]
 pub(crate) struct JoinReply {
     #[serde(default)]
+    pub international_connect: bool,
+    #[serde(default)]
     pub token: String,
     #[serde(default)]
     pub share_id: String,
@@ -77,7 +79,7 @@ pub(crate) struct JoinReply {
     pub ws_connect_timeout_ms: i32,
     #[serde(default)]
     pub streamer_retry_delta_ms: i32,
-    #[serde(default = "windows_platform")]
+    #[serde(default)]
     pub publisher_platform: i32,
     #[serde(default)]
     pub publisher_version_name: String,
@@ -85,9 +87,6 @@ pub(crate) struct JoinReply {
     pub publisher_device_id: String,
     #[serde(default)]
     pub control_id: String,
-}
-fn windows_platform() -> i32 {
-    1
 }
 impl JoinReply {
     pub(crate) fn validate(&self, controller_id: &str) -> Result<()> {

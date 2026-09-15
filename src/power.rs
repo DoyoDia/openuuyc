@@ -20,7 +20,11 @@ impl PowerAction {
         }
     }
 
-    pub fn check(self, device: &DeviceInfo) -> Result<()> {
+    pub fn check(
+        self,
+        device: &DeviceInfo,
+        features: &crate::feature_ability::FeatureCatalog,
+    ) -> Result<()> {
         device.validated_device_id()?;
         if !matches!(device.platform, 1 | 4) || !device.controlled_support {
             bail!("该设备不支持电脑电源操作");
@@ -38,17 +42,16 @@ impl PowerAction {
                 }
             }
             Self::Shutdown | Self::Reboot => {
-                // G's shipped feature matrix declares these for platform 1
-                // starting at 1.0.0, but not for macOS (4). Cloud (51) excluded.
-                if device.platform != 1 {
-                    bail!("原版能力表未开放该平台的关机和重启");
-                }
-                let version = device.version_name.split('.').collect::<Vec<_>>();
-                if version.len() < 3
-                    || !version.iter().all(|part| part.parse::<u32>().is_ok())
-                    || version[0].parse::<u32>().unwrap_or(0) < 1
+                let feature = if self == Self::Shutdown {
+                    crate::feature_ability::Feature::Shutdown
+                } else {
+                    crate::feature_ability::Feature::Reboot
+                };
+                if !features
+                    .policy(device.platform, &device.version_name)
+                    .supports(feature)
                 {
-                    bail!("设备版本未知或不支持该电源操作，请刷新或更新被控端");
+                    bail!("官方当前能力配置不支持该设备的电源操作");
                 }
                 if !device.is_connected() {
                     bail!("只有在线设备可以关机或重启");

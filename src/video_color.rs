@@ -1,5 +1,5 @@
 //! UU color-space RTP extension and the renderer's SDR conversion policy.
-//! Evidence: 314602/32B5D2/32C82E/C9A0D0, streamer 4.38.3.9325.
+//! Contract evidence: docs/official-440-controller-route.md.
 
 pub(crate) const COLOR_SPACE_URI: &str = "http://www.webrtc.org/experiments/rtp-hdrext/color-space";
 
@@ -9,6 +9,16 @@ pub(crate) struct VideoColorSpace {
     pub transfer: u8,
     pub matrix: u8,
     pub range: u8,
+    pub hdr_metadata: Option<HdrMetadata>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HdrMetadata {
+    pub max_luminance: u16,
+    pub min_luminance: u16,
+    pub chromaticity: [u16; 8],
+    pub max_content_light_level: u16,
+    pub max_frame_average_light_level: u16,
 }
 
 impl VideoColorSpace {
@@ -27,9 +37,9 @@ impl VideoColorSpace {
         {
             return None;
         }
-        if payload.len() == 28 {
+        let hdr_metadata = if payload.len() == 28 {
             // Validate the optional mastering metadata as the native parser
-            // does, even though HDR output is not enabled by this client.
+            // does. Keep it with the frame for HDR/SDR output selection.
             let word = |index| u16::from_be_bytes([payload[index], payload[index + 1]]);
             if word(4) > 20_000
                 || word(6) > 50_000
@@ -39,12 +49,22 @@ impl VideoColorSpace {
             {
                 return None;
             }
-        }
+            Some(HdrMetadata {
+                max_luminance: word(4),
+                min_luminance: word(6),
+                chromaticity: std::array::from_fn(|index| word(8 + index * 2)),
+                max_content_light_level: word(24),
+                max_frame_average_light_level: word(26),
+            })
+        } else {
+            None
+        };
         Some(Self {
             primaries,
             transfer,
             matrix,
             range: (flags >> 4) & 3,
+            hdr_metadata,
         })
     }
 
@@ -57,6 +77,8 @@ impl VideoColorSpace {
                 _ => ColorMatrix::Bt601,
             },
             full_range: self.range == 2,
+            hdr_peak_nits: (self.transfer == 16)
+                .then(|| self.hdr_metadata.map_or(1000, |meta| meta.max_luminance)),
         }
     }
 }
@@ -73,11 +95,14 @@ pub(crate) enum ColorMatrix {
 pub(crate) struct RenderColor {
     pub matrix: ColorMatrix,
     pub full_range: bool,
+    /// SMPTE ST 2084 (PQ), as produced by UU's Windows HDR capture path.
+    /// None means SDR, including ordinary 10-bit SDR fixtures.
+    pub hdr_peak_nits: Option<u16>,
 }
 
 impl RenderColor {
     /// Affine YUV->RGB rows, for normalized NV12 or high-aligned P010 samples.
-    #[cfg(windows)]
+
     pub(crate) fn transform(self, bit_depth: u8) -> [[f32; 4]; 3] {
         let (sample_scale, black, luma_span, center, chroma_span) =
             match (bit_depth, self.full_range) {

@@ -2,7 +2,7 @@
 use super::LocalDisplayInfo;
 use bytes::Bytes;
 use std::sync::mpsc::{self, Receiver};
-#[cfg(any(windows, target_os = "macos"))]
+
 use std::{
     process::{Command, Stdio},
     time::{Duration, Instant},
@@ -111,13 +111,13 @@ impl LocalDiagnostics {
 
 // Fixed read-only system queries, bounded and hidden; no shell interpolation
 // of device/account data. Collection happens once, outside the UI thread.
-#[cfg(any(windows, target_os = "macos"))]
+
 fn read_command(mut command: Command) -> Option<String> {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    #[cfg(windows)]
+
     {
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x08000000);
@@ -147,7 +147,7 @@ fn hardware() -> Vec<(String, String)> {
         "运行平台".into(),
         format!("{} / {}", std::env::consts::OS, std::env::consts::ARCH),
     )];
-    #[cfg(windows)]
+
     {
         let mut command = Command::new("powershell.exe");
         command.args(["-NoProfile", "-NonInteractive", "-Command", "[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); $ErrorActionPreference='Stop'; $os = Get-CimInstance Win32_OperatingSystem; $cpu = Get-ItemProperty -LiteralPath 'HKLM:\\HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0'; @{os=($os.Caption + ' ' + $os.Version);cpu=$cpu.ProcessorNameString;memory=[math]::Round($os.TotalVisibleMemorySize / 1MB, 1)} | ConvertTo-Json -Compress"]);
@@ -166,59 +166,6 @@ fn hardware() -> Vec<(String, String)> {
             rows.push(("硬件信息".into(), "系统查询失败或超时".into()));
         }
     }
-    #[cfg(target_os = "linux")]
-    {
-        if let Ok(cpu) = std::fs::read_to_string("/proc/cpuinfo") {
-            if let Some(value) = cpu.lines().find_map(|l| {
-                l.strip_prefix("model name")
-                    .and_then(|v| v.split_once(':'))
-                    .map(|(_, v)| v.trim())
-            }) {
-                rows.push(("处理器".into(), value.into()));
-            }
-        }
-        if let Ok(mem) = std::fs::read_to_string("/proc/meminfo") {
-            if let Some(kib) = mem
-                .lines()
-                .find_map(|l| l.strip_prefix("MemTotal:"))
-                .and_then(|v| v.split_whitespace().next())
-                .and_then(|v| v.parse::<f64>().ok())
-            {
-                rows.push(("物理内存".into(), format!("{:.1} GiB", kib / 1048576.0)));
-            }
-        }
-        if let Ok(os) = std::fs::read_to_string("/etc/os-release") {
-            if let Some(name) = os.lines().find_map(|l| l.strip_prefix("PRETTY_NAME=")) {
-                rows.push(("操作系统".into(), name.trim_matches('"').into()));
-            }
-        }
-    }
-    #[cfg(target_os = "macos")]
-    {
-        for (label, program, args) in [
-            ("操作系统", "/usr/bin/sw_vers", vec!["-productVersion"]),
-            (
-                "处理器",
-                "/usr/sbin/sysctl",
-                vec!["-n", "machdep.cpu.brand_string"],
-            ),
-            ("物理内存", "/usr/sbin/sysctl", vec!["-n", "hw.memsize"]),
-        ] {
-            let mut cmd = Command::new(program);
-            cmd.args(args);
-            if let Some(value) = read_command(cmd) {
-                let value = if label == "物理内存" {
-                    value
-                        .trim()
-                        .parse::<f64>()
-                        .map(|v| format!("{:.1} GiB", v / 1073741824.0))
-                        .unwrap_or_else(|_| "未提供".into())
-                } else {
-                    value.trim().to_owned()
-                };
-                rows.push((label.into(), value));
-            }
-        }
-    }
+
     rows
 }

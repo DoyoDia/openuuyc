@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use tokio::sync::{mpsc, Mutex};
 use waitgroup::WaitGroup;
@@ -47,6 +47,14 @@ impl ReportBuilder {
 
     fn build_rr(&self) -> ReceiverReport {
         let (close_tx, close_rx) = mpsc::channel(1);
+        // UU 4.40 329B3C/329DEA use the same Clock for RTP statistics and
+        // the eight-second report expiry. SR receipt and DLSR must use that
+        // clock too: mixing anchored RTP time with live wall time makes an
+        // OS clock adjustment look like media inactivity or RTCP delay.
+        let now = self.now.clone().unwrap_or_else(|| {
+            let anchor = (Instant::now(), SystemTime::now());
+            Arc::new(move || anchor.1 + anchor.0.elapsed())
+        });
         ReceiverReport {
             internal: Arc::new(ReceiverReportInternal {
                 interval: if let Some(interval) = &self.interval {
@@ -54,7 +62,7 @@ impl ReportBuilder {
                 } else {
                     Duration::from_secs(1)
                 },
-                now: self.now.clone(),
+                now: Some(now),
                 streams: Mutex::new(HashMap::new()),
                 close_rx: Mutex::new(Some(close_rx)),
                 media_intervals: self.media_intervals,

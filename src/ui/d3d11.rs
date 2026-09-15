@@ -25,6 +25,7 @@ pub(crate) struct UiPresenter {
     visual: IDCompositionVisual,
     pending_output: Option<egui_directx11::RendererOutput>,
     pending_present: bool,
+    attached: bool,
 }
 
 impl UiPresenter {
@@ -61,8 +62,6 @@ impl UiPresenter {
         let visual = unsafe { composition.CreateVisual() }?;
         unsafe {
             visual.SetContent(&swap_chain)?;
-            composition_target.SetRoot(&visual)?;
-            composition.Commit()?;
         }
         let (backbuffer, target) = create_backbuffer(&device, &swap_chain)?;
         let renderer = egui_directx11::Renderer::new(&device)?;
@@ -79,6 +78,7 @@ impl UiPresenter {
             visual,
             pending_output: None,
             pending_present: false,
+            attached: false,
         })
     }
 
@@ -173,6 +173,14 @@ impl UiPresenter {
             );
         }
         status.ok().context("present player UI layer")?;
+        if !self.attached {
+            // Do not expose an uninitialized swap chain during startup or replacement.
+            unsafe {
+                self.composition_target.SetRoot(&self.visual)?;
+                self.composition.Commit()?;
+            }
+            self.attached = true;
+        }
         self.pending_present = false;
         Ok(true)
     }

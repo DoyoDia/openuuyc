@@ -97,6 +97,7 @@ pub struct DTLSConn {
     pub(crate) flights: Option<Vec<Packet>>,
     pub(crate) cfg: HandshakeConfig,
     pub(crate) retransmit: bool,
+    pub(crate) current_retransmit_interval: Duration,
     // use additional oneshot sender to mimic rendezvous channel behavior
     pub(crate) handshake_rx: mpsc::Receiver<(oneshot::Sender<()>, mpsc::Sender<()>)>,
 
@@ -258,6 +259,7 @@ impl DTLSConn {
                 .unwrap(),
             ),
             retransmit_interval,
+            retransmit_interval_max: config.flight_interval_max,
             //log: logger,
             initial_epoch: 0,
             ..Default::default()
@@ -318,6 +320,7 @@ impl DTLSConn {
             flights: None,
             cfg,
             retransmit: false,
+            current_retransmit_interval: retransmit_interval,
             handshake_rx,
             packet_tx,
             handle_queue_tx,

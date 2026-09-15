@@ -345,6 +345,16 @@ impl RTCDtlsTransport {
         };
         self.state_change(RTCDtlsTransportState::Connecting).await;
 
+        // UU 4.40: 374C02 waits for writable ICE; 3759FA clamps its measured
+        // selected-pair RTT to 25..50 ms. No measurement retains the adapter's
+        // 25 ms default (3A0C14). 3A1272 doubles retries, capped at 500 ms.
+        let rtt = self.ice_transport.selected_pair_rtt().await;
+        let flight_interval = rtt.unwrap_or(std::time::Duration::from_millis(25)).clamp(
+            std::time::Duration::from_millis(25),
+            std::time::Duration::from_millis(50),
+        );
+        log::debug!("UU DTLS initial retransmission interval: {flight_interval:?}, measured ICE RTT: {rtt:?}");
+
         Ok((
             self.role().await,
             dtls::config::Config {
@@ -361,6 +371,8 @@ impl RTCDtlsTransport {
                 client_auth: ClientAuthType::RequireAnyClientCert,
                 insecure_skip_verify: true,
                 insecure_verification: self.setting_engine.allow_insecure_verification_algorithm,
+                flight_interval,
+                flight_interval_max: Some(std::time::Duration::from_millis(500)),
                 ..Default::default()
             },
         ))

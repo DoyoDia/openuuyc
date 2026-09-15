@@ -11,6 +11,7 @@ enum TabCommand {
 
 #[derive(Default)]
 pub(super) struct ScreenTabBar {
+    pub(super) device_switch: Option<super::super::device_switch::DeviceSwitcher>,
     pub tabs: Vec<(i32, String)>,
     selected: i32,
     pending: Option<i32>,
@@ -22,9 +23,14 @@ pub(super) struct ScreenTabBar {
 impl ScreenTabBar {
     pub(super) fn is_pending(&self) -> bool {
         self.pending.is_some()
+            || self
+                .device_switch
+                .as_ref()
+                .is_some_and(|switcher| switcher.is_switching())
     }
 
-    pub fn draw(&mut self, ui: &mut egui::Ui, window: &Window) {
+    pub fn draw(&mut self, ui: &mut egui::Ui, window: &Window, control: &StreamControlHandle) {
+        let snapshot = control.snapshot();
         let width = ui.available_width();
         let mut row = ui.new_child(
             egui::UiBuilder::new()
@@ -46,37 +52,65 @@ impl ScreenTabBar {
                 ui.horizontal_centered(|ui| {
                     for (id, name) in &self.tabs {
                         let selected = self.selected == *id;
-                        let label = if self.pending == Some(*id) {
-                            format!("{name} …")
-                        } else {
-                            name.clone()
-                        };
-                        let response = ui
-                            .add_sized(
-                                [140.0, 28.0],
-                                egui::Button::new(egui::RichText::new(label).size(12.0))
-                                    .selected(selected)
-                                    .truncate()
-                                    .sense(if self.software_only {
-                                        egui::Sense::click()
-                                    } else {
-                                        egui::Sense::click_and_drag()
-                                    }),
-                            )
-                            .on_hover_text(name);
-                        if response.clicked() {
+                        let pending =
+                            self.pending == Some(*id) || control.display_change_pending(*id);
+                        let closable = snapshot.ready
+                            && snapshot.dpi_settings_supported
+                            && snapshot.screens.len() > 1
+                            && (!snapshot.topology.pending || snapshot.topology.dismissed)
+                            && snapshot
+                                .screens
+                                .iter()
+                                .any(|s| s.id == *id && s.display.screen_type == 1);
+                        let (response, close_clicked) = ui
+                            .push_id(("screen-tab", *id), |ui| {
+                                crate::ui::controls::screen_tab(
+                                    ui,
+                                    name,
+                                    selected,
+                                    pending,
+                                    !self.software_only,
+                                    closable,
+                                )
+                            })
+                            .inner;
+                        let response = response.on_hover_text(name);
+                        if close_clicked {
+                            super::super::stream_menu::topology_menu::request(
+                                ui.ctx(),
+                                control,
+                                *id,
+                                crate::stream_control::DisplayTopologyAction::Remove {
+                                    screen_id: *id,
+                                },
+                            );
+                        } else if response.clicked() {
                             self.command = Some(TabCommand::Select(*id));
                         }
                         response.context_menu(|ui| {
-                            if ui
-                                .add_enabled(
-                                    !self.software_only,
-                                    egui::Button::new("在独立窗口打开"),
-                                )
-                                .on_disabled_hover_text(
-                                    "软解仅允许一个播放窗口，请使用标签切换屏幕",
-                                )
-                                .clicked()
+                            super::super::stream_menu::menu_style(ui);
+                            ui.set_width(crate::ui::theme::CONTEXT_MENU_WIDTH);
+                            if let Some(error) = super::super::stream_menu::tab_display_menu(
+                                ui,
+                                control,
+                                *id,
+                                window
+                                    .current_monitor()
+                                    .map(|m| (m.size().width, m.size().height)),
+                            ) {
+                                self.error = Some(error);
+                            }
+                            ui.separator();
+                            if crate::ui::controls::menu_row(
+                                ui,
+                                "在独立窗口打开",
+                                "",
+                                None,
+                                !self.software_only,
+                                false,
+                            )
+                            .on_disabled_hover_text("软解仅允许一个播放窗口，请使用标签切换屏幕")
+                            .clicked()
                             {
                                 if let Ok(origin) = window.outer_position() {
                                     self.command = Some(TabCommand::Detach(
@@ -106,12 +140,44 @@ impl ScreenTabBar {
                             let _ = unsafe { ReleaseCapture() };
                         }
                     }
+                    let snapshot = control.snapshot();
+                    if snapshot.topology_support.create_visible
+                        && crate::ui::controls::screen_add(
+                            ui,
+                            snapshot.ready
+                                && snapshot.topology_support.create
+                                && (!snapshot.topology.pending || snapshot.topology.dismissed),
+                        )
+                        .on_hover_text("添加虚拟屏")
+                        .on_disabled_hover_text(
+                            snapshot
+                                .topology_support
+                                .create_unavailable
+                                .unwrap_or("正在处理显示器操作"),
+                        )
+                        .clicked()
+                    {
+                        let (width, height, _) =
+                            super::super::stream_menu::topology_menu::local_parameters(
+                                ui.ctx(),
+                                control,
+                                window
+                                    .current_monitor()
+                                    .map(|m| (m.size().width, m.size().height)),
+                            );
+                        super::super::stream_menu::topology_menu::request(
+                            ui.ctx(),
+                            control,
+                            self.selected,
+                            crate::stream_control::DisplayTopologyAction::Create { width, height },
+                        );
+                    }
                 });
             });
         if let Some(error) = self.error.clone() {
             egui::Modal::new(ui.id().with("screen-error")).show(ui.ctx(), |ui| {
                 ui.set_width(300.0);
-                ui.heading("无法显示屏幕");
+                ui.heading("显示器操作失败");
                 ui.add_space(12.0);
                 ui.label(error);
                 ui.add_space(16.0);
@@ -141,6 +207,7 @@ struct ScreenWindow {
     pending: Option<PendingScreen>,
     tabs: Vec<i32>,
     selected: Option<i32>,
+    failed_screen: Option<(i32, i32, i32)>,
     close: bool,
     last_frame: Option<Instant>,
     repaint: Option<Instant>,
@@ -158,6 +225,9 @@ pub(super) struct ScreenWindows {
     generation: u64,
     next_refresh: Instant,
     catalog: Vec<RemoteScreen>,
+    topology_sequence: Option<i64>,
+    topology_owner: Option<WindowId>,
+    topology_focused: Option<i32>,
 }
 
 impl ScreenWindows {
@@ -173,7 +243,7 @@ impl ScreenWindows {
             .take_screen_playback()
             .context("screen playback owner unavailable")?;
         let shutdown = Arc::clone(&session.shutdown);
-        let screen_id = session.screen_id;
+        let screen_id = session.screen_id();
         let session = Arc::new(session);
         factory.register(Arc::clone(&session));
         let app = ThreadedWindowsApp::from_session(
@@ -189,6 +259,7 @@ impl ScreenWindows {
             pending: None,
             tabs,
             selected: Some(screen_id),
+            failed_screen: None,
             close: false,
             last_frame: None,
             repaint: Some(Instant::now()),
@@ -205,14 +276,33 @@ impl ScreenWindows {
             generation,
             next_refresh: Instant::now(),
             catalog,
+            topology_sequence: None,
+            topology_owner: None,
+            topology_focused: None,
         };
         group.sync_bars();
         Ok(group)
     }
 
-    pub fn take_window(&mut self) -> Option<Window> {
-        let id = self.windows.keys().next().copied()?;
+    pub fn viewer_preferences(&self, preferred: Option<WindowId>) -> ViewerPreferences {
+        preferred
+            .and_then(|id| self.windows.get(&id))
+            .or_else(|| self.windows.values().next())
+            .and_then(|slot| slot.app.as_ref())
+            .map_or(self.preferences, |app| ViewerPreferences {
+                performance_mode: app.performance_mode,
+                aspect_locked: app.aspect_locked,
+            })
+    }
+
+    pub fn take_window(&mut self, preferred: Option<WindowId>) -> Option<Window> {
+        let id = preferred
+            .filter(|id| self.windows.contains_key(id))
+            .or_else(|| self.windows.keys().next().copied())?;
         let mut slot = self.windows.remove(&id)?;
+        if let Some(app) = slot.app.as_mut() {
+            app.mouse.release(&slot.window);
+        }
         slot.app.take();
         slot.pending.take();
         Some(slot.window)
@@ -302,12 +392,15 @@ impl ScreenWindows {
     }
 
     fn begin_screen(&mut self, window: WindowId, screen_id: i32) -> Result<()> {
+        let switch_started = Instant::now();
+        tracing::debug!(screen_id, "screen switch begin");
         let screen = self
             .catalog
             .iter()
             .find(|screen| screen.id == screen_id)
             .context("显示器已断开")?;
         let slot = self.windows.get_mut(&window).context("窗口已关闭")?;
+        slot.failed_screen = None;
         if slot.selected == Some(screen_id) && slot.app.is_some() {
             slot.pending.take();
             if let Some(app) = slot.app.as_mut() {
@@ -323,6 +416,10 @@ impl ScreenWindows {
             return Ok(());
         }
         let cancelled_pending = slot.pending.take().map(|pending| pending.id);
+        if let Some(app) = slot.app.as_ref() {
+            app.stream_control
+                .cancel_display_change(app._session.screen_id());
+        }
         if let Some(app) = slot.app.as_mut() {
             app.mouse.release(&slot.window);
         }
@@ -335,25 +432,39 @@ impl ScreenWindows {
         let (connecting, display) = if slot.app.is_some() {
             (
                 None,
-                ViewerDisplayHandle {
-                    surface_writer: Some(
-                        crate::decoder::windows_surface::D3D11SurfaceWriter::new()?
-                    ),
-                },
+                // Cached tracks need no new device. New decoders choose their
+                // device on the decoder worker, outside the UI event thread.
+                ViewerDisplayHandle::default(),
             )
         } else {
-            let (connecting, display) = WindowsConnectionApp::new(
+            let (mut connecting, display) = WindowsConnectionApp::new(
                 &slot.window,
                 "显示器".into(),
                 receiver,
                 self.proxy.clone(),
                 self.generation,
             )?;
+            connecting.render(&slot.window)?;
             (Some(connecting), display)
         };
-        let (task, result) =
-            self.factory
-                .open(screen_id, display, slot.selected, cancelled_pending);
+        tracing::debug!(
+            screen_id,
+            elapsed_ms = switch_started.elapsed().as_secs_f64() * 1000.0,
+            "screen switch display prepared"
+        );
+        let repaint = slot
+            .app
+            .as_ref()
+            .map(|app| app.egui_context.clone())
+            .or_else(|| connecting.as_ref().map(|app| app.egui_context.clone()))
+            .expect("screen window UI context");
+        let (task, result) = self.factory.open(
+            screen_id,
+            display,
+            slot.selected,
+            cancelled_pending,
+            move || repaint.request_repaint(),
+        );
         slot.pending = Some(PendingScreen {
             id: screen_id,
             task,
@@ -373,6 +484,8 @@ impl ScreenWindows {
         };
         slot.pending.take();
         if let Some(app) = slot.app.as_mut() {
+            app.stream_control
+                .cancel_display_change(app._session.screen_id());
             app.mouse.release(&slot.window);
         }
         slot.app.take();
@@ -421,6 +534,7 @@ impl ScreenWindows {
         let target = {
             let window = event_loop.create_window(
                 WindowAttributes::default()
+                    .with_visible(false)
                     .with_title(source.window.title())
                     .with_window_icon(Some(crate::ui::branding::window_icon()))
                     .with_decorations(false)
@@ -440,6 +554,7 @@ impl ScreenWindows {
                     pending: None,
                     tabs: Vec::new(),
                     selected: None,
+                    failed_screen: None,
                     close: false,
                     last_frame: None,
                     repaint: Some(Instant::now()),
@@ -500,6 +615,7 @@ impl ScreenWindows {
     fn sync_bars(&mut self) {
         for slot in self.windows.values_mut() {
             if let Some(app) = slot.app.as_mut() {
+                app.screen_tabs.device_switch = self.factory.device_switch.clone();
                 app.screen_tabs.software_only = app._session.is_software();
                 app.screen_tabs.tabs = slot
                     .tabs
@@ -532,6 +648,172 @@ impl ScreenWindows {
         self.factory.set_visible(visible);
     }
 
+    fn refresh_catalog(&mut self) {
+        let topology = self.factory.topology();
+        if topology.sequence != self.topology_sequence {
+            self.topology_sequence = topology.sequence;
+            self.topology_focused = None;
+            self.topology_owner = self
+                .windows
+                .iter()
+                .find(|(_, s)| s.tabs.contains(&topology.origin_screen))
+                .or_else(|| self.windows.iter().find(|(_, s)| s.window.has_focus()))
+                .map(|(id, _)| *id);
+        }
+        let actual = self.factory.screens();
+        self.catalog = actual.clone();
+        for screen in &topology.transient_screens {
+            if !self.catalog.iter().any(|s| s.id == screen.id) {
+                self.catalog.push(screen.clone());
+            }
+        }
+        if self.catalog.is_empty() {
+            return;
+        }
+        let owner = self
+            .topology_owner
+            .filter(|id| self.windows.contains_key(id))
+            .or_else(|| {
+                self.windows
+                    .iter()
+                    .find(|(_, s)| s.window.has_focus())
+                    .map(|(id, _)| *id)
+            })
+            .or_else(|| self.windows.keys().next().copied());
+        for slot in self.windows.values_mut() {
+            slot.tabs
+                .retain(|id| self.catalog.iter().any(|screen| screen.id == *id));
+            if slot
+                .pending
+                .as_ref()
+                .is_some_and(|p| !actual.iter().any(|s| s.id == p.id))
+            {
+                slot.pending.take();
+            }
+        }
+        let assigned: Vec<_> = self
+            .windows
+            .values()
+            .flat_map(|s| s.tabs.iter().copied())
+            .collect();
+        if let Some(slot) = owner.and_then(|id| self.windows.get_mut(&id)) {
+            slot.tabs.extend(
+                self.catalog
+                    .iter()
+                    .filter(|s| !assigned.contains(&s.id))
+                    .map(|s| s.id),
+            );
+        }
+        let mut topology_selection = None;
+        if self.topology_focused != topology.selected_screen
+            && topology.reported
+            && !matches!(
+                topology.action,
+                Some(crate::stream_control::DisplayTopologyAction::Remove { .. })
+            )
+            && let Some(target) = topology
+                .selected_screen
+                .filter(|id| actual.iter().any(|s| s.id == *id))
+            && let Some(owner) = owner
+        {
+            for (id, slot) in &mut self.windows {
+                if *id != owner {
+                    slot.tabs.retain(|id| *id != target);
+                }
+            }
+            if let Some(slot) = self.windows.get_mut(&owner) {
+                if !slot.tabs.contains(&target) {
+                    slot.tabs.push(target);
+                }
+                if slot
+                    .pending
+                    .as_ref()
+                    .is_some_and(|pending| pending.id != target)
+                {
+                    slot.pending.take();
+                }
+                slot.failed_screen = None;
+            }
+            // Select the new source explicitly without changing the tab order.
+            topology_selection = Some((owner, target));
+            self.topology_focused = Some(target);
+        }
+        let empty: Vec<_> = self
+            .windows
+            .iter()
+            .filter(|(_, slot)| slot.tabs.is_empty())
+            .map(|(id, _)| *id)
+            .collect();
+        for id in empty {
+            if self.windows.len() > 1 {
+                self.close_window(id);
+            }
+        }
+        let replacements: Vec<_> = self
+            .windows
+            .iter_mut()
+            .filter_map(|(id, slot)| {
+                if slot.pending.is_some() {
+                    return None;
+                }
+                let selected = topology_selection
+                    .filter(|(window, _)| window == id)
+                    .map(|(_, screen)| screen)
+                    .or(slot.selected)
+                    .and_then(|id| self.catalog.iter().find(|s| s.id == id));
+                if selected.is_some_and(|s| !actual.iter().any(|real| real.id == s.id)) {
+                    return None;
+                }
+                let target = match selected {
+                    Some(screen)
+                        if slot.app.as_ref().is_some_and(|app| {
+                            app._session.track_index == screen.video_track_index
+                                && app.bound_screen
+                                    == (screen.id as u32 as u64
+                                        | ((screen.display.screen_type as u32 as u64) << 32))
+                        }) =>
+                    {
+                        return None;
+                    }
+                    Some(screen) => Some(screen.id),
+                    None => slot
+                        .tabs
+                        .iter()
+                        .find(|id| actual.iter().any(|s| s.id == **id))
+                        .copied(),
+                };
+                if target.is_some_and(|target| {
+                    actual.iter().any(|s| {
+                        s.id == target
+                            && slot.failed_screen
+                                == Some((s.id, s.video_track_index, s.display.screen_type))
+                    })
+                }) {
+                    return None;
+                }
+                if let Some(app) = slot.app.as_mut() {
+                    app.mouse.release(&slot.window);
+                }
+                slot.selected = None;
+                target.map(|target| (*id, target))
+            })
+            .collect();
+        for (window, screen) in replacements {
+            if let Err(error) = self.begin_screen(window, screen)
+                && let Some(slot) = self.windows.get_mut(&window)
+            {
+                slot.failed_screen = self
+                    .catalog
+                    .iter()
+                    .find(|s| s.id == screen)
+                    .map(|s| (s.id, s.video_track_index, s.display.screen_type));
+                if let Some(app) = slot.app.as_mut() {
+                    app.screen_tabs.error = Some(error.to_string());
+                }
+            }
+        }
+    }
+
     pub fn update(&mut self, event_loop: &ActiveEventLoop) {
         if self.shutdown.load(Ordering::Acquire) || self.windows.is_empty() {
             event_loop.exit();
@@ -558,6 +840,17 @@ impl ScreenWindows {
                 let mut pending = slot.pending.take().expect("pending screen");
                 match result {
                     Ok(session) => {
+                        if !self.factory.screens().iter().any(|s| {
+                            s.id == pending.id
+                                && s.video_track_index == session.track_index
+                                && session.screen_binding()
+                                    == (s.id as u32 as u64
+                                        | ((s.display.screen_type as u32 as u64) << 32))
+                        }) {
+                            self.next_refresh = Instant::now();
+                            continue;
+                        }
+                        tracing::debug!(screen_id = pending.id, "screen switch ready on UI");
                         let connected = if let Some(app) = slot.app.as_mut() {
                             app.replace_session(&slot.window, Arc::clone(&session))
                         } else {
@@ -576,6 +869,7 @@ impl ScreenWindows {
                                 self.sessions.insert(session.track_index, session);
                                 slot.selected = Some(pending.id);
                                 self.factory.focus(pending.id);
+                                tracing::debug!(screen_id = pending.id, "screen switch bound");
                             }
                             Err(error) => {
                                 tracing::error!(%error, "initialize screen presenter failed");
@@ -584,6 +878,14 @@ impl ScreenWindows {
                         }
                     }
                     Err(error) => {
+                        slot.failed_screen = Some(
+                            self.catalog
+                                .iter()
+                                .find(|s| s.id == pending.id)
+                                .map_or((pending.id, -1, -1), |s| {
+                                    (s.id, s.video_track_index, s.display.screen_type)
+                                }),
+                        );
                         if let Some(app) = slot.app.as_mut() {
                             app.screen_tabs.error = Some(format!("{error:#}"));
                         } else {
@@ -620,62 +922,7 @@ impl ScreenWindows {
         }
         let now = Instant::now();
         if now >= self.next_refresh {
-            let catalog = self.factory.screens();
-            if catalog != self.catalog {
-                self.catalog = catalog;
-                for slot in self.windows.values_mut() {
-                    slot.tabs
-                        .retain(|id| self.catalog.iter().any(|screen| screen.id == *id));
-                }
-                let assigned: Vec<_> = self
-                    .windows
-                    .values()
-                    .flat_map(|slot| slot.tabs.iter().copied())
-                    .collect();
-                if let Some(slot) = self.windows.values_mut().next() {
-                    slot.tabs.extend(
-                        self.catalog
-                            .iter()
-                            .filter(|screen| !assigned.contains(&screen.id))
-                            .map(|screen| screen.id),
-                    );
-                }
-                let replacements: Vec<_> = self
-                    .windows
-                    .iter_mut()
-                    .filter_map(|(id, slot)| {
-                        if slot.pending.is_some() {
-                            return None;
-                        }
-                        let selected = slot
-                            .selected
-                            .and_then(|id| self.catalog.iter().find(|screen| screen.id == id));
-                        let target = match selected {
-                            Some(screen)
-                                if slot.app.as_ref().is_some_and(|app| {
-                                    app._session.track_index == screen.video_track_index
-                                }) =>
-                            {
-                                return None;
-                            }
-                            Some(screen) => Some(screen.id),
-                            None => slot.tabs.first().copied(),
-                        };
-                        slot.selected = None;
-                        target.map(|screen| (*id, screen))
-                    })
-                    .collect();
-                for (window, screen) in replacements {
-                    if let Err(error) = self.begin_screen(window, screen)
-                        && let Some(app) = self
-                            .windows
-                            .get_mut(&window)
-                            .and_then(|slot| slot.app.as_mut())
-                    {
-                        app.screen_tabs.error = Some(error.to_string());
-                    }
-                }
-            }
+            self.refresh_catalog();
             self.next_refresh = now + Duration::from_millis(250);
             for slot in self.windows.values() {
                 slot.window.request_redraw();
@@ -733,9 +980,14 @@ impl Drop for ScreenWindows {
 
 fn screen_label(screen: &RemoteScreen, catalog: &[RemoteScreen]) -> String {
     let number = catalog.iter().position(|s| s.id == screen.id).unwrap_or(0) + 1;
-    if screen.name.is_empty() {
-        format!("显示屏 {number}")
+    let label = match screen.display.screen_type {
+        2 => "超级屏".to_owned(),
+        1 => format!("虚拟屏 {number}"),
+        _ => format!("显示屏 {number}"),
+    };
+    if screen.name.is_empty() || matches!(screen.display.screen_type, 1 | 2) {
+        label
     } else {
-        format!("显示屏 {number}（{}）", screen.name)
+        format!("{label}（{}）", screen.name)
     }
 }

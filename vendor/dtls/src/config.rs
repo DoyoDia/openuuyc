@@ -44,6 +44,10 @@ pub struct Config {
     /// defaults to time.Second
     pub flight_interval: Duration,
 
+    /// When set, double a flight's interval after each retransmission up to
+    /// this limit. A new flight starts again at `flight_interval`.
+    pub flight_interval_max: Option<Duration>,
+
     /// psk sets the pre-shared key used by this DTLS connection
     /// If psk is non-nil only psk cipher_suites will be used
     pub psk: Option<PskCallback>,
@@ -114,6 +118,7 @@ impl Default for Config {
             client_auth: ClientAuthType::default(),
             extended_master_secret: ExtendedMasterSecretType::default(),
             flight_interval: Duration::default(),
+            flight_interval_max: None,
             psk: None,
             psk_identity_hint: None,
             insecure_skip_verify: false,

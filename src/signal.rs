@@ -47,7 +47,7 @@ pub const RECONNECT_HEADER: &str = "X-NRD-RECONN-KEY";
 pub const CONTROLLING_HEADER: &str = "X-NRD-CONTROLLING";
 const STREAMER_VERSION_HEADER: &str = "streamer_version";
 const STREAMER_FLAG_HEADER: &str = "streamer_flag";
-const STREAMER_VERSION: &str = "V4.5.9";
+const STREAMER_VERSION: &str = crate::official_version::SDK;
 const STREAMER_FLAG: &str = r#"{"sdp_flags":{"gzip_sdp":true}}"#;
 const ROOM_INFO_ACK_ID: u64 = 1;
 const CONTROL_ACK_ID: u64 = 2;
@@ -254,12 +254,11 @@ fn parse_forward_setting(
             if ice_id != expected.ice_id {
                 return Ok(None);
             }
-            // AA2390: a nonempty array takes precedence; an empty/missing one
-            // uses the legacy flat entry. No merge of contradictory shapes.
+            // Current sender reports carry one entry per video track.
             let entries = payload
                 .get("sender_media_infos")
                 .and_then(Value::as_array)
-                .filter(|v| !v.is_empty());
+                .context("sender_para_info omitted sender_media_infos")?;
             let parse = |entry: &Value| RemoteSenderInfo {
                 video_track_index: entry
                     .get("video_track_index")
@@ -276,10 +275,7 @@ fn parse_forward_setting(
                     .unwrap_or_default()
                     .to_owned(),
             };
-            let infos = entries.map_or_else(
-                || vec![parse(payload)],
-                |entries| entries.iter().map(parse).collect(),
-            );
+            let infos = entries.iter().map(parse).collect();
             Ok(Some(ForwardSettingEvent::SenderParaInfo {
                 ice_id: ice_id.to_owned(),
                 infos,
@@ -320,7 +316,7 @@ pub struct ControlSessionInfo {
     pub ice_id: String,
     #[serde(rename = "iceServers", default)]
     pub ice_servers: Vec<ControlIceServer>,
-    #[serde(default, alias = "forceRelay")]
+    #[serde(default)]
     pub force_relay: bool,
     #[serde(default)]
     pub auto_switch_network: bool,
@@ -489,6 +485,8 @@ impl SignalSession {
         &mut self,
         controller_device_id: &str,
         profile: ConnectionMediaProfile,
+        connect_type: crate::control::ControlConnectType,
+        preferences: Option<crate::stream_control::StreamControlPreferences>,
     ) -> Result<ControlSessionInfo> {
         tracing::debug!(?profile, "starting control handshake");
         let decoder_support = detect_native_decoder_support(profile)?;
@@ -501,6 +499,8 @@ impl SignalSession {
             CONTROL_ACK_ID,
             &decoder_support,
             profile,
+            connect_type,
+            preferences,
         )?;
         let app_control_id = frames.app_control_id;
         self.send_binary_packet(frames.header, frames.attachment)?;
@@ -688,7 +688,6 @@ impl SignalSession {
 
         let mut local_gathering_complete = false;
         let mut answer_installed = false;
-        let mut pending_remote_candidates = Vec::new();
         let mut pending_events = VecDeque::new();
 
         loop {
@@ -736,32 +735,35 @@ impl SignalSession {
                     {
                         progress.remote_soac_events += 1;
                         tracing::trace!(argument_count = args.len(), "received remote SOAC event");
-                        match parse_remote_soac(&args, Some(info))? {
+                        let soac = match parse_remote_soac(&args, Some(info)) {
+                            Ok(soac) => soac,
+                            Err(error) => {
+                                tracing::warn!(%error, "discarded invalid SOAC event during negotiation");
+                                continue;
+                            }
+                        };
+                        match soac {
                             Some(RemoteSoac::Answer { sdp, restart_ice }) => {
                                 tracing::debug!(restart_ice, sdp_bytes = sdp.len(), "installing remote WebRTC answer");
                                 tracing::trace!(sdp_bytes = sdp.len(), "remote WebRTC answer");
                                 let sdp_bytes = sdp.len();
-                                peer.set_remote_answer(sdp, restart_ice).await?;
+                                if let Err(error) = peer.set_remote_answer(sdp, restart_ice).await {
+                                    tracing::warn!(%error, "remote answer rejected; awaiting a valid answer or peer deadline");
+                                    continue;
+                                }
                                 answer_installed = true;
                                 progress.answer_installed = true;
                                 report_negotiation(
                                     reporter,
                                     NegotiationEvent::AnswerInstalled { sdp_bytes },
                                 );
-                                for candidate in pending_remote_candidates.drain(..) {
-                                    peer.add_remote_candidate(candidate).await?;
-                                    progress.remote_candidates_installed += 1;
-                                    report_negotiation(
-                                        reporter,
-                                        NegotiationEvent::RemoteCandidateInstalled {
-                                            count: progress.remote_candidates_installed,
-                                        },
-                                    );
-                                }
                             }
                             Some(RemoteSoac::Candidate(candidate)) if answer_installed => {
                                 tracing::trace!(candidate = ?candidate, "installing remote ICE candidate");
-                                peer.add_remote_candidate(candidate).await?;
+                                if let Err(error) = peer.add_remote_candidate(candidate).await {
+                                    tracing::warn!(%error, "discarded rejected remote ICE candidate");
+                                    continue;
+                                }
                                 progress.remote_candidates_installed += 1;
                                 report_negotiation(
                                     reporter,
@@ -770,9 +772,8 @@ impl SignalSession {
                                     },
                                 );
                             }
-                            Some(RemoteSoac::Candidate(candidate)) => {
-                                tracing::trace!(candidate = ?candidate, "queueing remote ICE candidate before answer");
-                                pending_remote_candidates.push(candidate);
+                            Some(RemoteSoac::Candidate(_)) => {
+                                tracing::debug!("discarded remote ICE candidate before initial answer");
                             }
                             None => {}
                         }
@@ -987,12 +988,23 @@ impl SignalSession {
                             if event == "soac" =>
                         {
                             if let Some(peer) = peer.as_ref() {
-                                match parse_remote_soac(&args, control.as_ref())? {
+                                let soac = match parse_remote_soac(&args, control.as_ref()) {
+                                    Ok(soac) => soac,
+                                    Err(error) => {
+                                        tracing::warn!(%error, "discarded invalid SOAC event");
+                                        continue;
+                                    }
+                                };
+                                match soac {
                                     Some(RemoteSoac::Candidate(candidate)) => {
-                                        peer.add_remote_candidate(candidate).await?;
+                                        if let Err(error) = peer.add_remote_candidate(candidate).await {
+                                            tracing::warn!(%error, "discarded rejected remote ICE candidate; session retained");
+                                        }
                                     }
                                     Some(RemoteSoac::Answer { sdp, restart_ice }) => {
-                                        peer.set_remote_answer(sdp, restart_ice).await?;
+                                        if let Err(error) = peer.set_remote_answer(sdp, restart_ice).await {
+                                            tracing::warn!(%error, "remote answer rejected; session retained");
+                                        }
                                     }
                                     None => {}
                                 }
@@ -1140,6 +1152,11 @@ impl SignalSession {
         if let Some(network) = &network_control {
             network.close();
         }
+        if let Some(peer) = &peer {
+            // A signaling-only failure can leave DTLS writable. Retire input
+            // before waiting for WebSocket close so no new clicks are accepted.
+            peer.stream_control_handle().mouse().close().await;
+        }
         self.transport.set_controlling(false);
         let socket_result = self.graceful_close().await;
         let peer_result = match peer {
@@ -1197,10 +1214,7 @@ fn parse_remote_soac(
         return Ok(None);
     };
     if let Some(expected) = expected
-        && (data
-            .get("ice_id")
-            .and_then(Value::as_str)
-            .is_some_and(|value| value != expected.ice_id.as_str())
+        && (data.get("ice_id").and_then(Value::as_str) != Some(expected.ice_id.as_str())
             || data
                 .get("app_control_id")
                 .and_then(Value::as_str)

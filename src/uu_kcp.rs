@@ -93,7 +93,7 @@ impl UuKcpControl {
         version: u8,
         stream_control: StreamControlHandle,
     ) -> Result<()> {
-        ensure!(version != 0, "UU mixed-KCP version must be non-zero");
+        ensure!(version == 2, "unsupported UU mixed-KCP version {version}");
         let mut state = lock(&self.state);
         if state.version != 0 {
             ensure!(
@@ -393,16 +393,12 @@ impl Worker {
         let now_ms = self.now_ms();
         self.kcp.update(now_ms).context("update UU mixed-KCP")?;
         let now = Instant::now();
-        if self.version >= 2
-            && now.duration_since(self.last_recovery_info) >= RECOVERY_INFO_INTERVAL
-        {
+        if now.duration_since(self.last_recovery_info) >= RECOVERY_INFO_INTERVAL {
             self.last_recovery_info = now;
             let recovery_info = self.recovery.encode_info(self.version, now_ms);
             self.queue_wire_packet(recovery_info);
         }
-        if self.version >= 2
-            && now.duration_since(self.last_fec_network_update) >= FEC_NETWORK_UPDATE_INTERVAL
-        {
+        if now.duration_since(self.last_fec_network_update) >= FEC_NETWORK_UPDATE_INTERVAL {
             self.last_fec_network_update = now;
             if let Some(loss) = self.recovery.remote_loss_ratio
                 && let Some(decrease_fast_ack_after) =
@@ -418,10 +414,8 @@ impl Worker {
 
     async fn flush_output(&mut self, endpoint: &Endpoint) -> Result<()> {
         self.transform_kcp_output()?;
-        if self.version >= 2 {
-            for packet in self.fec_generator.poll(Instant::now())? {
-                self.queue_wire_packet(packet);
-            }
+        for packet in self.fec_generator.poll(Instant::now())? {
+            self.queue_wire_packet(packet);
         }
         while let Some(packet) = self.wire_packets.pop_front() {
             tracing::trace!(
@@ -485,15 +479,14 @@ impl Worker {
                 let mut wire = Vec::with_capacity(standard.len() + 4);
                 wire.extend_from_slice(&magic(self.version));
                 wire.extend_from_slice(standard);
-                if self.version >= 2 && command == CMD_PUSH && !first_transmission {
+                if command == CMD_PUSH && !first_transmission {
                     wire[8] = CMD_RESEND_PUSH;
                 }
                 self.wire_packets.push_back(WirePacket {
                     data: wire,
-                    fec_original_sequence: (self.version >= 2 && first_transmission)
-                        .then_some(sequence),
+                    fec_original_sequence: first_transmission.then_some(sequence),
                 });
-                if self.version >= 2 && first_transmission {
+                if first_transmission {
                     self.sent_order.push_back(sequence);
                     while self.sent_order.len() > MAX_RECENT_PACKETS {
                         if let Some(expired) = self.sent_order.pop_front() {
@@ -560,20 +553,18 @@ impl Worker {
             ensure!(end <= datagram.len(), "truncated UU mixed-KCP segment");
             let segment = &datagram[cursor..end];
             match command {
-                CMD_FEC if self.version >= 2 => {
+                CMD_FEC => {
                     let recovered = self.fec_receiver.receive_repair(segment, Instant::now())?;
                     for packet in recovered {
                         self.input_data_segment(&packet, true, stream_control)?;
                     }
                 }
-                CMD_RECOVERY_INFO if self.version >= 2 => {
+                CMD_RECOVERY_INFO => {
                     self.recovery.receive_info(segment)?;
                 }
-                CMD_FEC => {}
-                CMD_RECOVERY_INFO => {}
                 _ => {
                     self.input_data_segment(segment, false, stream_control)?;
-                    if self.version >= 2 && matches!(command, CMD_PUSH | CMD_RESEND_PUSH) {
+                    if matches!(command, CMD_PUSH | CMD_RESEND_PUSH) {
                         let sequence = read_u32(segment, 16)?;
                         let recovered = self.fec_receiver.remember_original(
                             sequence,

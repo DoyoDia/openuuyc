@@ -163,22 +163,23 @@ impl Context {
     }
 
     fn get_srtp_ssrc_state(&mut self, ssrc: u32) -> &mut SrtpSsrcState {
-        let s = SrtpSsrcState {
-            ssrc,
-            replay_detector: Some((self.new_srtp_replay_detector)()),
-            ..Default::default()
-        };
-
-        self.srtp_ssrc_states.entry(ssrc).or_insert(s)
+        self.srtp_ssrc_states
+            .entry(ssrc)
+            .or_insert_with(|| SrtpSsrcState {
+                ssrc,
+                replay_detector: Some((self.new_srtp_replay_detector)()),
+                ..Default::default()
+            })
     }
 
     fn get_srtcp_ssrc_state(&mut self, ssrc: u32) -> &mut SrtcpSsrcState {
-        let s = SrtcpSsrcState {
-            ssrc,
-            replay_detector: Some((self.new_srtcp_replay_detector)()),
-            ..Default::default()
-        };
-        self.srtcp_ssrc_states.entry(ssrc).or_insert(s)
+        self.srtcp_ssrc_states
+            .entry(ssrc)
+            .or_insert_with(|| SrtcpSsrcState {
+                ssrc,
+                replay_detector: Some((self.new_srtcp_replay_detector)()),
+                ..Default::default()
+            })
     }
 
     /// roc returns SRTP rollover counter value of specified SSRC.

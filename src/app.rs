@@ -23,13 +23,12 @@ mod assist;
 mod catalog;
 mod device_sync;
 mod diagnostics;
-#[cfg(windows)]
+
 pub mod instance;
 mod phone;
 mod power;
 mod updates;
 mod view;
-mod wallpaper;
 use assist::{AssistOperation, AssistResult, AssistUi};
 use phone::{LoginMethod, PhoneForm};
 use view::{CenterUi, configure_visuals};
@@ -41,7 +40,6 @@ pub struct GuiOptions {
 }
 
 pub fn run(options: GuiOptions) -> Result<()> {
-    crate::ui::ensure_supported()?;
     let (local_display, display_warning) = match detect_local_display() {
         Ok(display) => (display, None),
         Err(error) => (
@@ -571,6 +569,12 @@ impl DeviceCenterApp {
             self.sync_login_running();
         }
 
+        if let Some(session) = &mut self.active_session
+            && let Some(target) = session.owner.info().and_then(|info| info.target)
+        {
+            session.device_id = Some(target.device_id);
+            session.alias = target.alias;
+        }
         let finished = self
             .active_session
             .as_mut()
@@ -890,7 +894,14 @@ impl DeviceCenterApp {
             }
         };
         let mut command = Command::new(executable);
-        let owner = match ViewerOwner::new() {
+        let background = device_id.as_deref().and_then(|id| {
+            self.devices.as_ref().and_then(|list| {
+                all_devices(list)
+                    .find(|(_, d)| d.device_id == id)
+                    .map(|(_, d)| crate::wallpaper::Source::new(&d.device_id, &d.wallpaper_url))
+            })
+        });
+        let owner = match ViewerOwner::new(background) {
             Ok(owner) => owner,
             Err(error) => {
                 self.status = StatusMessage::error(format!("无法创建观看生命周期通道：{error:#}"));
@@ -979,6 +990,9 @@ impl DeviceCenterApp {
 
 impl crate::ui::App for DeviceCenterApp {
     fn on_focus_changed(&mut self, focused: bool) {
+        if !focused {
+            self.center_ui.shortcuts.cancel_recording();
+        }
         self.worker.focus.send_if_modified(|current| {
             if *current == focused {
                 return false;
@@ -990,11 +1004,15 @@ impl crate::ui::App for DeviceCenterApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui) {
+        crate::viewer_shortcuts::refresh();
         let ctx = ui.ctx().clone();
         self.drain_events(&ctx);
         self.tick_power();
         self.draw_center(ui);
         self.draw_dialogs(&ctx);
+        if !self.login_restoring && !self.login_running {
+            self.update_dialog(&ctx);
+        }
         ui.ctx().request_repaint_after(WORKER_TICK);
     }
 

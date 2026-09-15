@@ -1,12 +1,10 @@
-//! Pure Rust D3D11 Video and H.264 software decoding.
+//! Rust DXVA11 and H.264 software decoding.
 //! No MFT, native video bridge or implicit backend fallback.
 #![cfg(windows)]
 use crate::decoder::platform::{
     DecodeError, DecoderNotification, VideoDecoder, VideoDecoderConfig, VideoOutputPreference,
 };
-use mediaway_common::{
-    Bytes, CodecKind, GpuDeviceHandle, Packet, PixelFormat, VideoFrame, VideoFrameStorage,
-};
+use mediaway_common::{Bytes, CodecKind, GpuDeviceHandle, Packet};
 use std::collections::VecDeque;
 use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
 mod rust_dxva;
@@ -25,6 +23,7 @@ impl WindowsGpuVideoFrame {
     pub fn texture(&self) -> &ID3D11Texture2D {
         &self.texture
     }
+
     pub const fn subresource(&self) -> u32 {
         self.subresource
     }
@@ -62,7 +61,6 @@ pub enum WindowsCpuFormat {
 }
 pub struct WindowsCpuVideoFrame {
     pub pts: i64,
-    pub duration: u64,
     pub width: u32,
     pub height: u32,
     pub format: WindowsCpuFormat,
@@ -121,14 +119,15 @@ impl WindowsVideoDecoder {
             notification: DecoderNotification::default(),
         })
     }
-    pub fn probe(
+    pub fn probe_format(
         device: GpuDeviceHandle,
         codec: CodecKind,
         width: u32,
         height: u32,
         depth: u8,
+        chroma: u8,
     ) -> bool {
-        rust_dxva::Session::probe(device, codec, width, height, depth)
+        rust_dxva::Session::probe(device, codec, width, height, depth, chroma)
     }
     pub fn poll_owned_frame(&mut self) -> Result<Option<WindowsDecodedFrame>, DecodeError> {
         if self.notification.is_cancelled() {
@@ -190,7 +189,6 @@ impl VideoDecoder for WindowsVideoDecoder {
                     self.pending
                         .push_back(WindowsDecodedFrame::Cpu(WindowsCpuVideoFrame {
                             pts: output.token as i64,
-                            duration: packet.duration,
                             width: picture.crop.width as u32,
                             height: picture.crop.height as u32,
                             format: if picture.chroma == openuuyc_h264::picture::Chroma::Yuv444 {
@@ -205,27 +203,9 @@ impl VideoDecoder for WindowsVideoDecoder {
             }
         }
     }
-    fn poll_frame(&mut self) -> Result<Option<VideoFrame>, DecodeError> {
-        match self.poll_owned_frame()? {
-            None => Ok(None),
-            Some(WindowsDecodedFrame::Cpu(frame)) if frame.format == WindowsCpuFormat::Nv12 => {
-                Ok(Some(VideoFrame {
-                    pts: frame.pts,
-                    duration: frame.duration,
-                    width: frame.width,
-                    height: frame.height,
-                    format: PixelFormat::Nv12,
-                    storage: VideoFrameStorage::Cpu { data: frame.data },
-                }))
-            }
-            _ => Err(DecodeError::Unsupported),
-        }
-    }
 }
 impl Drop for WindowsVideoDecoder {
     fn drop(&mut self) {
         self.pending.clear();
     }
 }
-#[cfg(test)]
-mod tests;

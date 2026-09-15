@@ -2,8 +2,8 @@
 //!
 //! UU uses two different reliable DataChannels for this state machine:
 //! protobuf ECHO/feature negotiation is binary data on CONTROL, while both
-//! `CaptureSettingRequest` and the legacy `CaptureConfig` are protobuf bytes
-//! sent with the text PPID on TEXT. Capture requests are complete snapshots,
+//! `CaptureSettingRequest` is sent as protobuf bytes with the text PPID on TEXT.
+//! Capture requests are complete snapshots,
 //! so no request is produced until the active remote screen's physical mode is
 //! known from `ScreenSources`.
 
@@ -15,14 +15,21 @@ use anyhow::{Result, anyhow, bail};
 use prost::Message as _;
 use tokio::sync::{Notify, mpsc};
 
-use crate::adaptive_bitrate::BudgetPolicy;
-pub use crate::adaptive_bitrate::{AdaptiveBitrateSnapshot, BudgetPhase};
 use crate::capability::{DualCapability, FrameQualityCapability};
 use crate::media::{ConnectionMediaProfile, FrameRateChoice, LocalDisplayInfo, VideoCodec};
 pub use crate::network_control::NetworkControlSnapshot;
 use crate::performance::PerformanceMonitor;
 pub use crate::remote_cursor::{CursorImage, RemoteCursor};
 pub use crate::remote_input::MouseMode;
+
+pub(crate) mod annotation;
+mod display_settings;
+mod display_topology;
+pub use display_settings::{
+    DisplayChangeRequest, DisplayChangeStatus, DisplayResolution, RemoteDisplayInfo,
+    RemoteDisplayMode,
+};
+pub use display_topology::{DisplayTopologyAction, DisplayTopologyStatus, DisplayTopologySupport};
 
 const VIDEO_QUALITY_FAST: i32 = 1;
 const VIDEO_QUALITY_GENERAL: i32 = 2;
@@ -39,7 +46,8 @@ const FPS_144: i32 = 4;
 const ACTION_TYPE_ECHO_REQUEST: i32 = 0;
 const ACTION_TYPE_ECHO_RESPONSE: i32 = 1;
 const CHROMA_420: i32 = 1;
-const RESOLUTION_ORIGINAL: i32 = 1;
+const CHROMA_444: i32 = 3;
+const RESOLUTION_DEFAULT: i32 = 1;
 // Official VideoScreenState::buildCaptureConfig(-2): update existing tracks,
 // not a physical monitor. Negative dimensions bypass changeResolution, and
 // zero DPI bypasses SetDisplayDpi on the host. Never echo a stale monitor mode.
@@ -57,7 +65,6 @@ pub enum StreamQuality {
     High,
     Clear,
     Custom,
-    Adaptive,
     Fast,
 }
 
@@ -69,19 +76,18 @@ impl StreamQuality {
             Self::Clear => 2,
             Self::High => 3,
             Self::Original => 4,
-            Self::Custom | Self::Adaptive => 5,
+            Self::Custom => 5,
         }
     }
 
     pub const fn label(self) -> &'static str {
         match self {
-            Self::Auto => "自动（原画）",
-            Self::Original => "原画 20M",
-            Self::High => "高清 8M",
-            Self::Clear => "清晰 2M",
+            Self::Auto => "自动",
+            Self::Original => "原画 30M",
+            Self::High => "超清 14M",
+            Self::Clear => "高清 8M",
             Self::Custom => "自定义",
-            Self::Adaptive => "受限自适应",
-            Self::Fast => "快速（480P）",
+            Self::Fast => "低码率 1M",
         }
     }
 
@@ -91,7 +97,7 @@ impl StreamQuality {
             Self::Original => VIDEO_QUALITY_BLURAY,
             Self::High => VIDEO_QUALITY_HD,
             Self::Clear => VIDEO_QUALITY_GENERAL,
-            Self::Custom | Self::Adaptive => VIDEO_QUALITY_CUSTOM,
+            Self::Custom => VIDEO_QUALITY_CUSTOM,
             Self::Fast => VIDEO_QUALITY_FAST,
         }
     }
@@ -100,31 +106,73 @@ impl StreamQuality {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StreamControlProtocol {
     Negotiating,
-    CaptureSetting { feature_level: u32 },
-    LegacyCaptureConfig,
+    CaptureSetting,
+    Unsupported,
 }
 
 impl StreamControlProtocol {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Negotiating => "协商中",
-            Self::CaptureSetting { .. } => "CaptureSetting",
-            Self::LegacyCaptureConfig => "CaptureConfig（兼容）",
+            Self::CaptureSetting => "CaptureSetting",
+            Self::Unsupported => "串流协议不受支持",
         }
-    }
-
-    pub const fn supports_custom_bitrate(self) -> bool {
-        matches!(self, Self::CaptureSetting { feature_level: 4.. })
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StreamControlSettings {
+    #[serde(default)]
+    pub hdr: bool,
+    #[serde(default)]
+    pub true_color: bool,
     pub frame_rate: FrameRateChoice,
     pub quality: StreamQuality,
     pub custom_bitrate_mbps: u32,
-    pub adaptive_ceiling_mbps: u32,
-    pub stability_priority: bool,
+}
+
+pub(crate) fn default_auto_quality() -> i32 {
+    VIDEO_QUALITY_GENERAL
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SavedStreamControl {
+    pub settings: StreamControlSettings,
+    pub auto_frame_quality: i32,
+}
+
+pub(crate) struct LoadedStreamControl {
+    pub settings: Option<StreamControlSettings>,
+    pub auto_frame_quality: i32,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ViewingPreferenceUpdate {
+    Settings(SavedStreamControl),
+    AutoQuality(i32),
+}
+
+pub fn custom_bitrate_choices(limit: u32) -> Vec<u32> {
+    let limit = limit.clamp(1, MAX_CUSTOM_BITRATE_MBPS);
+    let mut choices: Vec<_> = (1..=20)
+        .chain((25..=100).step_by(5))
+        .chain((110..=200).step_by(10))
+        .chain([250, 300, 350, 400, 500])
+        .filter(|value| *value <= limit)
+        .collect();
+    if choices.last() != Some(&limit) {
+        choices.push(limit);
+    }
+    choices
+}
+
+pub(crate) fn normalize_custom_bitrate(value: u32) -> u32 {
+    custom_bitrate_choices(MAX_CUSTOM_BITRATE_MBPS)
+        .into_iter()
+        .rev()
+        .find(|n| *n <= value)
+        .unwrap_or(1)
 }
 
 /// User-facing state survives a room replacement, unlike PB sequence numbers,
@@ -132,24 +180,57 @@ pub struct StreamControlSettings {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct StreamControlPreferences {
     pub(crate) settings: StreamControlSettings,
+    pub(crate) custom_bitrate_limit: Option<u32>,
     audio: Option<crate::audio::AudioSettings>,
     auto_frame_quality: i32,
-    adaptive_start_mbps: Option<u32>,
 }
 
 impl StreamControlPreferences {
-    pub(crate) fn from_saved(
-        mut settings: StreamControlSettings,
-        display: LocalDisplayInfo,
-    ) -> Self {
-        if !settings.frame_rate.is_supported(display) {
-            settings.frame_rate = FrameRateChoice::Auto;
+    fn saved(self) -> SavedStreamControl {
+        SavedStreamControl {
+            settings: self.settings,
+            auto_frame_quality: self.auto_frame_quality,
         }
+    }
+    pub(crate) fn initial_capture_quality(self) -> Result<(u64, u64, u64)> {
+        let bitrate = if self.settings.quality == StreamQuality::Custom {
+            if !(1..=MAX_CUSTOM_BITRATE_MBPS).contains(&self.settings.custom_bitrate_mbps) {
+                bail!("自定义码率超出有效范围");
+            }
+            u64::from(
+                self.settings
+                    .custom_bitrate_mbps
+                    .min(self.custom_bitrate_limit.unwrap_or(MAX_CUSTOM_BITRATE_MBPS)),
+            ) * 1_000_000
+        } else {
+            0
+        };
+        Ok((
+            u64::try_from(self.settings.quality.protobuf())?,
+            u64::try_from(self.auto_frame_quality)?,
+            bitrate,
+        ))
+    }
+
+    pub(crate) fn from_saved(saved: LoadedStreamControl, profile: ConnectionMediaProfile) -> Self {
+        let mut settings = saved.settings.unwrap_or(StreamControlSettings {
+            true_color: false,
+            hdr: false,
+            quality: StreamQuality::Auto,
+            frame_rate: frame_rate_choice(profile.stream_fps),
+            custom_bitrate_mbps: DEFAULT_CUSTOM_BITRATE_MBPS,
+        });
+        normalize_low_quality(&mut settings);
+        settings.custom_bitrate_mbps = normalize_custom_bitrate(settings.custom_bitrate_mbps);
         Self {
             settings,
+            custom_bitrate_limit: None,
             audio: None,
-            auto_frame_quality: VIDEO_QUALITY_BLURAY,
-            adaptive_start_mbps: None,
+            auto_frame_quality: if settings.quality == StreamQuality::Auto {
+                saved.auto_frame_quality
+            } else {
+                VIDEO_QUALITY_GENERAL
+            },
         }
     }
 }
@@ -163,7 +244,7 @@ pub struct RemoteDisplayState {
     pub refresh_hz: u32,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RemoteScreen {
     pub id: i32,
     pub name: String,
@@ -172,10 +253,18 @@ pub struct RemoteScreen {
     pub width: u32,
     pub height: u32,
     pub refresh_hz: u32,
+    pub display: RemoteDisplayInfo,
 }
 
 #[derive(Clone, Debug)]
 pub struct StreamControlSnapshot {
+    pub hdr_supported: bool,
+    pub hdr_unavailable: Option<String>,
+    pub custom_bitrate_limit: u32,
+    pub auto_quality_label: String,
+    pub true_color_supported: bool,
+    pub true_color_unavailable: Option<String>,
+    pub true_color_max_quality: Option<StreamQuality>,
     pub mouse_preference: MouseMode,
     pub mouse_mode: MouseMode,
     pub mouse_pending: bool,
@@ -187,8 +276,15 @@ pub struct StreamControlSnapshot {
     pub remote_display: Option<RemoteDisplayState>,
     pub screens: Vec<RemoteScreen>,
     pub screens_generation: u64,
+    pub topology: DisplayTopologyStatus,
+    pub topology_support: DisplayTopologySupport,
+    pub display_settings_supported: bool,
+    pub dpi_settings_supported: bool,
+    pub display_changes: std::collections::BTreeMap<i32, DisplayChangeStatus>,
 
     pub protocol: StreamControlProtocol,
+    pub custom_bitrate_supported: bool,
+    pub mouse_modes_supported: bool,
     pub control_channel_open: bool,
     pub text_channel_open: bool,
     pub pb_connected: bool,
@@ -199,7 +295,7 @@ pub struct StreamControlSnapshot {
     pub last_applied_sequence: Option<i64>,
     pub last_error: Option<String>,
     pub last_notice: Option<String>,
-    pub adaptive: Option<AdaptiveBitrateSnapshot>,
+    pub remote_notice: Option<&'static str>,
     pub persistence_error: Option<String>,
     pub network: NetworkControlSnapshot,
 }
@@ -231,6 +327,7 @@ pub(crate) struct PbHandshakeStatus {
 }
 
 pub(crate) struct OutgoingControlMessage {
+    pub annotation_generation: Option<u64>,
     pub sequence: i64,
     pub payload: Vec<u8>,
     pub protocol: StreamControlProtocol,
@@ -265,17 +362,29 @@ struct ScreenBaseline {
     pixel_height: u32,
     dpi_scale: u32,
     resolution_type: i32,
+    display: RemoteDisplayInfo,
+}
+
+struct PendingCapturePreferences {
+    sequence: i64,
+    preferences: StreamControlPreferences,
+    cursor_capture: bool,
+    persist: bool,
 }
 
 struct StreamControlState {
+    remote_upgrade: Option<crate::remote_upgrade::RemoteUpgrade>,
+    annotation: annotation::Annotation,
+    custom_bitrate_limit: u32,
+    features: Option<crate::feature_ability::FeaturePolicy>,
+    remote_notice: Option<(Instant, &'static str)>,
     preferred_mouse_mode: MouseMode,
     remote_cursor: crate::remote_cursor::RemoteCursorState,
     peer_mouse_relative: Option<bool>,
-    mouse_policy_waiting: bool,
+    cursor_sync_needed: bool,
+    cursor_desired_capture: bool,
     mouse_restore_point: Option<(i32, [f64; 2])>,
     mouse: crate::remote_input::RemoteInput,
-    mouse_transition: Option<(i64, MouseMode)>,
-    mouse_restore_pending: bool,
     mouse_transport_connected: bool,
     cursor_pending: Option<(i64, bool, Instant)>,
     cursor_error: Option<String>,
@@ -288,6 +397,9 @@ struct StreamControlState {
     current_screen_id: i32,
     screens: Vec<ScreenBaseline>,
     screens_generation: u64,
+    display_changes: display_settings::DisplayChanges,
+    topology: display_topology::DisplayTopology,
+    assistance: bool,
 
     settings: StreamControlSettings,
     baseline: CaptureSettingBaseline,
@@ -303,11 +415,12 @@ struct StreamControlState {
     pending_sequences: VecDeque<i64>,
     last_applied_sequence: Option<i64>,
     latest_requested_sequence: Option<i64>,
-    budget: Option<BudgetPolicy>,
     last_error: Option<String>,
     last_notice: Option<String>,
-    preference_updates: tokio::sync::watch::Sender<Option<StreamControlSettings>>,
-    user_preference_pending: Option<(i64, StreamControlSettings)>,
+    preference_updates: tokio::sync::watch::Sender<Option<ViewingPreferenceUpdate>>,
+    confirmed_preferences: StreamControlPreferences,
+    pending_capture_preferences: VecDeque<PendingCapturePreferences>,
+    user_settings_requested: bool,
     persistence_error: Option<String>,
     audio_persistence_error: Option<String>,
     performance: PerformanceMonitor,
@@ -332,14 +445,18 @@ impl StreamControlHandle {
         let mouse = crate::remote_input::RemoteInput::default();
         let cursor = crate::remote_cursor::RemoteCursorState::default();
         let state = StreamControlState {
+            remote_upgrade: None,
+            annotation: Default::default(),
+            custom_bitrate_limit: MAX_CUSTOM_BITRATE_MBPS,
+            features: None,
             preferred_mouse_mode: MouseMode::Smart,
+            remote_notice: None,
             remote_cursor: cursor.clone(),
             peer_mouse_relative: None,
-            mouse_policy_waiting: false,
+            cursor_sync_needed: false,
+            cursor_desired_capture: true,
             mouse_restore_point: None,
             mouse: mouse.clone(),
-            mouse_transition: None,
-            mouse_restore_pending: false,
             mouse_transport_connected: false,
             cursor_pending: None,
             cursor_error: None,
@@ -352,19 +469,22 @@ impl StreamControlHandle {
             current_screen_id: 0,
             screens: Vec::new(),
             screens_generation: 0,
+            display_changes: Default::default(),
+            topology: Default::default(),
+            assistance: false,
 
             settings: StreamControlSettings {
+                true_color: false,
+                hdr: false,
                 frame_rate,
                 quality: StreamQuality::Auto,
                 custom_bitrate_mbps: DEFAULT_CUSTOM_BITRATE_MBPS,
-                adaptive_ceiling_mbps: 20,
-                stability_priority: true,
             },
             baseline: CaptureSettingBaseline {
                 requested_fps: profile.stream_fps,
                 fps_count,
                 frame_quality: VIDEO_QUALITY_AUTO,
-                auto_frame_quality: VIDEO_QUALITY_BLURAY,
+                auto_frame_quality: VIDEO_QUALITY_GENERAL,
                 // Independent CursorShape coordinates are only sampled at
                 // shape changes. Watching needs capture-side cursor motion.
                 cursor_capture: true,
@@ -391,11 +511,23 @@ impl StreamControlHandle {
             pending_sequences: VecDeque::new(),
             last_applied_sequence: None,
             latest_requested_sequence: None,
-            budget: None,
             last_error: None,
             last_notice: None,
             preference_updates: tokio::sync::watch::channel(None).0,
-            user_preference_pending: None,
+            confirmed_preferences: StreamControlPreferences {
+                custom_bitrate_limit: None,
+                settings: StreamControlSettings {
+                    true_color: false,
+                    hdr: false,
+                    frame_rate,
+                    quality: StreamQuality::Auto,
+                    custom_bitrate_mbps: DEFAULT_CUSTOM_BITRATE_MBPS,
+                },
+                audio: None,
+                auto_frame_quality: VIDEO_QUALITY_GENERAL,
+            },
+            pending_capture_preferences: VecDeque::new(),
+            user_settings_requested: false,
             persistence_error: None,
             audio_persistence_error: None,
             performance,
@@ -433,23 +565,29 @@ impl StreamControlHandle {
         let mut state = lock(&self.shared);
         state.mouse_transport_connected = connected;
         if !connected {
+            state.annotation.disconnect();
             state.peer_mouse_relative = None;
-            state.mouse_policy_waiting = false;
+            state.cursor_sync_needed = false;
+            state.cursor_desired_capture = true;
             state.mouse_restore_point = None;
-            state.mouse_restore_pending = false;
             // Reconnect always starts in View, even after a failed mode change.
             state.baseline.cursor_capture = true;
             state.initial_capture_sync_sent = false;
-            if let Some((sequence, _)) = state.mouse_transition.take() {
+            if let Some((sequence, _, _)) = state.cursor_pending {
                 fail_cursor_request(&mut state, sequence, "鼠标连接已中断".into());
                 state
                     .pending_sequences
                     .retain(|pending| *pending != sequence);
+                state
+                    .pending_capture_preferences
+                    .retain(|pending| pending.sequence != sequence);
             }
             state.mouse.set_ready(false);
         } else {
             state.mouse.set_ready(
-                state.pb_connected && state.control_channel_open && state.text_channel_open,
+                protocol(&state) == StreamControlProtocol::CaptureSetting
+                    && state.control_channel_open
+                    && state.text_channel_open,
             );
             self.maybe_send_initial_capture_sync(&mut state);
         }
@@ -491,6 +629,11 @@ impl StreamControlHandle {
         let mut state = lock(&self.shared);
         expire_cursor_request(&mut state);
         let active_protocol = protocol(&state);
+        let mut network = self.network.snapshot();
+        if !feature_supported(&state, crate::feature_ability::Feature::ManualTransfer) {
+            network.available = false;
+            network.unavailable_reason = Some("官方当前能力配置未开放手动中转");
+        }
         let waiting_for = if !state.control_channel_open {
             Some("CONTROL 通道")
         } else if !state.text_channel_open {
@@ -505,15 +648,28 @@ impl StreamControlHandle {
             None
         };
         StreamControlSnapshot {
+            hdr_supported: state.peer_capture_setting >= 6 && state.capability.is_some(),
+            hdr_unavailable: format_proposal(&state, None, Some(true))
+                .err()
+                .map(|e| e.to_string()),
+            custom_bitrate_limit: state.custom_bitrate_limit,
+            auto_quality_label: format!(
+                "自动（{}）",
+                quality_name(state.baseline.auto_frame_quality)
+            ),
+            true_color_supported: color_supported(&state),
+            true_color_unavailable: validate_color(&state, true)
+                .err()
+                .map(|error| error.to_string()),
+            true_color_max_quality: state
+                .capability
+                .as_ref()
+                .map(|cap| cap.select(3, state.settings.hdr, 0))
+                .filter(|cap| cap.result == 0)
+                .and_then(|cap| quality_from_capability(cap.max_frame_quality)),
             mouse_preference: state.preferred_mouse_mode,
-            mouse_mode: if state.mouse_policy_waiting {
-                MouseMode::Smart
-            } else {
-                state
-                    .mouse_transition
-                    .map_or_else(|| state.mouse.mode(), |(_, mode)| mode)
-            },
-            mouse_pending: state.mouse_transition.is_some() || state.mouse_policy_waiting,
+            mouse_mode: state.mouse.mode(),
+            mouse_pending: state.mouse.waiting_for_neutral(),
             mouse_error: state.mouse.error(),
             cursor_pending: state.cursor_pending.is_some(),
             cursor_error: state.cursor_error.clone(),
@@ -521,6 +677,12 @@ impl StreamControlHandle {
             settings: state.settings,
             remote_display: state.remote_display,
             screens_generation: state.screens_generation,
+            display_settings_supported: display_settings::supported(&state),
+            dpi_settings_supported: display_settings::supported(&state)
+                && state.peer_capture_setting >= 5,
+            display_changes: state.display_changes.status.clone(),
+            topology: state.topology.status.clone(),
+            topology_support: display_topology::support(&state),
 
             screens: state
                 .screens
@@ -533,25 +695,36 @@ impl StreamControlHandle {
                     width: screen.width,
                     height: screen.height,
                     refresh_hz: screen.fps,
+                    display: screen.display.clone(),
                 })
                 .collect(),
             protocol: active_protocol,
+            custom_bitrate_supported: custom_bitrate_supported(&state)
+                && feature_supported(&state, crate::feature_ability::Feature::CustomBitrate),
+            mouse_modes_supported: feature_supported(
+                &state,
+                crate::feature_ability::Feature::SmartMouse,
+            ),
             control_channel_open: state.control_channel_open,
             text_channel_open: state.text_channel_open,
             pb_connected: state.pb_connected,
-            ready: waiting_for.is_none(),
+            ready: waiting_for.is_none()
+                && active_protocol == StreamControlProtocol::CaptureSetting,
             waiting_for,
             pending_sequence: state.pending_sequences.back().copied(),
             pending_count: state.pending_sequences.len(),
             last_applied_sequence: state.last_applied_sequence,
             last_error: state.last_error.clone(),
             last_notice: state.last_notice.clone(),
-            adaptive: state.budget.as_ref().map(BudgetPolicy::snapshot),
+            remote_notice: state
+                .remote_notice
+                .filter(|(at, _)| at.elapsed() < std::time::Duration::from_secs(3))
+                .map(|(_, notice)| notice),
             persistence_error: state
                 .persistence_error
                 .clone()
                 .or_else(|| state.audio_persistence_error.clone()),
-            network: self.network.snapshot(),
+            network,
         }
     }
 
@@ -562,13 +735,11 @@ impl StreamControlHandle {
     pub(crate) fn preferences(&self) -> StreamControlPreferences {
         let state = lock(&self.shared);
         StreamControlPreferences {
-            settings: state.settings,
+            settings: state.confirmed_preferences.settings,
+            custom_bitrate_limit: (state.custom_bitrate_limit < MAX_CUSTOM_BITRATE_MBPS)
+                .then_some(state.custom_bitrate_limit),
             audio: Some(self.audio.settings()),
-            auto_frame_quality: state.baseline.auto_frame_quality,
-            adaptive_start_mbps: state
-                .budget
-                .as_ref()
-                .and_then(|b| b.snapshot().applied_mbps),
+            auto_frame_quality: state.confirmed_preferences.auto_frame_quality,
         }
     }
     pub(crate) fn network_control(&self) -> crate::network_control::NetworkControl {
@@ -576,12 +747,74 @@ impl StreamControlHandle {
     }
 
     pub fn set_relay_enabled(&self, enabled: bool) -> Result<()> {
+        if !feature_supported(
+            &lock(&self.shared),
+            crate::feature_ability::Feature::ManualTransfer,
+        ) {
+            bail!("官方当前能力配置未开放手动中转");
+        }
         self.network.request(enabled)
+    }
+
+    pub(crate) fn set_feature_policy(&self, policy: crate::feature_ability::FeaturePolicy) {
+        lock(&self.shared).features = Some(policy);
+    }
+
+    pub(crate) fn set_remote_upgrade(&self, upgrade: crate::remote_upgrade::RemoteUpgrade) {
+        lock(&self.shared).remote_upgrade = Some(upgrade);
+    }
+
+    pub(crate) fn remote_upgrade(&self) -> Option<crate::remote_upgrade::RemoteUpgrade> {
+        lock(&self.shared).remote_upgrade.clone()
+    }
+
+    pub(crate) async fn stop_acquire_update(&self) -> Result<()> {
+        let (complete, done) = tokio::sync::oneshot::channel();
+        {
+            let mut state = lock(&self.shared);
+            ensure_ready(&state)?;
+            if state.remote_upgrade.is_none() {
+                bail!("当前会话不支持被控端更新");
+            }
+            let sequence = state.next_sequence;
+            state.next_sequence += 1;
+            self.outgoing
+                .send(OutgoingControlMessage {
+                    annotation_generation: None,
+                    sequence,
+                    payload: PbControlMessage {
+                        seq: 0,
+                        timestamp: 0,
+                        payload: Some(PbPayload::SimpleAction(PbSimpleAction {
+                            action: 20,
+                            args: String::new(),
+                            params: None,
+                        })),
+                    }
+                    .encode_to_vec(),
+                    protocol: protocol(&state),
+                    completion: Some(complete),
+                })
+                .map_err(|_| anyhow!("观看连接已关闭"))?;
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(5), done)
+            .await
+            .map_err(|_| anyhow!("延后安装请求发送超时"))?
+            .map_err(|_| anyhow!("观看连接已关闭"))?
+            .map_err(anyhow::Error::msg)
     }
 
     /// Ordinary desktop capture only. Negative IDs include all-screen actions
     /// and are never accepted from a single monitor/window operation.
     pub async fn set_screen_capture(&self, screen_id: i32, active: bool) -> Result<()> {
+        if active {
+            let state = lock(&self.shared);
+            if screen_id != state.current_screen_id
+                && !feature_supported(&state, crate::feature_ability::Feature::MultiScreen)
+            {
+                bail!("官方当前能力配置未开放多屏观看");
+            }
+        }
         if screen_id < 0
             || !self
                 .snapshot()
@@ -615,6 +848,7 @@ impl StreamControlHandle {
             .encode_to_vec();
             self.outgoing
                 .send(OutgoingControlMessage {
+                    annotation_generation: None,
                     sequence,
                     payload,
                     protocol: protocol(&state),
@@ -702,11 +936,13 @@ impl StreamControlHandle {
             send_video_track: Some(PbSendVideoTrackRequest {
                 video_track_index: tracks.clone(),
             }),
+            ..Default::default()
         };
         let payload = encode_envelope(sequence, PbPayload::RpcRequest(request.encode_to_vec()));
         if self
             .outgoing
             .send(OutgoingControlMessage {
+                annotation_generation: None,
                 sequence,
                 payload,
                 protocol: protocol(state),
@@ -722,7 +958,7 @@ impl StreamControlHandle {
 
     pub(crate) fn preference_updates(
         &self,
-    ) -> tokio::sync::watch::Receiver<Option<StreamControlSettings>> {
+    ) -> tokio::sync::watch::Receiver<Option<ViewingPreferenceUpdate>> {
         lock(&self.shared).preference_updates.subscribe()
     }
 
@@ -739,19 +975,12 @@ impl StreamControlHandle {
         if state.initial_capture_sync_sent || state.baseline.codec_type != 0 {
             bail!("串流偏好必须在新房间选择视频轨道之前恢复");
         }
+        state.custom_bitrate_limit = preferences
+            .custom_bitrate_limit
+            .unwrap_or(MAX_CUSTOM_BITRATE_MBPS);
         set_requested_settings(&mut state, preferences.settings)?;
-        if state.settings.quality == StreamQuality::Adaptive {
-            state.budget = Some(BudgetPolicy::new(
-                state.settings.adaptive_ceiling_mbps,
-                state.settings.stability_priority,
-                Instant::now(),
-            ));
-            if let Some(cap) = preferences.adaptive_start_mbps {
-                state.baseline.max_custom_bitrate =
-                    cap.clamp(1, state.settings.adaptive_ceiling_mbps) * 1_000_000;
-            }
-        }
         state.baseline.auto_frame_quality = preferences.auto_frame_quality;
+        state.confirmed_preferences = preferences;
         if let Some(audio) = preferences.audio {
             self.audio.set_settings(audio);
         }
@@ -766,59 +995,45 @@ impl StreamControlHandle {
     pub fn set_mouse_mode(&self, mode: MouseMode) -> Result<()> {
         let mut state = lock(&self.shared);
         expire_cursor_request(&mut state);
-        let previous = state.mouse.mode();
-        // Explicit user mode changes invalidate a deferred game-exit warp.
         state.mouse_restore_point = None;
-        state.mouse_policy_waiting = false;
         if mode == MouseMode::View {
-            // Revoke input immediately, even if capture negotiation is busy.
+            // Local revocation never waits for remote settings.
             state.mouse.disable();
-            state.mouse_restore_pending = true;
-            if let Some((_, target)) = &mut state.mouse_transition {
-                *target = MouseMode::View;
+        } else {
+            ensure_ready(&state)?;
+            if state.annotation.enabled || state.annotation.toggling() {
+                bail!("请先关闭批注，再开启键鼠控制");
             }
-            if !state.pending_sequences.is_empty() {
-                return Ok(());
-            }
-        }
-        ensure_ready(&state)?;
-        if !state.pending_sequences.is_empty() {
-            bail!("输入已停止或等待设置确认，请稍后重试");
-        }
-        let (relative, visible) = mouse_policy(&state, mode);
-        if previous != MouseMode::View
-            && mode != MouseMode::View
-            && visible == state.baseline.cursor_capture
-        {
+            let (relative, _) = mouse_policy(&state, mode);
             state.mouse.enable(mode, relative)?;
             state.preferred_mouse_mode = mode;
-            return Ok(());
         }
-        state.mouse_restore_pending = false;
-        state.mouse.disable();
-        let sequence = self.request_cursor_locked(&mut state, visible)?;
-        state.mouse_transition = Some((sequence, mode));
+        // Explicit choices may retry uncertain cursor capture; newer intent is
+        // independent of an earlier cursor request still awaiting its response.
+        state.cursor_sync_needed = true;
+        self.refresh_mouse_policy(&mut state);
+        drop(state);
+        self.mouse.repaint();
         Ok(())
     }
 
     fn request_cursor_locked(&self, state: &mut StreamControlState, visible: bool) -> Result<i64> {
         expire_cursor_request(state);
         ensure_ready(state)?;
-        if !state.pending_sequences.is_empty() {
-            bail!("请等待当前串流设置确认");
-        }
         let sequence = state.next_sequence;
         let mut baseline = state.baseline;
         baseline.cursor_capture = visible;
+        // BECA40/FD9FF0 update desired capture immediately, independently of
+        // ACKs. Later complete snapshots must carry this same current intent.
+        state.baseline.cursor_capture = visible;
         let active_protocol = protocol(state);
         let payload = match active_protocol {
-            StreamControlProtocol::CaptureSetting { .. } => {
-                encode_capture_setting(sequence, baseline)?
-            }
-            StreamControlProtocol::LegacyCaptureConfig => {
-                encode_legacy_capture_config(sequence, baseline)?
-            }
+            StreamControlProtocol::CaptureSetting => encode_capture_setting(sequence, baseline)?,
+
             StreamControlProtocol::Negotiating => bail!("PB 特性协商尚未完成"),
+            StreamControlProtocol::Unsupported => {
+                bail!("对端不支持当前串流协议（需要CaptureSetting RPC）")
+            }
         };
         state.next_sequence = state.next_sequence.wrapping_add(1);
         state.pending_sequences.push_back(sequence);
@@ -830,6 +1045,7 @@ impl StreamControlHandle {
         let result = self.send_locked(
             state,
             OutgoingControlMessage {
+                annotation_generation: None,
                 sequence,
                 payload,
                 protocol: active_protocol,
@@ -852,76 +1068,105 @@ impl StreamControlHandle {
     }
 
     pub fn apply(&self, settings: StreamControlSettings) -> Result<i64> {
+        self.apply_settings_locked(&mut lock(&self.shared), settings)
+    }
+
+    pub(crate) fn set_custom_bitrate_limit(&self, limit: Option<u32>) {
+        lock(&self.shared).custom_bitrate_limit = limit
+            .filter(|v| (1..=MAX_CUSTOM_BITRATE_MBPS).contains(v))
+            .unwrap_or(MAX_CUSTOM_BITRATE_MBPS);
+    }
+
+    pub fn apply_color(
+        &self,
+        screen_id: i32,
+        enabled: bool,
+        quality: Option<StreamQuality>,
+    ) -> Result<i64> {
+        let mut state = lock(&self.shared);
+        ensure_ready(&state)?;
+        anyhow::ensure!(color_supported(&state), "当前会话不支持色彩切换");
+        anyhow::ensure!(
+            state.screens.iter().any(|screen| screen.id == screen_id),
+            "显示器已断开"
+        );
+        let mut settings = state.settings;
+        settings.true_color = enabled;
+        if let Some(quality) = quality {
+            settings.quality = quality;
+        }
+        self.apply_settings_target(&mut state, settings, Some(screen_id))
+    }
+
+    pub(crate) fn propose_format(
+        &self,
+        true_color: Option<bool>,
+        hdr: Option<bool>,
+    ) -> Result<StreamControlSettings> {
+        format_proposal(&lock(&self.shared), true_color, hdr)
+    }
+
+    pub(crate) fn apply_format(
+        &self,
+        screen_id: i32,
+        settings: StreamControlSettings,
+    ) -> Result<i64> {
+        self.apply_settings_target(&mut lock(&self.shared), settings, Some(screen_id))
+    }
+
+    fn apply_settings_locked(
+        &self,
+        state: &mut StreamControlState,
+        settings: StreamControlSettings,
+    ) -> Result<i64> {
+        self.apply_settings_target(state, settings, None)
+    }
+
+    fn apply_settings_target(
+        &self,
+        mut state: &mut StreamControlState,
+        settings: StreamControlSettings,
+        screen: Option<i32>,
+    ) -> Result<i64> {
         {
-            let mut state = lock(&self.shared);
             expire_cursor_request(&mut state);
-            if state.cursor_pending.is_some() {
-                bail!("请等待光标显示设置确认");
-            }
             ensure_ready(&state)?;
             let active_protocol = protocol(&state);
-            if matches!(
-                settings.quality,
-                StreamQuality::Custom | StreamQuality::Adaptive
-            ) && !active_protocol.supports_custom_bitrate()
+            if matches!(settings.quality, StreamQuality::Custom)
+                && !custom_bitrate_supported(&state)
             {
                 bail!("被控端不支持运行时自定义码率");
             }
+            anyhow::ensure!(
+                settings.quality != StreamQuality::Custom
+                    || settings.custom_bitrate_mbps <= state.custom_bitrate_limit
+                    || (state.settings.quality == StreamQuality::Custom
+                        && settings.custom_bitrate_mbps == state.settings.custom_bitrate_mbps),
+                "当前连接自定义码率最高为 {} Mbps",
+                state.custom_bitrate_limit
+            );
             let quality_changed = settings.quality != state.settings.quality;
-            let selected = if quality_changed
-                && !matches!(
-                    settings.quality,
-                    StreamQuality::Custom | StreamQuality::Adaptive
-                ) {
-                validate_quality(&state, settings.quality)?
+            let color_changed = settings.true_color != state.settings.true_color;
+            let hdr_changed = settings.hdr != state.settings.hdr;
+            if hdr_changed {
+                anyhow::ensure!(state.peer_capture_setting >= 6, "当前会话不支持 HDR 切换");
+                if settings.hdr {
+                    ensure_hdr_displays(&state)?;
+                }
+            }
+            if color_changed {
+                anyhow::ensure!(color_supported(&state), "当前会话不支持色彩切换");
+            }
+            let selected = if color_changed
+                || hdr_changed
+                || (quality_changed && !matches!(settings.quality, StreamQuality::Custom))
+            {
+                validate_format(&state, settings.quality, settings.true_color, settings.hdr)?
             } else {
                 None
             };
             let previous_quality = state.settings.quality;
-            // FPS edits must not silently restore a budget that was already
-            // reduced. An explicitly changed ceiling starts a fresh assessment.
-            let retain_budget = settings.quality == StreamQuality::Adaptive
-                && state.settings.quality == StreamQuality::Adaptive
-                && settings.adaptive_ceiling_mbps == state.settings.adaptive_ceiling_mbps;
-            let retained_cap = retain_budget
-                .then(|| {
-                    state.budget.as_ref().and_then(|b| {
-                        let budget = b.snapshot();
-                        budget.pending_mbps.or(budget.applied_mbps)
-                    })
-                })
-                .flatten();
             set_requested_settings(&mut state, settings)?;
-            state.budget = if settings.quality == StreamQuality::Adaptive {
-                if let Some(cap) = retained_cap {
-                    state.baseline.max_custom_bitrate =
-                        cap.min(settings.adaptive_ceiling_mbps) * 1_000_000;
-                }
-                if retain_budget {
-                    state
-                        .budget
-                        .take()
-                        .map(|mut budget| {
-                            budget.set_automatic(settings.stability_priority);
-                            budget
-                        })
-                        .or_else(|| {
-                            Some(BudgetPolicy::new(
-                                settings.adaptive_ceiling_mbps,
-                                settings.stability_priority,
-                                Instant::now(),
-                            ))
-                        })
-                } else {
-                    Some(BudgetPolicy::new(
-                        settings.adaptive_ceiling_mbps,
-                        settings.stability_priority,
-                        Instant::now(),
-                    ))
-                }
-            } else {
-                None
-            };
             if settings.quality == StreamQuality::Auto
                 && matches!(
                     previous_quality,
@@ -936,6 +1181,7 @@ impl StreamControlHandle {
             constrain_auto_quality(&mut state);
             tracing::debug!(
                 screen_id = EXISTING_SESSION_TRACKS,
+                enable_hdr = state.baseline.enable_hdr,
                 requested_fps = state.baseline.requested_fps,
                 fps_count = state.baseline.fps_count,
                 frame_quality = state.baseline.frame_quality,
@@ -950,13 +1196,27 @@ impl StreamControlHandle {
 
             let sequence = state.next_sequence;
             let payload = match active_protocol {
-                StreamControlProtocol::CaptureSetting { .. } => {
-                    encode_capture_setting(sequence, state.baseline)?
+                StreamControlProtocol::CaptureSetting => {
+                    let mut request = capture_setting_request(state.baseline)?;
+                    if let Some(id) = screen {
+                        let screen = state
+                            .screens
+                            .iter()
+                            .find(|s| s.id == id)
+                            .ok_or_else(|| anyhow!("显示器已断开"))?;
+                        request.screen_id = id;
+                        request.resolution_width = screen.width as i32;
+                        request.resolution_height = screen.height as i32;
+                        request.resolution_pixel_width = screen.pixel_width as i32;
+                        request.resolution_pixel_height = screen.pixel_height as i32;
+                    }
+                    encode_capture_request(sequence, request)
                 }
-                StreamControlProtocol::LegacyCaptureConfig => {
-                    encode_legacy_capture_config(sequence, state.baseline)?
-                }
+
                 StreamControlProtocol::Negotiating => bail!("PB 特性协商尚未完成"),
+                StreamControlProtocol::Unsupported => {
+                    bail!("对端不支持当前串流协议（需要CaptureSetting RPC）")
+                }
             };
             state.next_sequence = state.next_sequence.wrapping_add(1);
             state.pending_sequences.push_back(sequence);
@@ -966,6 +1226,7 @@ impl StreamControlHandle {
             state.last_error = None;
             state.last_notice = None;
             let outgoing = OutgoingControlMessage {
+                annotation_generation: None,
                 sequence,
                 payload,
                 protocol: active_protocol,
@@ -976,8 +1237,8 @@ impl StreamControlHandle {
                 settings.quality.label(),
                 settings.frame_rate.label(state.local_display)
             );
+            state.user_settings_requested = true;
             let sent = self.send_locked(&mut state, outgoing, Some(switch_target))?;
-            state.user_preference_pending = Some((sent, settings));
             Ok(sent)
         }
     }
@@ -990,13 +1251,6 @@ impl StreamControlHandle {
     ) -> Result<i64> {
         let sequence = outgoing.sequence;
         state.latest_requested_sequence = Some(sequence);
-        if let Some(budget) = &mut state.budget {
-            budget.submitted(
-                sequence,
-                state.baseline.max_custom_bitrate / 1_000_000,
-                Instant::now(),
-            );
-        }
         if let Some(target) = target {
             state.performance.begin_stream_switch(sequence, target);
         }
@@ -1005,146 +1259,36 @@ impl StreamControlHandle {
         if self.outgoing.send(outgoing).is_err() {
             state.initial_capture_sync_sent = false;
             state.pending_sequences.clear();
+            state.pending_capture_preferences.clear();
+            restore_confirmed_capture(state);
             state.last_error = Some("串流设置发送任务已经停止".to_owned());
-            if let Some(budget) = &mut state.budget {
-                budget.suspend();
-            }
             state
                 .performance
                 .fail_stream_switch(sequence, "串流设置发送任务已经停止");
             bail!("串流设置发送任务已经停止");
         }
+        state
+            .pending_capture_preferences
+            .push_back(PendingCapturePreferences {
+                sequence,
+                preferences: StreamControlPreferences {
+                    custom_bitrate_limit: (state.custom_bitrate_limit < MAX_CUSTOM_BITRATE_MBPS)
+                        .then_some(state.custom_bitrate_limit),
+                    settings: state.settings,
+                    audio: None,
+                    auto_frame_quality: state.baseline.auto_frame_quality,
+                },
+                cursor_capture: state.baseline.cursor_capture,
+                persist: state.user_settings_requested,
+            });
         Ok(sequence)
     }
 
-    pub(crate) fn observe_budget(
-        &self,
-        performance: &PerformanceMonitor,
-        rtt: Option<std::time::Duration>,
-        route: Option<&str>,
-        connected: bool,
-    ) {
-        // No full performance snapshot/history sorting in the observer.
+    pub(crate) fn poll_timeouts(&self) {
         let mut state = lock(&self.shared);
+        self.drive_display_changes(&mut state);
         expire_cursor_request(&mut state);
-        if state.cursor_pending.is_some() {
-            return;
-        }
-        if state.settings.quality != StreamQuality::Adaptive {
-            return;
-        }
-        let sample = performance.budget_sample(rtt);
-        let ready = connected
-            && route.is_some()
-            && ensure_ready(&state).is_ok()
-            && state.latest_requested_sequence == state.last_applied_sequence;
-        let context = format!(
-            "{}:{:?}:{}",
-            route.unwrap_or(""),
-            state.remote_display,
-            state.baseline.codec_type
-        );
-        let Some(budget) = &mut state.budget else {
-            return;
-        };
-        let proposal = budget.observe(sample, &context, ready);
-        if budget.snapshot().phase == BudgetPhase::Suspended
-            && let Some(sequence) = state
-                .latest_requested_sequence
-                .filter(|seq| state.pending_sequences.contains(seq))
-        {
-            state.pending_sequences.clear();
-            state.last_error = Some("视频预算确认超时，远端是否生效未知；已暂停自动调整".into());
-            state
-                .performance
-                .fail_stream_switch(sequence, "视频预算确认超时");
-        }
-        if let Some(cap) = proposal
-            && let Err(error) = self.request_budget_locked(&mut state, cap)
-        {
-            state.last_error = Some(error.to_string());
-            if let Some(budget) = &mut state.budget {
-                budget.suspend();
-            }
-        }
-    }
-
-    fn request_budget_locked(&self, state: &mut StreamControlState, cap: u32) -> Result<i64> {
-        if state.cursor_pending.is_some() {
-            bail!("请等待光标显示设置确认");
-        }
-        ensure_ready(state)?;
-        if state.settings.quality != StreamQuality::Adaptive
-            || !protocol(state).supports_custom_bitrate()
-        {
-            bail!("当前模式不支持受限自适应");
-        }
-        if state.latest_requested_sequence != state.last_applied_sequence {
-            bail!("请等待当前串流设置确认");
-        }
-        if !(1..=state.settings.adaptive_ceiling_mbps).contains(&cap) {
-            bail!("视频预算超过用户上限");
-        }
-        let mut baseline = state.baseline;
-        baseline.max_custom_bitrate = cap * 1_000_000;
-        let sequence = state.next_sequence;
-        let payload = encode_capture_setting(sequence, baseline)?;
-        state.baseline = baseline;
-        state.next_sequence = state.next_sequence.wrapping_add(1);
-        state.pending_sequences.push_back(sequence);
-        state.last_error = None;
-        tracing::info!(
-            sequence,
-            cap_mbps = cap,
-            ceiling_mbps = state.settings.adaptive_ceiling_mbps,
-            "bounded adaptive video budget requested"
-        );
-        let protocol = protocol(state);
-        self.send_locked(
-            state,
-            OutgoingControlMessage {
-                sequence,
-                payload,
-                protocol,
-                completion: None,
-            },
-            Some(format!("受限自适应 · 视频预算 {cap} Mbps")),
-        )
-    }
-
-    pub fn adopt_budget_suggestion(&self) -> Result<i64> {
-        let mut state = lock(&self.shared);
-        let cap = state
-            .budget
-            .as_ref()
-            .and_then(|b| b.snapshot().suggested_mbps)
-            .ok_or_else(|| anyhow!("当前没有有效的试调建议"))?;
-        self.request_budget_locked(&mut state, cap)
-    }
-
-    /// Explicitly retry the user's ceiling; only this action forgets a recent
-    /// failed bound. Routine recovery does not repeatedly hit that failed rate.
-    pub fn reassess_budget(&self) -> Result<i64> {
-        let mut state = lock(&self.shared);
-        expire_cursor_request(&mut state);
-        if state.cursor_pending.is_some() {
-            bail!("请等待光标显示设置确认");
-        }
-        ensure_ready(&state)?;
-        if state.settings.quality != StreamQuality::Adaptive {
-            bail!("请先选择受限自适应");
-        }
-        let settings = state.settings;
-        state.budget = Some(BudgetPolicy::new(
-            settings.adaptive_ceiling_mbps,
-            settings.stability_priority,
-            Instant::now(),
-        ));
-        // A prior timed-out attempt has no known result; this explicit full
-        // snapshot supersedes it and provides a new acknowledgment boundary.
-        state.latest_requested_sequence = state.last_applied_sequence;
-        state.pending_sequences.clear();
-        self.request_budget_locked(&mut state, settings.adaptive_ceiling_mbps)
+        self.refresh_mouse_policy(&mut state);
     }
 
     pub(crate) fn set_data_channel_open(&self, label: &str, open: bool) {
@@ -1167,31 +1311,37 @@ impl StreamControlHandle {
             _ => return,
         }
         if !open {
+            state.annotation.disconnect();
+            state.topology.disconnect();
+            state
+                .display_changes
+                .cancel_all("连接已断开，显示设置未确认");
             state.peer_mouse_relative = None;
-            state.mouse_policy_waiting = false;
+            state.cursor_sync_needed = false;
+            state.cursor_desired_capture = true;
             state.mouse_restore_point = None;
-            state.mouse_restore_pending = false;
             state.baseline.cursor_capture = true;
             state.mouse.set_ready(false);
-            state.mouse_transition = None;
             if let Some((sequence, _, _)) = state.cursor_pending {
                 fail_cursor_request(&mut state, sequence, "连接已断开，光标设置未确认".into());
             }
             state.registered_video_tracks.clear();
             state.track_registration = None;
             state.track_registration_error = None;
-            if let Some(budget) = &mut state.budget {
-                budget.suspend();
-            }
             if let Some(sequence) = state.pending_sequences.back().copied() {
                 state
                     .performance
                     .fail_stream_switch(sequence, format!("{label} 通道已关闭"));
             }
             state.pending_sequences.clear();
+            state.pending_capture_preferences.clear();
         }
         self.maybe_send_initial_capture_sync(&mut state);
-        if open && state.pb_connected && state.control_channel_open && state.text_channel_open {
+        if open
+            && protocol(&state) == StreamControlProtocol::CaptureSetting
+            && state.control_channel_open
+            && state.text_channel_open
+        {
             state.mouse.set_ready(state.mouse_transport_connected);
         }
         drop(state);
@@ -1204,20 +1354,28 @@ impl StreamControlHandle {
     pub(crate) fn set_video_stream(&self, codec: VideoCodec, video_track_index: i32) {
         let mut state = lock(&self.shared);
         state.active_video_track_index = video_track_index;
-        state.baseline.codec_type = match codec {
-            VideoCodec::H264 => 1,
-            VideoCodec::H265 => 2,
-        };
+        // The initial CaptureSetting may already have selected another codec
+        // before the first RTP packet. Do not overwrite that intent with an
+        // old-format packet still in flight during the change.
+        if !state.initial_capture_sync_sent {
+            state.baseline.codec_type = match codec {
+                VideoCodec::H264 => 1,
+                VideoCodec::H265 => 2,
+            };
+        }
         refresh_active_screen(&mut state);
         self.maybe_send_initial_capture_sync(&mut state);
     }
 
     pub(crate) fn set_capability(&self, capability: DualCapability) {
         tracing::info!(capability = %serde_json::to_string(&capability).expect("integer capability fields serialize"),
-            "official dual capability model updated; no capture request triggered");
-        // B770F0 updates the model only. Do not turn late/duplicate capability
-        // messages into unsolicited stream changes or decoder restarts.
-        lock(&self.shared).capability = Some(capability);
+            "official dual capability model updated");
+        let mut state = lock(&self.shared);
+        state.capability = Some(capability);
+        // Complete a pending initial configuration once its actual inputs
+        // exist. After it is submitted, late/duplicate capabilities do not
+        // trigger stream changes or decoder restarts.
+        self.maybe_send_initial_capture_sync(&mut state);
     }
 
     pub(crate) fn select_viewed_video_track(&self, video_track_index: i32) {
@@ -1228,6 +1386,15 @@ impl StreamControlHandle {
 
     pub(crate) fn mark_send_failed(&self, sequence: i64, error: &str) {
         let mut state = lock(&self.shared);
+        if self.topology_send_failed(&mut state, sequence, error) {
+            return;
+        }
+        if state.display_changes.send_failed(sequence, error) {
+            return;
+        }
+        state
+            .pending_capture_preferences
+            .retain(|pending| pending.sequence != sequence);
         fail_cursor_request(&mut state, sequence, error.to_owned());
         if state
             .track_registration
@@ -1244,11 +1411,8 @@ impl StreamControlHandle {
         if state.latest_requested_sequence != Some(sequence) {
             return;
         }
-        state.pending_sequences.clear();
-        if let Some(budget) = &mut state.budget {
-            budget.suspend();
-        }
         state.last_error = Some(error.to_owned());
+        restore_confirmed_capture(&mut state);
         state.performance.fail_stream_switch(sequence, error);
     }
 
@@ -1269,7 +1433,7 @@ impl StreamControlHandle {
         let mut state = lock(&self.shared);
         if !state.pb_connected {
             // D4C410 only stops retrying. No ECHO response means no negotiated
-            // feature version, not permission to invent a legacy handshake.
+            // feature version; no protocol is selected without a response.
             state.last_error = Some("PB 特性协商超时；画面继续播放，串流设置尚未就绪".to_owned());
         }
     }
@@ -1326,10 +1490,13 @@ impl StreamControlHandle {
                             state.mouse.set_ready(
                                 state.mouse_transport_connected
                                     && state.control_channel_open
-                                    && state.text_channel_open,
+                                    && state.text_channel_open
+                                    && protocol(&state) == StreamControlProtocol::CaptureSetting,
                             );
                             handshake_changed = true;
-                            state.last_error = None;
+                            state.last_error = (protocol(&state)
+                                == StreamControlProtocol::Unsupported)
+                                .then(|| "对端不支持当前串流协议（需要CaptureSetting RPC）".into());
                             tracing::info!(
                                 capture_setting_feature_level = state.peer_capture_setting,
                                 protocol = protocol(&state).label(),
@@ -1340,11 +1507,46 @@ impl StreamControlHandle {
                     _ => {}
                 }
             }
+            Some(PbPayload::ReportError(report)) => {
+                if let Some(upgrade) = &state.remote_upgrade {
+                    upgrade.receive(report.error_code);
+                    if report.error_code == -6 {
+                        state.mouse.disable();
+                        state.annotation.disconnect();
+                    }
+                }
+                // Upgrade notifications are attached only to a normal owned
+                // Windows viewing session; they never execute an inbound updater.
+                if report.error_code == -9 {
+                    state.remote_notice = Some((
+                        Instant::now(),
+                        "被控端系统会话发生变化，画面会有短暂卡顿，请稍候",
+                    ));
+                }
+                tracing::debug!(
+                    action = report.action,
+                    code = report.error_code,
+                    type_value = report.type_value,
+                    "remote capture status received"
+                );
+            }
             Some(PbPayload::ReportQosStats(qos)) => {
                 if state.baseline.frame_quality == VIDEO_QUALITY_AUTO
                     && let Some(auto_quality) = reported_auto_quality(qos.video_quality)
                 {
                     state.baseline.auto_frame_quality = auto_quality;
+                    if state.confirmed_preferences.settings == state.settings
+                        && state.pending_capture_preferences.is_empty()
+                        && state.confirmed_preferences.auto_frame_quality != auto_quality
+                    {
+                        state.confirmed_preferences.auto_frame_quality = auto_quality;
+                        let update = if state.user_settings_requested {
+                            ViewingPreferenceUpdate::Settings(state.confirmed_preferences.saved())
+                        } else {
+                            ViewingPreferenceUpdate::AutoQuality(auto_quality)
+                        };
+                        state.preference_updates.send_replace(Some(update));
+                    }
                     state.performance.set_quality(viewing_quality_label(&state));
                 }
                 tracing::debug!(encoder_type = %qos.encoder_type, capture_type = %qos.capture_type, probe_bps = qos.probe_bps, video_quality = qos.video_quality,
@@ -1353,8 +1555,8 @@ impl StreamControlHandle {
             }
             Some(PbPayload::Screens(screens)) => update_screen_baseline(&mut state, screens),
             Some(PbPayload::CaptureSettingSync(bytes)) => {
-                // GameViewer 141041270 (ordinary video) has no tag-25 state
-                // consumer. E50910 belongs to SecondScreenSettingsModel.
+                // 4.40 F6B150/F62360 -> 1410F2780 (ordinary video) has no
+                // tag-25 state consumer. EC6650 is SecondScreenSettingsModel.
                 // Keep the oneof tag, but do not import that module's state.
                 tracing::debug!(
                     ?source,
@@ -1365,51 +1567,54 @@ impl StreamControlHandle {
             }
             Some(PbPayload::RpcResponse(response)) => {
                 if let Some(header) = response.response_header {
-                    match response.payload {
-                        Some(PbRpcResponsePayload::CaptureSetting(capture)) => {
-                            apply_capture_setting_response(&mut state, header.request_id, capture)
-                        }
-                        Some(PbRpcResponsePayload::SendVideoTrackRsp(result))
-                            if state
-                                .track_registration
-                                .as_ref()
-                                .is_some_and(|(seq, _)| *seq == header.request_id) =>
-                        {
-                            let (_, tracks) = state
-                                .track_registration
-                                .take()
-                                .expect("matching registration");
-                            if result.error_code == 0 {
-                                tracing::info!(
-                                    ?tracks,
-                                    "remote video track pool registration confirmed"
-                                );
-                                state.registered_video_tracks = tracks;
-                            } else {
-                                state.track_registration_error =
-                                    Some(format!("视频轨道注册被拒绝（{}）", result.error_code));
+                    if !self.handle_topology_response(
+                        &mut state,
+                        header.request_id,
+                        response.payload.as_ref(),
+                    ) {
+                        match response.payload {
+                            Some(PbRpcResponsePayload::DrawResp(draw)) => {
+                                state.annotation.response(header.request_id, draw)
                             }
+                            Some(PbRpcResponsePayload::CaptureSetting(capture)) => {
+                                apply_capture_setting_response(
+                                    &mut state,
+                                    header.request_id,
+                                    capture,
+                                )
+                            }
+                            Some(PbRpcResponsePayload::SendVideoTrackRsp(result))
+                                if state
+                                    .track_registration
+                                    .as_ref()
+                                    .is_some_and(|(seq, _)| *seq == header.request_id) =>
+                            {
+                                let (_, tracks) = state
+                                    .track_registration
+                                    .take()
+                                    .expect("matching registration");
+                                if result.error_code == 0 {
+                                    tracing::info!(
+                                        ?tracks,
+                                        "remote video track pool registration confirmed"
+                                    );
+                                    state.registered_video_tracks = tracks;
+                                } else {
+                                    state.track_registration_error = Some(format!(
+                                        "视频轨道注册被拒绝（{}）",
+                                        result.error_code
+                                    ));
+                                }
+                            }
+                            _ => {}
                         }
-                        _ => {}
                     }
                 }
-            }
-            Some(PbPayload::CaptureConfigResponse(response)) => {
-                apply_legacy_capture_response(&mut state, response)
             }
             _ => {}
         }
         self.maybe_send_initial_capture_sync(&mut state);
-        if state.mouse_restore_pending
-            && state.pending_sequences.is_empty()
-            && ensure_ready(&state).is_ok()
-        {
-            state.mouse_restore_pending = false;
-            match self.request_cursor_locked(&mut state, true) {
-                Ok(sequence) => state.mouse_transition = Some((sequence, MouseMode::View)),
-                Err(error) => state.mouse.fail(error.to_string()),
-            }
-        }
+        self.drive_display_changes(&mut state);
         self.refresh_mouse_policy(&mut state);
         drop(state);
         if handshake_changed {
@@ -1453,7 +1658,7 @@ impl StreamControlHandle {
             2 => {
                 anyhow::ensure!(
                     !force || (x.is_none() && y.is_none()),
-                    "invalid legacy mouse restore"
+                    "invalid mouse restore command"
                 );
                 let restore = match (x, y) {
                     (None, None) => None,
@@ -1493,39 +1698,26 @@ impl StreamControlHandle {
     }
 
     fn refresh_mouse_policy(&self, state: &mut StreamControlState) {
-        if state.mouse_transition.is_some() {
+        let mode = state.mouse.mode();
+        let (relative, wanted) = mouse_policy(state, mode);
+        if mode == MouseMode::Smart && state.mouse.relative_mode() != relative {
+            state.mouse.set_relative_mode(relative);
+        }
+        if state.cursor_desired_capture != wanted {
+            state.cursor_desired_capture = wanted;
+            state.cursor_sync_needed = true;
+        }
+        if !state.cursor_sync_needed || ensure_ready(state).is_err() {
             return;
         }
-        if state.mouse.mode() != MouseMode::Smart && !state.mouse_policy_waiting {
+        state.cursor_sync_needed = false;
+        if wanted == state.baseline.cursor_capture && state.cursor_error.is_none() {
             return;
         }
-        let (relative, visible) = mouse_policy(state, MouseMode::Smart);
-        if visible == state.baseline.cursor_capture {
-            if state.mouse_policy_waiting {
-                state.mouse_policy_waiting = false;
-                if let Err(error) = state.mouse.enable(MouseMode::Smart, relative) {
-                    state.mouse.fail(error.to_string());
-                }
-            } else if state.mouse.relative_mode() != relative {
-                // Automatic shape changes must not release a held fire button.
-                state.mouse.set_relative_mode(relative);
-            }
-        } else {
-            state.mouse.disable();
-            state.mouse_policy_waiting = true;
-            if !state.pending_sequences.is_empty() || ensure_ready(state).is_err() {
-                return;
-            }
-            match self.request_cursor_locked(state, visible) {
-                Ok(sequence) => {
-                    state.mouse_policy_waiting = false;
-                    state.mouse_transition = Some((sequence, MouseMode::Smart));
-                }
-                Err(error) => {
-                    state.mouse_policy_waiting = false;
-                    state.mouse.fail(error.to_string());
-                }
-            }
+        // Failure does not revoke input or retry forever. A new policy change
+        // or explicit choice is required before submitting again.
+        if let Err(error) = self.request_cursor_locked(state, wanted) {
+            state.cursor_error = Some(error.to_string());
         }
     }
 
@@ -1546,20 +1738,13 @@ impl StreamControlHandle {
 
 fn set_requested_settings(
     state: &mut StreamControlState,
-    settings: StreamControlSettings,
+    mut settings: StreamControlSettings,
 ) -> Result<()> {
-    if !settings.frame_rate.is_supported(state.local_display) {
-        bail!("串流帧率超过本机显示档位");
-    }
+    normalize_low_quality(&mut settings);
     if settings.quality == StreamQuality::Custom
         && !(1..=MAX_CUSTOM_BITRATE_MBPS).contains(&settings.custom_bitrate_mbps)
     {
         bail!("自定义码率必须在 1..={MAX_CUSTOM_BITRATE_MBPS} Mbps 之间");
-    }
-    if settings.quality == StreamQuality::Adaptive
-        && !(1..=MAX_CUSTOM_BITRATE_MBPS).contains(&settings.adaptive_ceiling_mbps)
-    {
-        bail!("视频码率上限必须在 1..={MAX_CUSTOM_BITRATE_MBPS} Mbps 之间");
     }
     let requested_fps = settings.frame_rate.value(state.local_display);
     state.baseline.requested_fps = requested_fps;
@@ -1568,13 +1753,29 @@ fn set_requested_settings(
         .refresh_hz
         .clamp(1, requested_fps.max(1));
     state.baseline.frame_quality = settings.quality.protobuf();
+    state.baseline.enable_hdr = settings.hdr;
+    state.baseline.chroma_format = if settings.true_color {
+        CHROMA_444
+    } else {
+        CHROMA_420
+    };
     state.baseline.max_custom_bitrate = match settings.quality {
-        StreamQuality::Custom => settings.custom_bitrate_mbps * 1_000_000,
-        StreamQuality::Adaptive => settings.adaptive_ceiling_mbps * 1_000_000,
+        StreamQuality::Custom => {
+            settings.custom_bitrate_mbps.min(state.custom_bitrate_limit) * 1_000_000
+        }
         _ => 0,
     };
     state.settings = settings;
     Ok(())
+}
+
+fn normalize_low_quality(settings: &mut StreamControlSettings) {
+    // Current 4.40.1 buildCaptureConfig also normalizes an actual low-tier
+    // capability fallback to Custom 1M; this is not a separate menu entry.
+    if settings.quality == StreamQuality::Fast {
+        settings.quality = StreamQuality::Custom;
+        settings.custom_bitrate_mbps = 1;
+    }
 }
 
 pub(crate) fn encode_pb_echo_request() -> Vec<u8> {
@@ -1617,24 +1818,52 @@ fn prepare_initial_capture_sync(
         || !state.text_channel_open
         || !state.pb_connected
         || state.remote_display.is_none()
-        || state.baseline.codec_type == 0
     {
         return Ok(None);
     }
     let active_protocol = protocol(state);
-    if matches!(
-        state.settings.quality,
-        StreamQuality::Custom | StreamQuality::Adaptive
-    ) && !active_protocol.supports_custom_bitrate()
+    if matches!(state.settings.quality, StreamQuality::Custom) && !custom_bitrate_supported(&state)
     {
         bail!("新连接的被控端不支持自定义码率，不能恢复该选择");
     }
+    if (state.settings.hdr || state.settings.true_color) && state.capability.is_none() {
+        return Ok(None);
+    }
+    if let Some(cap) = &state.capability {
+        let original = state.settings;
+        let hdr_allowed = ensure_hdr_displays(state).is_ok();
+        let color_allowed = color_supported(state);
+        let candidates = [
+            (original.true_color, original.hdr),
+            (false, original.hdr),
+            (original.true_color, false),
+            (false, false),
+        ];
+        if let Some((color, hdr)) = candidates.into_iter().find(|(color, hdr)| {
+            (!*hdr || hdr_allowed)
+                && (!*color || color_allowed)
+                && cap.select(if *color { 3 } else { 1 }, *hdr, 0).result == 0
+        }) {
+            if color != original.true_color || hdr != original.hdr {
+                let mut settings = original;
+                settings.true_color = color;
+                settings.hdr = hdr;
+                set_requested_settings(state, settings)?;
+                state.last_notice =
+                    Some("当前设备组合无法恢复原色彩/HDR选择，本次连接已使用可用模式".into());
+            }
+        }
+    }
     if let Some(capability) = &state.capability {
         let requested = state.settings.quality.capability_quality();
-        let selected = capability.select(CHROMA_420 as u8, false, requested);
+        let selected = capability.select(
+            state.baseline.chroma_format as u8,
+            state.settings.hdr,
+            requested,
+        );
         if selected.result != 0 {
             bail!(
-                "双端没有可用的420 SDR视频格式（协商结果{}）",
+                "双端没有可用的所选色彩视频格式（协商结果{}）",
                 selected.result
             );
         }
@@ -1652,15 +1881,20 @@ fn prepare_initial_capture_sync(
         }
         apply_codec_limits(state, selected);
     }
+    // Submit from screen state and negotiated capabilities, independently
+    // of first-frame delivery. The evidence is in the controller-route doc.
+    // If neither negotiation nor RTP supplied a codec, keep waiting rather
+    // than inventing a default codec or an incomplete RPC.
+    if state.baseline.codec_type == 0 {
+        return Ok(None);
+    }
     constrain_auto_quality(state);
     let baseline = state.baseline;
     let sequence = state.next_sequence;
     let payload = match active_protocol {
-        StreamControlProtocol::CaptureSetting { .. } => encode_capture_setting(sequence, baseline)?,
-        StreamControlProtocol::LegacyCaptureConfig => {
-            encode_legacy_capture_config(sequence, baseline)?
-        }
-        StreamControlProtocol::Negotiating => return Ok(None),
+        StreamControlProtocol::CaptureSetting => encode_capture_setting(sequence, baseline)?,
+
+        StreamControlProtocol::Negotiating | StreamControlProtocol::Unsupported => return Ok(None),
     };
     state.next_sequence = state.next_sequence.wrapping_add(1);
     state.pending_sequences.push_back(sequence);
@@ -1682,6 +1916,7 @@ fn prepare_initial_capture_sync(
         "official initial capture-setting snapshot prepared"
     );
     Ok(Some(OutgoingControlMessage {
+        annotation_generation: None,
         sequence,
         payload,
         protocol: active_protocol,
@@ -1699,24 +1934,109 @@ fn quality_from_capability(quality: i32) -> Option<StreamQuality> {
     }
 }
 
-fn validate_quality(
+fn color_supported(state: &StreamControlState) -> bool {
+    state.peer_capture_setting >= 3
+        && feature_supported(state, crate::feature_ability::Feature::ScreenChroma)
+        && state.capability.is_some()
+}
+
+fn validate_color(state: &StreamControlState, enabled: bool) -> Result<()> {
+    anyhow::ensure!(color_supported(state), "当前会话未开放色彩切换");
+    validate_format(state, state.settings.quality, enabled, state.settings.hdr)?;
+    Ok(())
+}
+
+fn validate_format(
     state: &StreamControlState,
     quality: StreamQuality,
+    true_color: bool,
+    hdr: bool,
 ) -> Result<Option<FrameQualityCapability>> {
     let Some(capability) = &state.capability else {
         return Ok(None);
     };
     let requested = quality.capability_quality();
-    let selected = capability.select(CHROMA_420 as u8, false, requested);
-    if selected.result != 0 || selected.max_frame_quality < requested {
+    let selected = capability.select(if true_color { 3 } else { 1 }, hdr, requested);
+    if selected.result != 0
+        || (!matches!(requested, 0 | 5) && selected.max_frame_quality < requested)
+    {
         bail!(
-            "双端能力不支持{}（最高能力档位{}，结果{}）",
+            "双端能力不支持此色彩下的{}（最高能力档位{}，结果{}）",
             quality.label(),
             selected.max_frame_quality,
             selected.result
         );
     }
     Ok(Some(selected))
+}
+
+fn ensure_hdr_displays(state: &StreamControlState) -> Result<()> {
+    anyhow::ensure!(state.peer_capture_setting >= 6, "当前会话不支持 HDR");
+    let cap = state
+        .capability
+        .as_ref()
+        .ok_or_else(|| anyhow!("正在等待 HDR 能力"))?;
+    anyhow::ensure!(
+        cap.remote_display_info
+            .iter()
+            .any(|display| display.hdr == 0),
+        "请先在被控端支持 HDR 的屏幕上开启 Windows HDR"
+    );
+    anyhow::ensure!(
+        cap.local_display_info
+            .iter()
+            .any(|display| display.hdr == 0),
+        "请先在本机支持 HDR 的屏幕上开启 Windows HDR"
+    );
+    Ok(())
+}
+
+fn format_proposal(
+    state: &StreamControlState,
+    color: Option<bool>,
+    hdr: Option<bool>,
+) -> Result<StreamControlSettings> {
+    let mut settings = state.settings;
+    if let Some(enabled) = color {
+        anyhow::ensure!(color_supported(state), "当前会话不支持色彩切换");
+        settings.true_color = enabled;
+    }
+    if let Some(enabled) = hdr {
+        anyhow::ensure!(state.peer_capture_setting >= 6, "当前会话不支持 HDR");
+        settings.hdr = enabled;
+    }
+    if hdr == Some(true) {
+        ensure_hdr_displays(state)?;
+    }
+    let cap = state
+        .capability
+        .as_ref()
+        .ok_or_else(|| anyhow!("正在等待串流能力"))?;
+    let mut selected = cap.select(
+        if settings.true_color { 3 } else { 1 },
+        settings.hdr,
+        settings.quality.capability_quality(),
+    );
+    if selected.result != 0 && settings.hdr && settings.true_color {
+        if hdr == Some(true) {
+            selected = cap.select(1, true, settings.quality.capability_quality());
+            if selected.result == 0 {
+                settings.true_color = false;
+            }
+        } else if color == Some(true) {
+            selected = cap.select(3, false, settings.quality.capability_quality());
+            if selected.result == 0 {
+                settings.hdr = false;
+            }
+        }
+    }
+    anyhow::ensure!(selected.result == 0, "双方设备不支持所选色彩与 HDR 组合");
+    let requested = settings.quality.capability_quality();
+    if !matches!(requested, 0 | 5) && selected.max_frame_quality < requested {
+        settings.quality = quality_from_capability(selected.max_frame_quality)
+            .ok_or_else(|| anyhow!("无可用画质档位"))?;
+    }
+    Ok(settings)
 }
 
 fn apply_codec_limits(state: &mut StreamControlState, selected: FrameQualityCapability) {
@@ -1732,7 +2052,13 @@ fn constrain_auto_quality(state: &mut StreamControlState) {
     if let Some(row) = state
         .capability
         .as_ref()
-        .and_then(|cap| cap.exact(state.baseline.codec_type, CHROMA_420 as u8, false))
+        .and_then(|cap| {
+            cap.exact(
+                state.baseline.codec_type,
+                state.baseline.chroma_format as u8,
+                state.settings.hdr,
+            )
+        })
         .filter(|row| row.result == 0)
         && let Some(maximum) = quality_from_capability(row.max_frame_quality)
         && state.baseline.auto_frame_quality > maximum.protobuf()
@@ -1751,6 +2077,9 @@ fn ensure_ready(state: &StreamControlState) -> Result<()> {
     if !state.pb_connected {
         bail!("UU PB 特性协商尚未完成");
     }
+    if protocol(state) == StreamControlProtocol::Unsupported {
+        bail!("对端不支持当前串流协议（需要CaptureSetting RPC）");
+    }
     if state.remote_display.is_none() {
         bail!("尚未收到活动屏幕基线，已阻止发送不完整的串流设置");
     }
@@ -1760,25 +2089,37 @@ fn ensure_ready(state: &StreamControlState) -> Result<()> {
     Ok(())
 }
 
+fn custom_bitrate_supported(state: &StreamControlState) -> bool {
+    state.pb_connected
+        && state.peer_capture_setting >= crate::official_version::CUSTOM_BITRATE_MIN_LEVEL
+}
+
+fn feature_supported(state: &StreamControlState, feature: crate::feature_ability::Feature) -> bool {
+    state
+        .features
+        .as_ref()
+        .is_some_and(|policy| policy.supports(feature))
+}
+
 fn protocol(state: &StreamControlState) -> StreamControlProtocol {
     if !state.pb_connected {
         StreamControlProtocol::Negotiating
-    } else if state.peer_capture_setting >= 1 {
-        StreamControlProtocol::CaptureSetting {
-            feature_level: state.peer_capture_setting,
-        }
+    } else if state.peer_capture_setting >= crate::official_version::CAPTURE_SETTING_RPC_MIN_LEVEL {
+        StreamControlProtocol::CaptureSetting
     } else {
-        StreamControlProtocol::LegacyCaptureConfig
+        StreamControlProtocol::Unsupported
     }
 }
 
 fn update_screen_baseline(state: &mut StreamControlState, screens: PbScreenSources) {
+    let previous_screens = state.screens.clone();
     state.screens_generation = state.screens_generation.wrapping_add(1);
     state.current_screen_id = screens.current_screen_id;
     state.screens = screens
         .screens
         .into_iter()
         .filter_map(|screen| {
+            let display = RemoteDisplayInfo::from_screen(&screen)?;
             let resolution = screen.current_resolution?;
             let width = u32::try_from(resolution.width).ok()?;
             let height = u32::try_from(resolution.height).ok()?;
@@ -1800,9 +2141,22 @@ fn update_screen_baseline(state: &mut StreamControlState, screens: PbScreenSourc
                     .map(|dpi| u32::try_from(dpi.current_dpi).unwrap_or_default())
                     .unwrap_or_default(),
                 resolution_type: screen.resolution_type,
+                display,
             })
         })
         .collect();
+    if previous_screens.iter().any(|old| {
+        !state.screens.iter().any(|new| {
+            old.id == new.id
+                && old.video_track_index == new.video_track_index
+                && old.display.screen_type == new.display.screen_type
+        })
+    }) {
+        state.mouse.pause_layout();
+    }
+    state
+        .topology
+        .observe(state.screens_generation, &state.screens);
     for screen in &state.screens {
         tracing::debug!(screen_id = screen.id, name = %screen.name,
             primary = screen.primary, track = screen.video_track_index,
@@ -1852,11 +2206,34 @@ fn apply_capture_setting_response(
     request_id: i64,
     response: PbCaptureSettingResponse,
 ) {
+    if state.display_changes.ack(request_id, &response) {
+        return;
+    }
+    let current = state.latest_requested_sequence == Some(request_id)
+        && state.pending_sequences.contains(&request_id);
+    let mut reported_color = None;
     let mut failures = Vec::new();
     let mut notices = Vec::new();
     for error in response.errors {
         match error.error_code {
             0 => {}
+            -6 => {
+                match serde_json::from_str::<serde_json::Value>(&error.error_detail)
+                    .ok()
+                    .and_then(|v| v.get("error_code").and_then(|n| n.as_i64()))
+                {
+                    Some(code @ (0 | 1 | 2 | 3 | 4 | 5)) => {
+                        reported_color = Some(matches!(code, 0 | 3 | 4));
+                        if matches!(code, 1 | 2) {
+                            notices.push("远端未能启用 YUV 4:4:4，已使用 YUV 4:2:0".into());
+                        }
+                        if matches!(code, 3 | 4) {
+                            notices.push("远端已保留 YUV 4:4:4，其他显示操作未完全生效".into());
+                        }
+                    }
+                    _ => failures.push(format_pb_error(error)),
+                }
+            }
             CAPTURE_RESULT_FPS_ADJUSTED => notices.push(format!(
                 "远端屏幕刷新率低于请求档位，串流已按屏幕能力降档（{}）",
                 format_pb_error(error)
@@ -1864,28 +2241,37 @@ fn apply_capture_setting_response(
             _ => failures.push(format_pb_error(error)),
         }
     }
+    if let Some(enabled) = reported_color
+        && let Some(pending) = state
+            .pending_capture_preferences
+            .iter_mut()
+            .find(|p| p.sequence == request_id)
+    {
+        pending.preferences.settings.true_color = enabled;
+    }
     finish_request(state, request_id, failures, notices);
+    if current && let Some(enabled) = reported_color {
+        apply_reported_color(state, enabled, state.user_settings_requested);
+    }
 }
 
-fn apply_legacy_capture_response(
-    state: &mut StreamControlState,
-    response: PbCaptureConfigResponse,
-) {
-    let failures = (response.error_code != 0)
-        .then(|| {
-            format!(
-                "{}: {}",
-                response.error_code,
-                if response.error_message.is_empty() {
-                    "CaptureConfig failed"
-                } else {
-                    &response.error_message
-                }
-            )
-        })
-        .into_iter()
-        .collect();
-    finish_request(state, response.request_seq, failures, Vec::new());
+fn apply_reported_color(state: &mut StreamControlState, enabled: bool, persist: bool) {
+    state.settings.true_color = enabled;
+    state.baseline.chroma_format = if enabled { CHROMA_444 } else { CHROMA_420 };
+    let changed = state.confirmed_preferences.settings.true_color != enabled;
+    state.confirmed_preferences.settings.true_color = enabled;
+    if let Ok(Some(selected)) =
+        validate_format(state, state.settings.quality, enabled, state.settings.hdr)
+    {
+        apply_codec_limits(state, selected);
+    }
+    if changed && persist {
+        state
+            .preference_updates
+            .send_replace(Some(ViewingPreferenceUpdate::Settings(
+                state.confirmed_preferences.saved(),
+            )));
+    }
 }
 
 fn format_pb_error(error: PbError) -> String {
@@ -1914,19 +2300,22 @@ fn reported_auto_quality(quality: i32) -> Option<i32> {
     }
 }
 
+fn quality_name(quality: i32) -> &'static str {
+    match quality {
+        VIDEO_QUALITY_BLURAY => "原画",
+        VIDEO_QUALITY_HD => "超清",
+        VIDEO_QUALITY_GENERAL => "高清",
+        VIDEO_QUALITY_FAST => "低码率",
+        _ => "高清",
+    }
+}
+
 fn official_quality_label(baseline: &CaptureSettingBaseline) -> String {
     match baseline.frame_quality {
-        VIDEO_QUALITY_FAST => "480P".to_owned(),
-        VIDEO_QUALITY_GENERAL => "720P".to_owned(),
-        VIDEO_QUALITY_HD => "1080P".to_owned(),
-        VIDEO_QUALITY_BLURAY => "4K".to_owned(),
-        VIDEO_QUALITY_AUTO => match baseline.auto_frame_quality {
-            VIDEO_QUALITY_FAST => "480P auto".to_owned(),
-            VIDEO_QUALITY_GENERAL => "720P auto".to_owned(),
-            VIDEO_QUALITY_HD => "1080P auto".to_owned(),
-            VIDEO_QUALITY_BLURAY => "4K auto".to_owned(),
-            _ => "auto".to_owned(),
-        },
+        VIDEO_QUALITY_FAST..=VIDEO_QUALITY_BLURAY => {
+            quality_name(baseline.frame_quality).to_owned()
+        }
+        VIDEO_QUALITY_AUTO => format!("自动（{}）", quality_name(baseline.auto_frame_quality)),
         VIDEO_QUALITY_CUSTOM if baseline.max_custom_bitrate >= 1_000_000 => {
             format!("{} Mbps", baseline.max_custom_bitrate / 1_000_000)
         }
@@ -1936,18 +2325,7 @@ fn official_quality_label(baseline: &CaptureSettingBaseline) -> String {
 }
 
 fn viewing_quality_label(state: &StreamControlState) -> String {
-    if state.settings.quality == StreamQuality::Adaptive {
-        let applied = state
-            .budget
-            .as_ref()
-            .and_then(|budget| budget.snapshot().applied_mbps);
-        applied.map_or_else(
-            || "受限自适应 · 待确认".into(),
-            |cap| format!("受限自适应 {cap}M"),
-        )
-    } else {
-        official_quality_label(&state.baseline)
-    }
+    official_quality_label(&state.baseline)
 }
 
 fn finish_request(
@@ -1959,53 +2337,54 @@ fn finish_request(
     if !state.pending_sequences.contains(&request_id) {
         return;
     }
-    if let Some((sequence, visible, _)) = state.cursor_pending
-        && sequence == request_id
-    {
-        if failures.is_empty() {
-            state.baseline.cursor_capture = visible;
-            state.cursor_pending = None;
-            state.cursor_error = None;
-            if let Some((mouse_sequence, mode)) = state.mouse_transition.take()
-                && mouse_sequence == request_id
-            {
-                let (relative, wanted_cursor) = mouse_policy(state, mode);
-                if mode == MouseMode::Smart && wanted_cursor != visible {
-                    state.mouse_policy_waiting = true;
-                } else if let Err(error) = state.mouse.enable(mode, relative) {
-                    state.mouse.fail(error.to_string());
-                } else if mode != MouseMode::View {
-                    state.preferred_mouse_mode = mode;
-                }
-            }
-            tracing::info!(visible, "remote cursor visibility confirmed");
-        } else {
-            fail_cursor_request(state, request_id, failures.join("; "));
-        }
-    }
-    if let Some((sequence, settings)) = state.user_preference_pending
-        && sequence == request_id
-    {
-        if failures.is_empty() {
-            state.preference_updates.send_replace(Some(settings));
-        }
-        state.user_preference_pending = None;
-    }
+    let Some(index) = state
+        .pending_capture_preferences
+        .iter()
+        .position(|pending| pending.sequence == request_id)
+    else {
+        return;
+    };
+    let completed = state
+        .pending_capture_preferences
+        .remove(index)
+        .expect("matched capture request");
     state
         .pending_sequences
         .retain(|pending| *pending != request_id);
+    if failures.is_empty() {
+        // A successful complete snapshot supersedes older snapshots. A
+        // refusal does not: older requests still retain their own ACKs.
+        for earlier in state.pending_capture_preferences.drain(..index) {
+            state
+                .pending_sequences
+                .retain(|seq| *seq != earlier.sequence);
+        }
+        if completed.cursor_capture == state.baseline.cursor_capture {
+            state.cursor_error = None;
+        }
+        if state
+            .cursor_pending
+            .is_some_and(|(seq, _, _)| !state.pending_sequences.contains(&seq))
+        {
+            state.cursor_pending = None;
+        }
+        let settings_changed = state.confirmed_preferences.saved() != completed.preferences.saved();
+        state.confirmed_preferences = completed.preferences;
+        if completed.persist && settings_changed {
+            state
+                .preference_updates
+                .send_replace(Some(ViewingPreferenceUpdate::Settings(
+                    completed.preferences.saved(),
+                )));
+        }
+    } else {
+        fail_cursor_request(state, request_id, failures.join("; "));
+    }
     if state.latest_requested_sequence != Some(request_id) {
         return;
     }
-    // These are complete snapshots on one ordered channel. A terminal response
-    // for the newest request supersedes all older outstanding UI requests.
-    state.pending_sequences.clear();
     if failures.is_empty() {
-        if let Some(budget) = &mut state.budget {
-            budget.acknowledge(request_id, Instant::now());
-        }
         state.last_applied_sequence = Some(request_id);
-        state.cursor_error = None;
         state.last_error = None;
         state.last_notice = (!notices.is_empty()).then(|| notices.join("; "));
         state.performance.acknowledge_stream_switch(request_id);
@@ -2018,10 +2397,8 @@ fn finish_request(
             tracing::info!(sequence = request_id, %notice, "remote host adjusted runtime stream settings");
         }
     } else {
-        if let Some(budget) = &mut state.budget {
-            budget.suspend();
-        }
         let error = failures.join("; ");
+        restore_confirmed_capture(state);
         state.last_error = Some(error.clone());
         state.last_notice = None;
         state
@@ -2031,12 +2408,22 @@ fn finish_request(
     }
 }
 
+fn restore_confirmed_capture(state: &mut StreamControlState) {
+    let confirmed = state.confirmed_preferences;
+    let _ = set_requested_settings(state, confirmed.settings);
+    state.baseline.auto_frame_quality = confirmed.auto_frame_quality;
+    if let Ok(Some(selected)) = validate_format(
+        state,
+        confirmed.settings.quality,
+        confirmed.settings.true_color,
+        confirmed.settings.hdr,
+    ) {
+        apply_codec_limits(state, selected);
+    }
+}
+
 fn smart_mouse_requested(state: &StreamControlState) -> bool {
     state.mouse.mode() == MouseMode::Smart
-        || state.mouse_policy_waiting
-        || state
-            .mouse_transition
-            .is_some_and(|(_, mode)| mode == MouseMode::Smart)
 }
 
 fn mouse_policy(state: &StreamControlState, mode: MouseMode) -> (bool, bool) {
@@ -2054,14 +2441,6 @@ fn mouse_policy(state: &StreamControlState, mode: MouseMode) -> (bool, bool) {
 
 fn fail_cursor_request(state: &mut StreamControlState, sequence: i64, error: String) {
     if state
-        .mouse_transition
-        .is_some_and(|(pending, _)| pending == sequence)
-    {
-        state.mouse_transition = None;
-        state.mouse_restore_point = None;
-        state.mouse.fail(format!("鼠标模式切换未确认：{error}"));
-    }
-    if state
         .cursor_pending
         .is_some_and(|(pending, _, _)| pending == sequence)
     {
@@ -2077,20 +2456,25 @@ fn expire_cursor_request(state: &mut StreamControlState) {
         let error = "光标设置确认超时，远端状态未知；请重试".to_owned();
         fail_cursor_request(state, sequence, error.clone());
         state
+            .pending_capture_preferences
+            .retain(|pending| pending.sequence != sequence);
+        state
             .pending_sequences
             .retain(|pending| *pending != sequence);
         state
             .performance
             .fail_stream_switch(sequence, error.clone());
         state.last_error = Some(error);
-        if let Some(budget) = &mut state.budget {
-            budget.suspend();
-        }
     }
 }
 
 fn encode_capture_setting(sequence: i64, baseline: CaptureSettingBaseline) -> Result<Vec<u8>> {
-    let request = PbCaptureSettingRequest {
+    let request = capture_setting_request(baseline)?;
+    Ok(encode_capture_request(sequence, request))
+}
+
+fn capture_setting_request(baseline: CaptureSettingBaseline) -> Result<PbCaptureSettingRequest> {
+    Ok(PbCaptureSettingRequest {
         fps: fps_to_protobuf(baseline.requested_fps),
         frame_quality: baseline.frame_quality,
         cursor_capture: baseline.cursor_capture,
@@ -2100,7 +2484,7 @@ fn encode_capture_setting(sequence: i64, baseline: CaptureSettingBaseline) -> Re
         chroma_format: baseline.chroma_format,
         max_custom_bitrate: i32::try_from(baseline.max_custom_bitrate)?,
         dpi_scale: 0,
-        resolution_type: RESOLUTION_ORIGINAL,
+        resolution_type: RESOLUTION_DEFAULT,
         enable_hdr: baseline.enable_hdr,
         auto_frame_quality: baseline.auto_frame_quality,
         codec_type: baseline.codec_type,
@@ -2109,8 +2493,11 @@ fn encode_capture_setting(sequence: i64, baseline: CaptureSettingBaseline) -> Re
         resolution_pixel_width: 0,
         resolution_pixel_height: 0,
         fps_count: i32::try_from(baseline.fps_count)?,
-    };
-    Ok(encode_envelope(
+    })
+}
+
+fn encode_capture_request(sequence: i64, request: PbCaptureSettingRequest) -> Vec<u8> {
+    encode_envelope(
         sequence,
         PbPayload::RpcRequest(
             PbRpcRequest {
@@ -2119,35 +2506,11 @@ fn encode_capture_setting(sequence: i64, baseline: CaptureSettingBaseline) -> Re
                 }),
                 capture_setting: Some(request),
                 send_video_track: None,
+                ..Default::default()
             }
             .encode_to_vec(),
         ),
-    ))
-}
-
-fn encode_legacy_capture_config(
-    sequence: i64,
-    baseline: CaptureSettingBaseline,
-) -> Result<Vec<u8>> {
-    if baseline.frame_quality == VIDEO_QUALITY_CUSTOM {
-        bail!("legacy CaptureConfig does not support custom bitrate");
-    }
-    let capture = PbCaptureConfig {
-        client: 3,
-        fps: match baseline.requested_fps {
-            30 => 0,
-            60 => 1,
-            90 => 2,
-            _ => 3,
-        },
-        frame_quality: baseline.frame_quality,
-        cursor_capture: baseline.cursor_capture,
-        screen_id: EXISTING_SESSION_TRACKS,
-        resolution_width: UNCHANGED_PHYSICAL_DIMENSION,
-        resolution_height: UNCHANGED_PHYSICAL_DIMENSION,
-        config_flag: 0,
-    };
-    Ok(encode_envelope(sequence, PbPayload::CaptureConfig(capture)))
+    )
 }
 
 fn encode_envelope(sequence: i64, payload: PbPayload) -> Vec<u8> {
@@ -2197,7 +2560,7 @@ struct PbControlMessage {
     timestamp: i64,
     #[prost(
         oneof = "PbPayload",
-        tags = "3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27"
+        tags = "3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28"
     )]
     payload: Option<PbPayload>,
 }
@@ -2219,14 +2582,14 @@ enum PbPayload {
     Screens(PbScreenSources),
     #[prost(bytes, tag = "8")]
     CaptureChange(Vec<u8>),
-    #[prost(message, tag = "9")]
-    CaptureConfig(PbCaptureConfig),
+    #[prost(bytes, tag = "9")]
+    CaptureConfig(Vec<u8>),
     #[prost(bytes, tag = "10")]
     RomMessage(Vec<u8>),
     #[prost(bytes, tag = "11")]
     SendToRom(Vec<u8>),
-    #[prost(bytes, tag = "12")]
-    ReportError(Vec<u8>),
+    #[prost(message, tag = "12")]
+    ReportError(PbReportError),
     #[prost(bytes, tag = "13")]
     SystemMetrics(Vec<u8>),
     #[prost(message, tag = "14")]
@@ -2239,8 +2602,8 @@ enum PbPayload {
     ClipboardChange(Vec<u8>),
     #[prost(bytes, tag = "18")]
     CodecNegotiation(Vec<u8>),
-    #[prost(message, tag = "19")]
-    CaptureConfigResponse(PbCaptureConfigResponse),
+    #[prost(bytes, tag = "19")]
+    CaptureConfigResponse(Vec<u8>),
     #[prost(bytes, tag = "20")]
     InputEvent(Vec<u8>),
     #[prost(bytes, tag = "21")]
@@ -2257,6 +2620,20 @@ enum PbPayload {
     RemoteDownloadPath(Vec<u8>),
     #[prost(bytes, tag = "27")]
     PortMappingFrame(Vec<u8>),
+    #[prost(bytes, tag = "28")]
+    TerminalSessionChanged(Vec<u8>),
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct PbReportError {
+    #[prost(int32, tag = "1")]
+    action: i32,
+    #[prost(int32, tag = "2")]
+    error_code: i32,
+    #[prost(string, tag = "3")]
+    error_msg: String,
+    #[prost(int32, tag = "4")]
+    type_value: i32,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
@@ -2328,7 +2705,7 @@ struct PbFeatureFlag {
 impl PbFeatureFlag {
     fn read_only_viewer() -> Self {
         Self {
-            capture_setting: 6,
+            capture_setting: crate::official_version::CAPTURE_SETTING_LEVEL as i32,
             simple_action: 0,
             system_metrics: 0,
             private_screen: 0,
@@ -2341,38 +2718,6 @@ impl PbFeatureFlag {
             virtual_mouse_device: 0,
         }
     }
-}
-
-#[derive(Clone, PartialEq, prost::Message)]
-struct PbCaptureConfig {
-    #[prost(int32, tag = "1")]
-    client: i32,
-    #[prost(int32, tag = "2")]
-    fps: i32,
-    #[prost(int32, tag = "3")]
-    frame_quality: i32,
-    #[prost(bool, tag = "4")]
-    cursor_capture: bool,
-    #[prost(int32, tag = "5")]
-    screen_id: i32,
-    #[prost(int32, tag = "6")]
-    resolution_width: i32,
-    #[prost(int32, tag = "7")]
-    resolution_height: i32,
-    #[prost(int64, tag = "8")]
-    config_flag: i64,
-}
-
-#[derive(Clone, PartialEq, prost::Message)]
-struct PbCaptureConfigResponse {
-    #[prost(int64, tag = "1")]
-    request_seq: i64,
-    #[prost(int64, tag = "2")]
-    config_flag: i64,
-    #[prost(int32, tag = "3")]
-    error_code: i32,
-    #[prost(string, tag = "4")]
-    error_message: String,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
@@ -2389,10 +2734,20 @@ struct PbResponseHeader {
 
 #[derive(Clone, PartialEq, prost::Message)]
 struct PbRpcRequest {
+    #[prost(message, optional, tag = "27")]
+    draw: Option<annotation::PbDrawRequest>,
     #[prost(message, optional, tag = "1")]
     request_header: Option<PbRequestHeader>,
     #[prost(message, optional, tag = "2")]
     capture_setting: Option<PbCaptureSettingRequest>,
+    #[prost(message, optional, tag = "12")]
+    create_virtual_display: Option<display_topology::PbCreateVirtualDisplay>,
+    #[prost(message, optional, tag = "13")]
+    remove_virtual_display: Option<display_topology::PbRemoveVirtualDisplay>,
+    #[prost(message, optional, tag = "14")]
+    quit_super_screen: Option<display_topology::PbQuitSuperScreen>,
+    #[prost(message, optional, tag = "26")]
+    enter_super_screen: Option<display_topology::PbEnterSuperScreen>,
     #[prost(message, optional, tag = "15")]
     send_video_track: Option<PbSendVideoTrackRequest>,
 }
@@ -2464,8 +2819,8 @@ enum PbRpcResponsePayload {
     UpdateScreenSaverRsp(Vec<u8>),
     #[prost(bytes, tag = "22")]
     EnterSuperScreenRep(Vec<u8>),
-    #[prost(bytes, tag = "23")]
-    DrawResp(Vec<u8>),
+    #[prost(message, tag = "23")]
+    DrawResp(annotation::PbDrawResponse),
 }
 
 #[derive(Clone, PartialEq, prost::Message)]

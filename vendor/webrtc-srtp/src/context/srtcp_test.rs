@@ -75,7 +75,7 @@ lazy_static! {
         },
         RTCPTestCase{
             ssrc:      0x11111111,
-            index:     0x7fffffff, // Will be wrapped to 0
+            index:     0x7fffffff, // Legacy zero-index vector remains decryptable; encryption must stop.
             encrypted: Bytes::from_static(&[
                 0x80, 0xc8, 0x00, 0x06, 0x11, 0x11, 0x11, 0x11, 0x17, 0x8c, 0x15, 0xf1, 0x4b, 0x11,
                 0xda, 0xf5, 0x74, 0x53, 0x86, 0x2b, 0xc9, 0x07, 0x29, 0x40, 0xbf, 0x22, 0xf6, 0x46,
@@ -118,6 +118,13 @@ fn test_rtcp_lifecycle() -> Result<()> {
         );
 
         encrypt_context.set_index(test_case.ssrc, test_case.index);
+        if test_case.index == MAX_SRTCP_INDEX {
+            assert_eq!(
+                encrypt_context.encrypt_rtcp(&test_case.decrypted),
+                Err(Error::ErrExceededMaxPackets)
+            );
+            continue;
+        }
         let encrypt_result = encrypt_context.encrypt_rtcp(&test_case.decrypted)?;
         assert_eq!(
             encrypt_result, test_case.encrypted,

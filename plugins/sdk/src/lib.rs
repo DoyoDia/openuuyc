@@ -414,8 +414,7 @@ macro_rules! embed_manifest {
             const JSON: &[u8] = $json;
             #[used]
             #[unsafe(no_mangle)]
-            #[cfg_attr(target_os = "macos", unsafe(link_section = "__TEXT,__oumeta"))]
-            #[cfg_attr(not(target_os = "macos"), unsafe(link_section = ".oumeta"))]
+            #[unsafe(link_section = ".oumeta")]
             pub static openuuyc_plugin_manifest_v1: [u8; $crate::MANIFEST_HEADER + JSON.len()] =
                 $crate::manifest_section::<{ $crate::MANIFEST_HEADER + JSON.len() }>(JSON);
         };

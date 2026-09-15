@@ -10,7 +10,7 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread, ID3D11Texture2D,
 };
-use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_FORMAT_P010};
+use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
     IDXGIAdapter1, IDXGIDevice, IDXGIDevice1, IDXGIFactory1, IDXGIFactory6, IDXGIKeyedMutex,
@@ -46,6 +46,26 @@ pub(crate) fn acquire_texture_sync(sync: &IDXGIKeyedMutex, timeout_ms: u32) -> R
         bail!("acquire shared video texture failed: {status:?}");
     }
     Ok(())
+}
+
+pub(crate) fn acquire_owned_texture_sync(
+    texture: &ID3D11Texture2D,
+    timeout_ms: u32,
+) -> Result<Option<IDXGIKeyedMutex>> {
+    let mut desc = D3D11_TEXTURE2D_DESC::default();
+    unsafe {
+        texture.GetDesc(&mut desc);
+    }
+    if desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX.0 as u32 == 0 {
+        return Ok(None);
+    }
+    // Shared keyed resources require ownership even on their creating device.
+    // The presenter may adopt the creating device for non-shared resources.
+    let sync: IDXGIKeyedMutex = texture
+        .cast()
+        .context("query owning-device texture mutex")?;
+    acquire_texture_sync(&sync, timeout_ms)?;
+    Ok(Some(sync))
 }
 
 // The device is created with D3D11 multithread protection enabled. All immediate-context
@@ -105,34 +125,6 @@ impl D3D11SurfaceWriter {
         Ok(writers)
     }
 
-    pub(crate) fn supports_codec(
-        &self,
-        codec: mediaway_common::CodecKind,
-        width: u32,
-        height: u32,
-        depth: u8,
-    ) -> bool {
-        unsafe { self.shared.device.GetDeviceRemovedReason() }.is_ok()
-            && crate::decoder::platform::windows::WindowsVideoDecoder::probe(
-                self.device_handle(),
-                codec,
-                width,
-                height,
-                depth,
-            )
-    }
-
-    pub(crate) fn for_codec(
-        codec: mediaway_common::CodecKind,
-        width: u32,
-        height: u32,
-    ) -> Result<Self> {
-        Self::available()?
-            .into_iter()
-            .find(|writer| writer.supports_codec(codec, width, height, 8))
-            .context("no D3D11 adapter accepts the requested codec and dimensions")
-    }
-
     fn from_adapter(adapter: &IDXGIAdapter1) -> Result<Self> {
         let mut device = None;
         let mut context = None;
@@ -187,7 +179,10 @@ impl D3D11SurfaceWriter {
     pub(crate) fn wrap_decoded_surface(&self, frame: WindowsGpuVideoFrame) -> Result<D3D11Surface> {
         let mut source_desc = D3D11_TEXTURE2D_DESC::default();
         unsafe { frame.texture().GetDesc(&raw mut source_desc) };
-        if source_desc.Format != DXGI_FORMAT_NV12 && source_desc.Format != DXGI_FORMAT_P010 {
+        if !matches!(
+            source_desc.Format,
+            DXGI_FORMAT_NV12 | DXGI_FORMAT_P010 | DXGI_FORMAT_AYUV | DXGI_FORMAT_Y410
+        ) {
             bail!(
                 "Windows decoder returned unsupported D3D11 format {:?}",
                 source_desc.Format

@@ -146,7 +146,7 @@ fn parse_shape(shape: CursorShape) -> Result<Option<RemoteCursor>> {
 
 #[derive(Clone, PartialEq, Message)]
 struct SystemStateChange {
-    #[prost(oneof = "SystemState", tags = "1, 2, 3, 4, 5")]
+    #[prost(oneof = "SystemState", tags = "1, 2, 3, 4, 5, 6")]
     state: Option<SystemState>,
 }
 
@@ -162,6 +162,10 @@ enum SystemState {
     FileTransfer(Vec<u8>),
     #[prost(bytes, tag = "5")]
     PrivateScreen(Vec<u8>),
+    // Preserve oneof ordering for this notification without enabling
+    // the official remote-upgrade query that consumes this state.
+    #[prost(bytes, tag = "6")]
+    ClientUiReady(Vec<u8>),
 }
 
 #[derive(Clone, PartialEq, Message)]

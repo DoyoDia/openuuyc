@@ -30,9 +30,9 @@ pub(crate) struct DecoderPool {
     notification: crate::decoder::platform::DecoderNotification,
     callback_result: Option<VideoDecodeResult>,
     blocked_reason: Option<String>,
-    #[cfg(windows)]
+
     software_slot: Option<std::rc::Rc<crate::decoder::software_slot::SoftwareSlot>>,
-    #[cfg(windows)]
+
     writer: Option<crate::decoder::windows_surface::D3D11SurfaceWriter>,
 }
 
@@ -65,9 +65,8 @@ impl DecoderPool {
             .position(|entry| entry.kind == decoder.candidate())
             .expect("opened decoder belongs to the configured candidate list");
         Self {
-            #[cfg(windows)]
             software_slot: decoder.software_slot(),
-            #[cfg(windows)]
+
             writer: decoder.surface_writer(),
             decoder: Some(decoder),
             candidates,
@@ -90,6 +89,10 @@ impl DecoderPool {
         self.decoder
             .as_ref()
             .map_or("等待可用解码器", NativeVideoDecoder::label)
+    }
+
+    pub(crate) fn format(&self) -> Option<VideoFormatSignature> {
+        self.format
     }
 
     pub(crate) fn decoder(&mut self) -> Option<&mut NativeVideoDecoder> {
@@ -143,8 +146,14 @@ impl DecoderPool {
         codec: VideoCodec,
         format: Option<VideoFormatSignature>,
         keyframe: bool,
+        parameter_sets: Bytes,
     ) -> DecoderTransition {
         let codec_changed = codec != self.codec;
+        // A new codec/configuration must never be seeded with the first stream's
+        // VPS/SPS/PPS. Keep the latest keyframe parameters for backend replacement.
+        if keyframe && (codec_changed || !parameter_sets.is_empty()) {
+            self.extra_data = parameter_sets;
+        }
         let format_changed = format.is_some_and(|next| {
             self.format
                 .is_none_or(|current| !same_configuration(current, next))
@@ -271,16 +280,17 @@ impl DecoderPool {
             // Match actual stream parameters before choosing a backend. In
             // particular H264 4:4:4 belongs to the software candidate, rather
             // than losing its first keyframe to a predictable hardware error.
-            #[cfg(windows)]
+
             if let Some(format) = format {
                 let supported = match entry.kind {
                     DecoderCandidate::WindowsD3d11 => {
-                        format.chroma_format_idc == 1
+                        (format.chroma_format_idc == 1
+                            || self.codec == VideoCodec::H265 && format.chroma_format_idc == 3)
                             && format.bit_depth_luma == format.bit_depth_chroma
                             && (format.bit_depth_luma == 8
                                 || self.codec == VideoCodec::H265 && format.bit_depth_luma == 10)
                     }
-                    DecoderCandidate::PlatformMemory => {
+                    DecoderCandidate::SoftwareH264 => {
                         self.codec == VideoCodec::H264
                             && matches!(format.chroma_format_idc, 1 | 3)
                             && format.bit_depth_luma == 8
@@ -291,8 +301,7 @@ impl DecoderPool {
                     continue;
                 }
             }
-            #[cfg(not(windows))]
-            let _ = format;
+
             match NativeVideoDecoder::open_candidate(
                 entry.kind,
                 self.codec,
@@ -300,18 +309,15 @@ impl DecoderPool {
                 height,
                 self.frame_rate,
                 self.extra_data.clone(),
-                #[cfg(windows)]
                 self.writer.clone(),
-                #[cfg(windows)]
                 self.software_slot.clone(),
             ) {
                 Ok(mut decoder) => {
-                    #[cfg(windows)]
                     {
                         self.software_slot = decoder.software_slot();
                     }
                     decoder.set_notification(self.notification.clone());
-                    #[cfg(windows)]
+
                     if let Some(writer) = decoder.surface_writer() {
                         self.writer = Some(writer);
                     }
@@ -320,7 +326,6 @@ impl DecoderPool {
                     return true;
                 }
                 Err(error) => {
-                    #[cfg(windows)]
                     if error.is::<crate::decoder::software_slot::SoftwarePlaybackBusy>() {
                         self.blocked_reason = Some(error.to_string());
                     }
@@ -329,7 +334,7 @@ impl DecoderPool {
                 }
             }
         }
-        #[cfg(windows)]
+
         {
             self.software_slot = None;
         }

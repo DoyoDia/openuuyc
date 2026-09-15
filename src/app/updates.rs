@@ -15,13 +15,20 @@ pub(super) enum State {
     Checking,
     Current,
     Ahead,
-    Available { version: String, url: String },
+    Available {
+        version: String,
+        url: String,
+        notes: String,
+        published: Option<String>,
+    },
     NoRelease,
     Failed(String),
 }
 
 pub(super) struct UpdateCheck {
     pub state: State,
+    pub dialog_open: bool,
+    notified_version: Option<String>,
     pending: Option<Receiver<Result<State>>>,
     cancel: Option<oneshot::Sender<()>>,
     retry_at: Instant,
@@ -31,6 +38,8 @@ impl UpdateCheck {
     pub fn start(ctx: &egui::Context) -> Self {
         let mut check = Self {
             state: State::Checking,
+            dialog_open: false,
+            notified_version: None,
             pending: None,
             cancel: None,
             retry_at: Instant::now(),
@@ -94,6 +103,12 @@ impl UpdateCheck {
         self.pending = None;
         self.cancel = None;
         self.state = result.unwrap_or_else(|error| State::Failed(format!("{error:#}")));
+        if let State::Available { version, .. } = &self.state
+            && self.notified_version.as_ref() != Some(version)
+        {
+            self.notified_version = Some(version.clone());
+            self.dialog_open = true;
+        }
     }
 
     pub fn retry_wait(&self) -> u64 {
@@ -117,6 +132,8 @@ struct Release {
     tag_name: String,
     draft: bool,
     prerelease: bool,
+    body: Option<String>,
+    published_at: Option<String>,
 }
 
 async fn latest() -> Result<State> {
@@ -152,7 +169,11 @@ async fn latest() -> Result<State> {
         );
         body.extend_from_slice(&chunk);
     }
-    let release: Release = serde_json::from_slice(&body).context("无法解析 GitHub 版本信息")?;
+    release_state(&body, env!("CARGO_PKG_VERSION"))
+}
+
+fn release_state(body: &[u8], current: &str) -> Result<State> {
+    let release: Release = serde_json::from_slice(body).context("无法解析 GitHub 版本信息")?;
     ensure!(
         !release.draft && !release.prerelease,
         "GitHub 未返回正式版本"
@@ -165,8 +186,7 @@ async fn latest() -> Result<State> {
     )
     .context("GitHub 正式版本号格式不正确")?;
     ensure!(version.pre.is_empty(), "GitHub 最新版本不是正式版本");
-    let current =
-        semver::Version::parse(env!("CARGO_PKG_VERSION")).context("当前程序版本号格式不正确")?;
+    let current = semver::Version::parse(current).context("当前程序版本号格式不正确")?;
     match version.cmp_precedence(&current) {
         std::cmp::Ordering::Equal => Ok(State::Current),
         std::cmp::Ordering::Less => Ok(State::Ahead),
@@ -180,6 +200,12 @@ async fn latest() -> Result<State> {
             Ok(State::Available {
                 version: version.to_string(),
                 url: url.to_string(),
+                notes: release.body.unwrap_or_default(),
+                published: release.published_at.and_then(|value| {
+                    chrono::DateTime::parse_from_rfc3339(&value)
+                        .ok()
+                        .map(|date| date.format("%Y-%m-%d").to_string())
+                }),
             })
         }
     }

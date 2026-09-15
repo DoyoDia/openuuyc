@@ -1,4 +1,20 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
+// DXVA_PicParams_HEVC_RangeExt, Windows SDK dxva.h; packed ABI extends HEVC.
+#[repr(C, packed)]
+#[derive(Default)]
+pub struct HevcRangeParams {
+    pub base: HevcParams,
+    pub flags: u16,
+    pub diff_cu_chroma_qp_offset_depth: u8,
+    pub log2_sao_offset_scale_luma: u8,
+    pub log2_sao_offset_scale_chroma: u8,
+    pub log2_max_transform_skip_block_size_minus2: u8,
+    pub cb_qp_offset_list: [i8; 6],
+    pub cr_qp_offset_list: [i8; 6],
+    pub chroma_qp_offset_list_len_minus1: u8,
+    pub reserved: u16,
+}
+
 #[repr(C, packed)]
 #[allow(non_snake_case)]
 pub struct HevcParams {

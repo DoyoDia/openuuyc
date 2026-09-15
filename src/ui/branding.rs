@@ -39,14 +39,12 @@ pub(crate) fn paint(painter: &egui::Painter, rect: egui::Rect, texture: &egui::T
     );
 }
 
-#[cfg(windows)]
 pub(crate) fn window_icon() -> winit::window::Icon {
     let icon = icon();
     winit::window::Icon::from_rgba(icon.rgba.clone(), icon.width, icon.height)
         .expect("embedded window icon dimensions")
 }
 
-#[cfg(windows)]
 pub(crate) fn set_taskbar_icon(window: &winit::window::Window) {
     use winit::platform::windows::WindowExtWindows;
     window.set_taskbar_icon(Some(window_icon()));

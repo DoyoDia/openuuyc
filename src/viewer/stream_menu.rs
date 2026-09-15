@@ -1,11 +1,20 @@
-//! Viewer-only stream settings UI. Protocol and budget decisions stay in stream_control.
+//! Viewer-only stream settings UI. Protocol decisions stay in stream_control.
 use egui::{Align, FontId, RichText, Sense, Stroke, vec2};
 
 use crate::media::FrameRateChoice;
-use crate::stream_control::{
-    AdaptiveBitrateSnapshot, BudgetPhase, MAX_CUSTOM_BITRATE_MBPS, MouseMode, StreamControlHandle,
-    StreamControlSettings, StreamControlSnapshot, StreamQuality,
-};
+use crate::stream_control::{MouseMode, StreamControlHandle, StreamControlSettings, StreamQuality};
+
+mod display_menu;
+pub(super) mod topology_menu;
+
+pub(super) fn tab_display_menu(
+    ui: &mut egui::Ui,
+    handle: &StreamControlHandle,
+    screen_id: i32,
+    local_size: Option<(u32, u32)>,
+) -> Option<String> {
+    display_menu::context_menu(ui, handle, screen_id, local_size)
+}
 
 const WIDTH: f32 = 280.0;
 const ROW_HEIGHT: f32 = crate::ui::theme::MENU_HEIGHT;
@@ -18,8 +27,8 @@ enum Page {
     #[default]
     Quality,
     Custom,
-    Adaptive,
     Mouse,
+    Display,
 }
 
 impl Page {
@@ -27,8 +36,8 @@ impl Page {
         match self {
             Self::Quality => "画质",
             Self::Custom => "自定义码率",
-            Self::Adaptive => "自适应码率",
             Self::Mouse => "鼠标模式",
+            Self::Display => "显示设置",
         }
     }
 }
@@ -36,11 +45,12 @@ impl Page {
 #[derive(Default)]
 pub(super) struct StreamControlUi {
     pub(super) open: bool,
-    pub(super) budget_notice: Option<String>,
     page: Page,
     settings: Option<StreamControlSettings>,
     dirty: bool,
+    display: display_menu::DisplayMenu,
     local_error: Option<String>,
+    format_confirm: Option<(i32, StreamControlSettings)>,
 }
 
 pub(super) struct LocalViewSettings {
@@ -50,8 +60,8 @@ pub(super) struct LocalViewSettings {
 
 enum Action {
     Apply,
-    Adopt,
-    Reassess,
+    Color(bool),
+    Hdr(bool),
 }
 
 #[derive(Clone, Copy)]
@@ -59,7 +69,6 @@ enum Icon {
     Back,
     Close,
     Info,
-    Retry,
 }
 
 fn icon_button(ui: &mut egui::Ui, icon: Icon, hint: &str) -> egui::Response {
@@ -88,19 +97,6 @@ fn icon_button(ui: &mut egui::Ui, icon: Icon, hint: &str) -> egui::Response {
             ui.painter()
                 .line_segment([point(0.0, 0.0), point(0.0, 3.0)], stroke);
         }
-        Icon::Retry => {
-            let points = (0..=20)
-                .map(|step| {
-                    let angle = 0.25 + step as f32 / 20.0 * 5.0;
-                    center + vec2(angle.cos(), angle.sin()) * 5.0
-                })
-                .collect::<Vec<_>>();
-            ui.painter().add(egui::Shape::line(points, stroke));
-            ui.painter()
-                .line_segment([point(4.8, -2.4), point(4.8, 1.3)], stroke);
-            ui.painter()
-                .line_segment([point(1.2, 1.3), point(4.8, 1.3)], stroke);
-        }
     }
     response.on_hover_text(hint)
 }
@@ -119,74 +115,7 @@ fn section_separator(ui: &mut egui::Ui) {
     ui.add_space(SECTION_GAP);
 }
 
-fn menu_row(
-    ui: &mut egui::Ui,
-    label: &str,
-    detail: &str,
-    selected: Option<bool>,
-    enabled: bool,
-    more: bool,
-) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(
-        vec2(ui.available_width(), ROW_HEIGHT),
-        if enabled {
-            Sense::click()
-        } else {
-            Sense::hover()
-        },
-    );
-    if selected == Some(true) || (response.hovered() && enabled) {
-        ui.painter().rect_filled(
-            rect,
-            4.0,
-            if selected == Some(true) {
-                crate::ui::theme::SELECTED
-            } else {
-                HOVER
-            },
-        );
-    }
-    let color = if enabled {
-        TEXT
-    } else {
-        crate::ui::theme::DISABLED
-    };
-    if selected == Some(true) {
-        let origin = rect.left_center() + vec2(13.0, 0.0);
-        let stroke = Stroke::new(1.5, ACCENT);
-        ui.painter()
-            .line_segment([origin + vec2(-3.0, 0.0), origin + vec2(-0.5, 2.5)], stroke);
-        ui.painter()
-            .line_segment([origin + vec2(-0.5, 2.5), origin + vec2(4.5, -3.0)], stroke);
-    }
-    ui.painter().text(
-        rect.left_center() + vec2(if selected.is_some() { 28.0 } else { 10.0 }, 0.0),
-        egui::Align2::LEFT_CENTER,
-        label,
-        FontId::proportional(crate::ui::theme::COMPACT_TEXT),
-        color,
-    );
-    ui.painter().text(
-        rect.right_center() - vec2(if more { 26.0 } else { 10.0 }, 0.0),
-        egui::Align2::RIGHT_CENTER,
-        detail,
-        FontId::proportional(crate::ui::theme::SMALL),
-        if enabled {
-            MUTED
-        } else {
-            crate::ui::theme::DISABLED
-        },
-    );
-    if more {
-        let center = rect.right_center() - vec2(12.0, 0.0);
-        let stroke = Stroke::new(1.1, MUTED);
-        ui.painter()
-            .line_segment([center + vec2(-2.0, -3.5), center + vec2(1.5, 0.0)], stroke);
-        ui.painter()
-            .line_segment([center + vec2(1.5, 0.0), center + vec2(-2.0, 3.5)], stroke);
-    }
-    response
-}
+use crate::ui::controls::menu_row;
 
 fn switch_row(ui: &mut egui::Ui, label: &str, value: &mut bool) -> egui::Response {
     let enabled = ui.is_enabled();
@@ -401,15 +330,11 @@ fn volume_bar(
     .inner
 }
 
-fn bitrate_editor(ui: &mut egui::Ui, value: &mut u32, adaptive: bool, multi_screen: bool) -> bool {
+fn bitrate_editor(ui: &mut egui::Ui, value: &mut u32, multi_screen: bool, limit: u32) -> bool {
     let mut changed = false;
     ui.horizontal(|ui| {
-        ui.label(if multi_screen && adaptive {
-            "每屏上限"
-        } else if multi_screen {
+        ui.label(if multi_screen {
             "每屏码率"
-        } else if adaptive {
-            "视频码率上限"
         } else {
             "视频码率"
         });
@@ -418,26 +343,12 @@ fn bitrate_editor(ui: &mut egui::Ui, value: &mut u32, adaptive: bool, multi_scre
             Icon::Info,
             if multi_screen {
                 "同一上限分别应用到各屏幕；实际码率随内容和带宽变化，音频与重传另计。"
-            } else if adaptive {
-                "仅限制视频编码码率。音频、纠错、重传和协议还会占用额外带宽；不是总网络限速。"
             } else {
                 "使用UU的自定义码率设置；实际流量随画面内容和网络变化。"
             },
         );
         ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-            ui.label(
-                RichText::new("Mbps")
-                    .size(crate::ui::theme::TINY)
-                    .color(MUTED),
-            );
-            changed |= ui
-                .add_sized(
-                    [60.0, 30.0],
-                    egui::DragValue::new(value)
-                        .range(1..=MAX_CUSTOM_BITRATE_MBPS)
-                        .speed(1.0),
-                )
-                .changed();
+            ui.label(format!("{value}/{limit} Mbps"));
         });
     });
     ui.add_space(6.0);
@@ -446,14 +357,18 @@ fn bitrate_editor(ui: &mut egui::Ui, value: &mut u32, adaptive: bool, multi_scre
             ui.spacing_mut().slider_width = ui.available_width();
             ui.spacing_mut().slider_rail_height = 3.0;
             ui.spacing_mut().interact_size.y = 18.0;
-            ui.add(
-                egui::Slider::new(value, 1..=MAX_CUSTOM_BITRATE_MBPS)
-                    .logarithmic(true)
+            let choices = crate::stream_control::custom_bitrate_choices(limit);
+            let mut index = choices.iter().rposition(|n| *n <= *value).unwrap_or(0);
+            let response = ui.add(
+                egui::Slider::new(&mut index, 0..=choices.len() - 1)
                     .show_value(false)
                     .trailing_fill(true)
                     .handle_shape(egui::style::HandleShape::Circle),
-            )
-            .changed()
+            );
+            if response.changed() {
+                *value = choices[index];
+            }
+            response.changed()
         })
         .inner;
     ui.horizontal(|ui| {
@@ -464,99 +379,13 @@ fn bitrate_editor(ui: &mut egui::Ui, value: &mut u32, adaptive: bool, multi_scre
         );
         ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
             ui.label(
-                RichText::new(MAX_CUSTOM_BITRATE_MBPS.to_string())
+                RichText::new(limit.to_string())
                     .size(crate::ui::theme::MICRO)
                     .color(MUTED),
             );
         });
     });
     changed
-}
-
-fn budget_status(
-    ui: &mut egui::Ui,
-    budget: &AdaptiveBitrateSnapshot,
-    snapshot: &StreamControlSnapshot,
-    can_apply: bool,
-    action: &mut Option<Action>,
-) {
-    if let Some(cap) = budget.pending_mbps {
-        ui.label(
-            RichText::new(format!("正在调整至 {cap} Mbps…"))
-                .size(crate::ui::theme::SMALL)
-                .color(MUTED),
-        );
-        return;
-    }
-    if budget.phase == BudgetPhase::Suspended {
-        ui.label(
-            RichText::new("自动调整已暂停")
-                .size(crate::ui::theme::SMALL)
-                .color(super::warning_color()),
-        )
-        .on_hover_text(budget.message);
-    } else if let Some(cap) = budget.suggested_mbps {
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(format!("网络拥堵，建议 {cap} Mbps"))
-                    .size(crate::ui::theme::SMALL)
-                    .color(super::warning_color()),
-            )
-            .on_hover_text(budget.reference_video_mbps.map_or_else(
-                || budget.message.to_owned(),
-                |video| {
-                    format!(
-                        "过载前有效视频约 {video:.1} Mbps，留出约10%余量。该建议不是线路测速结果。"
-                    )
-                },
-            ));
-            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                if ui
-                    .add_enabled(can_apply, egui::Button::new("采用"))
-                    .clicked()
-                {
-                    *action = Some(Action::Adopt);
-                }
-            });
-        });
-    } else if budget.phase == BudgetPhase::Congested {
-        ui.label(
-            RichText::new("网络拥堵，建议降低上限")
-                .size(crate::ui::theme::SMALL)
-                .color(super::warning_color()),
-        )
-        .on_hover_text(budget.message);
-    }
-    if let Some(cap) = budget.applied_mbps
-        && cap < snapshot.settings.adaptive_ceiling_mbps
-    {
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(format!("当前限制  {cap} Mbps"))
-                    .size(crate::ui::theme::SMALL)
-                    .color(MUTED),
-            );
-            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                ui.add_enabled_ui(can_apply, |ui| {
-                    if icon_button(
-                        ui,
-                        Icon::Retry,
-                        "重新评估：再次尝试你设定的上限，可能短暂卡顿",
-                    )
-                    .clicked()
-                    {
-                        *action = Some(Action::Reassess);
-                    }
-                });
-            });
-        });
-    } else if budget.phase == BudgetPhase::Suspended
-        && ui
-            .add_enabled(can_apply, egui::Button::new("重试"))
-            .clicked()
-    {
-        *action = Some(Action::Reassess);
-    }
 }
 
 pub(super) fn menu_style(ui: &mut egui::Ui) {
@@ -572,26 +401,33 @@ pub(super) fn show_stream_control_window(
     handle: &StreamControlHandle,
     state: &mut StreamControlUi,
     view: &mut LocalViewSettings,
+    screen_id: i32,
+    local_size: Option<(u32, u32)>,
 ) {
+    topology_menu::show(ctx, handle, local_size);
+    topology_menu::show_error(ctx, handle);
     let snapshot = handle.snapshot();
+    state.display.select_screen(screen_id);
+    if let Some(notice) = snapshot.remote_notice {
+        egui::Area::new(egui::Id::new("remote-session-notice"))
+            .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -48.0])
+            .order(egui::Order::Foreground)
+            .interactable(false)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.label(notice);
+                });
+            });
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+    }
     let multi_screen = snapshot.screens.len() > 1;
-    state.budget_notice = snapshot.adaptive.as_ref().and_then(|budget| {
-        if budget.phase == BudgetPhase::Suspended {
-            Some("码率自动调整已暂停，打开设置重试".into())
-        } else if let Some(cap) = budget.suggested_mbps {
-            Some(format!("网络拥堵，建议 {cap} Mbps"))
-        } else {
-            budget
-                .applied_mbps
-                .filter(|cap| *cap < snapshot.settings.adaptive_ceiling_mbps)
-                .map(|cap| format!("当前视频限制为 {cap} Mbps"))
-        }
-    });
     if !state.open {
         state.page = Page::Quality;
         state.settings = None;
         state.dirty = false;
         state.local_error = None;
+        state.display.reset();
+        state.format_confirm = None;
         return;
     }
     if !state.dirty && state.local_error.is_none() {
@@ -628,7 +464,9 @@ pub(super) fn show_stream_control_window(
                     back =
                         icon_button(ui, Icon::Back, "返回画质菜单；未应用的修改会取消").clicked();
                 }
-                let title = if multi_screen {
+                let title = if state.page == Page::Display {
+                    "显示设置".to_owned()
+                } else if multi_screen {
                     format!("{} · 全部屏幕", state.page.title())
                 } else {
                     state.page.title().to_owned()
@@ -646,204 +484,315 @@ pub(super) fn show_stream_control_window(
             ui.scope(|ui| {
                 ui.set_width(WIDTH);
                 match state.page {
+                    Page::Display => {
+                        egui::ScrollArea::vertical()
+                            .max_height((ctx.content_rect().height() - 150.0).max(140.0))
+                            .show(ui, |ui| {
+                                state
+                                    .display
+                                    .draw(ui, handle, &snapshot, screen_id, local_size);
+                            });
+                    }
                     Page::Quality => {
-                        for (quality, label, detail) in [
-                            (StreamQuality::Auto, "自动（原画）", String::new()),
-                            (StreamQuality::Original, "原画", "20M".into()),
-                            (StreamQuality::High, "高清", "8M".into()),
-                            (StreamQuality::Clear, "清晰", "2M".into()),
-                            (
-                                StreamQuality::Custom,
-                                "自定义码率",
-                                format!("{} Mbps", settings.custom_bitrate_mbps),
-                            ),
-                            (
-                                StreamQuality::Adaptive,
-                                "自适应码率",
-                                format!("≤ {} Mbps", settings.adaptive_ceiling_mbps),
-                            ),
-                        ] {
-                            let more =
-                                matches!(quality, StreamQuality::Custom | StreamQuality::Adaptive);
-                            let enabled = snapshot.ready
-                                && !snapshot.cursor_pending
-                                && (!more || snapshot.protocol.supports_custom_bitrate());
-                            let response = menu_row(
-                                ui,
-                                label,
-                                &detail,
-                                Some(settings.quality == quality),
-                                enabled,
-                                more,
-                            );
-                            if response.clicked() {
-                                if more {
-                                    state.page = if quality == StreamQuality::Custom {
-                                        Page::Custom
+                        egui::ScrollArea::vertical()
+                            .id_salt("stream-settings-root")
+                            .max_height((ctx.content_rect().height() - 150.0).max(140.0))
+                            .show(ui, |ui| {
+                                for (quality, label, detail) in [
+                                    (
+                                        StreamQuality::Auto,
+                                        snapshot.auto_quality_label.as_str(),
+                                        String::new(),
+                                    ),
+                                    (StreamQuality::Original, "原画", "30M".into()),
+                                    (StreamQuality::High, "超清", "14M".into()),
+                                    (StreamQuality::Clear, "高清", "8M".into()),
+                                    (
+                                        StreamQuality::Custom,
+                                        "自定义码率",
+                                        format!(
+                                            "{} Mbps",
+                                            settings
+                                                .custom_bitrate_mbps
+                                                .min(snapshot.custom_bitrate_limit)
+                                        ),
+                                    ),
+                                ] {
+                                    let more = matches!(quality, StreamQuality::Custom);
+                                    let enabled = snapshot.ready
+                                        && (!more || snapshot.custom_bitrate_supported);
+                                    let response = menu_row(
+                                        ui,
+                                        label,
+                                        &detail,
+                                        Some(settings.quality == quality),
+                                        enabled,
+                                        more,
+                                    );
+                                    if response.clicked() {
+                                        if more {
+                                            state.page = Page::Custom;
+                                            settings.quality = StreamQuality::Custom;
+                                            settings.custom_bitrate_mbps = settings
+                                                .custom_bitrate_mbps
+                                                .min(snapshot.custom_bitrate_limit);
+                                            state.dirty = settings != snapshot.settings;
+                                        }
+                                        if !more
+                                            && (settings.quality != quality
+                                                || state.local_error.is_some()
+                                                || snapshot.last_error.is_some())
+                                        {
+                                            settings.quality = quality;
+                                            action = Some(Action::Apply);
+                                        }
+                                    }
+                                    if more && !snapshot.custom_bitrate_supported {
+                                        response.on_hover_text("此被控端不支持自定义码率");
+                                    }
+                                }
+                                ui.add_space(crate::ui::theme::MENU_GROUP_GAP);
+                                if menu_row(
+                                    ui,
+                                    "显示器分辨率与 DPI",
+                                    "当前屏幕",
+                                    None,
+                                    snapshot.display_settings_supported,
+                                    true,
+                                )
+                                .clicked()
+                                {
+                                    state.page = Page::Display;
+                                }
+                                ui.add_space(crate::ui::theme::MENU_GROUP_GAP);
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new("帧率")
+                                            .size(crate::ui::theme::TINY)
+                                            .color(MUTED),
+                                    )
+                                    .on_hover_text(
+                                        snapshot
+                                            .last_notice
+                                            .as_deref()
+                                            .unwrap_or("实际帧率受被控端刷新率和画面内容影响"),
+                                    );
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(Align::Center),
+                                        |ui| {
+                                            ui.label(
+                                                RichText::new("FPS")
+                                                    .size(crate::ui::theme::MICRO)
+                                                    .color(MUTED),
+                                            );
+                                        },
+                                    );
+                                });
+                                ui.add_space(ROW_GAP);
+                                let choices = FrameRateChoice::available(snapshot.local_display)
+                                    .into_iter()
+                                    .filter(|choice| *choice != FrameRateChoice::Auto)
+                                    .collect::<Vec<_>>();
+                                let width = (WIDTH
+                                    - 6.0 * (choices.len().saturating_sub(1)) as f32)
+                                    / choices.len().max(1) as f32;
+                                ui.add_enabled_ui(snapshot.ready, |ui| {
+                                    ui.horizontal(|ui| {
+                                        for choice in choices {
+                                            if ui
+                                                .add_sized(
+                                                    [width, ROW_HEIGHT],
+                                                    egui::Button::new(
+                                                        choice
+                                                            .value(snapshot.local_display)
+                                                            .to_string(),
+                                                    )
+                                                    .selected(
+                                                        settings
+                                                            .frame_rate
+                                                            .value(snapshot.local_display)
+                                                            == choice.value(snapshot.local_display),
+                                                    ),
+                                                )
+                                                .clicked()
+                                                && settings.frame_rate != choice
+                                            {
+                                                settings.frame_rate = choice;
+                                                action = Some(Action::Apply);
+                                            }
+                                        }
+                                    });
+                                });
+                                if snapshot.true_color_supported {
+                                    ui.add_space(crate::ui::theme::MENU_GROUP_GAP);
+                                    ui.label(
+                                        RichText::new("色度采样")
+                                            .size(crate::ui::theme::TINY)
+                                            .color(MUTED),
+                                    );
+                                    ui.add_space(ROW_GAP);
+                                    ui.add_enabled_ui(
+                                        snapshot.ready && snapshot.pending_sequence.is_none(),
+                                        |ui| {
+                                            ui.horizontal(|ui| {
+                                                for (enabled, label, hint) in [
+                                                    (
+                                                        true,
+                                                        "YUV 4:4:4",
+                                                        "保留完整色度细节，适合文字与图形",
+                                                    ),
+                                                    (
+                                                        false,
+                                                        "YUV 4:2:0",
+                                                        "对色度降采样，减少传输与解码开销",
+                                                    ),
+                                                ] {
+                                                    if ui
+                                                        .add_sized(
+                                                            [(WIDTH - 6.0) / 2.0, ROW_HEIGHT],
+                                                            egui::Button::new(label).selected(
+                                                                settings.true_color == enabled,
+                                                            ),
+                                                        )
+                                                        .on_hover_text(hint)
+                                                        .clicked()
+                                                        && settings.true_color != enabled
+                                                    {
+                                                        action = Some(Action::Color(enabled));
+                                                    }
+                                                }
+                                            });
+                                        },
+                                    );
+                                }
+                                if snapshot.hdr_supported {
+                                    ui.add_space(SECTION_GAP);
+                                    let mut hdr = settings.hdr;
+                                    let enabled = snapshot.ready
+                                        && snapshot.pending_sequence.is_none()
+                                        && (hdr || snapshot.hdr_unavailable.is_none());
+                                    let response = ui
+                                        .add_enabled_ui(enabled, |ui| {
+                                            switch_row(ui, "HDR", &mut hdr)
+                                        })
+                                        .inner;
+                                    if response.changed() {
+                                        action = Some(Action::Hdr(hdr));
+                                    }
+                                    response.on_hover_text(
+                                        snapshot
+                                            .hdr_unavailable
+                                            .as_deref()
+                                            .unwrap_or("高动态范围；需要双方屏幕已开启 HDR"),
+                                    );
+                                }
+                                section_separator(ui);
+                                let mut relay = snapshot.network.relay_enabled;
+                                let response = ui
+                                    .add_enabled_ui(snapshot.network.available, |ui| {
+                                        switch_row(ui, "高速中转连接 Beta", &mut relay)
+                                    })
+                                    .inner;
+                                if response.changed() {
+                                    state.local_error = handle
+                                        .set_relay_enabled(relay)
+                                        .err()
+                                        .map(|e| e.to_string());
+                                }
+                                response.on_hover_text(
+                                    snapshot.network.unavailable_reason.unwrap_or(
+                                        "仅本次连接生效；关闭后恢复自动选路，不保证一定直连",
+                                    ),
+                                );
+                                switch_row(ui, "按比例缩放", &mut view.aspect_locked)
+                                    .on_hover_text("仅当前播放窗口");
+                                let mut monitoring =
+                                    view.performance_mode != super::PerformancePanelMode::Hidden;
+                                if switch_row(ui, "性能监控", &mut monitoring)
+                                    .on_hover_text(format!(
+                                        "仅当前播放窗口；切换快捷键：{}",
+                                        crate::viewer_shortcuts::label(
+                                            crate::viewer_shortcuts::Action::Performance
+                                        )
+                                    ))
+                                    .changed()
+                                {
+                                    view.performance_mode = if monitoring {
+                                        super::PerformancePanelMode::Compact
                                     } else {
-                                        Page::Adaptive
+                                        super::PerformancePanelMode::Hidden
                                     };
                                 }
-                                if settings.quality != quality
-                                    || state.local_error.is_some()
-                                    || snapshot.last_error.is_some()
+                                if monitoring {
+                                    ui.horizontal(|ui| {
+                                        for (mode, label) in [
+                                            (super::PerformancePanelMode::Compact, "简洁"),
+                                            (super::PerformancePanelMode::Detailed, "详细"),
+                                        ] {
+                                            if ui
+                                                .add_sized(
+                                                    [(WIDTH - 6.0) / 2.0, ROW_HEIGHT],
+                                                    egui::Button::new(label)
+                                                        .selected(view.performance_mode == mode),
+                                                )
+                                                .clicked()
+                                            {
+                                                view.performance_mode = mode;
+                                            }
+                                        }
+                                    });
+                                }
+                                let mode_label = match snapshot.mouse_preference {
+                                    MouseMode::Smart | MouseMode::View => "智能鼠标",
+                                    MouseMode::Remote => "被控端鼠标",
+                                    MouseMode::Local => "主控端鼠标",
+                                };
+                                if menu_row(ui, "鼠标模式", mode_label, None, true, true).clicked()
                                 {
-                                    settings.quality = quality;
-                                    action = Some(Action::Apply);
+                                    state.page = Page::Mouse;
                                 }
-                            }
-                            if more && !snapshot.protocol.supports_custom_bitrate() {
-                                response.on_hover_text("此被控端不支持自定义码率");
-                            }
-                        }
-                        section_separator(ui);
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new("帧率")
-                                    .size(crate::ui::theme::TINY)
-                                    .color(MUTED),
-                            )
-                            .on_hover_text(
-                                snapshot
-                                    .last_notice
-                                    .as_deref()
-                                    .unwrap_or("实际帧率受被控端刷新率和画面内容影响"),
-                            );
-                            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                                ui.label(
-                                    RichText::new("FPS")
-                                        .size(crate::ui::theme::MICRO)
-                                        .color(MUTED),
+                                let audio = handle.audio();
+                                let mut audio_settings = audio.settings();
+                                let audio_status = audio.snapshot();
+                                volume_bar(
+                                    ui,
+                                    &mut audio_settings.volume,
+                                    &mut audio_settings.muted,
+                                    &audio,
+                                )
+                                .on_hover_text(
+                                    if audio_status.device.is_empty() && !audio_status.receiving {
+                                        "等待音频"
+                                    } else {
+                                        "音量"
+                                    },
                                 );
-                            });
-                        });
-                        ui.add_space(ROW_GAP);
-                        let choices = FrameRateChoice::available(snapshot.local_display)
-                            .into_iter()
-                            .filter(|choice| *choice != FrameRateChoice::Auto)
-                            .collect::<Vec<_>>();
-                        let width = (WIDTH - 6.0 * (choices.len().saturating_sub(1)) as f32)
-                            / choices.len().max(1) as f32;
-                        ui.add_enabled_ui(snapshot.ready && !snapshot.cursor_pending, |ui| {
-                            ui.horizontal(|ui| {
-                                for choice in choices {
-                                    if ui
-                                        .add_sized(
-                                            [width, ROW_HEIGHT],
-                                            egui::Button::new(
-                                                choice.value(snapshot.local_display).to_string(),
-                                            )
-                                            .selected(settings.frame_rate == choice),
-                                        )
-                                        .clicked()
-                                        && settings.frame_rate != choice
-                                    {
-                                        settings.frame_rate = choice;
-                                        action = Some(Action::Apply);
-                                    }
+                                audio.set_settings(audio_settings);
+                                if let Some(error) = audio_status.error {
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.colored_label(crate::ui::theme::AMBER, error);
+                                        if ui.small_button("重试").clicked() {
+                                            audio.retry();
+                                        }
+                                    });
+                                }
+                                if snapshot.network.pending {
+                                    ui.horizontal(|ui| {
+                                        ui.spinner();
+                                        ui.label(
+                                            RichText::new("正在切换线路…")
+                                                .size(crate::ui::theme::TINY)
+                                                .color(MUTED),
+                                        );
+                                    });
+                                } else if let Some(notice) = snapshot.network.notice {
+                                    ui.label(
+                                        RichText::new(notice)
+                                            .size(crate::ui::theme::TINY)
+                                            .color(MUTED),
+                                    );
                                 }
                             });
-                        });
-                        section_separator(ui);
-                        switch_row(ui, "按比例缩放", &mut view.aspect_locked)
-                            .on_hover_text("仅当前播放窗口");
-                        let mut monitoring =
-                            view.performance_mode != super::PerformancePanelMode::Hidden;
-                        if switch_row(ui, "性能监控", &mut monitoring)
-                            .on_hover_text("仅当前播放窗口；F3切换显示模式")
-                            .changed()
-                        {
-                            view.performance_mode = if monitoring {
-                                super::PerformancePanelMode::Compact
-                            } else {
-                                super::PerformancePanelMode::Hidden
-                            };
-                        }
-                        if monitoring {
-                            ui.horizontal(|ui| {
-                                for (mode, label) in [
-                                    (super::PerformancePanelMode::Compact, "简洁"),
-                                    (super::PerformancePanelMode::Detailed, "详细"),
-                                ] {
-                                    if ui
-                                        .add_sized(
-                                            [(WIDTH - 6.0) / 2.0, ROW_HEIGHT],
-                                            egui::Button::new(label)
-                                                .selected(view.performance_mode == mode),
-                                        )
-                                        .clicked()
-                                    {
-                                        view.performance_mode = mode;
-                                    }
-                                }
-                            });
-                        }
-                        let mode_label = match snapshot.mouse_preference {
-                            MouseMode::Smart | MouseMode::View => "智能鼠标",
-                            MouseMode::Remote => "被控端鼠标",
-                            MouseMode::Local => "主控端鼠标",
-                        };
-                        if menu_row(ui, "鼠标模式", mode_label, None, true, true).clicked() {
-                            state.page = Page::Mouse;
-                        }
-                        let mut relay = snapshot.network.relay_enabled;
-                        let response = ui
-                            .add_enabled_ui(snapshot.network.available, |ui| {
-                                switch_row(ui, "强制中转", &mut relay)
-                            })
-                            .inner;
-                        if response.changed() {
-                            state.local_error =
-                                handle.set_relay_enabled(relay).err().map(|e| e.to_string());
-                        }
-                        response.on_hover_text(
-                            snapshot
-                                .network
-                                .unavailable_reason
-                                .unwrap_or("仅本次连接生效；关闭后恢复自动选路，不保证一定直连"),
-                        );
-                        section_separator(ui);
-                        let audio = handle.audio();
-                        let mut audio_settings = audio.settings();
-                        let audio_status = audio.snapshot();
-                        volume_bar(
-                            ui,
-                            &mut audio_settings.volume,
-                            &mut audio_settings.muted,
-                            &audio,
-                        )
-                        .on_hover_text(
-                            if audio_status.device.is_empty() && !audio_status.receiving {
-                                "等待音频"
-                            } else {
-                                "音量"
-                            },
-                        );
-                        audio.set_settings(audio_settings);
-                        if let Some(error) = audio_status.error {
-                            ui.horizontal_wrapped(|ui| {
-                                ui.colored_label(crate::ui::theme::AMBER, error);
-                                if ui.small_button("重试").clicked() {
-                                    audio.retry();
-                                }
-                            });
-                        }
-                        if snapshot.network.pending {
-                            ui.horizontal(|ui| {
-                                ui.spinner();
-                                ui.label(
-                                    RichText::new("正在切换线路…")
-                                        .size(crate::ui::theme::TINY)
-                                        .color(MUTED),
-                                );
-                            });
-                        } else if let Some(notice) = snapshot.network.notice {
-                            ui.label(
-                                RichText::new(notice)
-                                    .size(crate::ui::theme::TINY)
-                                    .color(MUTED),
-                            );
-                        }
                     }
                     Page::Mouse => {
                         for (mode, label, description) in [
@@ -869,8 +818,8 @@ pub(super) fn show_stream_control_window(
                                 "",
                                 Some(snapshot.mouse_preference == mode),
                                 snapshot.ready
-                                    && !snapshot.mouse_pending
-                                    && snapshot.pending_count == 0,
+                                    && snapshot.mouse_modes_supported
+                                    && !snapshot.mouse_pending,
                                 false,
                             )
                             .clicked()
@@ -893,37 +842,24 @@ pub(super) fn show_stream_control_window(
                         separator(ui);
                         ui.add_space(7.0);
                         ui.label(
-                            RichText::new("按 Ctrl+Shift+Alt+Z 退出控制。")
-                                .size(crate::ui::theme::TINY)
-                                .color(MUTED),
+                            RichText::new(format!(
+                                "退出控制快捷键：{}",
+                                crate::viewer_shortcuts::label(
+                                    crate::viewer_shortcuts::Action::ReleaseMouse
+                                )
+                            ))
+                            .size(crate::ui::theme::TINY)
+                            .color(MUTED),
                         );
                     }
-                    Page::Custom | Page::Adaptive => {
-                        let adaptive = state.page == Page::Adaptive;
+                    Page::Custom => {
                         ui.add_enabled_ui(snapshot.ready, |ui| {
-                            let value = if adaptive {
-                                &mut settings.adaptive_ceiling_mbps
-                            } else {
-                                &mut settings.custom_bitrate_mbps
-                            };
-                            state.dirty |= bitrate_editor(ui, value, adaptive, multi_screen);
-                            if adaptive {
-                                ui.add_space(14.0);
-                                separator(ui);
-                                ui.add_space(9.0);
-                                state.dirty |=
-                                    switch_row(ui, "自动调整", &mut settings.stability_priority)
-                                        .changed();
-                                ui.label(
-                                    RichText::new(if settings.stability_priority {
-                                        "网络拥堵时降低码率"
-                                    } else {
-                                        "仅提醒，不自动调整"
-                                    })
-                                    .size(crate::ui::theme::TINY)
-                                    .color(MUTED),
-                                );
-                            }
+                            state.dirty |= bitrate_editor(
+                                ui,
+                                &mut settings.custom_bitrate_mbps,
+                                multi_screen,
+                                snapshot.custom_bitrate_limit,
+                            );
                             ui.add_space(16.0);
                             let can_apply = state.dirty
                                 || state.local_error.is_some()
@@ -949,74 +885,142 @@ pub(super) fn show_stream_control_window(
                                     }
                                 });
                             });
-                            // Keep the Apply target stationary when live
-                            // network advice appears or an ACK arrives.
-                            if adaptive && let Some(budget) = &snapshot.adaptive {
-                                ui.add_space(8.0);
-                                budget_status(
-                                    ui,
-                                    budget,
-                                    &snapshot,
-                                    !state.dirty
-                                        && action.is_none()
-                                        && snapshot.pending_sequence.is_none(),
-                                    &mut action,
-                                );
-                            }
                         });
                     }
                 }
-                if let Some(error) = state
-                    .local_error
-                    .as_ref()
-                    .or(snapshot.mouse_error.as_ref())
-                    .or(snapshot.cursor_error.as_ref())
-                    .or(snapshot.last_error.as_ref())
-                    .or(snapshot.network.error.as_ref())
-                {
-                    ui.add_space(9.0);
-                    ui.add(egui::Label::new(
-                        RichText::new("设置未生效")
-                            .size(crate::ui::theme::TINY)
-                            .color(super::bad_color()),
-                    ))
-                    .on_hover_text(error);
-                } else if let Some(error) = snapshot.persistence_error.as_ref() {
-                    ui.add_space(9.0);
-                    ui.label(
-                        RichText::new("设置未保存")
-                            .size(crate::ui::theme::TINY)
-                            .color(super::bad_color()),
-                    )
-                    .on_hover_text(error);
-                } else if let Some(waiting) = snapshot.waiting_for {
-                    ui.add_space(9.0);
-                    ui.label(
-                        RichText::new("等待串流就绪…")
-                            .size(crate::ui::theme::TINY)
-                            .color(MUTED),
-                    )
-                    .on_hover_text(waiting);
-                } else if snapshot.pending_sequence.is_some() && state.page != Page::Adaptive {
-                    ui.add_space(9.0);
-                    ui.label(
-                        RichText::new("正在应用…")
-                            .size(crate::ui::theme::TINY)
-                            .color(MUTED),
-                    );
+                if state.page != Page::Display {
+                    if let Some(error) = state
+                        .local_error
+                        .as_ref()
+                        .or(snapshot.mouse_error.as_ref())
+                        .or(snapshot.cursor_error.as_ref())
+                        .or(snapshot.last_error.as_ref())
+                        .or(snapshot.network.error.as_ref())
+                    {
+                        ui.add_space(9.0);
+                        ui.add(egui::Label::new(
+                            RichText::new("设置未生效")
+                                .size(crate::ui::theme::TINY)
+                                .color(super::bad_color()),
+                        ))
+                        .on_hover_text(error);
+                    } else if let Some(error) = snapshot.persistence_error.as_ref() {
+                        ui.add_space(9.0);
+                        ui.label(
+                            RichText::new("设置未保存")
+                                .size(crate::ui::theme::TINY)
+                                .color(super::bad_color()),
+                        )
+                        .on_hover_text(error);
+                    } else if let Some(waiting) = snapshot.waiting_for {
+                        ui.add_space(9.0);
+                        ui.label(
+                            RichText::new("等待串流就绪…")
+                                .size(crate::ui::theme::TINY)
+                                .color(MUTED),
+                        )
+                        .on_hover_text(waiting);
+                    } else if snapshot.pending_sequence.is_some() {
+                        ui.add_space(9.0);
+                        ui.label(
+                            RichText::new("正在应用…")
+                                .size(crate::ui::theme::TINY)
+                                .color(MUTED),
+                        );
+                    }
                 }
             });
         });
+    if let Some((target, proposed)) = state.format_confirm {
+        let current = handle.snapshot().settings;
+        let response = egui::Modal::new(egui::Id::new("stream-format-confirmation"))
+            .frame(crate::ui::controls::dialog_frame())
+            .show(ctx, |ui| {
+                ui.set_width(340.0);
+                ui.label(RichText::new("调整显示效果？").size(crate::ui::theme::SECTION));
+                ui.add_space(12.0);
+                ui.label("双方设备需要使用以下组合：");
+                ui.label(format!(
+                    "{} · {} · {}",
+                    proposed.quality.label(),
+                    if proposed.true_color {
+                        "YUV 4:4:4"
+                    } else {
+                        "YUV 4:2:0"
+                    },
+                    if proposed.hdr { "HDR" } else { "SDR" }
+                ));
+                if proposed.quality != current.quality {
+                    ui.label("画质会一并调整。");
+                }
+                ui.add_space(16.0);
+                ui.horizontal(|ui| {
+                    if ui.add(crate::ui::controls::secondary("取消")).clicked() {
+                        state.format_confirm = None;
+                    }
+                    if ui.add(crate::ui::controls::primary("应用")).clicked() {
+                        state.local_error = handle
+                            .apply_format(target, proposed)
+                            .err()
+                            .map(|e| e.to_string());
+                        state.format_confirm = None;
+                        settings = handle.snapshot().settings;
+                        state.dirty = false;
+                    }
+                });
+            });
+        if response.should_close() {
+            state.format_confirm = None;
+        }
+    }
     if back {
         state.page = Page::Quality;
+        state.display.reset();
         state.dirty = false;
         state.local_error = None;
         settings = snapshot.settings;
     } else if let Some(action) = action {
         let result = match action {
+            Action::Apply if handle.frame_rate_needs_super_screen(settings) => {
+                let (width, height, dpi) = topology_menu::local_parameters(ctx, handle, local_size);
+                topology_menu::request(
+                    ctx,
+                    handle,
+                    screen_id,
+                    crate::stream_control::DisplayTopologyAction::FrameRate {
+                        settings,
+                        width,
+                        height,
+                        dpi,
+                    },
+                );
+                settings = snapshot.settings;
+                Ok(0)
+            }
             Action::Apply => handle.apply(settings),
-            Action::Adopt => handle.adopt_budget_suggestion(),
-            Action::Reassess => handle.reassess_budget(),
+            Action::Color(enabled) | Action::Hdr(enabled) => {
+                let hdr_change = matches!(action, Action::Hdr(_));
+                match handle.propose_format(
+                    (!hdr_change).then_some(enabled),
+                    hdr_change.then_some(enabled),
+                ) {
+                    Ok(proposed) => {
+                        let current = handle.snapshot().settings;
+                        let extra_change = proposed.quality != current.quality
+                            || (hdr_change && proposed.true_color != current.true_color)
+                            || (!hdr_change && proposed.hdr != current.hdr);
+                        if extra_change {
+                            state.format_confirm = Some((screen_id, proposed));
+                            Ok(0)
+                        } else {
+                            let result = handle.apply_format(screen_id, proposed);
+                            settings = handle.snapshot().settings;
+                            result
+                        }
+                    }
+                    Err(error) => Err(error),
+                }
+            }
         };
         match result {
             Ok(sequence) => {

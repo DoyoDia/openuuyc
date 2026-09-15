@@ -46,15 +46,10 @@ impl FrameRateChoice {
         }
     }
 
-    pub fn is_supported(self, display: LocalDisplayInfo) -> bool {
-        self == Self::Auto || self.value(display) <= max_frame_rate_level(display.refresh_hz)
-    }
-
-    pub fn available(display: LocalDisplayInfo) -> Vec<Self> {
-        FPS_CHOICES
-            .into_iter()
-            .filter(|choice| choice.is_supported(display))
-            .collect()
+    pub fn available(_display: LocalDisplayInfo) -> Vec<Self> {
+        // The ordinary desktop menu exposes all four explicit levels. The
+        // receiver refresh rate limits fps_count, not the user's level list.
+        FPS_CHOICES.to_vec()
     }
 
     pub fn label(self, display: LocalDisplayInfo) -> String {
@@ -183,13 +178,6 @@ pub(crate) struct ConnectionMediaProfile {
 
 impl ConnectionMediaOptions {
     pub(crate) fn resolve(self, display: LocalDisplayInfo) -> Result<ConnectionMediaProfile> {
-        if !self.frame_rate.is_supported(display) {
-            bail!(
-                "{} exceeds the local display refresh tier for {} Hz",
-                self.frame_rate.label(display),
-                display.refresh_hz
-            );
-        }
         let stream_fps = self.frame_rate.value(display);
         Ok(ConnectionMediaProfile {
             muted: self.muted,
@@ -216,11 +204,16 @@ pub fn detect_local_display() -> Result<LocalDisplayInfo> {
     if display.width == 0 || display.height == 0 {
         bail!("local display reported an invalid resolution");
     }
-    let refresh_hz = if display.frequency.is_finite() && display.frequency > 0.0 {
-        display.frequency.round() as u32
-    } else {
-        60
-    };
+    // Use the maximum refresh of active displays with a 30 Hz floor.
+    // The primary display still supplies geometry; using
+    // only its refresh would incorrectly limit viewing on a faster monitor.
+    let refresh_hz = displays
+        .iter()
+        .filter(|display| display.frequency.is_finite() && display.frequency > 0.0)
+        .map(|display| display.frequency.round() as u32)
+        .max()
+        .unwrap_or(30)
+        .max(30);
     Ok(LocalDisplayInfo {
         width: display.width,
         height: display.height,

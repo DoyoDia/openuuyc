@@ -246,7 +246,7 @@ pub(crate) struct ReceivedVideoFrame {
 pub(crate) struct ReceiverResult {
     pub frames: Vec<ReceivedVideoFrame>,
     pub request_keyframe: bool,
-    pub force_keyframe: bool,
+    pub clear_nack: bool,
     pub accepted_packet: bool,
     pub continuous_sequence: Option<u16>,
     pub predecode_drops: usize,
@@ -411,9 +411,24 @@ impl OfficialVideoReceiver {
         Some(parsed)
     }
 
-    pub(crate) fn receive_parsed(&mut self, parsed: ParsedVideoPacket) -> ReceiverResult {
+    /// Parameter tracking precedes the per-packet RTCP flush in the official receiver.
+    pub(crate) fn prepare_video_packet(&mut self, parsed: &mut ParsedVideoPacket) -> bool {
+        self.packet_buffer.prepare_parameters(parsed)
+    }
+
+    pub(crate) fn receive_prepared(&mut self, parsed: ParsedVideoPacket) -> ReceiverResult {
         let insert = self.packet_buffer.insert(parsed);
         self.accept_insert(insert)
+    }
+
+    /// The caller has already flushed the parameter tracker's keyframe request.
+    pub(crate) fn parameter_packet_rejected(&mut self) -> ReceiverResult {
+        let mut result = self.accept_insert(PacketInsertResult {
+            parameter_rejected: true,
+            ..PacketInsertResult::empty()
+        });
+        result.request_keyframe = false;
+        result
     }
 
     pub(crate) fn receive_padding(&mut self, sequence_number: u16) -> ReceiverResult {
@@ -459,7 +474,7 @@ impl OfficialVideoReceiver {
         ReceiverResult {
             frames,
             request_keyframe,
-            force_keyframe: request_keyframe,
+            clear_nack: request_keyframe,
             accepted_packet: false,
             continuous_sequence: self.pending_continuous_sequence.take(),
             predecode_drops: std::mem::take(&mut self.pending_predecode_drops),
@@ -503,7 +518,7 @@ impl OfficialVideoReceiver {
         ReceiverResult {
             frames,
             request_keyframe,
-            force_keyframe: request_keyframe,
+            clear_nack: request_keyframe,
             predecode_drops: std::mem::take(&mut self.pending_predecode_drops),
             frame_buffer_frames: self.frame_buffer.frames.len(),
             ..ReceiverResult::default()
@@ -519,7 +534,7 @@ impl OfficialVideoReceiver {
         ReceiverResult {
             frames,
             request_keyframe,
-            force_keyframe: false,
+            clear_nack: false,
             accepted_packet: !insert.parameter_rejected,
             continuous_sequence: self.pending_continuous_sequence.take(),
             predecode_drops: std::mem::take(&mut self.pending_predecode_drops),
@@ -582,6 +597,16 @@ impl OfficialVideoReceiver {
                 self.timing.incoming_timestamp(timestamp, received_at);
             }
         }
+        // FrameBuffer can reject, evict or clear frames without a successful
+        // Decode. Keep sequence metadata only while a consumer still owns it;
+        // otherwise a stalled/failing decoder grows this map without bound.
+        // The last continuous ID may already have left FrameBuffer, but its
+        // sequence is still needed when insert() reports that same frontier.
+        self.last_sequence_by_frame.retain(|id, _| {
+            self.frame_buffer.frames.contains_key(id)
+                || self.in_flight.contains_key(id)
+                || self.frame_buffer.last_continuous_frame_id == Some(*id)
+        });
     }
 
     fn take_ready_frames(&mut self, release_scheduled: bool) -> Vec<ReceivedVideoFrame> {
@@ -1104,7 +1129,14 @@ fn process_media_packet(
         parsed.packet_keyframe,
         color_extension.as_deref(),
     );
-    let insert = packet_buffer.insert(parsed);
+    let insert = if packet_buffer.prepare_parameters(&mut parsed) {
+        packet_buffer.insert(parsed)
+    } else {
+        PacketInsertResult {
+            parameter_rejected: true,
+            ..PacketInsertResult::empty()
+        }
+    };
     stats.parameter_requests += u64::from(insert.parameter_rejected);
     stats.duplicate_packets += u64::from(insert.duplicate);
     stats.packet_buffer_expansions += insert.expansions as u64;
@@ -1238,7 +1270,7 @@ impl PacketBuffer {
         self.parameters.install_h264_sprop(fmtp);
     }
 
-    fn insert(&mut self, mut packet: ParsedVideoPacket) -> PacketInsertResult {
+    fn prepare_parameters(&mut self, packet: &mut ParsedVideoPacket) -> bool {
         let tracked = match packet.codec {
             VideoCodecKind::H264 => self.parameters.h264(
                 &mut packet.nalus,
@@ -1257,12 +1289,13 @@ impl PacketBuffer {
                     sequence_number = packet.sequence_number,
                     "request keyframe for missing codec parameter dependency"
                 );
-                return PacketInsertResult {
-                    parameter_rejected: true,
-                    ..PacketInsertResult::empty()
-                };
+                return false;
             }
         }
+        true
+    }
+
+    fn insert(&mut self, packet: ParsedVideoPacket) -> PacketInsertResult {
         let sequence_number = packet.sequence_number;
         if !self.first_packet_received {
             self.first_sequence_number = sequence_number;
@@ -2150,12 +2183,10 @@ fn sequence_at_or_ahead(value: u16, reference: u16) -> bool {
 }
 
 fn parse_video_timing(payload: &[u8]) -> Option<VideoSendTiming> {
-    let (flags, deltas) = match payload.len() {
-        // Legacy WebRTC wire format omitted the flags byte.
-        12 => (0, payload),
-        13 => (payload[0], &payload[1..]),
-        _ => return None,
-    };
+    if payload.len() != 13 {
+        return None;
+    }
+    let (flags, deltas) = (payload[0], &payload[1..]);
     if flags == u8::MAX {
         return None;
     }

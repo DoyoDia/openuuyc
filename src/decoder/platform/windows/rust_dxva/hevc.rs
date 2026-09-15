@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 use super::{
     dxva::{Codec, Failure, Lease, Picture, Pool},
-    params::HevcParams,
+    params::{HevcParams, HevcRangeParams},
 };
 use anyhow::{Context, Result, ensure};
 use oxideav_h265::{
@@ -141,7 +141,8 @@ impl Hevc {
             self.reset();
         }
         ensure!(
-            s.chroma_format_idc == 1
+            matches!(s.chroma_format_idc, 1 | 3)
+                && !s.separate_colour_plane_flag
                 && s.bit_depth_luma_minus8 == s.bit_depth_chroma_minus8
                 && matches!(s.bit_depth_luma_minus8, 0 | 2),
             Failure::Unsupported
@@ -150,14 +151,15 @@ impl Hevc {
         let width = s.pic_width_in_luma_samples;
         let height = s.pic_height_in_luma_samples;
         let crop = &s.conformance_window;
+        let crop_unit = if s.chroma_format_idc == 1 { 2 } else { 1 };
         ensure!(
             crop.left_offset
                 .checked_add(crop.right_offset)
-                .is_some_and(|v| v < width / 2)
+                .is_some_and(|v| v < width / crop_unit)
                 && crop
                     .top_offset
                     .checked_add(crop.bottom_offset)
-                    .is_some_and(|v| v < height / 2),
+                    .is_some_and(|v| v < height / crop_unit),
             "invalid HEVC crop"
         );
         let capacity = s.sub_layer_ordering_info[s.max_sub_layers_minus1 as usize]
@@ -168,6 +170,7 @@ impl Hevc {
             pool.width != width
                 || pool.height != height
                 || pool.depth != depth
+                || pool.chroma != s.chroma_format_idc as u8
                 || pool.dpb < capacity as usize
         }) {
             ensure!(self.refs.is_empty(), "HEVC resize requires reference reset");
@@ -178,6 +181,7 @@ impl Hevc {
                     width,
                     height,
                     depth,
+                    s.chroma_format_idc as u8,
                     capacity as usize,
                 )
                 .map_err(|e| e.context(Failure::HardwareFailure))?,
@@ -324,11 +328,14 @@ impl Hevc {
         v.RefPicSetStCurrAfter = indices(&after, &self.refs)?;
         v.RefPicSetLtCurr = indices(&lt, &self.refs)?;
         let matrix = matrix(&s, &p);
+        let range = range_parameters(v, &s, &p)?;
+        let parameter_len = if s.chroma_format_idc == 3 {
+            std::mem::size_of::<HevcRangeParams>()
+        } else {
+            std::mem::size_of::<HevcParams>()
+        };
         let bytes = unsafe {
-            std::slice::from_raw_parts(
-                (&v as *const HevcParams).cast(),
-                std::mem::size_of::<HevcParams>(),
-            )
+            std::slice::from_raw_parts((&range as *const HevcRangeParams).cast(), parameter_len)
         };
         pool.submit(&current, bytes, &matrix, &slices, cancel)
             .map_err(|e| e.context(Failure::HardwareFailure))?;
@@ -343,10 +350,10 @@ impl Hevc {
         });
         Ok(Some(Picture {
             surface: current,
-            left: 2 * crop.left_offset,
-            top: 2 * crop.top_offset,
-            width: width - 2 * (crop.left_offset + crop.right_offset),
-            height: height - 2 * (crop.top_offset + crop.bottom_offset),
+            left: crop_unit * crop.left_offset,
+            top: crop_unit * crop.top_offset,
+            width: width - crop_unit * (crop.left_offset + crop.right_offset),
+            height: height - crop_unit * (crop.top_offset + crop.bottom_offset),
             poc: poc.val,
             reorder_limit: s.sub_layer_ordering_info[s.max_sub_layers_minus1 as usize]
                 .max_num_reorder_pics,
@@ -385,6 +392,47 @@ fn inline_rps_bits(rbsp: &[u8], kind: u8, s: &SeqParameterSet, p: &PicParameterS
     ShortTermRefPicSet::parse_slice_inline(&mut b, s)?;
     Ok((b.bit_pos() - start).try_into()?)
 }
+fn range_parameters(
+    base: HevcParams,
+    s: &SeqParameterSet,
+    p: &PicParameterSet,
+) -> Result<HevcRangeParams> {
+    let mut out = HevcRangeParams {
+        base,
+        ..Default::default()
+    };
+    if let Some(s) = &s.sps_range_extension {
+        out.flags = (s.transform_skip_rotation_enabled_flag as u16)
+            | (s.transform_skip_context_enabled_flag as u16) << 1
+            | (s.implicit_rdpcm_enabled_flag as u16) << 2
+            | (s.explicit_rdpcm_enabled_flag as u16) << 3
+            | (s.extended_precision_processing_flag as u16) << 4
+            | (s.intra_smoothing_disabled_flag as u16) << 5
+            | (s.persistent_rice_adaptation_enabled_flag as u16) << 6
+            | (s.high_precision_offsets_enabled_flag as u16) << 7
+            | (s.cabac_bypass_alignment_enabled_flag as u16) << 8;
+    }
+    if let Some(p) = &p.pps_range_extension {
+        out.flags |= (p.cross_component_prediction_enabled_flag as u16) << 9
+            | (p.chroma_qp_offset_list_enabled_flag as u16) << 10;
+        out.diff_cu_chroma_qp_offset_depth = p.diff_cu_chroma_qp_offset_depth.try_into()?;
+        out.log2_sao_offset_scale_luma = p.log2_sao_offset_scale_luma.try_into()?;
+        out.log2_sao_offset_scale_chroma = p.log2_sao_offset_scale_chroma.try_into()?;
+        out.log2_max_transform_skip_block_size_minus2 =
+            p.log2_max_transform_skip_block_size_minus2.try_into()?;
+        out.chroma_qp_offset_list_len_minus1 = p.chroma_qp_offset_list_len_minus1.try_into()?;
+        ensure!(
+            p.chroma_qp_offset_list.len() <= 6,
+            "invalid HEVC chroma QP list"
+        );
+        for (index, entry) in p.chroma_qp_offset_list.iter().enumerate() {
+            out.cb_qp_offset_list[index] = entry.cb_qp_offset;
+            out.cr_qp_offset_list[index] = entry.cr_qp_offset;
+        }
+    }
+    Ok(out)
+}
+
 // Reserved SDK fields stay zero while independently specified flags are packed.
 #[allow(clippy::field_reassign_with_default)]
 fn parameters(

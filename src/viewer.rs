@@ -21,19 +21,22 @@ use crate::stream_control::StreamControlHandle;
 use crate::video_color::RenderColor;
 use crate::video_format::{VideoFormatSignature, parse_annex_b_format};
 
+pub(crate) mod device_switch;
+mod performance_panel;
 mod screens;
 mod stream_menu;
 use stream_menu::{StreamControlUi, show_stream_control_window};
+mod annotation;
+mod display_transition;
 
-#[cfg(target_os = "windows")]
 mod windows_cursor;
-#[cfg(target_os = "windows")]
+
 mod windows_keyboard;
-#[cfg(windows)]
+
 mod windows_mouse;
-#[cfg(windows)]
+
 mod windows_presenter;
-#[cfg(windows)]
+
 mod windows_ui;
 
 const CONNECTION_PROGRESS_STEPS: u8 = 13;
@@ -51,11 +54,11 @@ pub struct ConnectionProgress {
     pub title: String,
     pub detail: String,
     pub state: ConnectionProgressState,
+    pub(crate) background: Option<crate::wallpaper::Source>,
 }
 
 #[derive(Clone, Default)]
 pub(crate) struct ViewerDisplayHandle {
-    #[cfg(windows)]
     pub surface_writer: Option<crate::decoder::windows_surface::D3D11SurfaceWriter>,
 }
 
@@ -66,6 +69,7 @@ impl ConnectionProgress {
             title: title.into(),
             detail: detail.into(),
             state: ConnectionProgressState::Working,
+            background: None,
         }
     }
 
@@ -75,6 +79,7 @@ impl ConnectionProgress {
             title: "连接完成".to_owned(),
             detail: detail.into(),
             state: ConnectionProgressState::Ready,
+            background: None,
         }
     }
 
@@ -84,6 +89,16 @@ impl ConnectionProgress {
             title: "无法建立连接".to_owned(),
             detail: detail.into(),
             state: ConnectionProgressState::Failed,
+            background: None,
+        }
+    }
+}
+
+impl ConnectionProgress {
+    pub(crate) fn background(source: crate::wallpaper::Source) -> Self {
+        Self {
+            background: Some(source),
+            ..Self::working(0, "", "")
         }
     }
 }
@@ -98,7 +113,6 @@ pub(crate) fn run_connecting_viewer_window(
     session: std_mpsc::Receiver<ViewerWindowEvent>,
     display_sender: oneshot::Sender<ViewerDisplayHandle>,
 ) -> Result<()> {
-    #[cfg(windows)]
     {
         windows_presenter::run_connecting(windows_presenter::ConnectingWindowsRunConfig {
             alias,
@@ -107,17 +121,14 @@ pub(crate) fn run_connecting_viewer_window(
             display_sender,
         })
     }
-    #[cfg(not(windows))]
-    {
-        let _ = (alias, progress, session, display_sender);
-        crate::ui::ensure_supported()
-    }
 }
 
 pub(crate) enum ViewerWindowEvent {
     Close,
     Playing(Box<NativeViewerSession>),
     Reconnect {
+        alias: String,
+        window: Option<winit::window::WindowId>,
         progress: std_mpsc::Receiver<ConnectionProgress>,
         display: oneshot::Sender<ViewerDisplayHandle>,
     },
@@ -126,7 +137,7 @@ pub(crate) enum ViewerWindowEvent {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct ViewerPreferences {
     performance_mode: PerformancePanelMode,
-    #[cfg(windows)]
+
     aspect_locked: bool,
 }
 
@@ -134,7 +145,7 @@ impl Default for ViewerPreferences {
     fn default() -> Self {
         Self {
             performance_mode: PerformancePanelMode::Compact,
-            #[cfg(windows)]
+
             aspect_locked: true,
         }
     }
@@ -143,10 +154,12 @@ impl Default for ViewerPreferences {
 pub(super) struct ConnectionProgressApp {
     alias: String,
     receiver: std_mpsc::Receiver<ConnectionProgress>,
-    steps: Vec<ConnectionProgress>,
+    details_open: bool,
     events: Vec<(Duration, ConnectionProgress)>,
     current: ConnectionProgress,
     started_at: Instant,
+    background: Option<crate::wallpaper::Source>,
+    wallpapers: crate::wallpaper::Wallpapers,
 }
 
 impl ConnectionProgressApp {
@@ -155,30 +168,29 @@ impl ConnectionProgressApp {
         Self {
             alias,
             receiver,
-            steps: vec![current.clone()],
+            details_open: false,
             events: vec![(Duration::ZERO, current.clone())],
             current,
             started_at: Instant::now(),
+            background: None,
+            wallpapers: Default::default(),
         }
     }
 
     pub(super) fn drain(&mut self) {
         while let Ok(mut progress) = self.receiver.try_recv() {
+            if let Some(source) = progress.background.take() {
+                if self.background.as_ref() != Some(&source) {
+                    self.wallpapers.clear();
+                    self.background = Some(source);
+                }
+                continue;
+            }
             if progress.step == 0 {
                 progress.step = self.current.step;
             }
             self.events
                 .push((self.started_at.elapsed(), progress.clone()));
-            if let Some(existing) = self
-                .steps
-                .iter_mut()
-                .find(|existing| existing.step == progress.step)
-            {
-                *existing = progress.clone();
-            } else {
-                self.steps.push(progress.clone());
-                self.steps.sort_by_key(|step| step.step);
-            }
             if matches!(progress.state, ConnectionProgressState::Ready) {
                 tracing::debug!("connection UI reached ready state");
             }
@@ -187,166 +199,7 @@ impl ConnectionProgressApp {
     }
 }
 
-impl ConnectionProgressApp {
-    pub(super) fn draw(&mut self, ui: &mut egui::Ui) {
-        let ctx = ui.ctx().clone();
-        self.drain();
-        ctx.request_repaint_after(Duration::from_millis(33));
-        egui::CentralPanel::default()
-            .frame(
-                egui::Frame::new()
-                    .fill(crate::ui::theme::BG)
-                    .inner_margin(egui::Margin::same(28)),
-            )
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new(crate::APP_NAME)
-                            .size(crate::ui::theme::DIALOG_TITLE)
-                            .strong()
-                            .color(egui::Color32::WHITE),
-                    );
-                    ui.add_space(8.0);
-                    ui.label(
-                        egui::RichText::new(&self.alias)
-                            .size(crate::ui::theme::BODY)
-                            .color(crate::ui::theme::MUTED),
-                    );
-                });
-                ui.add_space(24.0);
-                ui.columns(2, |columns| {
-                    columns[0].set_width(310.0);
-                    columns[0].label(
-                        egui::RichText::new("连接进度")
-                            .size(crate::ui::theme::COMPACT_TEXT)
-                            .color(crate::ui::theme::MUTED),
-                    );
-                    columns[0].add_space(12.0);
-                    for step in &self.steps {
-                        let complete = step.step < self.current.step
-                            || matches!(step.state, ConnectionProgressState::Ready);
-                        let active = step.step == self.current.step;
-                        let color = if matches!(step.state, ConnectionProgressState::Failed) {
-                            crate::ui::theme::RED
-                        } else if complete {
-                            crate::ui::theme::GREEN
-                        } else if active {
-                            crate::ui::theme::ACCENT
-                        } else {
-                            crate::ui::theme::DISABLED
-                        };
-                        columns[0].horizontal(|ui| {
-                            ui.colored_label(color, if complete { "●" } else { "○" });
-                            ui.label(egui::RichText::new(&step.title).color(if active {
-                                egui::Color32::WHITE
-                            } else {
-                                color
-                            }));
-                        });
-                    }
-
-                    columns[1].vertical(|ui| {
-                        ui.add_space(14.0);
-                        if matches!(self.current.state, ConnectionProgressState::Working) {
-                            ui.spinner();
-                        }
-                        let accent = match self.current.state {
-                            ConnectionProgressState::Working => crate::ui::theme::ACCENT,
-                            ConnectionProgressState::Ready => crate::ui::theme::GREEN,
-                            ConnectionProgressState::Failed => crate::ui::theme::RED,
-                        };
-                        ui.add_space(14.0);
-                        ui.label(
-                            egui::RichText::new(&self.current.title)
-                                .size(crate::ui::theme::TITLE)
-                                .strong()
-                                .color(accent),
-                        );
-                        ui.add_space(10.0);
-                        ui.label(
-                            egui::RichText::new(&self.current.detail)
-                                .size(crate::ui::theme::BODY)
-                                .color(crate::ui::theme::MUTED),
-                        );
-                        ui.add_space(24.0);
-                        ui.add(
-                            egui::ProgressBar::new(
-                                f32::from(self.current.step.min(CONNECTION_PROGRESS_STEPS))
-                                    / f32::from(CONNECTION_PROGRESS_STEPS),
-                            )
-                            .desired_width(360.0)
-                            .animate(matches!(
-                                self.current.state,
-                                ConnectionProgressState::Working
-                            )),
-                        );
-                        ui.add_space(18.0);
-                        ui.separator();
-                        ui.add_space(10.0);
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new("实时连接诊断")
-                                    .size(crate::ui::theme::COMPACT_TEXT)
-                                    .strong()
-                                    .color(crate::ui::theme::TEXT),
-                            );
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    ui.label(
-                                        egui::RichText::new(format!(
-                                            "{:.1} 秒",
-                                            self.started_at.elapsed().as_secs_f64()
-                                        ))
-                                        .size(crate::ui::theme::TINY)
-                                        .color(crate::ui::theme::MUTED),
-                                    );
-                                },
-                            );
-                        });
-                        egui::ScrollArea::vertical()
-                            .max_height(230.0)
-                            .stick_to_bottom(true)
-                            .show(ui, |ui| {
-                                for (elapsed, event) in &self.events {
-                                    ui.horizontal_top(|ui| {
-                                        ui.label(
-                                            egui::RichText::new(format!(
-                                                "{:>5.2}s",
-                                                elapsed.as_secs_f64()
-                                            ))
-                                            .monospace()
-                                            .size(crate::ui::theme::MICRO)
-                                            .color(crate::ui::theme::DISABLED),
-                                        );
-                                        ui.vertical(|ui| {
-                                            ui.label(
-                                                egui::RichText::new(&event.title)
-                                                    .size(crate::ui::theme::TINY)
-                                                    .strong()
-                                                    .color(crate::ui::theme::TEXT),
-                                            );
-                                            ui.label(
-                                                egui::RichText::new(&event.detail)
-                                                    .size(crate::ui::theme::MICRO)
-                                                    .color(crate::ui::theme::MUTED),
-                                            );
-                                        });
-                                    });
-                                    ui.add_space(5.0);
-                                }
-                            });
-                        if matches!(self.current.state, ConnectionProgressState::Failed) {
-                            ui.add_space(20.0);
-                            if ui.button("关闭窗口").clicked() {
-                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                            }
-                        }
-                    });
-                });
-            });
-    }
-}
+mod connection_progress;
 
 #[derive(Debug)]
 struct DecodedVideoFrame {
@@ -551,19 +404,17 @@ fn take_next_frame(
 #[derive(Clone, Default)]
 struct FrameWake {
     visible: Arc<AtomicBool>,
-    #[cfg(windows)]
+
     render_thread: Arc<Mutex<Option<std::thread::Thread>>>,
 }
 
 impl FrameWake {
-    #[cfg(windows)]
     fn install_render_thread(&self, thread: std::thread::Thread) {
         *mutex_lock(&self.render_thread) = Some(thread);
         self.visible.store(true, Ordering::Release);
     }
 
     fn notify(&self) {
-        #[cfg(windows)]
         if let Some(thread) = mutex_lock(&self.render_thread).as_ref() {
             thread.unpark();
         }
@@ -577,12 +428,9 @@ struct DecodeActivity {
     idle: tokio::sync::watch::Receiver<u64>,
 }
 
-#[cfg(all(test, windows))]
-#[path = "viewer/software_window_tests.rs"]
-mod software_window_tests;
-
 pub struct NativeViewerSession {
-    screen_id: i32,
+    // A negotiated track may be reassigned after a display topology change.
+    screen_binding: std::sync::atomic::AtomicU64,
     track_index: i32,
     screens: Option<Box<screens::ScreenPlayback>>,
     title: String,
@@ -629,6 +477,11 @@ pub(crate) struct ViewerLaunchConfig {
 }
 
 impl NativeViewerSession {
+    pub(crate) fn set_device_switch(&mut self, switcher: device_switch::DeviceSwitcher) {
+        if let Some(screens) = &mut self.screens {
+            screens.device_switch = Some(switcher);
+        }
+    }
     pub(crate) async fn launch(config: ViewerLaunchConfig) -> Result<Self> {
         let ViewerLaunchConfig {
             codec,
@@ -648,7 +501,7 @@ impl NativeViewerSession {
         let shutdown = Arc::new(AtomicBool::new(false));
         let fatal_error = Arc::new(Mutex::new(None));
         let (startup_sender, startup_receiver) = oneshot::channel();
-        let software_decode = Arc::new(AtomicBool::new(cfg!(windows) && !hardware_decode));
+        let software_decode = Arc::new(AtomicBool::new(!hardware_decode));
         let decode_enabled = Arc::new(AtomicBool::new(true));
         let (decode_idle_sender, decode_idle) = tokio::sync::watch::channel(0);
         let pause_epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -672,7 +525,7 @@ impl NativeViewerSession {
                     decode_enabled: manager_enabled,
                     decode_idle: decode_idle_sender,
                     pause_epoch: manager_pause_epoch,
-                    #[cfg(windows)]
+
                     surface_writer: display.surface_writer,
                 },
                 video_source,
@@ -689,7 +542,7 @@ impl NativeViewerSession {
         // Establish the owner before awaiting initialization. Dropping this
         // future (close/account cancellation) must also stop and join its worker.
         let session = Self {
-            screen_id: 0,
+            screen_binding: std::sync::atomic::AtomicU64::new(0),
             track_index: 0,
             screens: None,
             title,
@@ -777,19 +630,39 @@ impl NativeViewerSession {
         track: i32,
     ) {
         self.track_index = track;
-        self.screen_id = self
+        if let Some(screen) = self
             .stream_control
             .snapshot()
             .screens
             .iter()
             .find(|screen| screen.video_track_index == track)
-            .map_or(0, |screen| screen.id);
+        {
+            self.bind_screen(screen);
+        }
         self.screens = Some(Box::new(screens::ScreenPlayback::new(
             peer,
             profile,
             alias,
-            self.screen_id,
+            self.screen_id(),
         )));
+    }
+
+    pub(crate) fn screen_id(&self) -> i32 {
+        self.screen_binding.load(Ordering::Acquire) as u32 as i32
+    }
+
+    pub(crate) fn screen_binding(&self) -> u64 {
+        self.screen_binding.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn bind_screen(&self, screen: &crate::stream_control::RemoteScreen) -> bool {
+        let binding =
+            (screen.id as u32 as u64) | ((screen.display.screen_type as u32 as u64) << 32);
+        let changed = self.screen_binding.swap(binding, Ordering::AcqRel) != binding;
+        if changed {
+            mutex_lock(&self.frame_queue).clear();
+        }
+        changed
     }
 
     pub fn close_handle(&self) -> ViewerCloseHandle {
@@ -819,14 +692,7 @@ impl NativeViewerSession {
     }
 
     pub fn run(self) -> Result<()> {
-        #[cfg(windows)]
-        {
-            windows_presenter::run(self)
-        }
-        #[cfg(not(windows))]
-        {
-            crate::ui::ensure_supported()
-        }
+        windows_presenter::run(self)
     }
 }
 
@@ -904,7 +770,7 @@ struct DecoderConfig {
     decode_enabled: Arc<AtomicBool>,
     decode_idle: tokio::sync::watch::Sender<u64>,
     pause_epoch: Arc<std::sync::atomic::AtomicU64>,
-    #[cfg(windows)]
+
     surface_writer: Option<crate::decoder::windows_surface::D3D11SurfaceWriter>,
 }
 
@@ -931,10 +797,7 @@ fn decoder_manager(
     let mut pool: Option<DecoderPool> = None;
     let first_open_attempt = std::time::Instant::now();
     let max_open_wait = std::time::Duration::from_secs(3);
-    let notification = crate::decoder::platform::DecoderNotification::new(
-        std::thread::current(),
-        Arc::clone(&shutdown),
-    );
+    let notification = crate::decoder::platform::DecoderNotification::new(Arc::clone(&shutdown));
     let mut timings = VecDeque::<FrameTiming>::new();
     let mut inflight = HashMap::<i64, u32>::new();
     let mut cutover_state = DecoderCutoverState::new();
@@ -954,10 +817,7 @@ fn decoder_manager(
             }
             match video_source.try_recv() {
                 Ok(frame) => {
-                    let _ = receiver_feedback.send(VideoReceiverFeedback::DecoderFinished {
-                        frame_id: frame.frame_id,
-                        result: VideoDecodeResult::Decoded,
-                    });
+                    frame.completion.complete(VideoDecodeResult::Decoded);
                 }
                 Err(mpsc::error::TryRecvError::Empty) => std::thread::park(),
                 Err(mpsc::error::TryRecvError::Disconnected) => break 'decode,
@@ -997,6 +857,7 @@ fn decoder_manager(
         if shutdown.load(Ordering::Acquire) {
             break;
         }
+        let completion = frame.completion.clone();
         let submitted_at = Instant::now();
         let frame_id = frame.frame_id;
         let keyframe = frame.keyframe;
@@ -1006,10 +867,7 @@ fn decoder_manager(
             .or_else(|| parse_annex_b_format(frame.codec, &frame.data));
         if pool.is_none() {
             if startup_sender.is_none() && !keyframe {
-                let _ = receiver_feedback.send(VideoReceiverFeedback::DecoderFinished {
-                    frame_id,
-                    result: VideoDecodeResult::RequestKeyframe,
-                });
+                completion.complete(VideoDecodeResult::RequestKeyframe);
                 continue 'decode;
             }
             let extra = extract_parameter_sets(frame.codec, &frame.data);
@@ -1026,7 +884,6 @@ fn decoder_manager(
                 width,
                 height,
                 extra,
-                #[cfg(windows)]
                 config.surface_writer.clone(),
             );
             match opened {
@@ -1071,12 +928,25 @@ fn decoder_manager(
         }
         let pool = pool.as_mut().expect("decoder opened before admission");
         pool.set_notification(notification.clone());
+        let mut render_color = frame
+            .color_space
+            .map(|color| color.rendering())
+            .unwrap_or_default();
+        // Current UU's renderer uses the received bit_depth_minus8 (CA7F90 /
+        // CADDF0 / CAC0C0), not the pending UI checkbox, to select HDR output.
+        // In this product's wire contract high-bit-depth video is the HDR path.
+        render_color.hdr_peak_nits = format
+            .or(pool.format())
+            .filter(|f| f.bit_depth_luma > 8)
+            .map(|_| {
+                frame
+                    .color_space
+                    .and_then(|c| c.hdr_metadata)
+                    .map_or(1000, |m| m.max_luminance)
+            });
         timings.push_back(FrameTiming {
             is_new_picture: frame.is_new_picture,
-            color: frame
-                .color_space
-                .map(|color| color.rendering())
-                .unwrap_or_default(),
+            color: render_color,
             rtp_timestamp: timestamp,
             received_at: frame.received_at,
             assembled_at: frame.assembled_at,
@@ -1086,7 +956,12 @@ fn decoder_manager(
             sender_timing: frame.sender_timing,
         });
 
-        let prepared = pool.prepare(frame.codec, format, keyframe);
+        let parameters = if keyframe {
+            extract_parameter_sets(frame.codec, &frame.data).unwrap_or_default()
+        } else {
+            Bytes::new()
+        };
+        let prepared = pool.prepare(frame.codec, format, keyframe, parameters);
         config
             .software_decode
             .store(pool.is_software(), Ordering::Release);
@@ -1103,8 +978,7 @@ fn decoder_manager(
             if !result.accepted() {
                 timings.clear();
             }
-            let _ =
-                receiver_feedback.send(VideoReceiverFeedback::DecoderFinished { frame_id, result });
+            completion.complete(result);
             continue;
         }
         if let Some(callback_result) = pool.callback_result() {
@@ -1127,8 +1001,7 @@ fn decoder_manager(
             if !result.accepted() {
                 timings.clear();
             }
-            let _ =
-                receiver_feedback.send(VideoReceiverFeedback::DecoderFinished { frame_id, result });
+            completion.complete(result);
             continue;
         }
         if frame.codec != active_codec {
@@ -1238,7 +1111,7 @@ fn decoder_manager(
         if !result.accepted() {
             timings.clear();
         }
-        let _ = receiver_feedback.send(VideoReceiverFeedback::DecoderFinished { frame_id, result });
+        completion.complete(result);
     }
     performance.set_decoder_queue_frames(0);
 }
@@ -1300,7 +1173,7 @@ fn open_decoder_with_metadata(
     width: u32,
     height: u32,
     extra_data: Option<Bytes>,
-    #[cfg(windows)] surface_writer: Option<crate::decoder::windows_surface::D3D11SurfaceWriter>,
+    surface_writer: Option<crate::decoder::windows_surface::D3D11SurfaceWriter>,
 ) -> Result<NativeVideoDecoder> {
     tracing::debug!(
         ?codec,
@@ -1310,7 +1183,7 @@ fn open_decoder_with_metadata(
         "opening native decoder with first-frame metadata"
     );
     let extra = extra_data.unwrap_or_default();
-    #[cfg(windows)]
+
     let opened = match surface_writer {
         Some(surface_writer) => NativeVideoDecoder::open_with_surface_writer(
             codec,
@@ -1330,15 +1203,7 @@ fn open_decoder_with_metadata(
             extra,
         ),
     };
-    #[cfg(not(windows))]
-    let opened = NativeVideoDecoder::open(
-        codec,
-        width,
-        height,
-        config.frame_rate,
-        config.hardware_decode,
-        extra,
-    );
+
     opened
 }
 
@@ -1377,7 +1242,6 @@ fn process_decoded_batch(
     forward_decoded_frames(batch.frames, timings, &mut context, pool);
     for issue in batch.output_issues {
         match issue {
-            #[cfg(any(windows, target_os = "macos"))]
             DecoderOutputIssue::Dropped(token) => {
                 if context.inflight.remove(&token).is_some() {
                     tracing::debug!(token, "backend explicitly dropped a decoded input");
@@ -1506,7 +1370,9 @@ pub(super) fn show_performance_overlay(
     match mode {
         PerformancePanelMode::Hidden => {}
         PerformancePanelMode::Compact => show_compact_performance(ctx, &stats, audio),
-        PerformancePanelMode::Detailed => show_detailed_performance(ctx, &stats, grid_id),
+        PerformancePanelMode::Detailed => {
+            performance_panel::show(ctx, performance, &stats, grid_id)
+        }
     }
 }
 
@@ -1696,47 +1562,6 @@ fn compact_audio_meter(ui: &mut egui::Ui, audio: &crate::audio::AudioPlayback, h
     }
 }
 
-fn show_detailed_performance(
-    ctx: &egui::Context,
-    stats: &PerformanceSnapshot,
-    grid_id: &'static str,
-) {
-    egui::Window::new("性能详情")
-        .id(egui::Id::new(grid_id))
-        .anchor(egui::Align2::RIGHT_BOTTOM, [-12.0, -12.0])
-        .default_width(480.0)
-        .resizable(true)
-        .collapsible(true)
-        .frame(performance_frame())
-        .show(ctx, |ui| {
-            ui.set_min_width(430.0);
-            ui.visuals_mut().override_text_color = Some(egui::Color32::WHITE);
-            ui.horizontal(|ui| {
-                ui.label(&stats.quality);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.weak(format_uptime(stats.uptime));
-                });
-            });
-            ui.add_space(8.0);
-            egui::ScrollArea::vertical()
-                .max_height((ctx.content_rect().height() - 120.0).clamp(100.0, 560.0))
-                .show(ui, |ui| {
-                    egui::Grid::new((grid_id, "metrics"))
-                        .num_columns(2)
-                        .spacing([18.0, 5.0])
-                        .show(ui, |ui| draw_performance_grid(ui, stats));
-                });
-        });
-}
-
-fn performance_frame() -> egui::Frame {
-    egui::Frame::new()
-        .fill(egui::Color32::from_black_alpha(225))
-        .stroke(egui::Stroke::new(1.0, egui::Color32::from_white_alpha(30)))
-        .corner_radius(crate::ui::theme::PANEL_RADIUS)
-        .inner_margin(egui::Margin::same(10))
-}
-
 fn compact_performance_frame() -> egui::Frame {
     egui::Frame::new()
         .fill(egui::Color32::from_black_alpha(165))
@@ -1758,369 +1583,6 @@ fn compact_hud_line(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
     .on_hover_text(text);
 }
 
-fn draw_performance_grid(ui: &mut egui::Ui, stats: &PerformanceSnapshot) {
-    section(ui, "网络");
-    metric_colored(
-        ui,
-        "连接",
-        &stats.connection,
-        connection_color(&stats.connection),
-    );
-    metric(
-        ui,
-        "自动切路",
-        &format!(
-            "{}（尝试 {} / 成功 {}）",
-            network_switch_phase_label(stats.network_switch_phase),
-            stats.network_switch_attempts,
-            stats.network_switch_successes
-        ),
-    );
-    metric_colored(
-        ui,
-        "RTT",
-        &format_optional_ms(stats.current_delay_ms),
-        threshold_color(stats.current_delay_ms.unwrap_or_default(), 20.0, 50.0),
-    );
-    metric(ui, "码率", &format!("{:.1} Mbps", stats.bitrate_mbps));
-    metric_colored(
-        ui,
-        "最终未恢复",
-        &format!("{:.2}%", stats.packet_loss_percent),
-        threshold_color(stats.packet_loss_percent, 0.1, 1.0),
-    );
-    metric_colored(
-        ui,
-        "RTP 抖动",
-        &format!("{:.2} ms", stats.rtp_jitter_ms),
-        threshold_color(stats.rtp_jitter_ms, 1.0, 5.0),
-    );
-    if stats.low_latency_playout {
-        metric(ui, "播放时序", "UU 低延迟接收调度 · 直接呈现");
-    } else {
-        metric(
-            ui,
-            "播放时序",
-            &format!(
-                "调度目标 {:.1} ms（抖动估计 {:.1} ms；直接呈现）",
-                stats.target_playout_delay_ms, stats.jitter_playout_delay_ms
-            ),
-        );
-    }
-    metric(
-        ui,
-        "有序入口",
-        &format!(
-            "{} 包（峰值 {}）",
-            stats.ingress_queue_packets, stats.ingress_queue_peak_packets
-        ),
-    );
-    metric(
-        ui,
-        "待恢复 NACK",
-        &format!("{} 包", stats.outstanding_nacks),
-    );
-    metric(
-        ui,
-        "RTX 恢复",
-        &format!(
-            "{} / {} 回灌/收到",
-            stats.rtx_packets_accepted, stats.rtx_packets_received
-        ),
-    );
-    metric(
-        ui,
-        "RS-FEC",
-        &format!(
-            "{} 恢复 / {} repair",
-            stats.fec_packets_recovered, stats.fec_packets_received
-        ),
-    );
-
-    section(ui, "帧流水线");
-    metric(ui, "画面更新", &format!("{:.0} FPS", stats.actual_fps));
-    metric_colored(
-        ui,
-        "帧率",
-        &format!(
-            "{:.0}/{:.0}/{:.0} 接收/解码/显示",
-            stats.receive_fps, stats.decode_fps, stats.render_fps
-        ),
-        frame_rate_color(stats),
-    );
-    metric_colored(
-        ui,
-        "FrameBuffer",
-        &format!(
-            "{} 帧（峰值 {}）",
-            stats.frame_buffer_frames, stats.frame_buffer_peak_frames
-        ),
-        threshold_color(stats.frame_buffer_frames as f64, 3.0, 8.0),
-    );
-    metric_colored(
-        ui,
-        "解码队列",
-        &format!(
-            "{} 帧（峰值 {}）",
-            stats.decoder_queue_frames, stats.decoder_queue_peak_frames
-        ),
-        threshold_color(stats.decoder_queue_frames as f64, 1.0, 3.0),
-    );
-    metric_colored(
-        ui,
-        "呈现丢帧",
-        &format!(
-            "{} 帧（{:.2}%）",
-            stats.dropped_present_frames, stats.presentation_drop_percent
-        ),
-        threshold_color(stats.presentation_drop_percent, 0.5, 2.0),
-    );
-    metric_colored(
-        ui,
-        "呈现队列",
-        &format!(
-            "{} 帧（峰值 {}）",
-            stats.presentation_queue_frames, stats.presentation_queue_peak_frames
-        ),
-        threshold_color(stats.presentation_queue_frames as f64, 1.0, 3.0),
-    );
-    metric(
-        ui,
-        "解码前快进",
-        &format!("{} 帧", stats.predecode_dropped_frames),
-    );
-    metric_colored(
-        ui,
-        "卡顿分级",
-        &format!(
-            "{} / {} / {} 次（100–179 / ≥180 / ≥500 ms）",
-            stats.small_jank_count, stats.jank_count, stats.big_jank_count
-        ),
-        if stats.jank_count == 0 {
-            good_color()
-        } else if stats.big_jank_count == 0 {
-            warning_color()
-        } else {
-            bad_color()
-        },
-    );
-    metric_colored(
-        ui,
-        "RTP 时间戳",
-        &format_cadence(stats.source_cadence),
-        cadence_color(stats.source_cadence),
-    );
-    metric_colored(
-        ui,
-        "组帧到达",
-        &format_cadence(stats.receive_cadence),
-        cadence_color(stats.receive_cadence),
-    );
-    metric_colored(
-        ui,
-        "解码输出",
-        &format_cadence(stats.decode_cadence),
-        cadence_color(stats.decode_cadence),
-    );
-    metric_colored(
-        ui,
-        "显示提交",
-        &format_cadence(stats.render_cadence),
-        if stats.render_cadence.average_ms > 0.0
-            && stats.render_cadence.p95_ms > stats.render_cadence.average_ms * 1.5
-        {
-            warning_color()
-        } else {
-            good_color()
-        },
-    );
-
-    metric(
-        ui,
-        "估算帧延迟（官方 frm）",
-        &stats.frame_delay_ms.map_or_else(
-            || "等待测量".to_owned(),
-            |value| format!("{value} ms（处理 + 发送 + RTT）"),
-        ),
-    );
-    section(ui, "本地流水线（含组帧/恢复）");
-    metric_colored(
-        ui,
-        "当前单帧（含组帧/恢复）",
-        &format!("{:.1} ms", stats.local_frame_delay_ms),
-        threshold_color(stats.local_frame_delay_ms, 8.0, 16.7),
-    );
-    metric(
-        ui,
-        "近 300 帧",
-        &format!(
-            "平均 {:.1} / P95 {:.1} / 最大 {:.1} ms",
-            stats.local_frame_delay_average_ms,
-            stats.local_frame_delay_p95_ms,
-            stats.local_frame_delay_max_ms
-        ),
-    );
-    metric(
-        ui,
-        "RTP 组帧",
-        &format!("{:.1} ms", stats.assembly_delay_ms),
-    );
-    metric(
-        ui,
-        "输入排队",
-        &format!("{:.1} ms", stats.input_queue_delay_ms),
-    );
-    metric(
-        ui,
-        "原生解码",
-        &format!("{:.1} ms", stats.decode_pipeline_delay_ms),
-    );
-    metric(
-        ui,
-        "Surface",
-        &format!("{:.1} ms", stats.surface_transfer_delay_ms),
-    );
-    metric(
-        ui,
-        "Present 等待",
-        &format!("{:.1} ms", stats.present_wait_delay_ms),
-    );
-    metric(
-        ui,
-        "GUI 排队",
-        &format!("{:.1} ms", stats.render_queue_delay_ms),
-    );
-    if let Some(pipeline) = &stats.pipeline_stats {
-        section(ui, "码流时序分段");
-        metric(
-            ui,
-            "发送/接收帧率",
-            &format!(
-                "{} / {:.1} FPS",
-                pipeline
-                    .source_fps
-                    .map_or_else(|| "—".to_owned(), |fps| format!("{fps:.1}")),
-                pipeline.received_fps
-            ),
-        );
-        if let Some(sending) = pipeline.sending {
-            metric(
-                ui,
-                "发送总计",
-                &format!(
-                    "平均 {:.1} / 最大 {:.1} ms",
-                    sending.average_ms, sending.max_ms
-                ),
-            );
-        }
-        for (label, phase) in [
-            ("采集", pipeline.capture),
-            ("编码", pipeline.encode),
-            ("Pacer", pipeline.pacer),
-            ("传输", pipeline.transport),
-            ("组帧", pipeline.assembly),
-            ("解码", pipeline.decode),
-        ] {
-            if let Some(phase) = phase {
-                metric(
-                    ui,
-                    label,
-                    &format!("P50 {:.1} / P90 {:.1} ms", phase.p50_ms, phase.p90_ms),
-                );
-            }
-        }
-        if let Some(e2e) = pipeline.e2e {
-            metric_colored(
-                ui,
-                "采集→解码完成",
-                &format!(
-                    "平均 {:.1} / P50 {:.1} / P90 {:.1} / P99 {:.1} / 最大 {:.1} ms",
-                    e2e.average_ms, e2e.p50_ms, e2e.p90_ms, e2e.p99_ms, e2e.max_ms
-                ),
-                threshold_color(e2e.p90_ms, 30.0, 60.0),
-            );
-        } else {
-            metric(ui, "采集→解码完成", "远端未提供有效测量");
-        }
-    }
-    if let Some(stream_switch) = stats.stream_switch.as_ref() {
-        section(ui, "串流切换");
-        metric(
-            ui,
-            "状态",
-            &format!(
-                "#{} {}（{:.0} ms）",
-                stream_switch.sequence, stream_switch.stage, stream_switch.age_ms
-            ),
-        );
-        metric(ui, "目标", &stream_switch.target);
-        metric(
-            ui,
-            "控制/持续画面",
-            &format!(
-                "{} / {}",
-                format_optional_ms(stream_switch.request_to_ack_ms),
-                format_optional_ms(stream_switch.request_to_continuity_ms),
-            ),
-        );
-        metric(
-            ui,
-            "关键帧/切换显示",
-            &format!(
-                "{} / {}",
-                format_optional_ms(stream_switch.request_to_media_ms),
-                format_optional_ms(stream_switch.request_to_present_ms)
-            ),
-        );
-        metric(
-            ui,
-            "切换帧间隔",
-            &format!(
-                "{} / {} / {} 接收/解码/显示",
-                format_optional_ms(stream_switch.receive_gap_ms),
-                format_optional_ms(stream_switch.decode_gap_ms),
-                format_optional_ms(stream_switch.presentation_gap_ms)
-            ),
-        );
-        let resolution = format!(
-            "{} → {}",
-            format_resolution(stream_switch.from_resolution),
-            format_resolution(stream_switch.actual_resolution)
-        );
-        metric(ui, "分辨率", &resolution);
-        if let Some(error) = stream_switch.error.as_ref() {
-            metric_colored(ui, "错误", error, bad_color());
-        }
-    }
-    section(ui, "视频");
-    metric(ui, "官方画质档位", &stats.quality);
-    metric(ui, "协商编码", &stats.video_codec);
-    metric(ui, "码流格式", &stats.video_format);
-    metric(ui, "解码画面", &format_resolution(stats.decoded_resolution));
-    metric(ui, "解码器", &stats.decoder);
-    metric(ui, "远端采集", &stats.remote_capture);
-    metric(ui, "远端编码器", &stats.remote_encoder);
-    metric(
-        ui,
-        "累计帧",
-        &format!(
-            "{} / {} / {} 接收/解码/显示（关键帧 {}）",
-            stats.total_received_frames,
-            stats.total_decoded_frames,
-            stats.total_rendered_frames,
-            stats.total_key_frames_decoded
-        ),
-    );
-}
-
-fn network_switch_phase_label(phase: u8) -> &'static str {
-    match phase {
-        1 => "UDP relay",
-        2 => "TLS relay",
-        _ => "直连",
-    }
-}
-
 fn connection_color(connection: &str) -> egui::Color32 {
     if connection.contains("P2P") || connection.contains("LAN") {
         good_color()
@@ -2128,21 +1590,6 @@ fn connection_color(connection: &str) -> egui::Color32 {
         warning_color()
     } else {
         egui::Color32::WHITE
-    }
-}
-
-fn format_cadence(cadence: crate::performance::CadenceMetrics) -> String {
-    format!(
-        "平均 {:.1} / P95 {:.1} / 最大 {:.1} ms",
-        cadence.average_ms, cadence.p95_ms, cadence.max_ms
-    )
-}
-
-fn cadence_color(cadence: crate::performance::CadenceMetrics) -> egui::Color32 {
-    if cadence.average_ms > 0.0 && cadence.p95_ms > cadence.average_ms * 1.5 {
-        warning_color()
-    } else {
-        good_color()
     }
 }
 
@@ -2178,26 +1625,6 @@ fn format_resolution(value: Option<(u32, u32)>) -> String {
         || "—".to_owned(),
         |(width, height)| format!("{width}×{height}"),
     )
-}
-
-fn section(ui: &mut egui::Ui, title: &str) {
-    ui.label(
-        egui::RichText::new(title)
-            .strong()
-            .color(egui::Color32::LIGHT_BLUE),
-    );
-    ui.separator();
-    ui.end_row();
-}
-
-fn metric(ui: &mut egui::Ui, label: &str, value: &str) {
-    metric_colored(ui, label, value, egui::Color32::WHITE);
-}
-
-fn metric_colored(ui: &mut egui::Ui, label: &str, value: &str, color: egui::Color32) {
-    ui.weak(label);
-    ui.label(egui::RichText::new(value).color(color));
-    ui.end_row();
 }
 
 fn threshold_color(value: f64, good_max: f64, warning_max: f64) -> egui::Color32 {
@@ -2250,7 +1677,7 @@ pub(crate) fn install_system_cjk_font(ctx: &egui::Context) {
 
 fn system_cjk_font_candidates() -> Vec<PathBuf> {
     let mut paths = Vec::new();
-    #[cfg(target_os = "windows")]
+
     {
         let fonts = std::env::var_os("WINDIR")
             .map(PathBuf::from)
@@ -2260,21 +1687,7 @@ fn system_cjk_font_candidates() -> Vec<PathBuf> {
             paths.push(fonts.join(name));
         }
     }
-    #[cfg(target_os = "macos")]
-    {
-        paths.extend([
-            PathBuf::from("/System/Library/Fonts/PingFang.ttc"),
-            PathBuf::from("/System/Library/Fonts/STHeiti Light.ttc"),
-        ]);
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        paths.extend([
-            PathBuf::from("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
-            PathBuf::from("/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc"),
-            PathBuf::from("/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc"),
-        ]);
-    }
+
     paths
 }
 

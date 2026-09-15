@@ -19,7 +19,7 @@ pub enum Mode {
 pub struct Shortcut {
     pub binding: Option<Binding>,
     pub mode: Mode,
-    /// Disabled legacy sources remain blocking until explicitly edited.
+    /// An explicitly disabled condition remains blocking until edited.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub disabled: bool,
 }
@@ -326,7 +326,7 @@ pub fn valid(binding: &Binding) -> bool {
     (matches!(binding.key, 1 | 2 | 4 | 5 | 6) || (8..=254).contains(&binding.key))
         && !matches!(binding.key,16..=18|91..=92|160..=165)
         && binding.modifiers <= 15
-        && !(binding.modifiers == 7 && matches!(binding.key, 70 | 81 | 90))
+        && crate::viewer_shortcuts::match_key(binding.key, binding.modifiers).is_none()
 }
 pub fn label(binding: &Binding) -> String {
     let mut words = Vec::new();

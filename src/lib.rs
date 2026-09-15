@@ -1,9 +1,11 @@
 //! OpenUUYC: native UU Remote interoperability building blocks.
 
+#[cfg(not(windows))]
+compile_error!("OpenUUYC currently supports Windows only");
+
 pub const APP_NAME: &str = "OpenUUYC";
 pub(crate) const VIEWER_TITLE_PREFIX: &str = "OpenUUYC — ";
 
-mod adaptive_bitrate;
 pub mod api;
 pub mod app;
 pub mod assist;
@@ -19,6 +21,8 @@ mod decoder_pool;
 mod decoder_result;
 mod device_change;
 mod device_session;
+mod display_hdr;
+mod feature_ability;
 mod flexfec;
 pub mod logging;
 pub mod login;
@@ -26,13 +30,15 @@ pub mod media;
 mod network_control;
 mod nrd_http;
 pub mod official_receiver;
+mod official_version;
 pub mod performance;
-#[cfg(windows)]
+
 pub mod plugins;
 mod power;
 mod presence;
 mod remote_cursor;
 mod remote_input;
+mod remote_upgrade;
 mod rsfec;
 pub mod rtc;
 mod rtcp_timing;
@@ -48,6 +54,8 @@ mod video_color;
 mod video_format;
 pub mod viewer;
 mod viewer_owner;
+mod viewer_shortcuts;
 mod viewing_settings;
 mod virtual_hardware;
+mod wallpaper;
 mod xor_fec;

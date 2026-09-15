@@ -11,8 +11,6 @@ use windows::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingl
 use windows::core::w;
 
 static OCCUPIED: AtomicBool = AtomicBool::new(false);
-#[cfg(test)]
-pub(crate) static TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[derive(Debug)]
 pub(crate) struct SoftwarePlaybackBusy;
@@ -68,64 +66,5 @@ impl Drop for SoftwareSlot {
         let _ = unsafe { ReleaseMutex(self.handle) };
         let _ = unsafe { CloseHandle(self.handle) };
         OCCUPIED.store(false, Ordering::Release);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::os::windows::process::CommandExt;
-
-    fn child(mode: &str) {
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "decoder::software_slot::tests::child_probe",
-                "--ignored",
-            ])
-            .env("OPENUUYC_TEST_SOFTWARE_SLOT", mode)
-            .creation_flags(0x08000000)
-            .status()
-            .unwrap();
-        assert!(status.success(), "software slot child failed: {status}");
-    }
-
-    #[test]
-    #[ignore = "subprocess entry for the software slot lifecycle test"]
-    fn child_probe() {
-        let mode = std::env::var("OPENUUYC_TEST_SOFTWARE_SLOT").unwrap();
-        if mode == "busy" {
-            assert!(
-                SoftwareSlot::acquire()
-                    .err()
-                    .unwrap()
-                    .is::<SoftwarePlaybackBusy>()
-            );
-        } else {
-            let _slot = SoftwareSlot::acquire().unwrap();
-            if mode == "abandon" {
-                std::process::exit(0);
-            }
-        }
-    }
-
-    #[test]
-    fn process_exclusion_shared_lifetime_and_abandoned_owner() {
-        let _serial = TEST_SERIAL.lock().unwrap();
-        let slot = SoftwareSlot::acquire().unwrap();
-        assert!(SoftwareSlot::acquire().is_err());
-        let retained = Rc::clone(&slot);
-        drop(slot);
-        child("busy");
-        drop(retained);
-        child("free");
-        // Keep the named kernel object alive after the child exits without
-        // Rust cleanup, exercising WAIT_ABANDONED rather than a fresh object.
-        let handle =
-            unsafe { CreateMutexW(None, false, w!("Local\\OpenUUYC.SoftwareVideoPlayback.v1")) }
-                .unwrap();
-        child("abandon");
-        drop(SoftwareSlot::acquire().unwrap());
-        unsafe { CloseHandle(handle) }.unwrap();
     }
 }

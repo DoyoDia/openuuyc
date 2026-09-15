@@ -13,12 +13,14 @@ pub(super) struct Catalog {
     pub groups: DeviceGroups,
     pub details: HashMap<String, CachedDetail>,
     pub suggested_name: String,
+    pub features: crate::feature_ability::FeatureCatalog,
 }
 impl Catalog {
     pub fn from_groups(
         groups: DeviceGroups,
         previous: Option<Self>,
         mut suggested_name: String,
+        features: crate::feature_ability::FeatureCatalog,
     ) -> Self {
         let details = previous.map(|c| c.details).unwrap_or_default();
         if groups
@@ -32,6 +34,7 @@ impl Catalog {
             groups,
             details,
             suggested_name,
+            features,
         };
         catalog.prune_details();
         catalog

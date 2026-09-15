@@ -16,10 +16,7 @@ use tokio::sync::{Mutex, broadcast, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use webrtc::api::APIBuilder;
 use webrtc::api::interceptor_registry::configure_twcc_receiver_with_builder;
-use webrtc::api::media_engine::{
-    MIME_TYPE_G722, MIME_TYPE_H264, MIME_TYPE_HEVC, MIME_TYPE_OPUS, MIME_TYPE_PCMA, MIME_TYPE_PCMU,
-    MIME_TYPE_TELEPHONE_EVENT, MediaEngine,
-};
+use webrtc::api::media_engine::{MIME_TYPE_H264, MIME_TYPE_HEVC, MIME_TYPE_OPUS, MediaEngine};
 use webrtc::api::setting_engine::SettingEngine;
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::data_channel::data_channel_init::{RTCDataChannelInit, RTCDataChannelPriority};
@@ -113,7 +110,6 @@ pub struct NativePeer {
     connection: Arc<RTCPeerConnection>,
     connection_states: Mutex<mpsc::UnboundedReceiver<RTCPeerConnectionState>>,
     local_candidate_tx: broadcast::Sender<Option<RTCIceCandidateInit>>,
-    last_pli: Arc<Mutex<Option<Instant>>>,
     performance: PerformanceMonitor,
     nack_rtt_micros: Arc<AtomicU64>,
     rtcp_timing: RtcpTiming,
@@ -401,6 +397,8 @@ async fn send_official_control_messages(
     const PB_CONNECT_MAX_ATTEMPTS: u32 = 30;
     let notifications = stream_control.protocol_notifications();
     let mut generation = None;
+    let mut annotation_tick = tokio::time::interval(Duration::from_millis(16));
+    annotation_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut attempts = 0_u32;
     let mut timer: Option<tokio::time::Interval> = None;
     loop {
@@ -428,6 +426,7 @@ async fn send_official_control_messages(
         }
         tokio::select! {
             _ = &mut changed => continue,
+            _ = annotation_tick.tick() => stream_control.annotation_tick(),
             _ = async {
                 if let Some(timer) = timer.as_mut() { timer.tick().await; }
                 else { std::future::pending::<()>().await; }
@@ -454,18 +453,24 @@ async fn send_official_control_messages(
             }
             message = messages.recv() => {
                 let Some(message) = message else { break; };
+                if let Some(generation) = message.annotation_generation {
+                    if !stream_control.annotation_message_current(message.sequence, generation) { continue; }
+                }
+                let is_annotation = message.annotation_generation.is_some();
                 let payload = Bytes::from(message.payload);
                 let is_screen_request = message.completion.is_some();
                 match text_channel.send_text_bytes(&payload).await {
                     Ok(bytes) => {
                         if let Some(done) = message.completion { let _ = done.send(Ok(())); }
-                        tracing::info!(sequence = message.sequence, bytes, is_screen_request, protocol = message.protocol.label(), "viewing control request sent");
+                        if is_annotation { tracing::debug!(sequence = message.sequence, bytes, "annotation request sent"); }
+                        else { tracing::info!(sequence = message.sequence, bytes, is_screen_request, protocol = message.protocol.label(), "viewing control request sent"); }
                     }
                     Err(error) => {
                         let description = error.to_string();
                         if let Some(done) = message.completion { let _ = done.send(Err(description.clone())); }
-                        if !is_screen_request { stream_control.mark_send_failed(message.sequence, &description); }
-                        tracing::warn!(sequence = message.sequence, %error, "runtime capture-setting request send failed");
+                        if is_annotation { stream_control.annotation_send_failed(message.sequence, &description); }
+                        else if !is_screen_request { stream_control.mark_send_failed(message.sequence, &description); }
+                        tracing::warn!(sequence = message.sequence, %error, "runtime viewer request send failed");
                     }
                 }
             }
@@ -799,7 +804,6 @@ pub(crate) struct VideoTrackSource {
     pub feedback: mpsc::UnboundedSender<VideoReceiverFeedback>,
     started: watch::Sender<bool>,
     keyframes: watch::Receiver<u64>,
-    last_pli: Arc<Mutex<Option<Instant>>>,
     nack_rtt_micros: Arc<AtomicU64>,
 }
 
@@ -845,6 +849,7 @@ pub(crate) enum VideoReceiverFeedback {
 
 #[derive(Clone, Debug)]
 pub(crate) struct EncodedVideoFrame {
+    pub completion: DecodeCompletion,
     pub frame_id: i64,
     pub data: Bytes,
     pub rtp_timestamp: u32,
@@ -859,6 +864,52 @@ pub(crate) struct EncodedVideoFrame {
     pub codec: VideoCodec,
     pub parameter_format: Option<crate::video_format::VideoFormatSignature>,
     pub color_space: Option<crate::video_color::VideoColorSpace>,
+}
+
+/// A receive-stream admission follows its frame through queueing and decoder
+/// ownership. Dropping the last copy without a Decode result retires it too.
+#[derive(Clone, Debug)]
+pub(crate) struct DecodeCompletion(Arc<DecodeCompletionState>);
+
+#[derive(Debug)]
+struct DecodeCompletionState {
+    frame_id: i64,
+    feedback: mpsc::UnboundedSender<VideoReceiverFeedback>,
+    completed: AtomicBool,
+}
+
+impl DecodeCompletion {
+    pub(crate) fn new(
+        frame_id: i64,
+        feedback: mpsc::UnboundedSender<VideoReceiverFeedback>,
+    ) -> Self {
+        Self(Arc::new(DecodeCompletionState {
+            frame_id,
+            feedback,
+            completed: AtomicBool::new(false),
+        }))
+    }
+
+    pub(crate) fn complete(&self, result: crate::decoder_result::VideoDecodeResult) {
+        self.0.complete(result);
+    }
+}
+
+impl DecodeCompletionState {
+    fn complete(&self, result: crate::decoder_result::VideoDecodeResult) {
+        if !self.completed.swap(true, Ordering::AcqRel) {
+            let _ = self.feedback.send(VideoReceiverFeedback::DecoderFinished {
+                frame_id: self.frame_id,
+                result,
+            });
+        }
+    }
+}
+
+impl Drop for DecodeCompletionState {
+    fn drop(&mut self) {
+        self.complete(crate::decoder_result::VideoDecodeResult::Uninitialized);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -969,7 +1020,6 @@ const RTP_DEFAULT_RTT: Duration = Duration::from_millis(50);
 const RTP_NACK_MAX_RETRIES: u8 = 17;
 const RTP_NACK_BACKOFF_BASE: f64 = 1.25;
 const RTP_NACK_BACKOFF_START: Duration = Duration::from_millis(50);
-const PLI_MIN_INTERVAL: Duration = Duration::from_millis(200);
 const KEYFRAME_PACKET_WINDOW: Duration = Duration::from_millis(200);
 const ACTIVE_STREAM_WINDOW: Duration = Duration::from_secs(5);
 
@@ -1007,18 +1057,11 @@ impl RtcpFeedbackBuffer {
         self.nack_sequences.extend(batch.sequences);
     }
 
-    async fn flush(
-        &mut self,
-        connection: &RTCPeerConnection,
-        last_pli: &Mutex<Option<Instant>>,
-        media_ssrc: u32,
-    ) {
+    async fn flush(&mut self, connection: &RTCPeerConnection, media_ssrc: u32) {
         let request_keyframe = std::mem::take(&mut self.request_keyframe);
         let nack_sequences = std::mem::take(&mut self.nack_sequences);
         if request_keyframe {
-            if let Err(error) =
-                send_picture_loss_indication(connection, last_pli, media_ssrc, false).await
-            {
+            if let Err(error) = send_picture_loss_indication(connection, media_ssrc).await {
                 tracing::warn!(%error, "buffered keyframe request failed");
             }
         } else if !nack_sequences.is_empty()
@@ -1076,12 +1119,12 @@ struct TrackForwardContext {
     audio: crate::audio::AudioPlayback,
     audio_generation: Option<u64>,
     connection: Arc<RTCPeerConnection>,
-    last_pli: Arc<Mutex<Option<Instant>>>,
     video_annexb_sinks: Arc<Mutex<Vec<VideoFrameSink>>>,
     performance: PerformanceMonitor,
     nack_rtt_micros: Arc<AtomicU64>,
     remote_ntp: Arc<StdMutex<RemoteNtpEstimator>>,
     receiver_feedback: Option<mpsc::UnboundedReceiver<VideoReceiverFeedback>>,
+    receiver_feedback_sender: mpsc::UnboundedSender<VideoReceiverFeedback>,
 }
 
 #[derive(Clone, Copy)]
@@ -1489,6 +1532,12 @@ impl NackRequester {
         self.get_batch(NackFilter::Time, Instant::now())
     }
 
+    fn clear_pending(&mut self) {
+        // Clearing pending repairs preserves RTT, sequence anchors,
+        // recovered/keyframe history and cumulative diagnostics.
+        self.entries.clear();
+    }
+
     fn clear_up_to(&mut self, sequence_number: u16) {
         self.entries
             .retain(|sequence, _| sequence_ahead_or_at(*sequence, sequence_number));
@@ -1806,13 +1855,7 @@ async fn sample_network_performance(
                 Ordering::Relaxed,
             );
         }
-        stream_control.observe_budget(
-            &performance,
-            rtcp_rtt,
-            last_candidate_pair.as_deref(),
-            selected_candidate_ids.is_some()
-                && connection.connection_state() == RTCPeerConnectionState::Connected,
-        );
+        stream_control.poll_timeouts();
         pipeline_sample = pipeline_sample.wrapping_add(1);
         if pipeline_sample.is_multiple_of(5) {
             let snapshot = performance.snapshot();
@@ -2018,9 +2061,10 @@ impl NativePeer {
         )
         .context("register WebRTC transport feedback interceptors")?;
         let mut setting_engine = SettingEngine::default();
-        // UU SrtpSession::SetKey uses a 1024-packet replay window. SRTCP
-        // has an independent index/window policy and is not changed here.
+        // UU uses separate replay policies: SRTP has a 1024-packet window,
+        // while SRTCP's non-wrapping 31-bit index has a 128-packet window.
         setting_engine.set_srtp_replay_protection_window(1024);
+        setting_engine.set_srtcp_replay_protection_window(128);
         setting_engine.set_continual_gathering(true);
         let api = APIBuilder::new()
             .with_media_engine(media_engine)
@@ -2174,7 +2218,6 @@ impl NativePeer {
             connection,
             connection_states: Mutex::new(connection_states),
             local_candidate_tx,
-            last_pli: Arc::new(Mutex::new(None)),
             performance,
             nack_rtt_micros,
             rtcp_timing,
@@ -2409,7 +2452,7 @@ impl NativePeer {
 
     pub async fn set_remote_answer(&self, mut sdp: String, restart_ice: bool) -> Result<()> {
         tracing::debug!(restart_ice, "installing remote SDP answer");
-        let mixed_kcp_version = negotiated_mixed_kcp_version(&sdp);
+        let mixed_kcp_version = negotiated_mixed_kcp_version(&sdp)?;
         if self.p2p_only.load(Ordering::Acquire) {
             sdp = remove_relay_candidates_from_sdp(&sdp);
         }
@@ -2463,23 +2506,14 @@ impl NativePeer {
                 version,
                 self.data_channels.stream_control.clone(),
             )?;
-        } else if self.uu_kcp.is_negotiated() {
-            self.uu_kcp.close().await;
         }
+        // Keep mixed-KCP selected until this peer is closed; a restart
+        // omitting the attribute must not silently move CONTROL back to SCTP.
         Ok(())
     }
 
     pub async fn request_keyframe(&self, media_ssrc: u32) -> Result<()> {
-        let track = self
-            .video_tracks
-            .all()
-            .into_iter()
-            .find(|track| track.metadata.ssrc == media_ssrc);
-        let last_pli = track
-            .as_ref()
-            .map_or(&self.last_pli, |track| &track.last_pli);
-        send_picture_loss_indication(&self.connection, last_pli, media_ssrc, true).await?;
-        Ok(())
+        send_picture_loss_indication(&self.connection, media_ssrc).await
     }
 
     pub async fn next_connection_state(&self) -> Option<RTCPeerConnectionState> {
@@ -2580,7 +2614,6 @@ impl NativePeer {
                 let announcement_tx = announcement_tx.clone();
                 let mut forwarding_ready = forwarding_ready.clone();
                 let connection = connection.clone();
-                let last_pli = Arc::new(Mutex::new(None));
                 let mut performance = performance.clone();
                 let nack_rtt_micros = Arc::new(AtomicU64::new(nack_rtt_micros.load(Ordering::Relaxed)));
                 let rtcp_timing = rtcp_timing.clone();
@@ -2632,7 +2665,7 @@ impl NativePeer {
                         let source = Arc::new(VideoTrackSource {
                             metadata: ForwardedTrack { kind: media_kind, id: id.clone(), codec: codec.clone(), payload_type: track.payload_type(), ssrc: track.ssrc() },
                             index, performance: performance.clone(), sinks: Arc::clone(&video_annexb_sinks),
-                            feedback, started, keyframes, last_pli: Arc::clone(&last_pli),
+                            feedback: feedback.clone(), started, keyframes,
                             nack_rtt_micros: Arc::clone(&nack_rtt_micros),
                         });
                         {
@@ -2808,12 +2841,12 @@ impl NativePeer {
                                 audio,
                                 audio_generation,
                                 connection,
-                                last_pli,
                                 video_annexb_sinks,
                                 performance,
                                 nack_rtt_micros,
                                 remote_ntp,
                                 receiver_feedback,
+                                receiver_feedback_sender: feedback,
                             },
                         )
                         .await;
@@ -2888,12 +2921,12 @@ async fn forward_remote_track(
         audio,
         audio_generation,
         connection,
-        last_pli,
         video_annexb_sinks,
         performance,
         nack_rtt_micros,
         remote_ntp,
         receiver_feedback,
+        receiver_feedback_sender,
     } = context;
 
     if kind == MediaKind::Video {
@@ -2915,11 +2948,11 @@ async fn forward_remote_track(
             extmap_allow_mixed,
             video_keyframe_tx,
             connection,
-            last_pli,
             performance,
             nack_rtt_micros,
             remote_ntp,
             receiver_feedback,
+            receiver_feedback_sender,
             playout_delay_extension_id,
             forwarding_ready,
             video_annexb_sinks,
@@ -2994,11 +3027,11 @@ async fn forward_official_video_track(
     extmap_allow_mixed: bool,
     video_keyframe_tx: watch::Sender<u64>,
     connection: Arc<RTCPeerConnection>,
-    last_pli: Arc<Mutex<Option<Instant>>>,
     performance: PerformanceMonitor,
     nack_rtt_micros: Arc<AtomicU64>,
     remote_ntp: Arc<StdMutex<RemoteNtpEstimator>>,
     mut receiver_feedback: mpsc::UnboundedReceiver<VideoReceiverFeedback>,
+    receiver_feedback_sender: mpsc::UnboundedSender<VideoReceiverFeedback>,
     playout_delay_extension_id: Option<u8>,
     mut forwarding_ready: watch::Receiver<bool>,
     video_annexb_sinks: Arc<Mutex<Vec<VideoFrameSink>>>,
@@ -3205,9 +3238,7 @@ async fn forward_official_video_track(
                     nack_requester.outstanding(),
                     nack_requester.final_lost_packets(),
                 );
-                rtcp_feedback
-                    .flush(&connection, &last_pli, track.ssrc())
-                    .await;
+                rtcp_feedback.flush(&connection, track.ssrc()).await;
             }
             Event::ReceiverDeadline => {
                 let now = Instant::now();
@@ -3218,20 +3249,19 @@ async fn forward_official_video_track(
                     now.saturating_duration_since(received_at) < KEYFRAME_PACKET_WINDOW
                 });
                 let result = receiver.poll(active, receiving_keyframe);
-                if !emit_official_receiver_result(
+                emit_official_receiver_result(
                     result,
+                    &receiver_feedback_sender,
+                    &mut nack_requester,
+                    &mut rtcp_feedback,
                     &video_annexb_sinks,
                     &video_keyframe_tx,
                     &performance,
                     &remote_ntp,
                     &connection,
-                    &last_pli,
                     track.ssrc(),
                 )
-                .await
-                {
-                    break;
-                }
+                .await;
             }
             Event::Feedback(VideoReceiverFeedback::DecodeTiming {
                 duration,
@@ -3248,20 +3278,19 @@ async fn forward_official_video_track(
                         nack_requester.final_lost_packets(),
                     );
                 }
-                if !emit_official_receiver_result(
+                emit_official_receiver_result(
                     result,
+                    &receiver_feedback_sender,
+                    &mut nack_requester,
+                    &mut rtcp_feedback,
                     &video_annexb_sinks,
                     &video_keyframe_tx,
                     &performance,
                     &remote_ntp,
                     &connection,
-                    &last_pli,
                     track.ssrc(),
                 )
-                .await
-                {
-                    break;
-                }
+                .await;
             }
             Event::Fec(packet, received_at) => {
                 performance.record_fec_packet_received();
@@ -3393,7 +3422,7 @@ async fn forward_official_video_track(
                     nack_requester.set_rtt(Duration::from_micros(
                         nack_rtt_micros.load(Ordering::Relaxed),
                     ));
-                    let nack = nack_requester.on_received(sequence_number, false, recovered);
+                    let nack = nack_requester.on_received(sequence_number, false, false);
                     rtcp_feedback.buffer(nack.batch);
                 } else {
                     let Some((mime, fmtp)) = video_payload_codecs.get(&payload_type) else {
@@ -3492,10 +3521,16 @@ async fn forward_official_video_track(
                     );
                     parsed.set_receive_timing(playout_delay, nack.nack_count);
                     rtcp_feedback.buffer(nack.batch);
-                    rtcp_feedback
-                        .flush(&connection, &last_pli, track.ssrc())
-                        .await;
-                    result = receiver.receive_parsed(parsed);
+                    let prepared = receiver.prepare_video_packet(&mut parsed);
+                    // Parameter failure overrides this packet's buffered NACK.
+                    // Packet-buffer/complete-frame feedback occurs after this flush.
+                    rtcp_feedback.request_keyframe |= !prepared;
+                    rtcp_feedback.flush(&connection, track.ssrc()).await;
+                    result = if prepared {
+                        receiver.receive_prepared(parsed)
+                    } else {
+                        receiver.parameter_packet_rejected()
+                    };
                 }
 
                 performance.set_nack_state(
@@ -3512,20 +3547,19 @@ async fn forward_official_video_track(
                 if media.flags.recovered_from_rtx {
                     performance.record_rtx_packet(result.accepted_packet);
                 }
-                if !emit_official_receiver_result(
+                emit_official_receiver_result(
                     result,
+                    &receiver_feedback_sender,
+                    &mut nack_requester,
+                    &mut rtcp_feedback,
                     &video_annexb_sinks,
                     &video_keyframe_tx,
                     &performance,
                     &remote_ntp,
                     &connection,
-                    &last_pli,
                     track.ssrc(),
                 )
-                .await
-                {
-                    break;
-                }
+                .await;
 
                 if let Some(source) = media.rsfec_source.take() {
                     remember_fec_source(
@@ -3549,18 +3583,26 @@ async fn forward_official_video_track(
 #[allow(clippy::too_many_arguments)]
 async fn emit_official_receiver_result(
     result: ReceiverResult,
+    receiver_feedback_sender: &mpsc::UnboundedSender<VideoReceiverFeedback>,
+    nack_requester: &mut NackRequester,
+    rtcp_feedback: &mut RtcpFeedbackBuffer,
     video_sinks: &Mutex<Vec<VideoFrameSink>>,
     video_keyframe_tx: &watch::Sender<u64>,
     performance: &PerformanceMonitor,
     remote_ntp: &StdMutex<RemoteNtpEstimator>,
     connection: &RTCPeerConnection,
-    last_pli: &Mutex<Option<Instant>>,
     media_ssrc: u32,
-) -> bool {
+) {
+    if result.clear_nack {
+        nack_requester.clear_pending();
+        rtcp_feedback.nack_sequences.clear();
+        performance.set_nack_state(
+            nack_requester.outstanding(),
+            nack_requester.final_lost_packets(),
+        );
+    }
     if result.request_keyframe {
-        let _ =
-            send_picture_loss_indication(connection, last_pli, media_ssrc, result.force_keyframe)
-                .await;
+        let _ = send_picture_loss_indication(connection, media_ssrc).await;
     }
     performance.record_predecode_drops(result.predecode_drops);
     performance.set_frame_buffer_frames(result.frame_buffer_frames);
@@ -3598,7 +3640,6 @@ async fn emit_official_receiver_result(
             frame.last_received_at,
         );
         performance.record_received_frame(
-            frame.data.len(),
             frame.last_received_at.duration_since(frame.received_at),
             frame.rtp_timestamp,
             frame.assembled_at,
@@ -3609,6 +3650,7 @@ async fn emit_official_receiver_result(
             video_keyframe_tx.send_modify(|value| *value += 1);
         }
         let encoded = EncodedVideoFrame {
+            completion: DecodeCompletion::new(frame.frame_id, receiver_feedback_sender.clone()),
             parameter_format: frame.parameter_format,
             color_space: frame.color_space,
             frame_id: frame.frame_id,
@@ -3629,11 +3671,10 @@ async fn emit_official_receiver_result(
         };
         let mut sinks = video_sinks.lock().await;
         sinks.retain(|sink| sink.send(encoded.clone()));
-        if sinks.is_empty() {
-            return false;
-        }
+        // A failed/cancelled window does not end the media track. If no sink
+        // accepts this frame, its completion returns the admission token and
+        // the existing receiver recovery remains available for a retry.
     }
-    true
 }
 
 fn frame_sender_timing(
@@ -3645,7 +3686,7 @@ fn frame_sender_timing(
     // UU ReceiveStatisticsProxy::OnTimingFrameInfoUpdated (323C4C) admits
     // cross-clock phase/E2E samples only with the measured flag (bit 2).
     // A sender report alone does not establish that an arbitrary RTP frame
-    // carries a valid capture-domain timing measurement (notably older peers).
+    // carries a valid capture-domain timing measurement.
     let timing = timing.filter(|sample| sample.flags & 4 != 0);
     let capture_at = timing.and(capture_at);
     let millis = |value: u16| Duration::from_millis(u64::from(value));
@@ -3858,16 +3899,9 @@ fn recover_rtx_packet(
 
 async fn send_picture_loss_indication(
     connection: &RTCPeerConnection,
-    last_pli: &Mutex<Option<Instant>>,
     media_ssrc: u32,
-    force: bool,
-) -> Result<bool> {
-    let mut last = last_pli.lock().await;
-    let now = Instant::now();
-    if !force && last.is_some_and(|value| now.duration_since(value) < PLI_MIN_INTERVAL) {
-        return Ok(false);
-    }
-    tracing::debug!(media_ssrc, force, "sending RTCP PLI");
+) -> Result<()> {
+    tracing::debug!(media_ssrc, "sending RTCP PLI");
     let pli: Box<dyn RtcpPacket + Send + Sync> = Box::new(PictureLossIndication {
         sender_ssrc: DEFAULT_RECEIVER_SSRC,
         media_ssrc,
@@ -3876,8 +3910,7 @@ async fn send_picture_loss_indication(
         .write_rtcp(&[pli])
         .await
         .context("send RTCP picture-loss indication")?;
-    *last = Some(now);
-    Ok(true)
+    Ok(())
 }
 
 async fn send_transport_layer_nack(
@@ -3970,31 +4003,33 @@ fn apply_uu_application_attributes(sdp: &mut String) -> Result<()> {
     Ok(())
 }
 
-fn negotiated_mixed_kcp_version(sdp: &str) -> Option<u8> {
-    sdp.lines()
+fn negotiated_mixed_kcp_version(sdp: &str) -> Result<Option<u8>> {
+    let Some(value) = sdp
+        .lines()
         .find_map(|line| line.strip_prefix("a=x-uuremote-mix-kcp:"))
-        .and_then(|version| version.trim().parse::<u8>().ok())
-        .filter(|version| *version != 0)
-        .map(|version| version.min(2))
+    else {
+        return Ok(None);
+    };
+    let version = value
+        .trim()
+        .parse::<u8>()
+        .context("invalid mixed-KCP version")?;
+    if version == 0 {
+        return Ok(None);
+    }
+    ensure!(version >= 2, "unsupported mixed-KCP version {version}");
+    Ok(Some(2))
 }
 
 fn register_uu_codecs(media_engine: &mut MediaEngine) -> Result<()> {
-    for (mime_type, payload_type, clock_rate, channels, fmtp, transport_cc) in [
-        (
-            MIME_TYPE_OPUS,
-            111,
-            48_000,
-            2,
-            "minptime=10;stereo=1;useinbandfec=1",
-            true,
-        ),
-        (MIME_TYPE_G722, 9, 8_000, 0, "", false),
-        (MIME_TYPE_PCMU, 0, 8_000, 0, "", false),
-        (MIME_TYPE_PCMA, 8, 8_000, 0, "", false),
-        ("audio/CN", 13, 8_000, 0, "", false),
-        (MIME_TYPE_TELEPHONE_EVENT, 110, 48_000, 0, "", false),
-        (MIME_TYPE_TELEPHONE_EVENT, 126, 8_000, 0, "", false),
-    ] {
+    for (mime_type, payload_type, clock_rate, channels, fmtp, transport_cc) in [(
+        MIME_TYPE_OPUS,
+        111,
+        48_000,
+        2,
+        "minptime=10;stereo=1;useinbandfec=1",
+        true,
+    )] {
         media_engine
             .register_codec(
                 RTCRtpCodecParameters {

@@ -615,10 +615,9 @@ impl AgentInternal {
     }
 
     pub(super) async fn uu_on_nonselected_payload(&self, pair: &Arc<CandidatePair>) {
-        // 2060E0 -> 1A4990: a direct Connection ping, outside the periodic
-        // controller's global ping budget. Preserve outstanding-ping ownership.
-        pair.note_check_sent();
-        ControlledSelector::ping_candidate(self, &pair.local_port, &pair.remote).await;
+        // UU 4.40 206D68 -> 20DD62 -> 27E0A8 proposes this Connection with
+        // reason 6 (data received). It removed 4.38's extra direct ping;
+        // ordinary controller checks still own connectivity probing.
         let selected = self.agent_conn.get_selected_pair();
         if self.uu_should_switch_connection(pair, selected.as_ref()) {
             log::info!("UU selected connection after nonselected payload: {pair}");

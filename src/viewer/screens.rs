@@ -9,11 +9,12 @@ use tokio::sync::watch;
 
 use super::{NativeViewerSession, ViewerDisplayHandle, ViewerLaunchConfig};
 use crate::media::{ConnectionMediaProfile, VideoCodec};
-use crate::rtc::NativePeer;
+use crate::rtc::{NativePeer, VideoTrackSource};
 use crate::stream_control::{RemoteScreen, StreamControlHandle};
 
 #[derive(Clone)]
 pub(crate) struct ScreenPlayback {
+    pub(crate) device_switch: Option<super::device_switch::DeviceSwitcher>,
     peer: Weak<NativePeer>,
     control: StreamControlHandle,
     profile: ConnectionMediaProfile,
@@ -22,7 +23,7 @@ pub(crate) struct ScreenPlayback {
     runtime: tokio::runtime::Handle,
     decoders: Arc<std::sync::Mutex<HashMap<i32, Arc<NativeViewerSession>>>>,
     opening: Arc<tokio::sync::Mutex<()>>,
-    capture_lock: Arc<tokio::sync::Mutex<()>>,
+    capture_lock: Arc<tokio::sync::Mutex<HashSet<i32>>>,
     visibility_update: Arc<AtomicBool>,
 }
 
@@ -36,11 +37,10 @@ impl ScreenPlayback {
         let control = peer.stream_control_handle();
         let (visible, mut receiver) = watch::channel(vec![initial]);
         let activity_control = control.clone();
-        let capture_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let capture_lock = Arc::new(tokio::sync::Mutex::new(HashSet::new()));
         let activity_lock = Arc::clone(&capture_lock);
         peer.spawn_viewing_task(async move {
             let mut inactive = HashMap::<i32, Instant>::new();
-            let mut stopped = HashSet::new();
             let mut tick = tokio::time::interval(Duration::from_millis(250));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
@@ -51,27 +51,28 @@ impl ScreenPlayback {
                 let visible = receiver.borrow_and_update().clone();
                 let screens = activity_control.snapshot().screens;
                 inactive.retain(|id, _| screens.iter().any(|screen| screen.id == *id));
+                activity_lock.lock().await.retain(|id| screens.iter().any(|screen| screen.id == *id));
                 for screen in screens {
                     if screen.id < 0 { continue; }
                     if visible.contains(&screen.id) {
                         inactive.remove(&screen.id);
-                        stopped.remove(&screen.id);
-                    } else if screen.video_track_index >= 0 && !stopped.contains(&screen.id) {
+                    } else if screen.video_track_index >= 0 {
                         let since = inactive.entry(screen.id).or_insert_with(Instant::now);
                         if since.elapsed() >= Duration::from_secs(5) {
-                            let _operation = activity_lock.lock().await;
-                            if receiver.borrow().contains(&screen.id) { continue; }
+                            let mut stopped = activity_lock.lock().await;
+                            if receiver.borrow().contains(&screen.id) || stopped.contains(&screen.id) { continue; }
+                            stopped.insert(screen.id);
                             // No -1/all-screen operation: other windows keep playing.
                             if let Err(error) = activity_control.set_screen_capture(screen.id, false).await {
                                 tracing::warn!(screen_id = screen.id, %error, "stop inactive screen capture failed");
                             }
-                            stopped.insert(screen.id);
                         }
                     }
                 }
             }
         });
         Self {
+            device_switch: None,
             peer: Arc::downgrade(peer),
             control,
             profile,
@@ -83,6 +84,10 @@ impl ScreenPlayback {
             capture_lock,
             visibility_update: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    pub(crate) fn topology(&self) -> crate::stream_control::DisplayTopologyStatus {
+        self.control.snapshot().topology
     }
 
     pub(crate) fn screens(&self) -> Vec<RemoteScreen> {
@@ -107,7 +112,8 @@ impl ScreenPlayback {
         });
         let wanted = self.visible.borrow().clone();
         let needs_update = super::mutex_lock(&self.decoders).values().any(|session| {
-            session.is_software() && session.decode_paused() == wanted.contains(&session.screen_id)
+            session.is_software()
+                && session.decode_paused() == wanted.contains(&session.screen_id())
         });
         if !(changed || needs_update) || self.visibility_update.swap(true, Ordering::AcqRel) {
             return;
@@ -124,7 +130,7 @@ impl ScreenPlayback {
             // Late RTP for a paused decoder is retired without decoding.
             for session in &sessions {
                 if session.is_software()
-                    && !visible.contains(&session.screen_id)
+                    && !visible.contains(&session.screen_id())
                     && let Err(error) = session.pause_software().await
                 {
                     tracing::debug!(%error, "hidden software decoder already stopped");
@@ -132,21 +138,18 @@ impl ScreenPlayback {
             }
             for session in sessions {
                 if session.is_software()
-                    && factory.visible.borrow().contains(&session.screen_id)
+                    && factory.visible.borrow().contains(&session.screen_id())
                     && session.resume_decode()
                 {
-                    let _capture = factory.capture_lock.lock().await;
-                    if let Err(error) = factory
-                        .control
-                        .set_screen_capture(session.screen_id, true)
-                        .await
-                    {
-                        tracing::warn!(%error, "resume software screen capture failed");
-                    }
-                    if let Some(peer) = factory.peer.upgrade()
-                        && let Some(track) = peer.video_tracks().get(session.track_index)
-                    {
-                        let _ = peer.request_keyframe(track.metadata.ssrc).await;
+                    if let Some(peer) = factory.peer.upgrade() {
+                        match factory.capture_track(&peer, session.screen_id()).await {
+                            Ok(track) => {
+                                let _ = peer.request_keyframe(track.metadata.ssrc).await;
+                            }
+                            Err(error) => {
+                                tracing::warn!(%error, "resume software screen capture failed")
+                            }
+                        }
                     }
                 }
             }
@@ -172,6 +175,7 @@ impl ScreenPlayback {
         display: ViewerDisplayHandle,
         replace: Option<i32>,
         cancelled_pending: Option<i32>,
+        ready: impl FnOnce() + Send + 'static,
     ) -> (
         tokio::task::JoinHandle<()>,
         tokio::sync::oneshot::Receiver<Result<Arc<NativeViewerSession>>>,
@@ -179,7 +183,7 @@ impl ScreenPlayback {
         let replace_software = replace.is_some_and(|id| {
             super::mutex_lock(&self.decoders)
                 .values()
-                .any(|session| session.screen_id == id && session.is_software())
+                .any(|session| session.screen_id() == id && session.is_software())
         });
         self.visible.send_modify(|visible| {
             visible.retain(|id| {
@@ -194,6 +198,7 @@ impl ScreenPlayback {
         let task = self.runtime.spawn(async move {
             let result = factory.open_screen(screen_id, display, replace).await;
             let _ = send.send(result);
+            ready();
         });
         (task, receive)
     }
@@ -209,48 +214,38 @@ impl ScreenPlayback {
         super::mutex_lock(&self.decoders).clear();
     }
 
-    async fn open_screen(
+    async fn capture_track(
         &self,
+        peer: &NativePeer,
         screen_id: i32,
-        display: ViewerDisplayHandle,
-        replace: Option<i32>,
-    ) -> Result<Arc<NativeViewerSession>> {
-        let _opening = self.opening.lock().await;
-        let peer = self.peer.upgrade().context("观看连接已关闭")?;
-        let existing_sessions = super::mutex_lock(&self.decoders)
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        for session in existing_sessions {
-            if session.is_software()
-                && session.screen_id != screen_id
-                && (Some(session.screen_id) == replace
-                    || !self.visible.borrow().contains(&session.screen_id))
-            {
-                self.visible
-                    .send_modify(|visible| visible.retain(|id| *id != session.screen_id));
-                session.pause_software().await?;
+    ) -> Result<Arc<VideoTrackSource>> {
+        let generation = {
+            let mut stopped = self.capture_lock.lock().await;
+            let snapshot = self.control.snapshot();
+            let screen = snapshot
+                .screens
+                .iter()
+                .find(|screen| screen.id == screen_id)
+                .context("显示器已断开")?;
+            if screen.video_track_index < 0 || stopped.contains(&screen_id) {
+                // Keep restart required until the new mapping arrives, including cancellation.
+                // A local stop may already be sent while its ScreenSources is still in flight.
+                stopped.insert(screen_id);
+                self.control.set_screen_capture(screen_id, true).await?;
+                Some(snapshot.screens_generation)
+            } else {
+                None
             }
-        }
-        let screen = self
-            .screens()
-            .into_iter()
-            .find(|screen| screen.id == screen_id)
-            .context("显示器已断开")?;
-        let generation;
-        {
-            let _operation = self.capture_lock.lock().await;
-            generation = self.control.snapshot().screens_generation;
-            self.control.set_screen_capture(screen_id, true).await?;
-        }
+        };
         let track = tokio::time::timeout(Duration::from_secs(12), async {
             loop {
-                let screen = self
-                    .screens()
-                    .into_iter()
+                let snapshot = self.control.snapshot();
+                let screen = snapshot
+                    .screens
+                    .iter()
                     .find(|screen| screen.id == screen_id)
                     .context("显示器已断开")?;
-                if self.control.snapshot().screens_generation > generation
+                if generation.is_none_or(|generation| snapshot.screens_generation > generation)
                     && screen.video_track_index >= 0
                     && let Some(track) = peer.video_tracks().get(screen.video_track_index)
                 {
@@ -261,10 +256,58 @@ impl ScreenPlayback {
         })
         .await
         .map_err(|_| anyhow!("显示器未返回视频，请重试"))??;
+        if generation.is_some() {
+            self.capture_lock.lock().await.remove(&screen_id);
+        }
+        Ok(track)
+    }
+
+    async fn open_screen(
+        &self,
+        screen_id: i32,
+        display: ViewerDisplayHandle,
+        replace: Option<i32>,
+    ) -> Result<Arc<NativeViewerSession>> {
+        let switch_started = Instant::now();
+        let _opening = self.opening.lock().await;
+        let peer = self.peer.upgrade().context("观看连接已关闭")?;
+        let existing_sessions = super::mutex_lock(&self.decoders)
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for session in existing_sessions {
+            if session.is_software()
+                && session.screen_id() != screen_id
+                && (Some(session.screen_id()) == replace
+                    || !self.visible.borrow().contains(&session.screen_id()))
+            {
+                self.visible
+                    .send_modify(|visible| visible.retain(|id| *id != session.screen_id()));
+                session.pause_software().await?;
+            }
+        }
+        let track = self.capture_track(&peer, screen_id).await?;
+        let screen = self
+            .screens()
+            .into_iter()
+            .find(|screen| screen.id == screen_id && screen.video_track_index == track.index)
+            .context("显示器映射已变化")?;
+        tracing::debug!(
+            screen_id,
+            elapsed_ms = switch_started.elapsed().as_secs_f64() * 1000.0,
+            "screen switch mapping ready"
+        );
         let existing = { super::mutex_lock(&self.decoders).get(&track.index).cloned() };
         if let Some(session) = existing {
-            session.resume_decode();
-            peer.request_keyframe(track.metadata.ssrc).await?;
+            let rebound = session.bind_screen(&screen);
+            if session.resume_decode() || rebound {
+                peer.request_keyframe(track.metadata.ssrc).await?;
+            }
+            tracing::debug!(
+                screen_id,
+                elapsed_ms = switch_started.elapsed().as_secs_f64() * 1000.0,
+                "screen switch decoder reused"
+            );
             return Ok(session);
         }
         let mut session = NativeViewerSession::launch(ViewerLaunchConfig {
@@ -281,7 +324,7 @@ impl ScreenPlayback {
         })
         .await?;
         session.track_index = track.index;
-        session.screen_id = screen_id;
+        session.bind_screen(&screen);
         track.add_sink(session.video_sink()).await;
         track.start();
         peer.request_keyframe(track.metadata.ssrc).await?;

@@ -1,4 +1,4 @@
-//! UU 4.38.3 non-sender RTCP timing. Evidence and limits are recorded in
+//! Receiver RTCP timing. Evidence and limits are recorded in
 //! docs/official-full-chain-audit-2026-09-05.md (R06). No ICE/default RTT is
 //! admitted as an RTCP measurement or as an RTP/NTP clock calibration input.
 

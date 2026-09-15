@@ -79,7 +79,7 @@ impl DeviceCenterApp {
         {
             anyhow::bail!("仅支持本账号绑定的远端电脑");
         }
-        action.check(device)
+        action.check(device, &catalog.features)
     }
 
     pub(super) fn accept_power(&mut self, accepted: AcceptedPower) {

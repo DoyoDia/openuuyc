@@ -165,7 +165,7 @@ impl RawRouter {
             return;
         };
         let input = target.control.mouse();
-        if input.mode() == MouseMode::View {
+        if input.mode() == MouseMode::View || input.waiting_for_neutral() {
             return;
         }
         let mut point = POINT::default();
@@ -272,6 +272,11 @@ impl RawRouter {
         let input = target.control.mouse();
         let mode = input.mode();
         if mode == MouseMode::View {
+            return false;
+        }
+        if super::windows_keyboard::observe_mouse_buttons(target.owner(), flags)
+            || input.waiting_for_neutral()
+        {
             return false;
         }
         let held = input.owner_holds_buttons(target.owner());
@@ -430,6 +435,7 @@ impl WindowMouse {
             || mode == MouseMode::View
             || menu_open
             || context.any_popup_open()
+            || context.memory(|m| m.top_modal_layer().is_some())
             || context.text_edit_focused()
             || frame_size.is_none()
         {

@@ -6,7 +6,6 @@ pub const RAW: &str = "host.video_source.v1";
 pub const VIDEO: &str = "host.video_output.v1";
 pub const OVERLAY: &str = "host.overlay_output.v1";
 pub const INPUT: &str = "host.input_output.v1";
-const LEGACY_HOTKEY: &str = "host.hotkey.v1";
 const MAX_FILE: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -350,69 +349,6 @@ impl Catalog {
     }
 }
 impl Document {
-    pub fn migrate_shortcuts(&mut self) -> Result<()> {
-        let sources: BTreeMap<_, _> = self
-            .nodes
-            .iter()
-            .filter(|n| n.type_id == LEGACY_HOTKEY)
-            .map(|n| (n.id.clone(), n.clone()))
-            .collect();
-        if sources.is_empty() {
-            return Ok(());
-        }
-        ensure!(
-            self.nodes
-                .iter()
-                .map(|n| &n.id)
-                .collect::<BTreeSet<_>>()
-                .len()
-                == self.nodes.len(),
-            "旧图存在重复节点ID"
-        );
-        let mut migrated = BTreeSet::new();
-        for edge in &self.edges {
-            ensure!(
-                !sources.contains_key(&edge.to.node),
-                "旧快捷键节点不支持输入连线"
-            );
-            let Some(source) = sources.get(&edge.from.node) else {
-                continue;
-            };
-            ensure!(
-                edge.from.port == "active"
-                    && matches!(edge.to.port.as_str(), "enabled" | "trigger"),
-                "旧快捷键连线无法迁移"
-            );
-            ensure!(
-                migrated.insert((&edge.to.node, &edge.to.port)),
-                "旧快捷键条件存在重复连线"
-            );
-            let target = self
-                .nodes
-                .iter_mut()
-                .find(|n| n.id == edge.to.node)
-                .context("旧快捷键目标不存在")?;
-            let parameters = target
-                .parameters
-                .as_object_mut()
-                .context("旧快捷键目标参数无效")?;
-            let mut shortcut: super::hotkeys::Shortcut =
-                serde_json::from_value(source.parameters.clone()).context("旧快捷键参数无效")?;
-            shortcut.disabled |= !source.enabled;
-            // An explicitly edited inline binding wins over obsolete wiring.
-            parameters
-                .entry(edge.to.port.clone())
-                .or_insert(serde_json::to_value(shortcut)?);
-        }
-        self.nodes.retain(|n| !sources.contains_key(&n.id));
-        for node in &mut self.nodes {
-            node.inputs
-                .retain(|p| p.data_type != sdk::PortType::Activation);
-        }
-        self.edges
-            .retain(|e| !sources.contains_key(&e.from.node) && !sources.contains_key(&e.to.node));
-        Ok(())
-    }
     pub fn new(catalog: &Catalog) -> Result<Self> {
         let source = catalog.instantiate(RAW, [30.0, 80.0])?;
         let output = catalog.instantiate(VIDEO, [580.0, 80.0])?;
@@ -918,7 +854,7 @@ pub fn load(path: &Path) -> Result<Document> {
     );
     let bytes = std::fs::read(path)?;
     ensure!(bytes.len() <= MAX_FILE, "图文件过大");
-    let mut document: Document = serde_json::from_slice(&bytes)?;
+    let document: Document = serde_json::from_slice(&bytes)?;
     ensure!(
         document.graph_format_version == 1
             && document.nodes.len() <= 64
@@ -934,7 +870,6 @@ pub fn load(path: &Path) -> Result<Document> {
             && n.name.len() <= 128),
         "节点布局或端口规模无效"
     );
-    document.migrate_shortcuts()?;
     Ok(document)
 }
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {

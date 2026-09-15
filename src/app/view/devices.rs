@@ -319,7 +319,7 @@ fn row(
     ui: &mut egui::Ui,
     entry: &Entry,
     selected: bool,
-    wallpapers: &mut crate::app::wallpaper::Wallpapers,
+    wallpapers: &mut crate::wallpaper::Wallpapers,
 ) -> Option<Action> {
     let device = &entry.device;
     let wide = ui.available_width() >= 760.0;

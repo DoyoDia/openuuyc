@@ -8,6 +8,7 @@ mod device_visuals;
 mod devices;
 mod logs;
 mod power;
+mod update_dialog;
 
 use crate::ui::theme::{
     self, ACCENT as BLUE, AMBER, BG, GREEN, LINE, MUTED, RED, SIDEBAR, SURFACE, TEXT,
@@ -26,6 +27,7 @@ enum Page {
     Management,
     DeviceDetails,
     Settings,
+    Shortcuts,
     Logs,
     Plugins,
     About,
@@ -39,6 +41,7 @@ impl Page {
             Self::Management => "全部设备",
             Self::DeviceDetails => "设备详情",
             Self::Settings => "连接设置",
+            Self::Shortcuts => "快捷键设置",
             Self::Logs => "日志设置",
             Self::Plugins => "插件管理",
             Self::About => "关于",
@@ -52,12 +55,13 @@ pub(super) struct CenterUi {
     device_lists: [devices::ListUi; 2],
     detail_id: Option<String>,
     detail_parent: Page,
-    wallpapers: super::wallpaper::Wallpapers,
+    wallpapers: crate::wallpaper::Wallpapers,
     edit: Option<DeviceEdit>,
     power: Option<power::PowerConfirmation>,
     legal_document: Option<about::LegalDocument>,
     logs: logs::LogUi,
-    #[cfg(windows)]
+    pub(super) shortcuts: crate::viewer_shortcuts::Editor,
+
     plugins: crate::plugins::Manager,
 }
 
@@ -109,6 +113,7 @@ enum Icon {
     Logout,
     Logs,
     Plugins,
+    Keyboard,
 }
 
 pub(super) fn configure_visuals(ctx: &egui::Context) {
@@ -120,8 +125,8 @@ fn paint_icon(p: &egui::Painter, rect: egui::Rect, icon: Icon, color: Color32) {
     let q = |x, y| c + vec2(x, y);
     let s = Stroke::new(1.5, color);
     match icon {
+        Icon::Keyboard => crate::ui::controls::paint_keyboard(p, rect, color),
         Icon::Plugins => {
-            #[cfg(windows)]
             crate::plugins::paint_plugin_icon(p, rect, color);
         }
         Icon::Logs => {
@@ -579,6 +584,9 @@ impl DeviceCenterApp {
         {
             self.request_assist_refresh();
         }
+        if self.center_ui.page != Page::Shortcuts {
+            self.center_ui.shortcuts.reset();
+        }
         if self.center_ui.page != Page::DeviceDetails {
             self.center_ui.detail_id = None;
         }
@@ -595,13 +603,12 @@ impl DeviceCenterApp {
                     self.device_details_page(ui);
                 } else if self.center_ui.page == Page::Settings {
                     self.settings_page(ui);
+                } else if self.center_ui.page == Page::Shortcuts {
+                    self.shortcuts_page(ui);
                 } else if self.center_ui.page == Page::Logs {
                     self.logs_page(ui);
                 } else if self.center_ui.page == Page::Plugins {
-                    #[cfg(windows)]
                     self.center_ui.plugins.show(ui);
-                    #[cfg(not(windows))]
-                    ui.label("此平台尚未适配插件宿主");
                 } else if self.center_ui.page == Page::About {
                     self.about_page(ui);
                 } else if self.center_ui.page == Page::Management {
@@ -724,6 +731,15 @@ impl DeviceCenterApp {
                     self.center_ui.page == Page::Settings,
                 ) {
                     self.center_ui.page = Page::Settings;
+                }
+                if nav_item(
+                    ui,
+                    Icon::Keyboard,
+                    "快捷键设置",
+                    None,
+                    self.center_ui.page == Page::Shortcuts,
+                ) {
+                    self.center_ui.page = Page::Shortcuts;
                 }
                 if nav_item(
                     ui,
@@ -873,7 +889,7 @@ impl DeviceCenterApp {
                 format!("检查更新失败：{error}\n点击重试"),
                 None,
             ),
-            State::Available { version, url } => {
+            State::Available { version, url, .. } => {
                 let label = format!("↑ v{version}");
                 (
                     if label.chars().count() <= 10 {
@@ -882,7 +898,7 @@ impl DeviceCenterApp {
                         "有新版本".into()
                     },
                     BLUE,
-                    format!("发现新版本 v{version}（当前 {current}）\n点击打开 GitHub 发布页"),
+                    format!("发现新版本 v{version}（当前 {current}）\n点击查看更新内容"),
                     Some(url.clone()),
                 )
             }
@@ -941,8 +957,8 @@ impl DeviceCenterApp {
                 },
             );
         if response.clicked() {
-            if let Some(url) = destination {
-                ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+            if destination.is_some() {
+                self.updates.dialog_open = true;
             } else {
                 self.updates.request(ui.ctx());
             }
@@ -1044,6 +1060,17 @@ impl DeviceCenterApp {
                 }
             }
         });
+    }
+
+    fn shortcuts_page(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("快捷键设置").size(theme::TITLE).strong());
+        ui.add_space(18.0);
+        egui::ScrollArea::vertical()
+            .id_salt("center-shortcuts-scroll")
+            .show(ui, |ui| {
+                ui.set_max_width(theme::SHORTCUT_SETTINGS_WIDTH);
+                self.center_ui.shortcuts.draw(ui);
+            });
     }
 
     fn settings_page(&mut self, ui: &mut egui::Ui) {

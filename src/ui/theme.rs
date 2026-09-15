@@ -20,6 +20,9 @@ pub const SELECTION: Color32 = Color32::from_rgb(40, 70, 112);
 pub const ACTIVE: Color32 = Color32::from_rgb(36, 60, 92);
 pub const DISABLED: Color32 = Color32::from_gray(90);
 pub const WARNING_BG: Color32 = Color32::from_rgb(42, 35, 33);
+pub const VIEWER_SCRIM: Color32 = Color32::from_rgba_premultiplied(8, 10, 14, 232);
+pub const CONNECTION_WALLPAPER_DIM: u8 = 166;
+pub const CONNECTION_WALLPAPER_DETAIL_DIM: u8 = 212;
 
 pub const BODY: f32 = 14.0;
 pub const COMPACT_TEXT: f32 = 13.0;
@@ -28,11 +31,44 @@ pub const TINY: f32 = 11.0;
 pub const MICRO: f32 = 10.0;
 pub const SECTION: f32 = 16.0;
 pub const DIALOG_TITLE: f32 = 21.0;
+pub const UPDATE_DIALOG_WIDTH: f32 = 520.0;
+pub const REMOTE_UPGRADE_WIDTH: f32 = 408.0;
+pub const UPDATE_DIALOG_MARGIN: i8 = 24;
+pub const UPDATE_DIALOG_TITLE: f32 = 18.0;
+pub const UPDATE_HEADER_HEIGHT: f32 = 36.0;
+pub const UPDATE_ACTION_WIDTH: f32 = 104.0;
+pub const UPDATE_MESSAGE_HEIGHT: f32 = 132.0;
+pub const RELEASE_NOTES_HEIGHT: f32 = 300.0;
 pub const TITLE: f32 = 25.0;
 pub const BRAND: f32 = 17.0;
 pub const CONTROL_HEIGHT: f32 = 34.0;
 pub const COMPACT_HEIGHT: f32 = 26.0;
 pub const MENU_HEIGHT: f32 = 28.0;
+pub const MENU_GROUP_GAP: f32 = 8.0;
+pub const SHORTCUT_SETTINGS_WIDTH: f32 = 720.0;
+pub const SHORTCUT_ROW_HEIGHT: f32 = 56.0;
+pub const SHORTCUT_LABEL_WIDTH: f32 = 184.0;
+pub const PERFORMANCE_WIDTH: f32 = 540.0;
+pub const PERFORMANCE_LABEL_WIDTH: f32 = 102.0;
+pub const PERFORMANCE_ROW_HEIGHT: f32 = 44.0;
+pub const SCREEN_TAB_HEIGHT: f32 = 30.0;
+pub const VIEWER_TITLE_CONTENT_HEIGHT: f32 = 36.0;
+pub const VIEWER_TITLE_MARGIN: egui::Margin = egui::Margin::symmetric(10, 3);
+pub const VIEWER_TITLE_STROKE: f32 = 1.0;
+pub const VIEWER_WINDOW_CONTROLS_WIDTH: f32 = 106.0;
+pub const CONNECTION_CONTENT_WIDTH: f32 = 440.0;
+pub const CONNECTION_STAGE_WIDTH: f32 = 224.0;
+pub const CONNECTION_DETAIL_TIME_WIDTH: f32 = 64.0;
+pub const CONNECTION_DETAIL_TITLE_WIDTH: f32 = 160.0;
+pub const VIEWER_IDENTITY_MAX_WIDTH: f32 = 200.0;
+pub const VIEWER_LOGO_SIZE: f32 = 24.0;
+pub const VIEWER_IDENTITY_GAP: f32 = 16.0;
+pub const DEVICE_MENU_WIDTH: f32 = 248.0;
+pub const DEVICE_MENU_ROW_HEIGHT: f32 = 40.0;
+pub const DEVICE_MENU_ROW_GAP: f32 = 2.0;
+pub const SCREEN_TAB_MIN_WIDTH: f32 = 108.0;
+pub const SCREEN_TAB_MAX_WIDTH: f32 = 184.0;
+pub const CONTEXT_MENU_WIDTH: f32 = 248.0;
 pub const NAV_HEIGHT: f32 = 36.0;
 pub const SIDEBAR_WIDTH: f32 = 188.0;
 pub const CONTROL_RADIUS: u8 = 5;
@@ -93,3 +129,22 @@ pub mod graph {
     pub const PORT_INPUT: Color32 = Color32::from_rgb(240, 110, 110);
     pub const PORT_ACTIVATION: Color32 = Color32::from_rgb(240, 210, 110);
 }
+pub const ANNOTATION_BUTTON: f32 = 30.0;
+pub const ANNOTATION_WIDTH: f32 = 300.0;
+pub const ANNOTATION_TOOL_SIZE: f32 = 32.0;
+pub const ANNOTATION_TOOL_GAP: f32 = 4.0;
+pub const ANNOTATION_PICKER_WIDTH: f32 = 256.0;
+pub const ANNOTATION_COLOR_PLANE_HEIGHT: f32 = 148.0;
+pub const ANNOTATION_COLOR_BAR_HEIGHT: f32 = 14.0;
+pub const ANNOTATION_COLORS: [[u8; 3]; 6] = [
+    [255, 68, 68],
+    [255, 190, 64],
+    [83, 211, 159],
+    [67, 145, 255],
+    [198, 115, 255],
+    [255, 255, 255],
+];
+
+pub const POINTER_DEFAULT_SIZE: f32 = 20.0;
+pub const POINTER_LEFT_CLICK: Color32 = ACCENT;
+pub const POINTER_RIGHT_CLICK: Color32 = AMBER;

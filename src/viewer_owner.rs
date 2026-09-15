@@ -25,6 +25,7 @@ pub(crate) struct ViewerOwner {
 /// Small local-only facts; no credentials, packets or per-frame statistics.
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ViewerInfo {
+    pub target: Option<ViewerTarget>,
     pub connection: String,
     pub decoder: String,
     pub video_format: String,
@@ -32,8 +33,20 @@ pub(crate) struct ViewerInfo {
     pub remote_capture: String,
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ViewerTarget {
+    pub device_id: String,
+    pub alias: String,
+}
+
 impl ViewerOwner {
-    pub(crate) fn new() -> Result<Self> {
+    pub(crate) fn new(background: Option<crate::wallpaper::Source>) -> Result<Self> {
+        let bootstrap = serde_json::to_vec(&background)?;
+        let bootstrap = if bootstrap.len() <= 16384 {
+            bootstrap
+        } else {
+            b"null".to_vec()
+        };
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .context("bind viewer lifecycle endpoint")?;
         listener.set_nonblocking(true)?;
@@ -60,6 +73,8 @@ impl ViewerOwner {
                                 stream.read_exact(&mut received).await?;
                                 if received != *nonce.as_bytes() { bail!("wrong viewer lifecycle nonce"); }
                                 stream.write_all(&[1]).await?;
+                                stream.write_u32(bootstrap.len() as u32).await?;
+                                stream.write_all(&bootstrap).await?;
                                 Ok::<_, anyhow::Error>(())
                             }).await;
                             if !matches!(authenticated, Ok(Ok(()))) { continue; }
@@ -100,6 +115,7 @@ impl ViewerOwner {
 pub(crate) async fn report_until_owner_closes(
     mut stream: TcpStream,
     monitor: tokio::sync::watch::Receiver<Option<crate::performance::PerformanceMonitor>>,
+    mut target: tokio::sync::watch::Receiver<Option<ViewerTarget>>,
 ) {
     let (mut reader, mut writer) = stream.split();
     let mut tick = tokio::time::interval(Duration::from_secs(1));
@@ -109,11 +125,15 @@ pub(crate) async fn report_until_owner_closes(
         tokio::select! {
             biased;
             _ = reader.read(&mut eof) => return,
-            _ = tick.tick() => {
-                let info = monitor.borrow().as_ref().map(|m| {
+            _ = async { tokio::select! {
+                _ = tick.tick() => {},
+                _ = async { if target.changed().await.is_err() { std::future::pending::<()>().await; } } => {},
+            } } => {
+                let mut info = monitor.borrow().as_ref().map(|m| {
                     let s = m.snapshot();
-                    ViewerInfo { connection: s.connection.clone(), decoder: s.decoder.clone(), video_format: s.video_format.clone(), remote_encoder: s.remote_encoder.clone(), remote_capture: s.remote_capture.clone() }
+                    ViewerInfo { target: None, connection: s.connection.clone(), decoder: s.decoder.clone(), video_format: s.video_format.clone(), remote_encoder: s.remote_encoder.clone(), remote_capture: s.remote_capture.clone() }
                 }).unwrap_or_default();
+                info.target = target.borrow_and_update().clone();
                 let Ok(bytes) = serde_json::to_vec(&info) else { continue; };
                 if bytes.len() > 8192 { continue; }
                 let send = async { writer.write_u32(bytes.len() as u32).await?; writer.write_all(&bytes).await };
@@ -132,7 +152,9 @@ impl Drop for ViewerOwner {
     }
 }
 
-pub(crate) async fn connect(descriptor: &str) -> Result<TcpStream> {
+pub(crate) async fn connect(
+    descriptor: &str,
+) -> Result<(TcpStream, Option<crate::wallpaper::Source>)> {
     let (port, nonce) = descriptor
         .split_once(':')
         .context("invalid viewer owner descriptor")?;
@@ -148,8 +170,16 @@ pub(crate) async fn connect(descriptor: &str) -> Result<TcpStream> {
         if ready != [1] {
             bail!("viewer owner refused lifecycle connection");
         }
+        let size = stream.read_u32().await?;
+        if size > 16384 {
+            bail!("oversized viewer background metadata");
+        }
+        let mut bytes = vec![0; size as usize];
+        stream.read_exact(&mut bytes).await?;
+        let background =
+            serde_json::from_slice(&bytes).context("invalid viewer background metadata")?;
         tracing::debug!("viewer lifecycle owner attached");
-        Ok(stream)
+        Ok((stream, background))
     })
     .await
     .context("viewer owner handshake timed out")?

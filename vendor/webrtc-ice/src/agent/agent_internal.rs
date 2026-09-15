@@ -19,8 +19,8 @@ mod payload_transition_test {
     use super::*;
     use crate::candidate::candidate_host::CandidateHostConfig;
 
-    // Exercises the real data callback and a loopback Binding send, not a UU
-    // service substitute: steady media, recovery, pruned and controlled paths.
+    // Exercises the real data callback with loopback sockets: steady media,
+    // recovery, pruned paths and a controlled-side switch without an extra ping.
     #[tokio::test]
     async fn payload_callbacks_keep_recovery_without_per_packet_sorts(
     ) -> std::result::Result<(), Box<dyn std::error::Error>> {
@@ -129,13 +129,15 @@ mod payload_transition_test {
                 .await
         );
         let mut packet = [0; 2048];
-        let (n, _) =
-            tokio::time::timeout(Duration::from_secs(1), backup_socket.recv_from(&mut packet))
-                .await??;
-        let binding =
-            turn::client::message::decode(&packet[..n], turn::client::message::Dialect::Ice)?;
-        assert_eq!(binding.typ, BINDING_REQUEST);
-        assert!(binding.contains(ATTR_ICE_CONTROLLED));
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                backup_socket.recv_from(&mut packet)
+            )
+            .await
+            .is_err(),
+            "UU 4.40 data-received proposal must not emit an extra Binding request"
+        );
         assert!(Arc::ptr_eq(
             &internal.agent_conn.get_selected_pair().unwrap(),
             &pairs[1]
@@ -423,9 +425,7 @@ impl AgentInternal {
             }
         }
 
-        log::debug!(
-            "Started agent: isControlling? {is_controlling}"
-        );
+        log::debug!("Started agent: isControlling? {is_controlling}");
         self.set_remote_credentials(remote_ufrag, remote_pwd)
             .await?;
         {
@@ -2013,8 +2013,8 @@ impl AgentInternal {
         {
             log::warn!("[{}]: failed to write packet: {}", self.get_name(), err);
         }
-        // 2060E0: controlled-side data on another live Connection is a
-        // deliberate exception: ping that Connection and propose it directly.
+        // UU 4.40 206D68: controlled-side data on another live Connection
+        // proposes it directly, without the extra ping used in 4.38.
         if !self.is_controlling.load(Ordering::Relaxed)
             && self
                 .agent_conn

@@ -488,6 +488,17 @@ impl CandidatePair {
         );
     }
 
+    /// The selected connection's RTT is valid only after a STUN response.
+    /// UU P2PTransportChannel::GetRttEstimate (20769C) exposes this filtered
+    /// value, not the 3000 ms constructor default or the last raw sample.
+    pub fn rtt_estimate(&self) -> Option<Duration> {
+        (self.responses_received.load(Ordering::Acquire) != 0).then(|| {
+            Duration::from_millis(u64::from(
+                self.smoothed_round_trip_ms.load(Ordering::Relaxed),
+            ))
+        })
+    }
+
     pub(crate) fn record_round_trip(&self, micros: u64) {
         let sample_ms = (micros / 1000).min(u64::from(u32::MAX)) as u32;
         let old = self.smoothed_round_trip_ms.load(Ordering::Relaxed);
@@ -503,7 +514,7 @@ impl CandidatePair {
             .store(micros, Ordering::Relaxed);
         self.total_round_trip_micros
             .fetch_add(micros, Ordering::Relaxed);
-        self.responses_received.fetch_add(1, Ordering::Relaxed);
+        self.responses_received.fetch_add(1, Ordering::Release);
     }
 
     pub(crate) fn note_check_response(&self, receiving_timeout: Duration) {

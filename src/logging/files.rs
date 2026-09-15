@@ -10,7 +10,6 @@ pub const MAX_TOTAL_MIB: u64 = 256;
 pub const RETENTION_DAYS: u64 = 14;
 
 pub(super) fn directories() -> Result<(PathBuf, PathBuf)> {
-    #[cfg(windows)]
     {
         let base = std::env::var_os("LOCALAPPDATA")
             .map(PathBuf::from)
@@ -18,32 +17,6 @@ pub(super) fn directories() -> Result<(PathBuf, PathBuf)> {
             .context("LOCALAPPDATA must be an absolute directory")?
             .join("OpenUUYC");
         Ok((base.clone(), base.join("logs")))
-    }
-    #[cfg(not(windows))]
-    {
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .filter(|p| p.is_absolute())
-            .context("HOME must be an absolute directory")?;
-        #[cfg(target_os = "macos")]
-        {
-            Ok((
-                home.join("Library/Application Support/OpenUUYC"),
-                home.join("Library/Logs/OpenUUYC"),
-            ))
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let config = std::env::var_os("XDG_CONFIG_HOME")
-                .map(PathBuf::from)
-                .filter(|p| p.is_absolute())
-                .unwrap_or_else(|| home.join(".config"));
-            let state = std::env::var_os("XDG_STATE_HOME")
-                .map(PathBuf::from)
-                .filter(|p| p.is_absolute())
-                .unwrap_or_else(|| home.join(".local/state"));
-            Ok((config.join("openuuyc"), state.join("openuuyc/logs")))
-        }
     }
 }
 
@@ -55,11 +28,7 @@ fn create(path: &Path, append: bool) -> io::Result<File> {
     } else {
         options.create_new(true);
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
+
     options.open(path)
 }
 
@@ -75,7 +44,7 @@ fn open_lease(path: &Path) -> io::Result<File> {
 fn state_directory(directory: &Path) -> io::Result<PathBuf> {
     let state = directory.join(".state");
     fs::create_dir_all(&state)?;
-    #[cfg(windows)]
+
     {
         use std::os::windows::ffi::OsStrExt;
         use windows::{
@@ -102,7 +71,7 @@ pub(super) fn save_config(path: &Path, bytes: &[u8]) -> Result<()> {
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
-        #[cfg(windows)]
+
         {
             use std::os::windows::ffi::OsStrExt;
             use windows::{
@@ -121,8 +90,7 @@ pub(super) fn save_config(path: &Path, bytes: &[u8]) -> Result<()> {
                 )
             }?;
         }
-        #[cfg(not(windows))]
-        fs::rename(&temporary, path)?;
+
         Ok(())
     })();
     if result.is_err() {
@@ -132,7 +100,6 @@ pub(super) fn save_config(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 pub(super) fn open_directory(directory: &Path) -> Result<()> {
-    #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;
         use windows::{
@@ -155,21 +122,7 @@ pub(super) fn open_directory(directory: &Path) -> Result<()> {
             bail!("打开日志文件夹失败（{}）", result.0 as isize);
         }
     }
-    #[cfg(not(windows))]
-    {
-        let path = directory.to_owned();
-        // Reap the launcher without blocking the GUI event loop.
-        std::thread::Builder::new()
-            .name("open-log-folder".into())
-            .spawn(move || {
-                let mut cmd = std::process::Command::new(if cfg!(target_os = "macos") {
-                    "open"
-                } else {
-                    "xdg-open"
-                });
-                let _ = cmd.arg(path).status();
-            })?;
-    }
+
     Ok(())
 }
 
@@ -394,31 +347,19 @@ fn prune(directory: &Path) -> io::Result<()> {
         }
         let name = path.file_name().unwrap().to_string_lossy();
         let (stem, segment) = name.strip_suffix(".log").unwrap().rsplit_once('.').unwrap();
-        // Legacy releases used per-segment leases in the visible log directory.
-        let legacy = path.with_extension("lock");
-        let legacy_exists = legacy.exists();
-        let lease_path = if legacy_exists {
-            legacy
-        } else {
-            directory.join(".state").join(format!("{stem}.lock"))
-        };
+        let lease_path = directory.join(".state").join(format!("{stem}.lock"));
         let Ok(lease) = OpenOptions::new().read(true).write(true).open(&lease_path) else {
             continue;
         };
         let inactive = lease.try_lock().is_ok();
-        if !inactive
-            && (legacy_exists
-                || segment.parse::<u32>().unwrap() == current_sequence(directory, stem)?)
-        {
+        if !inactive && segment.parse::<u32>().unwrap() == current_sequence(directory, stem)? {
             continue;
         }
         // Retain the lease through deletion so cleanup cannot retire a live writer.
         match fs::remove_file(&path) {
             Ok(()) => {
                 total = total.saturating_sub(size);
-                if legacy_exists {
-                    let _ = fs::remove_file(lease_path);
-                } else if inactive {
+                if inactive {
                     let prefix = format!("{stem}.");
                     let remaining = fs::read_dir(directory)?
                         .filter_map(Result::ok)

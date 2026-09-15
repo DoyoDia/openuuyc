@@ -3,20 +3,10 @@ use super::*;
 
 pub fn path(id: &str) -> Result<PathBuf> {
     ensure!(super::valid_id(id), "插件 ID 无效");
-    #[cfg(windows)]
+
     let base = PathBuf::from(std::env::var_os("LOCALAPPDATA").context("LOCALAPPDATA unavailable")?)
         .join("OpenUUYC");
-    #[cfg(target_os = "macos")]
-    let base = PathBuf::from(std::env::var_os("HOME").context("HOME unavailable")?)
-        .join("Library/Application Support/OpenUUYC");
-    #[cfg(not(any(windows, target_os = "macos")))]
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .unwrap_or(
-            PathBuf::from(std::env::var_os("HOME").context("HOME unavailable")?).join(".config"),
-        )
-        .join("openuuyc");
+
     ensure!(base.is_absolute(), "插件配置目录必须为绝对路径");
     Ok(base.join("plugin-settings").join(format!("{id}.json")))
 }

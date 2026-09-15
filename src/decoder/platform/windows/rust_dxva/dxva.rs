@@ -17,22 +17,6 @@ pub enum Codec {
     H264,
     Hevc,
 }
-#[cfg(test)]
-thread_local! {
-    static TEST_ARRAY_SURFACES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-#[cfg(test)]
-pub struct ArraySurfaceTestGuard(bool);
-#[cfg(test)]
-impl Drop for ArraySurfaceTestGuard {
-    fn drop(&mut self) {
-        TEST_ARRAY_SURFACES.with(|mode| mode.set(self.0));
-    }
-}
-#[cfg(test)]
-pub fn array_surfaces_for_test() -> ArraySurfaceTestGuard {
-    ArraySurfaceTestGuard(TEST_ARRAY_SURFACES.with(|mode| mode.replace(true)))
-}
 #[derive(Debug)]
 pub enum Failure {
     Unsupported,
@@ -53,18 +37,28 @@ fn select(
     width: u32,
     height: u32,
     depth: u8,
+    chroma: u8,
 ) -> Result<(D3D11_VIDEO_DECODER_DESC, D3D11_VIDEO_DECODER_CONFIG)> {
     ensure!(
         width > 0 && height > 0 && width <= 16384 && height <= 16384,
         "invalid decoder geometry"
     );
-    let guid = match (codec, depth) {
-        (Codec::H264, 8) => D3D11_DECODER_PROFILE_H264_VLD_NOFGT,
-        (Codec::Hevc, 8) => D3D11_DECODER_PROFILE_HEVC_VLD_MAIN,
-        (Codec::Hevc, 10) => D3D11_DECODER_PROFILE_HEVC_VLD_MAIN10,
+    // Range-extension GUIDs from the Windows SDK d3d11.h (not in windows-rs).
+    let guid = match (codec, depth, chroma) {
+        (Codec::H264, 8, 1) => D3D11_DECODER_PROFILE_H264_VLD_NOFGT,
+        (Codec::Hevc, 8, 1) => D3D11_DECODER_PROFILE_HEVC_VLD_MAIN,
+        (Codec::Hevc, 10, 1) => D3D11_DECODER_PROFILE_HEVC_VLD_MAIN10,
+        (Codec::Hevc, 8, 3) => GUID::from_u128(0x4008018f_f537_4b36_98cf_61af8a2c1a33),
+        (Codec::Hevc, 10, 3) => GUID::from_u128(0x0dabeffa_4458_4602_bc03_0795659d617c),
         _ => bail!("unsupported codec/depth"),
     };
-    let format = if depth == 10 {
+    let format = if chroma == 3 {
+        if depth == 10 {
+            DXGI_FORMAT_Y410
+        } else {
+            DXGI_FORMAT_AYUV
+        }
+    } else if depth == 10 {
         DXGI_FORMAT_P010
     } else {
         DXGI_FORMAT_NV12
@@ -125,6 +119,7 @@ pub struct Pool {
     pub width: u32,
     pub height: u32,
     pub depth: u8,
+    pub chroma: u8,
     pub dpb: usize,
 }
 /// Owning decoded surface and its visible rectangle; cropping never moves or
@@ -252,9 +247,16 @@ impl Drop for Buffer<'_> {
     }
 }
 impl Pool {
-    pub fn probe(device: &ID3D11Device, codec: Codec, w: u32, h: u32, depth: u8) -> Result<()> {
+    pub fn probe(
+        device: &ID3D11Device,
+        codec: Codec,
+        w: u32,
+        h: u32,
+        depth: u8,
+        chroma: u8,
+    ) -> Result<()> {
         let video: ID3D11VideoDevice = device.cast()?;
-        let (d, c) = select(&video, codec, w, h, depth)?;
+        let (d, c) = select(&video, codec, w, h, depth, chroma)?;
         let _decoder = unsafe { video.CreateVideoDecoder(&d, &c)? };
         Ok(())
     }
@@ -264,6 +266,7 @@ impl Pool {
         width: u32,
         height: u32,
         depth: u8,
+        chroma: u8,
         dpb: usize,
     ) -> Result<Arc<Self>> {
         ensure!((1..=16).contains(&dpb), "invalid DPB size");
@@ -274,7 +277,7 @@ impl Pool {
         unsafe {
             let _ = multithread.SetMultithreadProtected(true);
         }
-        let (desc, cfg) = select(&vd, codec, width, height, depth)?;
+        let (desc, cfg) = select(&vd, codec, width, height, depth, chroma)?;
         let decoder = unsafe { vd.CreateVideoDecoder(&desc, &cfg)? };
         let mut options = D3D11_FEATURE_DATA_D3D11_OPTIONS::default();
         unsafe {
@@ -300,8 +303,6 @@ impl Pool {
             shared = false;
         }
         let single = cfg.ConfigDecoderSpecific & 0x4000 != 0;
-        #[cfg(test)]
-        let single = single && !TEST_ARRAY_SURFACES.with(std::cell::Cell::get);
         let count = (dpb + 5).max(cfg.ConfigMinRenderTargetBuffCount as usize);
         ensure!(
             count <= 127,
@@ -396,6 +397,7 @@ impl Pool {
             width,
             height,
             depth,
+            chroma,
             dpb,
         }))
     }

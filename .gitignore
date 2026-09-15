@@ -5,6 +5,9 @@ captures/
 /docs/
 /AGENTS.md
 /tools/
+/reference/
+/src/decoder/fixtures/
+/assets/banner-v*.png
 /src/**/*.md
 /vendor/**/*.md
 __pycache__/

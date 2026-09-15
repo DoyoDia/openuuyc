@@ -87,6 +87,9 @@ struct ResolvedConnection {
     preferences: Option<crate::stream_control::StreamControlPreferences>,
     audio_preferences: Option<crate::audio::AudioSettings>,
     target_platform: i32,
+    target_version: String,
+    refresh_after_upgrade: bool,
+    background: Option<crate::wallpaper::Source>,
 }
 
 impl ResolvedConnection {
@@ -96,6 +99,7 @@ impl ResolvedConnection {
         cancel: &CancellationToken,
         retries: &mut u32,
     ) -> Result<ControllerConnection> {
+        self.client.schedule_feature_refresh(true);
         if self.target_device_id == self.controller_device_id {
             bail!("cannot connect the virtual device to itself");
         }
@@ -106,6 +110,7 @@ impl ResolvedConnection {
                 .await?;
             self.target_device_id = reply.publisher_device_id.clone();
             self.target_platform = reply.publisher_platform;
+            self.target_version = reply.publisher_version_name.clone();
             if !reply.device_name.is_empty() {
                 self.summary.alias = reply.device_name.clone();
             }
@@ -144,6 +149,31 @@ impl ResolvedConnection {
                 }
             }
         };
+        if self.refresh_after_upgrade {
+            // Rejoining the room establishes that the target is back online.
+            // Refresh its real version before rebuilding feature policy.
+            let devices = cancellable(cancel, self.client.list_devices()).await?;
+            let device = devices
+                .my_binded_devices
+                .iter()
+                .find(|device| device.device_id == self.target_device_id)
+                .context("更新后的设备已不在当前账号中")?;
+            anyhow::ensure!(device.platform == 1, "更新后的设备类型已变化");
+            self.target_version = device.version_name.clone();
+            self.refresh_after_upgrade = false;
+        }
+        let bitrate_limit = if room.international_connect {
+            match cancellable(cancel, self.client.international_bitrate_limit()).await {
+                Ok(limit) => limit,
+                Err(error) if cancel.is_cancelled() => return Err(error),
+                Err(error) => {
+                    tracing::warn!(%error,"international bitrate configuration unavailable");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let mut persistence_error = None;
         let store = match self.client.viewing_settings_store(&self.target_device_id) {
             Ok(store) => Some(store),
@@ -160,13 +190,16 @@ impl ResolvedConnection {
                     self.preferences =
                         Some(crate::stream_control::StreamControlPreferences::from_saved(
                             settings,
-                            self.profile.local_display,
+                            self.profile,
                         ))
                 }
                 Ok(None) => {}
                 Err(error) if cancel.is_cancelled() => return Err(error),
                 Err(error) => persistence_error = Some(error.to_string()),
             }
+        }
+        if let Some(preferences) = self.preferences.as_mut() {
+            preferences.custom_bitrate_limit = bitrate_limit;
         }
         let mut audio_persistence_error = None;
         if self.audio_preferences.is_none() {
@@ -201,10 +234,19 @@ impl ResolvedConnection {
                 .max(self.profile.stream_fps);
             self.summary.stream_fps = self.profile.stream_fps;
         }
+
         let mut connection = ControllerConnection::establish(
             room,
             &self.controller_device_id,
             self.profile,
+            self.client
+                .feature_catalog()
+                .policy(self.target_platform, &self.target_version),
+            if self.assist.is_some() {
+                crate::control::ControlConnectType::Assistance
+            } else {
+                crate::control::ControlConnectType::Normal
+            },
             self.transport,
             self.preferences,
             self.audio_preferences.expect("resolved audio settings"),
@@ -213,6 +255,16 @@ impl ResolvedConnection {
         )
         .await?;
         let handle = connection.stream_control_handle();
+        if self.assist.is_none() && self.target_platform == 1 {
+            handle.set_remote_upgrade(crate::remote_upgrade::RemoteUpgrade::new(
+                Arc::clone(&self.client),
+                self.target_device_id.clone(),
+                self.summary.alias.clone(),
+                self.target_version.clone(),
+                cancel,
+            ));
+        }
+        handle.set_custom_bitrate_limit(bitrate_limit);
         handle.mouse().set_keyboard_platform(self.target_platform);
         handle.set_persistence_error(persistence_error);
         handle.set_audio_persistence_error(audio_persistence_error);
@@ -248,30 +300,38 @@ async fn run_viewer_window(
     target_id: Option<String>,
     assist: Option<crate::assist::AssistRequest>,
 ) -> Result<()> {
-    crate::ui::ensure_supported()?;
     let owns_presence = owner.is_none();
-    let owner = match owner {
-        Some(descriptor) => Some(crate::viewer_owner::connect(&descriptor).await?),
-        None => None,
+    let (owner, background) = match owner {
+        Some(descriptor) => {
+            let (stream, background) = crate::viewer_owner::connect(&descriptor).await?;
+            (Some(stream), background)
+        }
+        None => (None, None),
     };
     let (progress_sender, progress_receiver) = std::sync::mpsc::channel();
     let (viewer_sender, viewer_receiver) = std::sync::mpsc::channel();
     let reporter: ConnectionProgressReporter = Arc::new(move |progress| {
         let _ = progress_sender.send(progress);
     });
+    if let Some(background) =
+        background.filter(|s| target_id.as_deref() == Some(s.device_id.as_str()))
+    {
+        reporter(ConnectionProgress::background(background));
+    }
     let task_alias = alias.clone();
     let (display_sender, display_receiver) = oneshot::channel();
     let cancel = CancellationToken::new();
     let owner_cancel = cancel.clone();
     let close_sender = viewer_sender.clone();
     let (monitor_sender, monitor_receiver) = tokio::sync::watch::channel(None);
+    let (target_sender, target_receiver) = tokio::sync::watch::channel(None);
     let owner_task = tokio::spawn(async move {
         tokio::select! {
             biased;
             _ = owner_cancel.cancelled() => {},
             _ = async {
                 if let Some(owner) = owner {
-                    crate::viewer_owner::report_until_owner_closes(owner, monitor_receiver).await;
+                    crate::viewer_owner::report_until_owner_closes(owner, monitor_receiver, target_receiver).await;
                 } else { std::future::pending::<()>().await; }
             } => {
                 tracing::info!("device-center owner ended; closing viewer gracefully");
@@ -300,6 +360,7 @@ async fn run_viewer_window(
                 display: display_receiver,
                 owns_presence,
                 monitor: monitor_sender,
+                target: target_sender,
                 target_id,
                 assist,
             },
@@ -336,6 +397,7 @@ struct ViewerConnectionWindow {
     display: oneshot::Receiver<ViewerDisplayHandle>,
     owns_presence: bool,
     monitor: tokio::sync::watch::Sender<Option<crate::performance::PerformanceMonitor>>,
+    target: tokio::sync::watch::Sender<Option<crate::viewer_owner::ViewerTarget>>,
     target_id: Option<String>,
     assist: Option<crate::assist::AssistRequest>,
 }
@@ -352,6 +414,7 @@ async fn run_viewer_connection_owner(
         display: display_receiver,
         owns_presence,
         monitor,
+        target,
         target_id,
         assist,
     } = window;
@@ -405,9 +468,13 @@ async fn run_viewer_connection_owner(
             }));
         }
         let mut display = cancellable(cancel, async { display_receiver.await.context("player display was not created") }).await?;
+        let (switch_sender, mut switch_receiver) = tokio::sync::mpsc::channel::<crate::viewer::device_switch::SwitchRequest>(1);
         let mut retries = 0;
         loop {
             monitor.send_replace(None);
+            target.send_replace(Some(crate::viewer_owner::ViewerTarget {
+                device_id: resolved.target_device_id.clone(), alias: resolved.summary.alias.clone(),
+            }));
             let mut controller = match resolved.connect(Some(reporter), cancel, &mut retries).await {
                 Ok(controller) => controller,
                 Err(error) if !cancel.is_cancelled() && retry_session_failure(&error) && retries < 5 => {
@@ -442,6 +509,9 @@ async fn run_viewer_connection_owner(
             reporter(ConnectionProgress::ready(format!("{route} · {} · {}", playback.codec, controller.performance_monitor().snapshot().decoder)));
             tracing::info!(device = %resolved.summary.alias, codec = playback.codec, track = %playback.track_id, "single-window viewer entered playback");
             let close = viewer.close_handle();
+            let switcher = crate::viewer::device_switch::DeviceSwitcher::new(
+                Arc::clone(&resolved.client), resolved.target_device_id.clone(), switch_sender.clone(), cancel.clone());
+            viewer.set_device_switch(switcher.clone());
             if viewer_sender.send(ViewerWindowEvent::Playing(Box::new(viewer))).is_err() {
                 let _ = controller.close().await;
                 bail!("player window closed before playback");
@@ -453,19 +523,109 @@ async fn run_viewer_connection_owner(
             }
             let (stop_sender, stop_receiver) = oneshot::channel();
             let session_control = controller.stream_control_handle();
+            let upgrade = session_control.remote_upgrade();
+            let upgrade_deadline = async {
+                if let Some(upgrade) = &upgrade {
+                    upgrade.wait_for_restart().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            };
+            tokio::pin!(upgrade_deadline);
             let alive = controller.keep_alive(stop_receiver);
             tokio::pin!(alive);
-            let result = tokio::select! {
-                result = &mut alive => result,
-                _ = cancel.cancelled() => {
-                    let _ = stop_sender.send(());
-                    alive.await
+            let mut next_connection = None;
+            let mut upgrade_reconnect = false;
+            let result = loop {
+                tokio::select! {
+                    result = &mut alive => break result,
+                    _ = &mut upgrade_deadline => {
+                        upgrade_reconnect = true;
+                        let _ = stop_sender.send(());
+                        break alive.await;
+                    }
+                    _ = cancel.cancelled() => {
+                        let _ = stop_sender.send(());
+                        break alive.await;
+                    }
+                    Some(request) = switch_receiver.recv() => {
+                        if request.from != resolved.target_device_id || request.device.device_id == resolved.target_device_id { continue; }
+                        // Revalidate the real ID while the old room continues playing.
+                        let next = cancellable(cancel, resolve_connection_with_client(
+                            Arc::clone(&resolved.client), &request.device.alias, options, None,
+                            Some(&request.device.device_id))).await;
+                        let next = match next {
+                            Ok(next) => next,
+                            Err(error) => { switcher.failed(format!("无法切换：{error}")); continue; }
+                        };
+                        let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+                        let (display_tx, display_rx) = oneshot::channel();
+                        *reporter = Arc::new(move |progress| { let _ = progress_tx.send(progress); });
+                        reporter(ConnectionProgress::working(1, "切换设备", format!("正在连接 {}", next.summary.alias)));
+                        if let Some(background)=next.background.clone(){reporter(ConnectionProgress::background(background));}
+                        // The UI releases input and joins every old screen/decoder,
+                        // retaining the window in which the user selected the device.
+                        let replacement = async {
+                            viewer_sender.send(ViewerWindowEvent::Reconnect {
+                                alias: next.summary.alias.clone(), window: Some(request.window),
+                                progress: progress_rx, display: display_tx,
+                            }).map_err(|_| anyhow!("player window closed during device switch"))?;
+                            display_rx.await.context("player did not acknowledge device switch")
+                        };
+                        let new_display = cancellable(cancel, replacement).await;
+                        let _ = stop_sender.send(());
+                        let stopped = alive.await;
+                        let new_display = new_display?;
+                        if let Err(error) = stopped {
+                            tracing::debug!(%error, "old viewing session ended during device switch");
+                        }
+                        next_connection = Some((next, new_display));
+                        break Ok(());
+                    }
                 }
             };
             if cancel.is_cancelled() {
                 close.close();
                 return Ok(());
             }
+            if let Some((next, new_display)) = next_connection {
+                if let Some(upgrade) = &upgrade { upgrade.retire(); }
+                display = new_display;
+                resolved = next;
+                retries = 0;
+                continue;
+            }
+            if upgrade.as_ref().is_some_and(|upgrade| upgrade.started()) {
+                // A transport loss during installation is expected. Wait for
+                // the official update countdown instead of ordinary retries.
+                // The service also emits room leave/2005 here. Only a preceding
+                // update-start notice permits this exception to terminal leave.
+                if !upgrade_reconnect {
+                    cancellable(cancel, async {
+                        upgrade.as_ref().unwrap().wait_for_restart().await;
+                        Ok(())
+                    }).await?;
+                }
+                upgrade.as_ref().unwrap().retire();
+                resolved.preferences = Some(session_control.preferences());
+                resolved.audio_preferences = Some(session_control.audio().settings());
+                resolved.refresh_after_upgrade = true;
+                retries = 0;
+                let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+                let (display_tx, display_rx) = oneshot::channel();
+                *reporter = Arc::new(move |progress| { let _ = progress_tx.send(progress); });
+                reporter(ConnectionProgress::working(1, "更新后重新连接", format!("正在重新连接 {}", resolved.summary.alias)));
+                if let Some(background) = resolved.background.clone() { reporter(ConnectionProgress::background(background)); }
+                viewer_sender.send(ViewerWindowEvent::Reconnect {
+                    alias: resolved.summary.alias.clone(), window: None,
+                    progress: progress_rx, display: display_tx,
+                }).map_err(|_| anyhow!("更新等待窗口已关闭"))?;
+                display = cancellable(cancel, async {
+                    display_rx.await.context("更新等待窗口已关闭")
+                }).await?;
+                continue;
+            }
+            if let Some(upgrade) = &upgrade { upgrade.retire(); }
             match result {
                 Err(error) if retry_session_failure(&error) => {
                     resolved.preferences = Some(session_control.preferences());
@@ -475,7 +635,8 @@ async fn run_viewer_connection_owner(
                     let (display_tx, display_rx) = oneshot::channel();
                     *reporter = Arc::new(move |progress| { let _ = progress_tx.send(progress); });
                     reporter(ConnectionProgress::working(4, "重建观看会话", format!("{error:#}；正在重新加入房间（{retries}/5）")));
-                    viewer_sender.send(ViewerWindowEvent::Reconnect { progress: progress_rx, display: display_tx })
+                    if let Some(background)=resolved.background.clone(){reporter(ConnectionProgress::background(background));}
+                    viewer_sender.send(ViewerWindowEvent::Reconnect { alias: resolved.summary.alias.clone(), window: None, progress: progress_rx, display: display_tx })
                         .map_err(|_| anyhow!("player window closed during reconnect"))?;
                     display = cancellable(cancel, async { display_rx.await.context("player did not acknowledge room replacement") }).await?;
                 }
@@ -546,6 +707,8 @@ impl ControllerConnection {
         room: RoomSession,
         controller_device_id: &str,
         profile: ConnectionMediaProfile,
+        features: crate::feature_ability::FeaturePolicy,
+        connect_type: crate::control::ControlConnectType,
         transport: crate::media::TransportChoice,
         preferences: Option<crate::stream_control::StreamControlPreferences>,
         audio_settings: crate::audio::AudioSettings,
@@ -578,14 +741,18 @@ impl ControllerConnection {
                 profile.codec.label()
             ),
         );
-        let control =
-            match cancellable(cancel, signal.start_control(controller_device_id, profile)).await {
-                Ok(control) => control,
-                Err(error) => {
-                    let _ = signal.close().await;
-                    return Err(error).context("complete controller handshake");
-                }
-            };
+        let control = match cancellable(
+            cancel,
+            signal.start_control(controller_device_id, profile, connect_type, preferences),
+        )
+        .await
+        {
+            Ok(control) => control,
+            Err(error) => {
+                let _ = signal.close().await;
+                return Err(error).context("complete controller handshake");
+            }
+        };
         report_progress(
             reporter,
             5,
@@ -633,6 +800,9 @@ impl ControllerConnection {
                 return Err(error).context("create native WebRTC peer");
             }
         };
+        peer.stream_control_handle().set_feature_policy(features);
+        peer.stream_control_handle()
+            .set_display_connection_type(connect_type);
         if let Some(preferences) = preferences
             && let Err(error) = peer
                 .stream_control_handle()
@@ -858,6 +1028,7 @@ impl ControllerConnection {
         })
         .await?;
         viewer.attach_screen_playback(&self.peer, profile, alias, track_index);
+
         report_progress(
             reporter,
             11,
@@ -917,6 +1088,7 @@ impl ControllerConnection {
             requested_keyframe: true,
             player: "原生窗口",
         };
+
         Ok((viewer, summary))
     }
 
@@ -975,7 +1147,6 @@ pub async fn run_native_viewer_session(
     connection: ControllerConnection,
     viewer: NativeViewerSession,
 ) -> Result<()> {
-    crate::ui::ensure_supported()?;
     let close_handle = viewer.close_handle();
     let close_on_session_end = close_handle.clone();
     let close_on_interrupt = close_handle;
@@ -1073,6 +1244,10 @@ async fn resolve_connection_with_client(
         [device] => *device,
         _ => bail!("more than one device has the alias `{alias}`; rename one before connecting"),
     };
+    let background = crate::wallpaper::Source::new(&device.device_id, &device.wallpaper_url);
+    if let Some(reporter) = reporter {
+        reporter(ConnectionProgress::background(background.clone()));
+    }
     if !matches!(device.platform, 1 | 4) {
         bail!("this device type is for account management only");
     }
@@ -1131,5 +1306,8 @@ async fn resolve_connection_with_client(
         preferences: None,
         audio_preferences: None,
         target_platform: device.platform,
+        target_version: device.version_name.clone(),
+        refresh_after_upgrade: false,
+        background: Some(background),
     })
 }

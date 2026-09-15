@@ -1,8 +1,8 @@
 //! Cross-platform persistence for the login session and virtual device.
 //!
 //! Both records are kept in the operating system credential service. There is
-//! deliberately no plaintext fallback: Windows uses Credential Manager, macOS
-//! uses Keychain, and Linux uses Secret Service through the `keyring` crate.
+//! deliberately no plaintext fallback: credentials use Windows Credential Manager
+//! through the `keyring` crate.
 
 use std::fmt;
 
@@ -464,33 +464,15 @@ fn session_store_lock() -> Result<std::fs::File> {
 }
 
 fn credential_store_lock(filename: &str) -> Result<std::fs::File> {
-    #[cfg(windows)]
     let base = std::env::var_os("LOCALAPPDATA")
         .map(std::path::PathBuf::from)
         .context("LOCALAPPDATA is required for session-store coordination")?;
-    #[cfg(not(windows))]
-    let base = {
-        let home = std::env::var_os("HOME")
-            .map(std::path::PathBuf::from)
-            .context("HOME is required for session-store coordination")?;
-        #[cfg(target_os = "macos")]
-        let base = home.join("Library/Application Support");
-        #[cfg(not(target_os = "macos"))]
-        let base = std::env::var_os("XDG_STATE_HOME")
-            .map(std::path::PathBuf::from)
-            .filter(|path| path.is_absolute())
-            .unwrap_or_else(|| home.join(".local/state"));
-        base
-    };
+
     let directory = base.join("openuuyc");
     std::fs::create_dir_all(&directory).context("create session coordination directory")?;
     let mut options = std::fs::OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
+
     let lock = options
         .open(directory.join(filename))
         .context("open session coordination lock")?;

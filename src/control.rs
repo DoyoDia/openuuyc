@@ -15,8 +15,7 @@ use crate::{
 };
 
 // Streamer decoder implementation identifiers observed in the official client:
-// 32 DXVA11, 33 NvDec, 34 VideoToolbox, 35 AsyncMediaCodec,
-// 36 SyncMediaCodec, 37 Software.  The adapter identifier is part of the
+// Local implementations emit 32 (DXVA11) or 37 (software).  The adapter identifier is part of the
 // capability contract and can affect the encoder's selected frame-rate/format;
 // it must describe the local native adapter instead of being forced to 37.
 
@@ -26,11 +25,20 @@ pub(crate) struct ControlFrames {
     pub app_control_id: String,
 }
 
+#[derive(Clone, Copy, Debug)]
+#[repr(u64)]
+pub(crate) enum ControlConnectType {
+    Normal = 1,
+    Assistance = 2,
+}
+
 pub(crate) fn build_control_frames(
     controller_device_id: &str,
     ack_id: u64,
     decoder_support: &DeviceCapability,
     profile: ConnectionMediaProfile,
+    connect_type: ControlConnectType,
+    preferences: Option<crate::stream_control::StreamControlPreferences>,
 ) -> Result<ControlFrames> {
     build_control_frames_with_id(
         controller_device_id,
@@ -38,6 +46,8 @@ pub(crate) fn build_control_frames(
         &Uuid::new_v4().to_string(),
         decoder_support,
         profile,
+        connect_type,
+        preferences,
     )
 }
 
@@ -47,6 +57,8 @@ fn build_control_frames_with_id(
     app_control_id: &str,
     decoder_support: &DeviceCapability,
     profile: ConnectionMediaProfile,
+    connect_type: ControlConnectType,
+    preferences: Option<crate::stream_control::StreamControlPreferences>,
 ) -> Result<ControlFrames> {
     if controller_device_id.len() != 16
         || !controller_device_id
@@ -75,7 +87,13 @@ fn build_control_frames_with_id(
 
     Ok(ControlFrames {
         header: format!("451-{ack_id}{}", serde_json::to_string(&event)?),
-        attachment: encode_connect_options(controller_device_id, selected_capabilities, profile),
+        attachment: encode_connect_options(
+            controller_device_id,
+            selected_capabilities,
+            profile,
+            connect_type,
+            preferences,
+        )?,
         app_control_id: app_control_id.to_owned(),
     })
 }
@@ -84,7 +102,9 @@ fn encode_connect_options(
     controller_device_id: &str,
     selected_capabilities: &[CodecCapability],
     profile: ConnectionMediaProfile,
-) -> Vec<u8> {
+    connect_type: ControlConnectType,
+    preferences: Option<crate::stream_control::StreamControlPreferences>,
+) -> Result<Vec<u8>> {
     let mut capture = Vec::new();
     let fps_level = match profile.stream_fps {
         30 => 1,
@@ -93,7 +113,16 @@ fn encode_connect_options(
         _ => 4,
     };
     push_varint_field(&mut capture, 1, fps_level);
-    push_varint_field(&mut capture, 2, 5); // VIDEO_QUALITY_AUTO
+    // Preserve the confirmed quality in the initial request and room rebuild.
+    // Do not request Auto first and correct it only after receiving video.
+    let (quality, auto_quality, bitrate) = preferences
+        .map(|p| p.initial_capture_quality())
+        .transpose()?
+        .unwrap_or((5, 2, 0));
+    push_varint_field(&mut capture, 2, quality);
+    // The initial handshake leaves cursor_capture (tag 3) false. Once PB
+    // and screen state are ready, StreamControl sends the viewing policy
+    // with cursor capture enabled. See docs/official-440-controller-route.md.
     push_varint_field(&mut capture, 4, 3); // follow remote resolution
     // This is the controller's physical display size, not a request to resize
     // the controlled display. GameViewerServer::DisplayLayout::tryOpen falls
@@ -112,8 +141,26 @@ fn encode_connect_options(
         u64::from(profile.local_display.height),
     );
     push_bytes_field(&mut capture, 5, &local_resolution);
-    push_varint_field(&mut capture, 7, 1); // YUV 4:2:0
-    push_varint_field(&mut capture, 10, 4); // automatic frame quality: Blu-ray
+    push_varint_field(
+        &mut capture,
+        7,
+        if preferences.is_some_and(|p| p.settings.true_color) {
+            3
+        } else {
+            1
+        },
+    );
+    if bitrate != 0 {
+        push_varint_field(&mut capture, 8, bitrate);
+    }
+    if preferences.is_some_and(|p| p.settings.hdr)
+        && selected_capabilities
+            .iter()
+            .any(|cap| cap.bit_depth >= 10 && cap.width > 0 && cap.height > 0)
+    {
+        push_varint_field(&mut capture, 9, 1);
+    }
+    push_varint_field(&mut capture, 10, auto_quality);
     push_varint_field(
         &mut capture,
         11,
@@ -154,14 +201,16 @@ fn encode_connect_options(
     // target's own ID here selects the wrong state and can reapply a stale
     // physical monitor mode during session initialization.
     push_bytes_field(&mut options, 9, controller_device_id.as_bytes());
-    push_varint_field(&mut options, 10, 1); // normal control
+    // The actual connection source determines the host session semantics;
+    // Assistance also gates host-side display changes.
+    push_varint_field(&mut options, 10, connect_type as u64);
     // Keep initial ConnectOptions and both ECHO directions identical. Feature
     // levels are not harmless placeholders: the host reads private_screen
     // during display initialization, before the later ECHO replacement.
     let feature_flag = crate::stream_control::encode_read_only_feature_flags();
     push_bytes_field(&mut options, 11, &feature_flag);
     push_bytes_field(&mut options, 12, PROTOCOL_VERSION.as_bytes());
-    options
+    Ok(options)
 }
 
 fn push_signed_int32_field(output: &mut Vec<u8>, number: u32, value: i32) {

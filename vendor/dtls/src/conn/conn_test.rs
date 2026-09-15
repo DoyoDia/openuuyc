@@ -436,6 +436,7 @@ async fn test_export_keying_material() -> Result<()> {
         flights: None,
         cfg: HandshakeConfig::default(),
         retransmit: false,
+        current_retransmit_interval: INITIAL_TICKER_INTERVAL,
         handshake_rx,
 
         packet_tx: Arc::new(packet_tx),

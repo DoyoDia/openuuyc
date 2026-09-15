@@ -163,7 +163,6 @@ struct PerformanceInner {
     tracks: RwLock<std::collections::BTreeMap<u64, std::sync::Weak<PerformanceInner>>>,
     started_at: Instant,
     received_bytes: AtomicU64,
-    encoded_video_bytes: AtomicU64,
     primary_media_packets_received: AtomicU64,
     final_lost_packets: AtomicU64,
     rtp_jitter_micros: AtomicU64,
@@ -564,7 +563,6 @@ impl PerformanceMonitor {
                 tracks: RwLock::new(std::collections::BTreeMap::new()),
                 started_at: now,
                 received_bytes: AtomicU64::new(0),
-                encoded_video_bytes: AtomicU64::new(0),
                 primary_media_packets_received: AtomicU64::new(0),
                 final_lost_packets: AtomicU64::new(0),
                 rtp_jitter_micros: AtomicU64::new(0),
@@ -775,7 +773,6 @@ impl PerformanceMonitor {
 
     pub(crate) fn record_received_frame(
         &self,
-        encoded_bytes: usize,
         assembly_delay: Duration,
         rtp_timestamp: u32,
         assembled_at: Instant,
@@ -783,9 +780,6 @@ impl PerformanceMonitor {
         sending_delay_ms: Option<u16>,
     ) {
         self.inner.received_frames.fetch_add(1, Ordering::Relaxed);
-        self.inner
-            .encoded_video_bytes
-            .fetch_add(encoded_bytes as u64, Ordering::Relaxed);
         self.inner
             .assembly_delay_micros
             .store(duration_micros(assembly_delay), Ordering::Relaxed);
@@ -1217,6 +1211,11 @@ impl PerformanceMonitor {
         }
     }
 
+    /// Local UI identity; never sent on the wire or persisted.
+    pub(crate) fn history_identity(&self) -> usize {
+        Arc::as_ptr(&self.inner) as usize
+    }
+
     pub fn snapshot(&self) -> Arc<PerformanceSnapshot> {
         if self.session.is_none() {
             let selected = read_lock(&self.inner.remote_senders).active_track;
@@ -1242,51 +1241,6 @@ impl PerformanceMonitor {
         let snapshot = Arc::new(self.build_snapshot());
         *mutex_lock(&self.inner.snapshot_cache) = Some((now, Arc::clone(&snapshot)));
         snapshot
-    }
-
-    /// Budget policy reads existing counters once/second, without sorting GUI
-    /// histories or adding any packet queue. Encoded bytes are counted per AU.
-    pub(crate) fn budget_sample(
-        &self,
-        rtt: Option<Duration>,
-    ) -> crate::adaptive_bitrate::BudgetSample {
-        if self.session.is_none() {
-            let selected = read_lock(&self.inner.remote_senders).active_track;
-            let inner = selected.and_then(|index| {
-                read_lock(&self.inner.tracks)
-                    .get(&index)
-                    .and_then(std::sync::Weak::upgrade)
-            });
-            if let Some(inner) = inner {
-                // The existing opt-in policy observes one video stream. Do not
-                // compare summed multi-screen traffic to a per-stream setting.
-                return Self {
-                    inner,
-                    session: Some(Arc::clone(&self.inner)),
-                }
-                .budget_sample(rtt);
-            }
-        }
-        let read = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
-        crate::adaptive_bitrate::BudgetSample {
-            at: Instant::now(),
-            received_bytes: read(&self.inner.received_bytes),
-            encoded_bytes: read(&self.inner.encoded_video_bytes),
-            primary_packets: read(&self.inner.primary_media_packets_received),
-            repaired_packets: read(&self.inner.rtx_packets_received)
-                .saturating_add(read(&self.inner.fec_packets_recovered)),
-            frames: read(&self.inner.received_frames),
-            pending_nacks: read(&self.inner.outstanding_nacks),
-            rtt_ms: rtt.map(|v| v.as_secs_f64() * 1000.0),
-            local_delay_ms: read(&self.inner.local_frame_delay_micros) as f64 / 1000.0,
-            decoder_delay_ms: (read(&self.inner.decode_pipeline_delay_micros)
-                + read(&self.inner.input_queue_delay_micros)) as f64
-                / 1000.0,
-            geometry: (
-                self.inner.decoded_width.load(Ordering::Relaxed),
-                self.inner.decoded_height.load(Ordering::Relaxed),
-            ),
-        }
     }
 
     pub(crate) fn streamer_period_totals(&self) -> (u64, u64) {

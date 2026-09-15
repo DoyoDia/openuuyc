@@ -148,6 +148,8 @@ struct State {
     // Keep keys retired at an ownership boundary for session reconciliation.
     release_checkpoint: BTreeSet<u16>,
     keyboard_generation: u64,
+    activation_generation: u64,
+    waiting_for_neutral: bool,
     keyboard_platform: i32,
     queue: VecDeque<InputEvent>,
     in_flight: bool,
@@ -173,6 +175,34 @@ impl RemoteInput {
 
     pub fn keyboard_generation(&self) -> u64 {
         self.lock().keyboard_generation
+    }
+
+    pub fn activation_generation(&self) -> u64 {
+        self.lock().activation_generation
+    }
+
+    pub fn same_session(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.state, &other.state)
+    }
+
+    pub fn waiting_for_neutral(&self) -> bool {
+        self.lock().waiting_for_neutral
+    }
+
+    /// A native input adapter confirms that both keyboard and mouse are up.
+    /// A delayed callback from another activation cannot reopen input.
+    pub fn confirm_neutral(&self, generation: u64) {
+        let mut s = self.lock();
+        if s.activation_generation == generation
+            && s.waiting_for_neutral
+            && s.mode != MouseMode::View
+            && s.ready
+            && !s.stopping
+        {
+            s.waiting_for_neutral = false;
+            drop(s);
+            self.repaint();
+        }
     }
 
     pub fn keyboard_supported(&self) -> bool {
@@ -289,6 +319,7 @@ impl RemoteInput {
         if !ready {
             Self::advance_epoch(&mut s);
             s.mode = MouseMode::View;
+            s.waiting_for_neutral = false;
             s.owner = None;
             s.held = [false; 5];
             s.keys.clear();
@@ -317,8 +348,18 @@ impl RemoteInput {
         if !s.ready || s.stopping {
             bail!("控制连接尚未就绪");
         }
+        if s.mode == mode {
+            s.relative = relative;
+            return Ok(());
+        }
+        let entering_control = s.mode == MouseMode::View && mode != MouseMode::View;
+        let waiting = s.waiting_for_neutral;
         Self::release_locked(&mut s);
         s.mode = mode;
+        if entering_control {
+            s.activation_generation = s.activation_generation.wrapping_add(1);
+        }
+        s.waiting_for_neutral = mode != MouseMode::View && (entering_control || waiting);
         s.relative = relative;
         s.error = None;
         s.recovering = false;
@@ -383,6 +424,15 @@ impl RemoteInput {
         self.wake.notify_one();
     }
 
+    /// Retire input belonging to a display layout that is being replaced.
+    pub(crate) fn pause_layout(&self) {
+        let mut s = self.lock();
+        Self::release_locked(&mut s);
+        drop(s);
+        self.wake.notify_one();
+        self.repaint();
+    }
+
     /// Reconcile release-only state across an OS input-desktop transition.
     /// This also covers Focused(false) retiring keys before WTS_SESSION_LOCK.
     /// Never replay a press or restore a stale Caps/Num/Scroll lock preference.
@@ -406,6 +456,7 @@ impl RemoteInput {
     pub fn disable(&self) {
         let mut s = self.lock();
         s.mode = MouseMode::View;
+        s.waiting_for_neutral = false;
         Self::release_locked(&mut s);
         if !s.ready {
             s.queue.clear();
@@ -422,7 +473,7 @@ impl RemoteInput {
     }
 
     fn claim(s: &mut State, owner: u64) -> bool {
-        if !s.ready || s.stopping || s.mode == MouseMode::View {
+        if !s.ready || s.stopping || s.mode == MouseMode::View || s.waiting_for_neutral {
             return false;
         }
         if s.owner != Some(owner) {
@@ -904,6 +955,9 @@ impl RemoteInput {
     pub async fn close(&self) {
         {
             let mut s = self.lock();
+            if s.stopping && !s.ready {
+                return;
+            }
             s.stopping = true;
             s.mode = MouseMode::View;
             Self::release_locked(&mut s);

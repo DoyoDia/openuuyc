@@ -35,10 +35,9 @@ impl Watcher {
                         if previous != Some(stamp) {
                             let result = (|| -> Result<(String, Compiled)> {
                                 ensure!(metadata.len() <= 1024 * 1024, "节点图文件过大");
-                                let mut publication: Publication =
+                                let publication: Publication =
                                     serde_json::from_slice(&std::fs::read(&source)?)?;
                                 ensure!(publication.document.graph_id == id, "节点图身份不匹配");
-                                publication.document.migrate_shortcuts()?;
                                 let catalog = Catalog::load()?;
                                 let plan =
                                     compile(&publication.document, &catalog).map_err(|d| {

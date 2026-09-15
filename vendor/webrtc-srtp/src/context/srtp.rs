@@ -10,12 +10,20 @@ impl Context {
         encrypted: &[u8],
         header: &rtp::header::Header,
     ) -> Result<Bytes> {
-        let auth_tag_len = self.cipher.rtp_auth_tag_len();
+        let auth_tag_len = self.cipher.rtp_auth_tag_len() + self.cipher.aead_auth_tag_len();
         if encrypted.len() < header.marshal_size() + auth_tag_len {
             return Err(Error::ErrTooShortRtp);
         }
 
-        let state = self.get_srtp_ssrc_state(header.ssrc);
+        let mut provisional = None;
+        let state = match self.srtp_ssrc_states.get_mut(&header.ssrc) {
+            Some(state) => state,
+            None => provisional.insert(SrtpSsrcState {
+                ssrc: header.ssrc,
+                replay_detector: Some((self.new_srtp_replay_detector)()),
+                ..Default::default()
+            }),
+        };
         let (roc, diff, _) = state.next_rollover_count(header.sequence_number);
         if let Some(replay_detector) = &mut state.replay_detector {
             if !replay_detector.check(header.sequence_number as u64) {
@@ -27,12 +35,12 @@ impl Context {
         }
 
         let dst = self.cipher.decrypt_rtp(encrypted, header, roc)?;
-        {
-            let state = self.get_srtp_ssrc_state(header.ssrc);
-            if let Some(replay_detector) = &mut state.replay_detector {
-                replay_detector.accept();
-            }
-            state.update_rollover_count(header.sequence_number, diff);
+        if let Some(replay_detector) = &mut state.replay_detector {
+            replay_detector.accept();
+        }
+        state.update_rollover_count(header.sequence_number, diff);
+        if let Some(state) = provisional {
+            self.srtp_ssrc_states.insert(header.ssrc, state);
         }
 
         Ok(dst)

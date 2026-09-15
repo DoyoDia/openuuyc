@@ -15,6 +15,7 @@ mod watch;
 
 pub(crate) use chain::Controller;
 pub(crate) use manager::Manager;
+pub(crate) use parameters::capturing as capturing_shortcut;
 pub(crate) use process::{Sample, Shared};
 pub(crate) use ui::paint_plugin_icon;
 pub(crate) use video::{ChainShared, Graph, Tap};
