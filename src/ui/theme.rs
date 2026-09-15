@@ -28,6 +28,9 @@ pub const BODY: f32 = 14.0;
 pub const COMPACT_TEXT: f32 = 13.0;
 pub const SMALL: f32 = 12.0;
 pub const TINY: f32 = 11.0;
+pub const ICON_STROKE: f32 = 1.35;
+pub const VIEWER_CAPTION_BUTTON: f32 = 30.0;
+pub const SESSION_STATUS_WIDTH: f32 = 280.0;
 pub const MICRO: f32 = 10.0;
 pub const SECTION: f32 = 16.0;
 pub const DIALOG_TITLE: f32 = 21.0;
@@ -130,12 +133,35 @@ pub mod graph {
     pub const PORT_ACTIVATION: Color32 = Color32::from_rgb(240, 210, 110);
 }
 pub const ANNOTATION_BUTTON: f32 = 30.0;
+pub const ANNOTATION_PANEL_MARGIN: i8 = 8;
+pub const ANNOTATION_HEADER_HEIGHT: f32 = 22.0;
+pub const ANNOTATION_ROW_GAP: f32 = 6.0;
+pub const ANNOTATION_CLEAR_WIDTH: f32 = 360.0;
 pub const ANNOTATION_WIDTH: f32 = 300.0;
 pub const ANNOTATION_TOOL_SIZE: f32 = 32.0;
 pub const ANNOTATION_TOOL_GAP: f32 = 4.0;
 pub const ANNOTATION_PICKER_WIDTH: f32 = 256.0;
+pub const ANNOTATION_COLOR_WIDTH: f32 = 100.0;
+pub const ANNOTATION_SIZE_WIDTH: f32 = 96.0;
+pub const ANNOTATION_BOARD_PICKER_WIDTH: f32 = 220.0;
+pub const ANNOTATION_BOARD_SWATCH: egui::Vec2 = egui::vec2(68.0, 54.0);
+pub const ANNOTATION_BRAND_TILE: [u8; 3] = [16, 20, 26];
+pub const ANNOTATION_BRAND_PADDING: f32 = 24.0;
+pub const ANNOTATION_BRAND_LOGO_SIZE: f32 = 56.0;
+pub const ANNOTATION_BRAND_TITLE_SIZE: f32 = 26.0;
+pub const ANNOTATION_BRAND_INFO_SIZE: f32 = 13.0;
+pub const ANNOTATION_BRAND_GAP: f32 = 16.0;
+pub const ANNOTATION_BRAND_BLUE: [u8; 3] = [67, 145, 255];
+pub const ANNOTATION_BRAND_WHITE: [u8; 3] = [231, 235, 242];
+pub const ANNOTATION_BRAND_ON_LIGHT: [[u8; 3]; 2] = [[45, 58, 76], [104, 119, 137]];
+pub const ANNOTATION_BRAND_ON_DARK: [[u8; 3]; 2] = [[223, 231, 241], [153, 174, 191]];
 pub const ANNOTATION_COLOR_PLANE_HEIGHT: f32 = 148.0;
 pub const ANNOTATION_COLOR_BAR_HEIGHT: f32 = 14.0;
+pub const ANNOTATION_BOARD_COLORS: [(&str, [u8; 3]); 3] = [
+    ("白色", [255, 255, 255]),
+    ("深色", [24, 28, 32]),
+    ("绿色", [20, 74, 58]),
+];
 pub const ANNOTATION_COLORS: [[u8; 3]; 6] = [
     [255, 68, 68],
     [255, 190, 64],

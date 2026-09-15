@@ -1008,25 +1008,37 @@ impl DeviceCenterApp {
             return;
         };
         let alias = session.alias.clone();
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(if self.closing_session {
-                    format!("正在关闭  {alias}")
-                } else {
-                    format!("观看窗口已打开  ·  {alias}")
-                })
-                .color(TEXT),
-            );
-            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                if ui
-                    .add_enabled(!self.closing_session, egui::Button::new("结束观看"))
-                    .clicked()
-                {
-                    self.stop_viewer();
-                }
-            });
-        });
-        ui.add_space(10.0);
+        // Inline in the existing right-aligned header; never add a session row
+        // above the device list or assistance form.
+        if ui
+            .add_enabled(
+                !self.closing_session,
+                crate::ui::controls::secondary("结束观看"),
+            )
+            .clicked()
+        {
+            self.stop_viewer();
+        }
+        let text = if self.closing_session {
+            format!("正在关闭  {alias}")
+        } else {
+            format!("观看窗口已打开  ·  {alias}")
+        };
+        ui.add_sized(
+            [
+                ui.available_width()
+                    .min(crate::ui::theme::SESSION_STATUS_WIDTH)
+                    .max(0.),
+                crate::ui::theme::CONTROL_HEIGHT,
+            ],
+            egui::Label::new(
+                RichText::new(&text)
+                    .size(crate::ui::theme::SMALL)
+                    .color(MUTED),
+            )
+            .truncate(),
+        )
+        .on_hover_text(text);
     }
 
     fn empty_state(&mut self, ui: &mut egui::Ui, title: &str, detail: &str) {

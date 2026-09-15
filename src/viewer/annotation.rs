@@ -1,6 +1,6 @@
 use crate::stream_control::{
     StreamControlHandle,
-    annotation::{Point, Stroke as InkStroke, Style},
+    annotation::{LaserOptions, Point, Stroke as InkStroke, Style},
 };
 use crate::ui::{controls, theme};
 use controls::AnnotationIcon as Tool;
@@ -24,6 +24,8 @@ pub(super) struct AnnotationUi {
     opacity: u8,
     width: f32,
     laser_width: f32,
+    laser_options: LaserOptions,
+    board_color: [u8; 3],
     pointer_size: f32,
     gesture: Option<Gesture>,
     generation: u64,
@@ -44,7 +46,9 @@ impl AnnotationUi {
             rgb: [255, 68, 68],
             opacity: 100,
             width: 3.,
-            laser_width: 8.,
+            laser_width: 5.,
+            laser_options: LaserOptions::default(),
+            board_color: theme::ANNOTATION_BOARD_COLORS[0].1,
             pointer_size: theme::POINTER_DEFAULT_SIZE,
             gesture: None,
             generation: 0,
@@ -52,7 +56,10 @@ impl AnnotationUi {
             clear_confirm: false,
             panel_position: None,
             panel_drag: None,
-            panel_size: vec2(theme::ANNOTATION_WIDTH + 24., 142.),
+            panel_size: vec2(
+                theme::ANNOTATION_WIDTH + 2. * theme::ANNOTATION_PANEL_MARGIN as f32,
+                124.,
+            ),
         }
     }
     pub fn bind(&mut self, control: StreamControlHandle) {
@@ -67,15 +74,15 @@ impl AnnotationUi {
     }
     pub fn toggle(&mut self) {
         self.finish();
-        self.open = true;
-        let enabled = self.control.annotation_snapshot().enabled;
-        self.error = self
-            .control
-            .annotation_toggle(!enabled)
-            .err()
-            .map(|e| e.to_string());
-        if enabled && self.error.is_none() {
-            self.open = false;
+        self.clear_confirm = false;
+        self.panel_drag = None;
+        self.open = !self.open;
+        if self.open && !self.control.annotation_snapshot().enabled {
+            self.error = self
+                .control
+                .annotation_toggle(true)
+                .err()
+                .map(|e| e.to_string());
         }
     }
     pub fn finish(&mut self) {
@@ -114,6 +121,7 @@ impl AnnotationUi {
     ) {
         let ctx = ui.ctx().clone();
         let snapshot = self.control.annotation_snapshot();
+        let board_color = self.control.annotation_board_color(screen);
         if snapshot.generation != self.generation {
             self.gesture = None;
             self.generation = snapshot.generation;
@@ -125,180 +133,210 @@ impl AnnotationUi {
         if snapshot.toggling || snapshot.busy {
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
         }
-        if !snapshot.enabled && !self.open {
+        if !self.open && !snapshot.enabled {
             return;
         }
+        let panel_was_open = self.open;
         let popup_was_open = ctx.any_popup_open();
         if !focused {
             self.panel_drag = None;
         }
-        let bounds = ui.available_rect_before_wrap().shrink(8.0);
-        let initial = pos2(
-            bounds.center().x - self.panel_size.x / 2.,
-            bounds.bottom() - self.panel_size.y - 10.,
-        );
-        let position = panel_position(
-            self.panel_position.unwrap_or(initial),
-            self.panel_size,
-            bounds,
-        );
-        let mut next_position = position;
-        let panel = egui::Area::new(egui::Id::new("annotation-tools"))
-            .order(egui::Order::Foreground)
-            .fixed_pos(position)
-            .movable(false)
-            .constrain_to(bounds)
-            .show(&ctx, |ui| {
-                controls::annotation_frame().show(ui, |ui| {
-                    ui.set_width(theme::ANNOTATION_WIDTH);
-                    let (drag, close, undo, redo) =
-                        controls::annotation_header(ui, snapshot.can_undo, snapshot.can_redo);
-                    for event in ctx.input(|i| i.events.clone()) {
-                        match event {
-                            egui::Event::PointerButton {
-                                pos,
-                                button: egui::PointerButton::Primary,
-                                pressed: true,
-                                ..
-                            } if focused
-                                && drag.rect.contains(pos)
-                                && ctx.layer_id_at(pos) == Some(drag.layer_id) =>
-                            {
-                                self.finish();
-                                self.panel_drag = Some((pos, position));
-                            }
-                            egui::Event::PointerMoved(pos) => {
-                                if let Some((start, origin)) = self.panel_drag {
-                                    next_position = origin + (pos - start);
-                                }
-                            }
-                            egui::Event::PointerButton {
-                                pos,
-                                button: egui::PointerButton::Primary,
-                                pressed: false,
-                                ..
-                            } => {
-                                if let Some((start, origin)) = self.panel_drag.take() {
-                                    next_position = origin + (pos - start);
-                                }
-                            }
-                            egui::Event::PointerGone => self.panel_drag = None,
-                            _ => {}
-                        }
-                    }
-                    if self.panel_drag.is_some() {
-                        ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
-                    }
-                    if close {
-                        self.finish();
-                        self.error = self
-                            .control
-                            .annotation_toggle(false)
-                            .err()
-                            .map(|e| e.to_string());
-                        self.open = self.error.is_some();
-                    }
-                    if undo {
-                        self.error = self.control.annotation_undo().err().map(|e| e.to_string());
-                    }
-                    if redo {
-                        self.error = self.control.annotation_redo().err().map(|e| e.to_string());
-                    }
-                    ui.add_space(8.);
-                    controls::annotation_tool_frame().show(ui, |ui| {
-                        ui.spacing_mut().item_spacing.x = theme::ANNOTATION_TOOL_GAP;
-                        ui.horizontal(|ui| {
-                            for (tool, name) in [
-                                (Tool::Pen, "画笔 · 右键整笔擦除"),
-                                (Tool::Laser, "激光笔 · 移动指示，停下自动消退"),
-                                (Tool::Pointer, "鼠标指示 · 左键蓝色、右键橙色点击反馈"),
-                                (Tool::Line, "直线 · Shift 水平/垂直/45°对齐"),
-                                (Tool::Arrow, "箭头 · Shift 水平/垂直/45°对齐"),
-                                (Tool::Rectangle, "矩形 · Shift 绘制正方形"),
-                                (Tool::Ellipse, "椭圆 · Shift 绘制正圆"),
-                                (Tool::Eraser, "整笔擦除"),
-                            ] {
-                                if controls::annotation_tool_button(
-                                    ui,
-                                    tool,
-                                    self.tool == tool,
-                                    name,
-                                )
-                                .clicked()
+        if self.open {
+            let bounds = ui.available_rect_before_wrap().shrink(8.0);
+            let initial = pos2(
+                bounds.center().x - self.panel_size.x / 2.,
+                bounds.bottom() - self.panel_size.y - 10.,
+            );
+            let position = panel_position(
+                self.panel_position.unwrap_or(initial),
+                self.panel_size,
+                bounds,
+            );
+            let mut next_position = position;
+            let panel = egui::Area::new(egui::Id::new("annotation-tools"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(position)
+                .movable(false)
+                .constrain_to(bounds)
+                .show(&ctx, |ui| {
+                    controls::annotation_frame().show(ui, |ui| {
+                        ui.set_width(theme::ANNOTATION_WIDTH);
+                        ui.spacing_mut().interact_size.y = theme::ANNOTATION_HEADER_HEIGHT;
+                        ui.spacing_mut().item_spacing.y = theme::ANNOTATION_ROW_GAP;
+                        let (drag, close, undo, redo, end) =
+                            controls::annotation_header(ui, snapshot.can_undo, snapshot.can_redo);
+                        for event in ctx.input(|i| i.events.clone()) {
+                            match event {
+                                egui::Event::PointerButton {
+                                    pos,
+                                    button: egui::PointerButton::Primary,
+                                    pressed: true,
+                                    ..
+                                } if focused
+                                    && drag.rect.contains(pos)
+                                    && ctx.layer_id_at(pos) == Some(drag.layer_id) =>
                                 {
                                     self.finish();
-                                    self.tool = tool;
+                                    self.panel_drag = Some((pos, position));
                                 }
+                                egui::Event::PointerMoved(pos) => {
+                                    if let Some((start, origin)) = self.panel_drag {
+                                        next_position = origin + (pos - start);
+                                    }
+                                }
+                                egui::Event::PointerButton {
+                                    pos,
+                                    button: egui::PointerButton::Primary,
+                                    pressed: false,
+                                    ..
+                                } => {
+                                    if let Some((start, origin)) = self.panel_drag.take() {
+                                        next_position = origin + (pos - start);
+                                    }
+                                }
+                                egui::Event::PointerGone => self.panel_drag = None,
+                                _ => {}
                             }
-                        });
-                    });
-                    ui.add_space(10.);
-                    ui.horizontal(|ui| {
-                        controls::annotation_color(ui, &mut self.rgb, &mut self.opacity);
-                        controls::annotation_width(
-                            ui,
-                            if self.tool == Tool::Pointer {
-                                &mut self.pointer_size
-                            } else if self.tool == Tool::Laser {
-                                &mut self.laser_width
-                            } else {
-                                &mut self.width
-                            },
-                            self.tool,
-                        );
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui
-                                .add_enabled_ui(snapshot.enabled && !snapshot.busy, |ui| {
-                                    controls::annotation_button(
-                                        ui,
-                                        Tool::Clear,
-                                        false,
-                                        "清空全部屏幕批注",
-                                    )
-                                })
-                                .inner
-                                .clicked()
-                            {
-                                self.clear_confirm = true;
-                            }
-                        });
-                    });
-                    if snapshot.toggling {
-                        ui.label(egui::RichText::new("正在切换批注…").color(theme::MUTED));
-                    }
-                    if let Some(error) = self.error.as_ref().or(snapshot.error.as_ref()) {
-                        ui.label(egui::RichText::new(error).color(theme::RED));
-                    }
-                });
-            });
-        self.panel_size = panel.response.rect.size();
-        self.panel_position = Some(panel_position(next_position, self.panel_size, bounds));
-        if next_position != position {
-            ctx.request_repaint();
-        }
-        if self.clear_confirm {
-            let modal =
-                egui::Modal::new(egui::Id::new("annotation-clear-confirm")).show(&ctx, |ui| {
-                    ui.set_width(300.);
-                    ui.heading("清空批注？");
-                    ui.label("将清除这次连接中全部屏幕的批注。");
-                    ui.horizontal(|ui| {
-                        if ui.button("取消").clicked() {
-                            self.clear_confirm = false;
                         }
-                        if ui
-                            .add(egui::Button::new("清空").fill(theme::SELECTED))
-                            .clicked()
-                        {
+                        if self.panel_drag.is_some() {
+                            ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+                        }
+                        if close {
+                            self.finish();
+                            self.open = false;
+                            self.clear_confirm = false;
+                            self.panel_drag = None;
+                        }
+                        if end {
+                            self.finish();
+                            self.error = self
+                                .control
+                                .annotation_toggle(false)
+                                .err()
+                                .map(|e| e.to_string());
+                            self.open = self.error.is_some();
+                        }
+                        if undo {
                             self.error =
-                                self.control.annotation_clear().err().map(|e| e.to_string());
-                            self.clear_confirm = false;
+                                self.control.annotation_undo().err().map(|e| e.to_string());
+                        }
+                        if redo {
+                            self.error =
+                                self.control.annotation_redo().err().map(|e| e.to_string());
+                        }
+                        controls::annotation_tool_frame().show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.x = theme::ANNOTATION_TOOL_GAP;
+                            ui.horizontal(|ui| {
+                                for (tool, name) in [
+                                    (Tool::Pen, "画笔 · 右键整笔擦除"),
+                                    (Tool::Laser, "激光笔 · 移动指示，停下自动消退"),
+                                    (Tool::Pointer, "鼠标指示 · 左键蓝色、右键橙色点击反馈"),
+                                    (Tool::Line, "直线 · Shift 水平/垂直/45°对齐"),
+                                    (Tool::Arrow, "箭头 · Shift 水平/垂直/45°对齐"),
+                                    (Tool::Rectangle, "矩形 · Shift 绘制正方形"),
+                                    (Tool::Ellipse, "椭圆 · Shift 绘制正圆"),
+                                    (Tool::Eraser, "整笔擦除"),
+                                ] {
+                                    if controls::annotation_tool_button(
+                                        ui,
+                                        tool,
+                                        self.tool == tool,
+                                        name,
+                                    )
+                                    .clicked()
+                                    {
+                                        self.finish();
+                                        self.tool = tool;
+                                    }
+                                }
+                            });
+                        });
+                        ui.horizontal(|ui| {
+                            controls::annotation_color(ui, &mut self.rgb, &mut self.opacity);
+                            controls::annotation_width(
+                                ui,
+                                if self.tool == Tool::Pointer {
+                                    &mut self.pointer_size
+                                } else if self.tool == Tool::Laser {
+                                    &mut self.laser_width
+                                } else {
+                                    &mut self.width
+                                },
+                                self.tool,
+                                (self.tool == Tool::Laser)
+                                    .then_some(&mut self.laser_options.tail_ms),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui
+                                        .add_enabled_ui(snapshot.enabled && !snapshot.busy, |ui| {
+                                            controls::annotation_button(
+                                                ui,
+                                                Tool::Clear,
+                                                false,
+                                                "清空全部屏幕批注",
+                                            )
+                                        })
+                                        .inner
+                                        .clicked()
+                                    {
+                                        self.clear_confirm = true;
+                                    }
+                                    let action = ui
+                                        .add_enabled_ui(
+                                            snapshot.enabled
+                                                && !snapshot.busy
+                                                && !snapshot.uncertain,
+                                            |ui| {
+                                                controls::annotation_board(
+                                                    ui,
+                                                    board_color,
+                                                    &mut self.board_color,
+                                                )
+                                            },
+                                        )
+                                        .inner;
+                                    if let Some(color) = action {
+                                        self.finish();
+                                        self.error = self
+                                            .control
+                                            .annotation_board(self.owner, screen, color)
+                                            .err()
+                                            .map(|e| e.to_string());
+                                    }
+                                },
+                            );
+                        });
+                        if snapshot.board_busy {
+                            ui.label(egui::RichText::new("正在更新白板…").color(theme::MUTED));
+                        }
+                        if snapshot.toggling {
+                            ui.label(egui::RichText::new("正在切换批注…").color(theme::MUTED));
+                        }
+                        if let Some(error) = self.error.as_ref().or(snapshot.error.as_ref()) {
+                            ui.label(egui::RichText::new(error).color(theme::RED));
                         }
                     });
                 });
-            if modal.should_close() {
-                self.clear_confirm = false;
+            self.panel_size = panel.response.rect.size();
+            self.panel_position = Some(panel_position(next_position, self.panel_size, bounds));
+            if next_position != position {
+                ctx.request_repaint();
             }
+        }
+        // The click that hides or ends the panel must not also reach the canvas.
+        // On following frames visibility does not gate the active drawing tool.
+        if panel_was_open && !self.open {
+            return;
+        }
+        if self.clear_confirm
+            && let Some(clear) = controls::annotation_clear_dialog(&ctx, snapshot.uncertain)
+        {
+            if clear {
+                self.error = self.control.annotation_clear().err().map(|e| e.to_string());
+            }
+            self.clear_confirm = false;
         }
         let input_blocked = popup_was_open
             || self.panel_drag.is_some()
@@ -307,7 +345,12 @@ impl AnnotationUi {
             || self.clear_confirm
             || ctx.any_popup_open()
             || ctx.text_edit_focused();
-        if input_blocked || !snapshot.enabled || snapshot.toggling || snapshot.uncertain {
+        if input_blocked
+            || !snapshot.enabled
+            || snapshot.toggling
+            || snapshot.uncertain
+            || snapshot.board_busy
+        {
             self.finish();
             return;
         }
@@ -541,6 +584,7 @@ impl AnnotationUi {
                 screen,
                 normalize(rect, pos),
                 self.style(),
+                self.laser_options,
             )
         };
         self.error = result.err().map(|e| e.to_string());

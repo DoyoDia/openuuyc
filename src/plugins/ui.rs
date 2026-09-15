@@ -230,7 +230,7 @@ impl AnalysisController {
 }
 pub(crate) fn paint_plugin_icon(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
     let center = rect.center();
-    let stroke = egui::Stroke::new(1.4, color);
+    let stroke = egui::Stroke::new(crate::ui::theme::ICON_STROKE, color);
     painter.rect_stroke(
         egui::Rect::from_center_size(center + egui::vec2(0.0, -1.0), egui::vec2(12.0, 9.0)),
         2.5,

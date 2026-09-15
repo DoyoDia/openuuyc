@@ -1,3 +1,6 @@
+use crate::ui::controls::{
+    ViewerCaptionIcon as TitleIcon, viewer_caption_button as title_icon_button,
+};
 use crate::ui::d3d11::{create_backbuffer, nonzero_size, window_hwnd};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -917,14 +920,7 @@ fn player_title_bar(ui: &mut egui::Ui, mut bar: PlayerTitleBar<'_>) -> PlayerChr
                     || annotation.supported
                     || bar.stream_control.snapshot().ready
                         && bar.stream_control.remote_upgrade().is_some()),
-            |ui| {
-                crate::ui::controls::annotation_button(
-                    ui,
-                    crate::ui::controls::AnnotationIcon::Pen,
-                    annotation.enabled,
-                    "批注",
-                )
-            },
+            |ui| title_icon_button(ui, TitleIcon::Annotation, annotation.enabled, "批注"),
         )
         .inner
         .on_disabled_hover_text("当前设备暂不支持批注，或仍在连接中")
@@ -997,148 +993,6 @@ struct PlayerChromeAction {
     toggle_mouse: bool,
     toggle_annotation: bool,
     drag_window: bool,
-}
-
-#[derive(Clone, Copy)]
-enum TitleIcon {
-    Plugins,
-    OneToOne,
-    Mouse,
-    Quality,
-    Minimize,
-    Maximize,
-    Restore,
-    Close,
-}
-
-fn title_icon_button(
-    ui: &mut egui::Ui,
-    icon: TitleIcon,
-    selected: bool,
-    tooltip: &str,
-) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::click());
-    let fill = if matches!(icon, TitleIcon::Close) && response.hovered() {
-        crate::ui::theme::DANGER_FILL
-    } else if selected {
-        crate::ui::theme::SELECTED
-    } else if response.hovered() {
-        egui::Color32::from_white_alpha(18)
-    } else {
-        egui::Color32::TRANSPARENT
-    };
-    ui.painter().rect_filled(rect, 6.0, fill);
-    let color = if selected {
-        crate::ui::theme::ACCENT
-    } else if response.hovered() {
-        egui::Color32::WHITE
-    } else {
-        crate::ui::theme::MUTED
-    };
-    paint_title_icon(ui.painter(), rect, icon, color);
-    response.on_hover_text(tooltip)
-}
-
-fn paint_title_icon(
-    painter: &egui::Painter,
-    rect: egui::Rect,
-    icon: TitleIcon,
-    color: egui::Color32,
-) {
-    let center = rect.center();
-    let stroke = egui::Stroke::new(1.35, color);
-    match icon {
-        TitleIcon::Plugins => crate::plugins::paint_plugin_icon(painter, rect, color),
-        TitleIcon::OneToOne => {
-            for (x, y) in [(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
-                let corner = center + egui::vec2(x * 7.0, y * 6.0);
-                painter.line(
-                    vec![
-                        corner - egui::vec2(x * 4.0, 0.0),
-                        corner,
-                        corner - egui::vec2(0.0, y * 4.0),
-                    ],
-                    stroke,
-                );
-            }
-            painter.rect_stroke(
-                egui::Rect::from_center_size(center, egui::vec2(3.0, 3.0)),
-                0.0,
-                stroke,
-                egui::StrokeKind::Inside,
-            );
-        }
-        TitleIcon::Mouse => {
-            let body = egui::Rect::from_center_size(center, egui::vec2(11.0, 16.0));
-            painter.rect_stroke(body, 5.0, stroke, egui::StrokeKind::Inside);
-            painter.line_segment(
-                [
-                    center + egui::vec2(0.0, -6.0),
-                    center + egui::vec2(0.0, -2.0),
-                ],
-                stroke,
-            );
-            painter.line_segment(
-                [
-                    center + egui::vec2(-4.5, -1.0),
-                    center + egui::vec2(4.5, -1.0),
-                ],
-                stroke,
-            );
-        }
-        TitleIcon::Quality => {
-            for (offset, knob) in [(-5.0, -3.0), (0.0, 4.0), (5.0, -1.0)] {
-                painter.line_segment(
-                    [
-                        egui::pos2(center.x - 7.0, center.y + offset),
-                        egui::pos2(center.x + 7.0, center.y + offset),
-                    ],
-                    stroke,
-                );
-                painter.circle_filled(egui::pos2(center.x + knob, center.y + offset), 2.0, color);
-            }
-        }
-        TitleIcon::Minimize => {
-            painter.line_segment(
-                [
-                    egui::pos2(center.x - 6.0, center.y + 4.0),
-                    egui::pos2(center.x + 6.0, center.y + 4.0),
-                ],
-                stroke,
-            );
-        }
-        TitleIcon::Maximize => {
-            painter.rect_stroke(
-                egui::Rect::from_center_size(center, egui::vec2(11.0, 9.0)),
-                0.5,
-                stroke,
-                egui::StrokeKind::Inside,
-            );
-        }
-        TitleIcon::Restore => {
-            let back = egui::Rect::from_min_size(
-                egui::pos2(center.x - 4.0, center.y - 6.0),
-                egui::vec2(9.0, 8.0),
-            );
-            let front = back.translate(egui::vec2(-2.5, 2.5));
-            painter.rect_stroke(back, 0.5, stroke, egui::StrokeKind::Inside);
-            painter.rect_filled(front, 0.0, crate::ui::theme::SIDEBAR);
-            painter.rect_stroke(front, 0.5, stroke, egui::StrokeKind::Inside);
-        }
-        TitleIcon::Close => {
-            painter.line_segment(
-                [center - egui::vec2(5.0, 5.0), center + egui::vec2(5.0, 5.0)],
-                stroke,
-            );
-            painter.line_segment(
-                [
-                    center + egui::vec2(-5.0, 5.0),
-                    center + egui::vec2(5.0, -5.0),
-                ],
-                stroke,
-            );
-        }
-    }
 }
 
 fn paint_brand_logo(ui: &mut egui::Ui) {

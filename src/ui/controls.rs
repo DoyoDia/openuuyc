@@ -3,6 +3,7 @@ use super::theme::{self, HOVER, LINE, MUTED, SURFACE, TEXT};
 use egui::{Color32, RichText, Stroke, vec2};
 mod performance;
 mod updates;
+mod viewer_caption;
 pub(crate) use performance::{
     PerformanceTrace, metric_pair, performance_frame, performance_header, performance_trace,
 };
@@ -10,6 +11,7 @@ pub(crate) use updates::{
     UpdateIcon, update_actions, update_countdown, update_device_row, update_dialog_frame,
     update_dialog_header, update_prepared_notice,
 };
+pub(crate) use viewer_caption::{ViewerCaptionIcon, viewer_caption_button};
 
 pub const HEIGHT: f32 = theme::CONTROL_HEIGHT;
 pub const COMPACT_HEIGHT: f32 = theme::COMPACT_HEIGHT;
@@ -1032,6 +1034,7 @@ pub fn setting_row(
 mod annotation;
 mod annotation_color;
 pub(crate) use annotation::{
-    AnnotationIcon, annotation_button, annotation_color, annotation_frame, annotation_header,
-    annotation_tool_button, annotation_tool_frame, annotation_width,
+    AnnotationIcon, annotation_board, annotation_button, annotation_clear_dialog, annotation_color,
+    annotation_frame, annotation_header, annotation_tool_button, annotation_tool_frame,
+    annotation_width,
 };

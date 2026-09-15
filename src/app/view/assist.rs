@@ -14,6 +14,7 @@ impl DeviceCenterApp {
             }
         }
         ui.horizontal(|ui| {
+            ui.set_min_height(crate::ui::theme::CONTROL_HEIGHT);
             ui.label(
                 RichText::new(if favorites {
                     "收藏设备"
@@ -55,10 +56,10 @@ impl DeviceCenterApp {
                         code_changed: false,
                     });
                 }
+                self.active_view(ui);
             });
         });
         ui.add_space(18.0);
-        self.active_view(ui);
         let available = !self.assist.busy && !self.logout_pending && !self.mutation_pending;
         let mut connect = None;
         if !favorites {

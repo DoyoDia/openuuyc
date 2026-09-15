@@ -3,16 +3,32 @@ use super::*;
 use std::collections::{BTreeSet, HashMap};
 use std::time::Duration;
 
+mod board;
 mod clicks;
+mod laser;
+use board::{Board, BoardEdit};
 use clicks::ClickPulse;
+use laser::LaserTrail;
 
 const MAX_POINTS: usize = 32_768;
 const MAX_STROKES: usize = 256;
 const MAX_PENDING: usize = 512;
 const MAX_HISTORY: usize = 32;
-const LASER_LIFETIME: Duration = Duration::from_millis(650);
-const LASER_TAIL: Duration = Duration::from_millis(180);
-const LASER_MAX_POINTS: usize = 32;
+const BOARD_SLOT_IDS: u32 = 128;
+const BOARD_IDS: u32 = 256 * BOARD_SLOT_IDS;
+const LASER_FADE: Duration = Duration::from_millis(220);
+pub(crate) const LASER_TAIL_MIN: u16 = 40;
+pub(crate) const LASER_TAIL_MAX: u16 = 300;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LaserOptions {
+    pub tail_ms: u16,
+}
+impl Default for LaserOptions {
+    fn default() -> Self {
+        Self { tail_ms: 100 }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Point {
@@ -40,7 +56,7 @@ impl Default for Style {
         }
     }
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Stroke {
     pub id: u32,
     pub screen: i32,
@@ -63,6 +79,7 @@ struct Editing {
     edit: Edit,
     direction: Direction,
     remaining: usize,
+    clears_boards: bool,
 }
 struct Drawing {
     owner: u64,
@@ -74,13 +91,8 @@ struct Drawing {
 enum DrawingKind {
     Stroke,
     Shape,
-    Laser,
+    Laser(LaserOptions),
     Pointer,
-}
-struct LaserTrail {
-    samples: VecDeque<(Instant, Point)>,
-    last_move: Instant,
-    style: Style,
 }
 struct LiveShape {
     owner: u64,
@@ -99,6 +111,7 @@ enum Pending {
     Edit(u8),
     Shape(u8),
     Click(u32, u8),
+    Board(u8),
 }
 
 pub(super) struct Annotation {
@@ -115,6 +128,8 @@ pub(super) struct Annotation {
     undo: Vec<Edit>,
     redo: Vec<Edit>,
     editing: Option<Editing>,
+    boards: HashMap<i32, Board>,
+    board_edit: Option<BoardEdit>,
     uncertain: bool,
     error: Option<String>,
 }
@@ -123,7 +138,7 @@ impl Default for Annotation {
         Self {
             owners: BTreeSet::new(),
             generation: 0,
-            next_id: 1,
+            next_id: BOARD_IDS + 1,
             enabled: false,
             pending: HashMap::new(),
             drawing: None,
@@ -134,6 +149,8 @@ impl Default for Annotation {
             undo: Vec::new(),
             redo: Vec::new(),
             editing: None,
+            boards: HashMap::new(),
+            board_edit: None,
             uncertain: false,
             error: None,
         }
@@ -149,6 +166,8 @@ impl Annotation {
         self.clicks.clear();
         self.finishing.clear();
         self.editing = None;
+        self.boards.clear();
+        self.board_edit = None;
         self.strokes.clear();
         self.undo.clear();
         self.redo.clear();
@@ -235,6 +254,7 @@ impl Annotation {
         self.clicks.clear();
         self.finishing.clear();
         self.editing = None;
+        self.board_edit = None;
         self.undo.clear();
         self.redo.clear();
         self.uncertain = true;
@@ -263,9 +283,10 @@ impl Annotation {
         let matches = self.pending.get(&seq).is_some_and(|p| match p {
             Pending::Toggle(..) => kind == 3,
             Pending::Stroke(_) => kind == 1,
-            Pending::Edit(expected) | Pending::Shape(expected) | Pending::Click(_, expected) => {
-                kind == *expected
-            }
+            Pending::Edit(expected)
+            | Pending::Shape(expected)
+            | Pending::Click(_, expected)
+            | Pending::Board(expected) => kind == *expected,
         });
         if !matches {
             return;
@@ -290,6 +311,7 @@ impl Annotation {
             return;
         }
         match p {
+            Pending::Board(_) => board::complete(self),
             Pending::Stroke(_) => self.commit_drawing(),
             Pending::Shape(_) => self.finish_live_shape(),
             Pending::Click(..) => clicks::retire(self),
@@ -298,6 +320,9 @@ impl Annotation {
                     edit.remaining = edit.remaining.saturating_sub(1);
                     if edit.remaining == 0 {
                         let edit = self.editing.take().unwrap();
+                        if edit.clears_boards {
+                            self.boards.clear();
+                        }
                         self.apply_edit(&edit.edit, matches!(edit.direction, Direction::Undo));
                         match edit.direction {
                             Direction::Forward => self.push_history(edit.edit),
@@ -319,39 +344,6 @@ impl Annotation {
         }
     }
 }
-fn update_laser(annotation: &mut Annotation, now: Instant) {
-    let Some(shape) = &mut annotation.live_shape else {
-        return;
-    };
-    if shape.finish.is_some() {
-        return;
-    }
-    let Some(laser) = &mut shape.laser else {
-        return;
-    };
-    let age = now.saturating_duration_since(laser.last_move);
-    if age >= LASER_LIFETIME {
-        shape.finish = Some(false);
-        return;
-    }
-    while laser.samples.len() > 1 && now.saturating_duration_since(laser.samples[0].0) > LASER_TAIL
-    {
-        laser.samples.pop_front();
-    }
-    let points = laser.samples.iter().map(|(_, p)| *p).collect::<Vec<_>>();
-    let fade = (1.0 - age.as_secs_f32() / LASER_LIFETIME.as_secs_f32()).clamp(0.0, 1.0);
-    let fade = (fade * 16.0).ceil() / 16.0;
-    let alpha = (((laser.style.argb >> 24) as f32 * fade).round() as u32).max(1);
-    let style = Style {
-        argb: (laser.style.argb & 0x00ff_ffff) | (alpha << 24),
-        ..laser.style
-    };
-    if shape.stroke.points != points || shape.stroke.style != style {
-        shape.stroke.points = points;
-        shape.stroke.style = style;
-        shape.revision = shape.revision.wrapping_add(1);
-    }
-}
 fn error_text(code: i32) -> String {
     match code {
         2 => "被控端未登录，批注已关闭".into(),
@@ -365,6 +357,7 @@ pub(crate) struct Snapshot {
     pub enabled: bool,
     pub toggling: bool,
     pub busy: bool,
+    pub board_busy: bool,
     pub can_undo: bool,
     pub can_redo: bool,
     pub uncertain: bool,
@@ -399,6 +392,7 @@ impl StreamControlHandle {
             enabled: a.enabled,
             toggling: a.toggling(),
             busy: a.busy(),
+            board_busy: a.board_edit.is_some(),
             can_undo: !a.busy() && !a.uncertain && !a.undo.is_empty(),
             can_redo: !a.busy() && !a.uncertain && !a.redo.is_empty(),
             uncertain: a.uncertain,
@@ -537,8 +531,7 @@ impl StreamControlHandle {
         kind: DrawingKind,
     ) -> Result<()> {
         let live = kind != DrawingKind::Stroke;
-        let laser = kind == DrawingKind::Laser;
-        let transient = matches!(kind, DrawingKind::Laser | DrawingKind::Pointer);
+        let transient = matches!(kind, DrawingKind::Laser(_) | DrawingKind::Pointer);
         let mut s = lock(&self.shared);
         ensure_ready(&s)?;
         if !s.annotation.enabled || s.annotation.toggling() || s.annotation.uncertain {
@@ -547,6 +540,7 @@ impl StreamControlHandle {
         if s.annotation.drawing.is_some()
             || s.annotation.live_shape.is_some()
             || s.annotation.editing.is_some()
+            || s.annotation.board_edit.is_some()
         {
             bail!("当前笔迹操作尚未完成");
         }
@@ -594,14 +588,18 @@ impl StreamControlHandle {
         });
         if live {
             let drawing = a.drawing.take().unwrap();
-            let trail = laser.then(|| {
+            let trail = if let DrawingKind::Laser(options) = kind {
                 let now = Instant::now();
-                LaserTrail {
-                    samples: VecDeque::from([(now, drawing.stroke.points[0])]),
-                    last_move: now,
-                    style: drawing.stroke.style,
-                }
-            });
+                let style = drawing.stroke.style;
+                Some(LaserTrail::new(
+                    drawing.stroke.points[0],
+                    style,
+                    options,
+                    now,
+                ))
+            } else {
+                None
+            };
             a.live_shape = Some(LiveShape {
                 owner,
                 stroke: drawing.stroke,
@@ -667,7 +665,11 @@ impl StreamControlHandle {
         screen: i32,
         point: Point,
         style: Style,
+        options: LaserOptions,
     ) -> Result<()> {
+        if !(LASER_TAIL_MIN..=LASER_TAIL_MAX).contains(&options.tail_ms) {
+            bail!("激光笔拖尾长度超出范围");
+        }
         if !point.valid() {
             return Ok(());
         }
@@ -680,22 +682,20 @@ impl StreamControlHandle {
                 let Some(laser) = &mut shape.laser else {
                     return Ok(());
                 };
-                if laser.samples.back().is_some_and(|(_, last)| *last == point) {
-                    return Ok(());
-                }
-                let now = Instant::now();
-                laser.last_move = now;
-                laser.samples.push_back((now, point));
-                while laser.samples.len() > LASER_MAX_POINTS {
-                    laser.samples.pop_front();
-                }
+                laser.move_to(point, style, options, Instant::now());
                 return Ok(());
             }
             if s.annotation.drawing.is_some() || s.annotation.editing.is_some() {
                 return Ok(());
             }
         }
-        self.begin_annotation(owner, screen, vec![point], style, DrawingKind::Laser)
+        self.begin_annotation(
+            owner,
+            screen,
+            vec![point],
+            style,
+            DrawingKind::Laser(options),
+        )
     }
     pub(crate) fn annotation_laser_stop(&self, owner: u64) {
         let mut s = lock(&self.shared);
@@ -744,13 +744,6 @@ impl StreamControlHandle {
         self.drive_live_shape(&mut s);
     }
     fn drive_live_shape(&self, s: &mut StreamControlState) {
-        if s.annotation
-            .pending
-            .values()
-            .any(|p| matches!(p, Pending::Shape(_)))
-        {
-            return;
-        }
         let Some(shape) = s.annotation.live_shape.as_ref() else {
             return;
         };
@@ -763,19 +756,37 @@ impl StreamControlHandle {
                 .uncertain("批注屏幕已移除，形状绘制已结束".into());
             return;
         }
+        // Refresh the desired laser snapshot even while the previous replace is
+        // in flight. Only the latest short trail is sent when that batch finishes.
+        laser::update(&mut s.annotation, Instant::now());
+        if s.annotation
+            .pending
+            .values()
+            .any(|p| matches!(p, Pending::Shape(_)))
+        {
+            return;
+        }
+        let Some(shape) = s.annotation.live_shape.as_ref() else {
+            return;
+        };
         let cancel = shape.finish == Some(false);
         if cancel || shape.sent_revision != shape.revision {
-            let clear = shape
-                .shown
-                .then(|| clear_request(2, shape.stroke.id, Some(shape.stroke.screen)));
-            let draw = (!cancel).then(|| stroke_request(&shape.stroke, &shape.stroke.points));
-            // TEXT is ordered: clear only this preview ID, then replace its point list.
+            let count = usize::from(shape.shown) + usize::from(!cancel);
+            if count > MAX_PENDING.saturating_sub(s.annotation.pending.len()) {
+                return;
+            }
+            let mut requests = Vec::new();
+            if shape.shown {
+                requests.push((
+                    clear_request(2, shape.stroke.id, Some(shape.stroke.screen)),
+                    2,
+                ));
+            }
+            if !cancel {
+                requests.push((stroke_request(&shape.stroke, &shape.stroke.points), 1));
+            }
             // Keep one replacement in flight; later pointer updates replace the desired geometry.
-            for (request, kind) in clear
-                .into_iter()
-                .map(|r| (r, 2))
-                .chain(draw.into_iter().map(|r| (r, 1)))
-            {
+            for (request, kind) in requests {
                 if let Err(error) = self.send_draw(s, request, Pending::Shape(kind)) {
                     s.annotation.uncertain(error.to_string());
                     return;
@@ -866,9 +877,9 @@ impl StreamControlHandle {
                 .uncertain("批注切换未收到确认，请重新操作".into());
         }
         self.flush_annotation(&mut s);
-        update_laser(&mut s.annotation, Instant::now());
         self.drive_live_shape(&mut s);
         self.drive_clicks(&mut s, Instant::now());
+        self.refresh_board(&mut s);
     }
     pub(crate) fn annotation_undo(&self) -> Result<()> {
         self.annotation_history(false)
@@ -935,7 +946,17 @@ impl StreamControlHandle {
             (Edit::Add(stroke), true) | (Edit::Remove(stroke), false) => {
                 requests.push(clear_request(2, stroke.id, Some(stroke.screen)))
             }
-            (Edit::Clear(_), false) => requests.push(clear_request(1, 0, None)),
+            (Edit::Clear(strokes), false) => {
+                if s.annotation.boards.is_empty() || s.annotation.uncertain {
+                    requests.push(clear_request(1, 0, None));
+                } else {
+                    requests.extend(
+                        strokes
+                            .iter()
+                            .map(|stroke| clear_request(2, stroke.id, Some(stroke.screen))),
+                    );
+                }
+            }
             (Edit::Add(stroke), false) | (Edit::Remove(stroke), true) => {
                 for points in stroke.points.chunks(4096) {
                     requests.push(stroke_request(stroke, points));
@@ -956,6 +977,7 @@ impl StreamControlHandle {
             bail!("本次操作包含的笔迹过多，请清空后继续");
         }
         s.annotation.editing = Some(Editing {
+            clears_boards: matches!(&edit, Edit::Clear(_)) && s.annotation.uncertain,
             edit,
             direction,
             remaining: requests.len(),

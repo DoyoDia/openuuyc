@@ -162,6 +162,9 @@ impl DeviceCenterApp {
                     response
                         .on_hover_text(format!("上次状态更新于 {} 秒前", at.elapsed().as_secs()));
                 }
+                if !management {
+                    self.active_view(ui);
+                }
             });
         });
         ui.add_space(20.0);
@@ -202,9 +205,6 @@ impl DeviceCenterApp {
         let sort = state.sort;
         ui.add_space(16.0);
         self.alert(ui);
-        if !management {
-            self.active_view(ui);
-        }
         if management && let Some(error) = &self.catalog_error {
             ui.colored_label(AMBER, "完整清单暂未更新，显示已有设备")
                 .on_hover_text(error);

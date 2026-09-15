@@ -21,15 +21,15 @@ OpenUUYC 是用 Rust 编写的 UU 远程第三方 Windows 客户端。使用已�
 
 ## 构建
 
-需要 Rust stable（MSVC）、Visual Studio C++ 构建工具、Windows SDK 和 CMake。
+需要 Rust stable（MSVC）、Visual Studio C++ 构建工具、Windows SDK、CMake 和 UPX，确保 `upx` 在 PATH 中。
 
 ```powershell
 git clone https://github.com/djkcyl/openuuyc.git
 cd openuuyc
-cargo build --release --locked
+cargo dist
 ```
 
-程序位于 `target/release/OpenUUYC.exe`。命令行用法可通过 `OpenUUYC.exe --help` 查看。
+程序位于 `target/dist/upx/`，打包时自动进行 UPX 压缩、完整性和启动检查。命令行用法可通过程序的 `--help` 查看。
 
 ## 反馈与许可
 

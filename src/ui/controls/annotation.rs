@@ -14,6 +14,8 @@ pub(crate) enum AnnotationIcon {
     Undo,
     Redo,
     Clear,
+    Board,
+    Exit,
 }
 
 pub(crate) fn annotation_button(
@@ -69,7 +71,7 @@ pub(crate) fn annotation_frame() -> egui::Frame {
         .fill(theme::BG)
         .stroke(Stroke::new(1., theme::LINE))
         .corner_radius(theme::PANEL_RADIUS)
-        .inner_margin(12)
+        .inner_margin(theme::ANNOTATION_PANEL_MARGIN)
 }
 pub(crate) fn annotation_tool_frame() -> egui::Frame {
     egui::Frame::new()
@@ -81,13 +83,18 @@ pub(crate) fn annotation_header(
     ui: &mut Ui,
     can_undo: bool,
     can_redo: bool,
-) -> (Response, bool, bool, bool) {
+) -> (Response, bool, bool, bool, bool) {
     let mut undo = false;
     let mut redo = false;
     let mut close = false;
+    let mut end = false;
+    let height = theme::ANNOTATION_HEADER_HEIGHT;
     let row = ui.horizontal(|ui| {
-        let (rect, response) =
-            ui.allocate_exact_size(vec2(ui.available_width() - 102., 30.), Sense::drag());
+        ui.spacing_mut().item_spacing.x = 2.;
+        let (rect, response) = ui.allocate_exact_size(
+            vec2(ui.available_width() - 4. * (height + 2.), height),
+            Sense::drag(),
+        );
         let p = ui.painter();
         for x in [0., 5.] {
             for y in [-5., 0., 5.] {
@@ -114,20 +121,70 @@ pub(crate) fn annotation_header(
         ui.spacing_mut().item_spacing.x = 2.;
         undo = ui
             .add_enabled_ui(can_undo, |ui| {
-                annotation_button(ui, AnnotationIcon::Undo, false, "撤销 · Ctrl+Z")
+                ink_button(ui, AnnotationIcon::Undo, false, "撤销 · Ctrl+Z", height)
             })
             .inner
             .clicked();
         redo = ui
             .add_enabled_ui(can_redo, |ui| {
-                annotation_button(ui, AnnotationIcon::Redo, false, "重做 · Ctrl+Y")
+                ink_button(ui, AnnotationIcon::Redo, false, "重做 · Ctrl+Y", height)
             })
             .inner
             .clicked();
-        close = close_button(ui, "关闭批注并清除笔迹", 30.).clicked();
+        end = ink_button(
+            ui,
+            AnnotationIcon::Exit,
+            false,
+            "结束批注并清除笔迹与白板",
+            height,
+        )
+        .clicked();
+        close = close_button(ui, "收起面板，仍可继续批注", height).clicked();
         response
     });
-    (row.inner, close, undo, redo)
+    (row.inner, close, undo, redo, end)
+}
+
+pub(crate) fn annotation_clear_dialog(ctx: &egui::Context, uncertain: bool) -> Option<bool> {
+    let mut action = None;
+    let modal = egui::Modal::new(egui::Id::new("annotation-clear-confirm"))
+        .frame(dialog_frame())
+        .show(ctx, |ui| {
+            ui.set_width(
+                theme::ANNOTATION_CLEAR_WIDTH.min((ctx.content_rect().width() - 64.).max(160.)),
+            );
+            ui.label(
+                RichText::new("清空批注？")
+                    .size(theme::DIALOG_TITLE)
+                    .strong(),
+            );
+            ui.add_space(12.);
+            ui.add(
+                egui::Label::new(
+                    RichText::new(if uncertain {
+                        "清除全部批注并恢复桌面。"
+                    } else {
+                        "清除本次连接的全部笔迹，白板背景将保留。"
+                    })
+                    .size(theme::BODY)
+                    .color(theme::MUTED),
+                )
+                .wrap(),
+            );
+            ui.add_space(18.);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.add(primary("清空").fill(theme::DANGER_FILL)).clicked() {
+                    action = Some(true);
+                }
+                if ui.add(secondary("取消")).clicked() {
+                    action = Some(false);
+                }
+            });
+        });
+    if action.is_none() && modal.should_close() {
+        action = Some(false);
+    }
+    action
 }
 fn ink_property(ui: &mut Ui, width: f32) -> (Rect, Response) {
     let (r, response) = ui.allocate_exact_size(vec2(width, 30.), Sense::click());
@@ -148,7 +205,7 @@ fn ink_property(ui: &mut Ui, width: f32) -> (Rect, Response) {
     (r, response)
 }
 pub(crate) fn annotation_color(ui: &mut Ui, rgb: &mut [u8; 3], opacity: &mut u8) {
-    let (r, response) = ink_property(ui, 132.);
+    let (r, response) = ink_property(ui, theme::ANNOTATION_COLOR_WIDTH);
     let alpha = (u32::from(*opacity) * 255 / 100) as u8;
     let swatch = Rect::from_center_size(pos2(r.left() + 16., r.center().y), vec2(16., 16.));
     egui::color_picker::show_color_at(
@@ -159,7 +216,7 @@ pub(crate) fn annotation_color(ui: &mut Ui, rgb: &mut [u8; 3], opacity: &mut u8)
     ui.painter().text(
         pos2(r.left() + 32., r.center().y),
         egui::Align2::LEFT_CENTER,
-        format!("颜色  {}%", opacity),
+        format!("{}%", opacity),
         egui::FontId::proportional(theme::SMALL),
         theme::TEXT,
     );
@@ -167,10 +224,111 @@ pub(crate) fn annotation_color(ui: &mut Ui, rgb: &mut [u8; 3], opacity: &mut u8)
         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
         .show(|ui| super::annotation_color::show(ui, rgb, opacity));
 }
-pub(crate) fn annotation_width(ui: &mut Ui, width: &mut f32, tool: AnnotationIcon) {
+pub(crate) fn annotation_board(
+    ui: &mut Ui,
+    active: Option<[u8; 3]>,
+    color: &mut [u8; 3],
+) -> Option<Option<[u8; 3]>> {
+    let response = annotation_button(ui, AnnotationIcon::Board, active.is_some(), "白板背景");
+    let mut action = None;
+    egui::Popup::from_toggle_button_response(&response)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .show(|ui| {
+            action = annotation_board_content(ui, active, color);
+        });
+    action
+}
+fn annotation_board_content(
+    ui: &mut Ui,
+    active: Option<[u8; 3]>,
+    color: &mut [u8; 3],
+) -> Option<Option<[u8; 3]>> {
+    let mut action = None;
+    ui.set_width(theme::ANNOTATION_BOARD_PICKER_WIDTH);
+    ui.spacing_mut().item_spacing = vec2(8., 8.);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("白板").size(theme::COMPACT_TEXT).strong());
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .add_sized(
+                    vec2(52., theme::COMPACT_HEIGHT),
+                    egui::Button::new(if active.is_some() { "关闭" } else { "开启" })
+                        .selected(active.is_some()),
+                )
+                .clicked()
+            {
+                action = Some(if active.is_some() { None } else { Some(*color) });
+            }
+        });
+    });
+    ui.horizontal(|ui| {
+        for (name, rgb) in theme::ANNOTATION_BOARD_COLORS {
+            let selected = active.unwrap_or(*color) == rgb;
+            let (r, response) =
+                ui.allocate_exact_size(theme::ANNOTATION_BOARD_SWATCH, Sense::click());
+            ui.painter().rect(
+                r,
+                theme::CONTROL_RADIUS,
+                if selected {
+                    theme::SELECTED
+                } else if response.hovered() {
+                    theme::HOVER
+                } else {
+                    theme::SURFACE
+                },
+                Stroke::new(1., if selected { theme::ACCENT } else { theme::LINE }),
+                egui::StrokeKind::Inside,
+            );
+            let swatch =
+                Rect::from_min_max(r.min + vec2(6., 6.), pos2(r.right() - 6., r.top() + 29.));
+            ui.painter()
+                .rect_filled(swatch, 3., Color32::from_rgb(rgb[0], rgb[1], rgb[2]));
+            ui.painter().text(
+                pos2(r.center().x, r.bottom() - 12.),
+                egui::Align2::CENTER_CENTER,
+                name,
+                egui::FontId::proportional(theme::SMALL),
+                if selected { theme::TEXT } else { theme::MUTED },
+            );
+            if response.clicked() {
+                *color = rgb;
+                if active.is_some() {
+                    action = Some(Some(rgb));
+                }
+            }
+        }
+    });
+    action
+}
+fn annotation_laser_options(ui: &mut Ui, tail_ms: &mut u16) {
+    ui.add_space(8.);
+    ui.label(RichText::new("拖尾时长").strong());
+    ui.horizontal(|ui| {
+        for (value, label) in [(60, "短"), (100, "中"), (200, "长")] {
+            if ui.selectable_label(*tail_ms == value, label).clicked() {
+                *tail_ms = value;
+            }
+        }
+    });
+    ui.spacing_mut().slider_width = theme::ANNOTATION_PICKER_WIDTH - 80.;
+    ui.add(
+        egui::Slider::new(
+            tail_ms,
+            crate::stream_control::annotation::LASER_TAIL_MIN
+                ..=crate::stream_control::annotation::LASER_TAIL_MAX,
+        )
+        .suffix(" ms"),
+    );
+}
+pub(crate) fn annotation_width(
+    ui: &mut Ui,
+    width: &mut f32,
+    tool: AnnotationIcon,
+    tail_ms: Option<&mut u16>,
+) {
     let laser = tool == AnnotationIcon::Laser;
     let pointer = tool == AnnotationIcon::Pointer;
-    let (r, response) = ink_property(ui, 104.);
+    let (r, response) = ink_property(ui, theme::ANNOTATION_SIZE_WIDTH);
     let y = r.center().y;
     if pointer {
         paint_annotation_icon(
@@ -218,7 +376,7 @@ pub(crate) fn annotation_width(ui: &mut Ui, width: &mut f32, tool: AnnotationIco
                 for value in if pointer {
                     [16., 24., 32., 48.]
                 } else if laser {
-                    [4., 8., 12., 20.]
+                    [3., 5., 8., 12.]
                 } else {
                     [1., 3., 6., 12.]
                 } {
@@ -236,6 +394,9 @@ pub(crate) fn annotation_width(ui: &mut Ui, width: &mut f32, tool: AnnotationIco
                     .logarithmic(true)
                     .suffix(" px"),
             );
+            if let Some(tail_ms) = tail_ms {
+                annotation_laser_options(ui, tail_ms);
+            }
         });
 }
 pub(crate) fn paint_annotation_icon(
@@ -244,7 +405,7 @@ pub(crate) fn paint_annotation_icon(
     icon: AnnotationIcon,
     color: Color32,
 ) {
-    let stroke = Stroke::new(1.4, color);
+    let stroke = Stroke::new(theme::ICON_STROKE, color);
     let at = |x: f32, y: f32| pos2(r.left() + x * r.width(), r.top() + y * r.height());
     let line = |a, b| {
         p.line_segment([a, b], stroke);
@@ -332,6 +493,30 @@ pub(crate) fn paint_annotation_icon(
             ));
             line(f(0.4, 0.05), f(0.1, 0.32));
             line(f(0.1, 0.32), f(0.4, 0.6));
+        }
+        AnnotationIcon::Exit => {
+            p.add(egui::Shape::line(
+                vec![
+                    at(0.45, 0.05),
+                    at(0.05, 0.05),
+                    at(0.05, 0.95),
+                    at(0.45, 0.95),
+                ],
+                stroke,
+            ));
+            line(at(0.4, 0.5), at(1., 0.5));
+            line(at(0.75, 0.25), at(1., 0.5));
+            line(at(0.75, 0.75), at(1., 0.5));
+        }
+        AnnotationIcon::Board => {
+            p.rect_stroke(
+                Rect::from_min_max(at(0.05, 0.05), at(0.95, 0.7)),
+                2.,
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+            line(at(0.5, 0.7), at(0.5, 1.));
+            line(at(0.25, 1.), at(0.75, 1.));
         }
         AnnotationIcon::Clear => {
             line(at(0.1, 0.2), at(0.9, 0.2));

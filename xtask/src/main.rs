@@ -12,7 +12,6 @@ use std::{
 
 #[derive(Default)]
 struct Options {
-    upx: bool,
     build_directory: Option<PathBuf>,
 }
 
@@ -21,7 +20,6 @@ fn main() -> Result<()> {
     let mut args = std::env::args_os().skip(1);
     while let Some(arg) = args.next() {
         match arg.to_str() {
-            Some("--upx") => options.upx = true,
             Some("--build-directory") => {
                 options.build_directory = Some(
                     args.next()
@@ -31,9 +29,9 @@ fn main() -> Result<()> {
             }
             Some("--help" | "-h") => {
                 println!(
-                    "cargo dist [--upx] [--build-directory PATH]\n\
-                    Builds the Windows release, checks it and creates target/dist/raw or target/dist/upx.\n\
-                    UPX must be on PATH when --upx is selected."
+                    "cargo dist [--build-directory PATH]\n\
+                    Builds the Windows release, compresses and checks it, then creates target/dist/upx.\n\
+                    UPX must be installed and available on PATH."
                 );
                 return Ok(());
             }
@@ -49,17 +47,15 @@ fn main() -> Result<()> {
             .parent()
             .context("xtask must be inside the project")?,
     )?;
-    if options.upx {
-        ensure!(
-            command("upx")
-                .arg("--version")
-                .stdout(Stdio::null())
-                .status()
-                .context("UPX must be installed and available on PATH")?
-                .success(),
-            "UPX is unavailable"
-        );
-    }
+    ensure!(
+        command("upx")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .status()
+            .context("UPX must be installed and available on PATH")?
+            .success(),
+        "UPX is unavailable"
+    );
     let (source, version) = build(&root, options.build_directory)?;
     ensure!(
         source.is_file()
@@ -87,33 +83,27 @@ fn main() -> Result<()> {
         "invalid staging directory"
     );
     let candidate = stage.path().join(&file_name);
-    if options.upx {
-        ensure!(
-            command("upx")
-                .args(["--best", "--lzma", "-o"])
-                .arg(&candidate)
-                .arg(&source)
-                .status()
-                .context("compress executable")?
-                .success(),
-            "UPX compression failed; original build retained"
-        );
-        ensure!(
-            command("upx").arg("-t").arg(&candidate).status()?.success(),
-            "UPX integrity check failed"
-        );
-    } else {
-        fs::copy(&source, &candidate)?;
-    }
+    ensure!(
+        command("upx")
+            .args(["--best", "--lzma", "-o"])
+            .arg(&candidate)
+            .arg(&source)
+            .status()
+            .context("compress executable")?
+            .success(),
+        "UPX compression failed; original build retained"
+    );
+    ensure!(
+        command("upx").arg("-t").arg(&candidate).status()?.success(),
+        "UPX integrity check failed"
+    );
     check_startup(&candidate, &root, &version)?;
     ensure!(
         file_hash(&source)? == original_hash,
         "original build changed during packaging"
     );
 
-    let destination = target
-        .join("dist")
-        .join(if options.upx { "upx" } else { "raw" });
+    let destination = target.join("dist").join("upx");
     fs::create_dir_all(&destination)?;
     let published = destination.join(file_name);
     fs::copy(&candidate, &published).context("publish executable (close it first if in use)")?;
