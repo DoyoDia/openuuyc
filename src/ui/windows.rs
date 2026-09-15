@@ -1,6 +1,9 @@
 use super::d3d11::UiPresenter;
+use super::window_manager::{self, Event, Repaint, Request};
 use super::{AppFactory, AppSession, WindowConfig};
+use crate::viewer::windows_presenter::ConnectingWindowsRunner;
 use anyhow::{Context, Result, anyhow, bail};
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::{
@@ -14,43 +17,51 @@ use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalPosition;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
+use winit::platform::windows::EventLoopBuilderExtWindows;
 use winit::window::{Window, WindowId};
 
-struct Repaint {
-    pass: u64,
-    when: Instant,
-}
-
 pub(super) fn run(config: WindowConfig, factory: AppFactory) -> Result<()> {
-    let event_loop = EventLoop::<Repaint>::with_user_event()
-        .build()
-        .context("create desktop event loop")?;
-    let mut runner = Runner {
-        config,
-        factory: Some(factory),
-        state: None,
-        error: None,
-        proxy: event_loop.create_proxy(),
+    let mut builder = EventLoop::<Event>::with_user_event();
+    builder.with_msg_hook(crate::viewer::desktop_input_message);
+    let event_loop = builder.build().context("create desktop event loop")?;
+    let _input_hook = crate::viewer::desktop_input_hook()?;
+    let mut runner = Windows {
+        main: Runner {
+            config,
+            factory: Some(factory),
+            state: None,
+            error: None,
+            proxy: event_loop.create_proxy(),
+            root: true,
+            closed: false,
+        },
+        windows: HashMap::new(),
+        viewers: HashMap::new(),
     };
+    window_manager::install(Some(event_loop.create_proxy()));
     event_loop
         .run_app(&mut runner)
         .context("run D3D11 desktop event loop")?;
-    if let Some(error) = runner.error.take() {
+    window_manager::install(None);
+    if let Some(error) = runner.main.error.take() {
         bail!(error);
     }
     Ok(())
 }
 
 struct Runner {
+    root: bool,
+    closed: bool,
     config: WindowConfig,
     factory: Option<AppFactory>,
     state: Option<DesktopWindow>,
     error: Option<String>,
-    proxy: EventLoopProxy<Repaint>,
+    proxy: EventLoopProxy<Event>,
 }
 
 struct DesktopWindow {
-    // Shut down business workers first; release composition before the HWND.
+    // Hide before field destruction, then release business and composition
+    // resources before destroying the HWND.
     app: AppSession,
     presenter: UiPresenter,
     context: egui::Context,
@@ -63,11 +74,22 @@ struct DesktopWindow {
     window: Window,
 }
 
+impl Drop for DesktopWindow {
+    fn drop(&mut self) {
+        // UiPresenter detaches the composition tree in Drop. Hide the window
+        // first so its system background cannot appear during that interval.
+        self.window.set_visible(false);
+    }
+}
+
 impl Runner {
     fn fail(&mut self, event_loop: &ActiveEventLoop, error: anyhow::Error) {
         self.error = Some(format!("{error:#}"));
         self.state.take();
-        event_loop.exit();
+        self.closed = true;
+        if self.root {
+            event_loop.exit();
+        }
     }
 
     fn create(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
@@ -82,7 +104,9 @@ impl Runner {
             &self.config.viewport.clone().with_visible(false),
         )?;
         super::branding::set_taskbar_icon(&window);
-        crate::app::instance::register_window(super::d3d11::window_hwnd(&window)?)?;
+        if self.root {
+            crate::app::instance::register_window(super::d3d11::window_hwnd(&window)?)?;
+        }
         if self.config.centered
             && let Some(monitor) = window.current_monitor()
         {
@@ -107,14 +131,17 @@ impl Runner {
         let mut viewport = egui::ViewportInfo::default();
         egui_winit::update_viewport_info(&mut viewport, &context, &window, true);
         let proxy = self.proxy.clone();
+        let window_id = window.id();
         context.set_request_repaint_callback(move |info| {
             if info.viewport_id == egui::ViewportId::ROOT
                 && let Some(when) = Instant::now().checked_add(info.delay)
             {
-                let _ = proxy.send_event(Repaint {
+                let _ = proxy.send_event(Event::Repaint(Repaint {
+                    window: window_id,
+                    generation: 0,
                     pass: info.current_cumulative_pass_nr,
                     when,
-                });
+                }));
             }
         });
         let factory = self
@@ -230,7 +257,7 @@ impl DesktopWindow {
     }
 }
 
-impl ApplicationHandler<Repaint> for Runner {
+impl ApplicationHandler<Event> for Runner {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if let Err(error) = self.create(event_loop) {
             self.fail(event_loop, error);
@@ -253,7 +280,10 @@ impl ApplicationHandler<Repaint> for Runner {
                 state.render()
             }
             WindowEvent::Destroyed => {
-                event_loop.exit();
+                self.closed = true;
+                if self.root {
+                    event_loop.exit();
+                }
                 Ok(())
             }
             WindowEvent::Resized(size) => {
@@ -277,12 +307,21 @@ impl ApplicationHandler<Repaint> for Runner {
             .as_ref()
             .is_some_and(|state| state.close_requested)
         {
-            event_loop.exit();
+            self.closed = true;
+            if self.root {
+                event_loop.exit();
+            }
         }
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: Repaint) {
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: Event) {
+        let Event::Repaint(event) = event else {
+            return;
+        };
         if let Some(state) = &mut self.state {
+            if state.window.id() != event.window {
+                return;
+            }
             let current = state.context.cumulative_pass_nr();
             if current == event.pass || current == event.pass.saturating_add(1) {
                 state.schedule(event.when);
@@ -308,6 +347,175 @@ impl ApplicationHandler<Repaint> for Runner {
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         self.state.take();
+    }
+}
+
+struct ManagedViewer {
+    runner: ConnectingWindowsRunner,
+    done: Option<tokio::sync::oneshot::Sender<Result<()>>>,
+}
+impl ManagedViewer {
+    fn finish(&mut self, event_loop: &ActiveEventLoop) {
+        self.runner.exiting(event_loop);
+        if let Some(done) = self.done.take() {
+            let _ = done.send(
+                self.runner
+                    .error()
+                    .map_or(Ok(()), |error| Err(anyhow!(error))),
+            );
+        }
+    }
+}
+struct Windows {
+    windows: HashMap<String, Runner>,
+    viewers: HashMap<String, ManagedViewer>,
+    main: Runner,
+}
+impl Windows {
+    fn retire(&mut self, event_loop: &ActiveEventLoop) {
+        self.windows.retain(|_, window| !window.closed);
+        self.viewers.retain(|_, viewer| {
+            if viewer.runner.closed() {
+                viewer.finish(event_loop);
+                false
+            } else {
+                true
+            }
+        });
+    }
+    fn focus(&self, key: &str) {
+        if let Some(window) = self.windows.get(key).and_then(|r| r.state.as_ref()) {
+            window.window.set_visible(true);
+            window.window.focus_window();
+        }
+        if let Some(viewer) = self.viewers.get(key) {
+            viewer.runner.focus();
+        }
+    }
+}
+impl ApplicationHandler<Event> for Windows {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        self.main.resumed(event_loop);
+    }
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        if self
+            .main
+            .state
+            .as_ref()
+            .is_some_and(|s| s.window.id() == id)
+        {
+            self.main.window_event(event_loop, id, event);
+        } else if let Some(window) = self
+            .windows
+            .values_mut()
+            .find(|w| w.state.as_ref().is_some_and(|s| s.window.id() == id))
+        {
+            window.window_event(event_loop, id, event);
+        } else if let Some(viewer) = self.viewers.values_mut().find(|v| v.runner.owns(id)) {
+            viewer.runner.window_event(event_loop, id, event);
+        }
+        self.retire(event_loop);
+    }
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: Event) {
+        match event {
+            Event::Repaint(event) => {
+                if self
+                    .main
+                    .state
+                    .as_ref()
+                    .is_some_and(|s| s.window.id() == event.window)
+                {
+                    self.main.user_event(event_loop, Event::Repaint(event));
+                } else if let Some(window) = self.windows.values_mut().find(|w| {
+                    w.state
+                        .as_ref()
+                        .is_some_and(|s| s.window.id() == event.window)
+                }) {
+                    window.user_event(event_loop, Event::Repaint(event));
+                } else if let Some(viewer) = self
+                    .viewers
+                    .values_mut()
+                    .find(|v| v.runner.owns(event.window))
+                {
+                    viewer.runner.user_event(event_loop, Event::Repaint(event));
+                }
+            }
+            Event::Request(Request::Focus(key)) => self.focus(&key),
+            Event::Request(Request::Open {
+                key,
+                config,
+                factory,
+            }) => {
+                if self.windows.contains_key(&key) {
+                    self.focus(&key);
+                    return;
+                }
+                let mut window = Runner {
+                    config,
+                    factory: Some(factory),
+                    state: None,
+                    error: None,
+                    proxy: self.main.proxy.clone(),
+                    root: false,
+                    closed: false,
+                };
+                window.resumed(event_loop);
+                if !window.closed {
+                    self.windows.insert(key, window);
+                }
+            }
+            Event::Request(Request::Viewer { key, config, done }) => {
+                if self.viewers.contains_key(&key) {
+                    self.focus(&key);
+                    let _ = done.send(Err(anyhow!("观看窗口已打开")));
+                    return;
+                }
+                let mut viewer = ManagedViewer {
+                    runner: ConnectingWindowsRunner::new(
+                        config,
+                        true,
+                        self.main.proxy.clone(),
+                        true,
+                    ),
+                    done: Some(done),
+                };
+                viewer.runner.resumed(event_loop);
+                self.viewers.insert(key, viewer);
+            }
+        }
+        self.retire(event_loop);
+    }
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let mut wake = None::<Instant>;
+        self.main.about_to_wait(event_loop);
+        if let ControlFlow::WaitUntil(at) = event_loop.control_flow() {
+            wake = Some(at);
+        }
+        for window in self.windows.values_mut() {
+            event_loop.set_control_flow(ControlFlow::Wait);
+            window.about_to_wait(event_loop);
+            if let ControlFlow::WaitUntil(at) = event_loop.control_flow() {
+                wake = Some(wake.map_or(at, |old| old.min(at)));
+            }
+        }
+        for viewer in self.viewers.values_mut() {
+            event_loop.set_control_flow(ControlFlow::Wait);
+            viewer.runner.about_to_wait(event_loop);
+            if let ControlFlow::WaitUntil(at) = event_loop.control_flow() {
+                wake = Some(wake.map_or(at, |old| old.min(at)));
+            }
+        }
+        self.retire(event_loop);
+        event_loop.set_control_flow(wake.map_or(ControlFlow::Wait, ControlFlow::WaitUntil));
+    }
+    fn exiting(&mut self, event_loop: &ActiveEventLoop) {
+        window_manager::install(None);
+        for viewer in self.viewers.values_mut() {
+            viewer.finish(event_loop);
+        }
+        self.viewers.clear();
+        self.windows.clear();
+        self.main.exiting(event_loop);
     }
 }
 

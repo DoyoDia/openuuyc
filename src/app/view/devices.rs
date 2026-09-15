@@ -43,6 +43,7 @@ struct Entry {
 }
 
 enum Action {
+    PortMapping,
     Details,
     Connect,
 }
@@ -85,22 +86,7 @@ impl DeviceCenterApp {
                         .active_session
                         .as_ref()
                         .is_some_and(|s| s.device_id.as_deref() == Some(id));
-                    let connect_issue = if self.logout_pending {
-                        Some("正在退出账号".into())
-                    } else if self.mutation_pending {
-                        Some("正在处理设备操作".into())
-                    } else if self.active_session.is_some() {
-                        Some(
-                            if own_session {
-                                "该设备的观看窗口已打开"
-                            } else {
-                                "请先关闭当前观看窗口"
-                            }
-                            .into(),
-                        )
-                    } else {
-                        connectability_error(device).err()
-                    };
+                    let connect_issue = self.viewer_action_issue(device);
                     Entry {
                         device: device.clone(),
                         group,
@@ -120,6 +106,11 @@ impl DeviceCenterApp {
 
     fn device_list(&mut self, ui: &mut egui::Ui, management: bool) {
         let rows = self.device_entries(management);
+        let (pending, unresolved) = if management {
+            (0, 0)
+        } else {
+            self.watching_list_resolution()
+        };
         let index = usize::from(management);
         let count = rows.as_ref().map_or(0, Vec::len);
         let online = rows
@@ -209,6 +200,22 @@ impl DeviceCenterApp {
             ui.colored_label(AMBER, "完整清单暂未更新，显示已有设备")
                 .on_hover_text(error);
         }
+        if unresolved > 0 {
+            ui.horizontal(|ui| {
+                ui.colored_label(
+                    AMBER,
+                    format!("{unresolved} 台设备的信息未能确认，请刷新重试"),
+                );
+                if ui
+                    .add(crate::ui::controls::quiet_button("查看全部设备"))
+                    .clicked()
+                {
+                    self.center_ui.page = Page::Management;
+                }
+            });
+        } else if pending > 0 && count > 0 {
+            ui.label(RichText::new("正在读取其余设备信息…").color(MUTED));
+        }
         let Some(mut rows) = rows else {
             self.empty_state(ui, "正在读取设备清单…", "");
             return;
@@ -251,7 +258,11 @@ impl DeviceCenterApp {
         if rows.is_empty() {
             self.empty_state(
                 ui,
-                if count == 0 {
+                if count == 0 && pending > 0 {
+                    "正在读取设备信息…"
+                } else if count == 0 && unresolved > 0 {
+                    "设备信息暂未就绪"
+                } else if count == 0 {
                     "暂无设备"
                 } else {
                     "没有符合条件的设备"
@@ -305,6 +316,7 @@ impl DeviceCenterApp {
             });
         if let Some((id, action)) = picked {
             match action {
+                Action::PortMapping => self.open_port_mapping(id),
                 Action::Details => self.open_details(id),
                 Action::Connect => {
                     self.selected_device_id = Some(id);
@@ -514,5 +526,20 @@ fn row(
     if buttons.button("详情").clicked() {
         action = Some(Action::Details);
     }
+    response.context_menu(|ui| {
+        if ui
+            .add_enabled(
+                matches!(device.platform, 1 | 4)
+                    && !entry.current
+                    && device.controllable
+                    && device.is_connected(),
+                egui::Button::new("端口转发"),
+            )
+            .clicked()
+        {
+            action = Some(Action::PortMapping);
+            ui.close();
+        }
+    });
     action.or_else(|| response.clicked().then_some(Action::Details))
 }

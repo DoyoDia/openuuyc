@@ -110,6 +110,7 @@ pub struct SettingEngine {
     pub(crate) enable_sender_rtx: bool,
     /// Determines the max size of any message that may be sent through an SCTP transport.
     pub(crate) sctp_max_message_size_can_send: SctpMaxMessageSize,
+    pub(crate) data_channel_receive_limit: Option<usize>,
 }
 
 impl SettingEngine {
@@ -409,5 +410,11 @@ impl SettingEngine {
         max_message_size_can_send: SctpMaxMessageSize,
     ) {
         self.sctp_max_message_size_can_send = max_message_size_can_send
+    }
+
+    /// Maximum assembled message accepted by the on_message callback reader.
+    /// Keep this consistent with the local SDP receive capability.
+    pub fn set_data_channel_receive_limit(&mut self, limit: usize) {
+        self.data_channel_receive_limit = Some(limit.max(1));
     }
 }

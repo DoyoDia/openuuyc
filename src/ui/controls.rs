@@ -1,9 +1,13 @@
 //! Shared control appearance for the center, viewer menus and node editor.
 use super::theme::{self, HOVER, LINE, MUTED, SURFACE, TEXT};
 use egui::{Color32, RichText, Stroke, vec2};
+mod mapping;
 mod performance;
 mod updates;
 mod viewer_caption;
+pub(crate) use mapping::{
+    MappingRow, MappingRowAction, mapping_empty, mapping_row, mapping_table_header,
+};
 pub(crate) use performance::{
     PerformanceTrace, metric_pair, performance_frame, performance_header, performance_trace,
 };
@@ -16,6 +20,38 @@ pub(crate) use viewer_caption::{ViewerCaptionIcon, viewer_caption_button};
 pub const HEIGHT: f32 = theme::CONTROL_HEIGHT;
 pub const COMPACT_HEIGHT: f32 = theme::COMPACT_HEIGHT;
 pub const ACCENT: Color32 = theme::ACCENT;
+
+pub(crate) fn switch(ui: &mut egui::Ui, value: &mut bool) -> egui::Response {
+    sized_switch(ui, value, vec2(34.0, 20.0))
+}
+pub(crate) fn service_switch(ui: &mut egui::Ui, value: &mut bool) -> egui::Response {
+    sized_switch(ui, value, theme::SERVICE_SWITCH_SIZE)
+}
+fn sized_switch(ui: &mut egui::Ui, value: &mut bool, size: egui::Vec2) -> egui::Response {
+    let (rect, mut response) = ui.allocate_exact_size(size, egui::Sense::click());
+    if response.clicked() {
+        *value = !*value;
+        response.mark_changed();
+    }
+    ui.painter().rect_filled(
+        rect,
+        size.y / 2.0,
+        if *value { theme::ACCENT } else { theme::LINE },
+    );
+    ui.painter().circle_filled(
+        egui::pos2(
+            if *value {
+                rect.right() - size.y / 2.0
+            } else {
+                rect.left() + size.y / 2.0
+            },
+            rect.center().y,
+        ),
+        size.y / 2.0 - 3.0,
+        theme::TEXT,
+    );
+    response
+}
 
 pub(crate) fn connection_wallpaper(ui: &egui::Ui, texture: &egui::TextureHandle, details: bool) {
     let rect = ui.available_rect_before_wrap();
@@ -692,7 +728,29 @@ pub fn paint_close(painter: &egui::Painter, rect: egui::Rect, color: Color32) {
     }
 }
 
-pub fn close_button(ui: &mut egui::Ui, hint: &str, size: f32) -> egui::Response {
+pub(crate) fn edit_button(ui: &mut egui::Ui, hint: &str, size: f32) -> egui::Response {
+    let (rect, response) = icon_button_area(ui, size);
+    response
+        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), hint));
+    let center = rect.center();
+    let color = if response.hovered() { TEXT } else { MUTED };
+    let stroke = Stroke::new(theme::ICON_STROKE, color);
+    ui.painter().add(egui::Shape::closed_line(
+        vec![
+            center + vec2(-6.0, 6.0),
+            center + vec2(-5.0, 1.0),
+            center + vec2(2.0, -6.0),
+            center + vec2(6.0, -2.0),
+            center + vec2(-1.0, 5.0),
+        ],
+        stroke,
+    ));
+    ui.painter()
+        .line_segment([center + vec2(0.0, -4.0), center + vec2(4.0, 0.0)], stroke);
+    response.on_hover_text(hint)
+}
+
+fn icon_button_area(ui: &mut egui::Ui, size: f32) -> (egui::Rect, egui::Response) {
     let (rect, response) = ui.allocate_exact_size(vec2(size, size), egui::Sense::click());
     let visuals = ui.style().interact(&response);
     if response.hovered() || response.is_pointer_button_down_on() || response.has_focus() {
@@ -708,6 +766,11 @@ pub fn close_button(ui: &mut egui::Ui, hint: &str, size: f32) -> egui::Response 
             egui::StrokeKind::Inside,
         );
     }
+    (rect, response)
+}
+
+pub fn close_button(ui: &mut egui::Ui, hint: &str, size: f32) -> egui::Response {
+    let (rect, response) = icon_button_area(ui, size);
     paint_close(
         ui.painter(),
         rect,

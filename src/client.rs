@@ -8,7 +8,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     api::{ApiEnvelope, ApiFailure, DeviceList, NrdApi, RoomSession},
-    auth::{KeyringIdentityStore, KeyringSessionStore, LoginSession, NativeIdentity, SessionStore},
+    auth::{KeyringIdentityStore, KeyringSessionStore, LoginSession, SessionStore},
     device_session::{DeviceHandle, DeviceRuntime},
     session_restore::{self, RestoreTrigger},
 };
@@ -36,7 +36,7 @@ pub(crate) enum RestorationStage {
 pub struct AuthenticatedClient {
     api: Mutex<Option<NrdApi>>,
     session: LoginSession,
-    device: AccountDevice,
+    device: DeviceHandle,
     owned_device: tokio::sync::Mutex<Option<DeviceRuntime>>,
     session_store: KeyringSessionStore,
     ended: CancellationToken,
@@ -54,23 +54,6 @@ struct RestoreState {
     failure: Option<ApiFailure>,
 }
 
-enum AccountDevice {
-    Managed(DeviceHandle),
-    // A GUI-launched viewer inherits the device/account validated by its
-    // authenticated owner IPC. Like the native viewer, it is not another
-    // DeviceInitializer and must not register/reset that identity independently.
-    Inherited(Box<NativeIdentity>),
-}
-
-impl AccountDevice {
-    fn identity(&self) -> NativeIdentity {
-        match self {
-            Self::Managed(device) => device.identity(),
-            Self::Inherited(identity) => identity.as_ref().clone(),
-        }
-    }
-}
-
 pub struct LogoutOutcome {
     pub remote_error: Option<String>,
     pub local_error: Option<String>,
@@ -79,22 +62,14 @@ pub struct LogoutOutcome {
 impl AuthenticatedClient {
     pub fn from_saved_session() -> Result<Self> {
         let runtime = DeviceRuntime::start()?;
-        Self::load(AccountDevice::Managed(runtime.handle()), Some(runtime))
+        Self::load(runtime.handle(), Some(runtime))
     }
 
     pub(crate) fn from_saved_session_with_device(device: DeviceHandle) -> Result<Self> {
-        Self::load(AccountDevice::Managed(device), None)
+        Self::load(device, None)
     }
 
-    pub(crate) fn from_parent_session() -> Result<Self> {
-        let identity = KeyringIdentityStore::new()?.load_or_create()?;
-        if identity.client_identity()?.device_id.is_empty() {
-            bail!("parent has not initialized the virtual device");
-        }
-        Self::load(AccountDevice::Inherited(Box::new(identity)), None)
-    }
-
-    fn load(device: AccountDevice, owned_device: Option<DeviceRuntime>) -> Result<Self> {
+    fn load(device: DeviceHandle, owned_device: Option<DeviceRuntime>) -> Result<Self> {
         let session_store = KeyringSessionStore::new()?;
         let session = session_store.load()?.ok_or(NoSavedSession)?;
         let identity = device.identity().client_identity()?;
@@ -102,10 +77,8 @@ impl AuthenticatedClient {
         api.set_user_id(Some(session.user_id()))?;
         api.set_bearer_token(Some(session.token()))?;
         let ended = CancellationToken::new();
-        let inherited = matches!(&device, AccountDevice::Inherited(_));
-        if let AccountDevice::Managed(device) = &device {
-            device.watch_account(ended.clone())?;
-        }
+
+        device.watch_account(ended.clone())?;
         let restore_trigger = if owned_device.is_some() {
             RestoreTrigger::DeviceStartup
         } else {
@@ -120,16 +93,11 @@ impl AuthenticatedClient {
             session_store,
             ended,
             validated: tokio::sync::Mutex::new(RestoreState {
-                ready: inherited,
+                ready: false,
                 failure: None,
             }),
             restore_trigger,
-            restore_progress: tokio::sync::watch::channel(if inherited {
-                RestorationStage::Ready
-            } else {
-                RestorationStage::Device
-            })
-            .0,
+            restore_progress: tokio::sync::watch::channel(RestorationStage::Device).0,
             account_name,
             wallpaper: Mutex::new(wallpaper::Sync::default()),
             features: crate::feature_ability::FeatureCatalog::default(),
@@ -148,6 +116,12 @@ impl AuthenticatedClient {
         publisher_id: &str,
     ) -> Result<crate::viewing_settings::ViewingSettingsStore> {
         crate::viewing_settings::ViewingSettingsStore::new(self.session.user_id(), publisher_id)
+    }
+    pub(crate) fn port_mapping_store(
+        &self,
+        publisher_id: &str,
+    ) -> Result<crate::port_mapping::store::Store> {
+        crate::port_mapping::store::Store::new(self.session.user_id(), publisher_id)
     }
     pub fn ended(&self) -> CancellationToken {
         self.ended.clone()
@@ -185,9 +159,7 @@ impl AuthenticatedClient {
         if let Some(failure) = &validated.failure {
             return Err(failure.clone().into());
         }
-        let AccountDevice::Managed(device) = &self.device else {
-            return Ok(());
-        };
+        let device = &self.device;
         let identity = tokio::select! {
             biased;
             _ = self.ended.cancelled() => bail!("account session has ended"),
@@ -467,8 +439,7 @@ impl AuthenticatedClient {
             }
         };
         if id == self.device_id()
-            && let AccountDevice::Managed(device) = &self.device
-            && let Err(error) = device.set_name(id.into(), actual.clone()).await
+            && let Err(error) = self.device.set_name(id.into(), actual.clone()).await
         {
             return Ok((
                 actual,
@@ -613,9 +584,7 @@ impl AuthenticatedClient {
     }
 
     pub async fn set_controllable(&self, controllable: bool) -> Result<()> {
-        let AccountDevice::Managed(device) = &self.device else {
-            bail!("only the device owner can change its permissions");
-        };
+        let device = &self.device;
         self.request(|api| async move { api.set_controllable(controllable).await })
             .await?;
         device.set_controllable(controllable).await?;

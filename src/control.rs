@@ -32,6 +32,12 @@ pub(crate) enum ControlConnectType {
     Assistance = 2,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ControlPurpose {
+    Viewing,
+    PortMapping,
+}
+
 pub(crate) fn build_control_frames(
     controller_device_id: &str,
     ack_id: u64,
@@ -39,6 +45,7 @@ pub(crate) fn build_control_frames(
     profile: ConnectionMediaProfile,
     connect_type: ControlConnectType,
     preferences: Option<crate::stream_control::StreamControlPreferences>,
+    purpose: ControlPurpose,
 ) -> Result<ControlFrames> {
     build_control_frames_with_id(
         controller_device_id,
@@ -48,6 +55,7 @@ pub(crate) fn build_control_frames(
         profile,
         connect_type,
         preferences,
+        purpose,
     )
 }
 
@@ -59,6 +67,7 @@ fn build_control_frames_with_id(
     profile: ConnectionMediaProfile,
     connect_type: ControlConnectType,
     preferences: Option<crate::stream_control::StreamControlPreferences>,
+    purpose: ControlPurpose,
 ) -> Result<ControlFrames> {
     if controller_device_id.len() != 16
         || !controller_device_id
@@ -93,6 +102,7 @@ fn build_control_frames_with_id(
             profile,
             connect_type,
             preferences,
+            purpose,
         )?,
         app_control_id: app_control_id.to_owned(),
     })
@@ -104,6 +114,7 @@ fn encode_connect_options(
     profile: ConnectionMediaProfile,
     connect_type: ControlConnectType,
     preferences: Option<crate::stream_control::StreamControlPreferences>,
+    purpose: ControlPurpose,
 ) -> Result<Vec<u8>> {
     let mut capture = Vec::new();
     let fps_level = match profile.stream_fps {
@@ -168,7 +179,14 @@ fn encode_connect_options(
     );
 
     let mut options = Vec::new();
-    push_varint_field(&mut options, 1, 1); // desktop capture
+    push_varint_field(
+        &mut options,
+        1,
+        match purpose {
+            ControlPurpose::Viewing => 1,
+            ControlPurpose::PortMapping => 9,
+        },
+    );
     push_signed_int32_field(&mut options, 2, -1);
     push_bytes_field(&mut options, 3, &capture);
     let mut decoder_profiles = Vec::new();

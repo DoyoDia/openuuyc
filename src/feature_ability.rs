@@ -13,6 +13,7 @@ const RELOAD_AFTER: Duration = Duration::from_secs(21_600);
 
 #[derive(Clone, Copy)]
 pub(crate) enum Feature {
+    PortMapping,
     Annotation,
     ControlledUpdate,
     CustomBitrate,
@@ -28,6 +29,7 @@ pub(crate) enum Feature {
 impl Feature {
     fn name(self) -> &'static str {
         match self {
+            Self::PortMapping => "port_mapping",
             Self::Annotation => "annotation_v2",
             Self::ControlledUpdate => "controlled_update",
             Self::CustomBitrate => "custom_bitrate",

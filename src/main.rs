@@ -69,12 +69,10 @@ enum Commands {
     Connect {
         /// 设备的完整名称（必须唯一且完全匹配）
         device: String,
-        #[arg(long, hide = true)]
-        owner_control: Option<String>,
         /// 按已核实的设备 ID 选择目标，避免重复或变化的别名选错设备
         #[arg(long)]
         device_id: Option<String>,
-        /// Local GUI child payload; never put a device verification code in argv.
+        /// Read assistance credentials from stdin, never from argv.
         #[arg(long, hide = true, conflicts_with = "device_id")]
         assist_stdin: bool,
         /// 静音启动，只影响本地播放
@@ -198,7 +196,6 @@ fn main() -> Result<()> {
         Commands::Devices => tokio::runtime::Runtime::new()?.block_on(print_devices()),
         Commands::Connect {
             device,
-            owner_control,
             device_id,
             assist_stdin,
             mute,
@@ -215,7 +212,6 @@ fn main() -> Result<()> {
                 hardware_decode,
                 transport,
             },
-            owner_control,
             device_id,
             assist_stdin,
         )),
@@ -257,15 +253,14 @@ fn attach_parent_console() {
 async fn connect_device(
     device: String,
     options: media::ConnectionMediaOptions,
-    owner: Option<String>,
     device_id: Option<String>,
     assist_stdin: bool,
 ) -> Result<()> {
     if assist_stdin {
         let request = openuuyc::assist::read_launch_request()?;
-        return controller::run_assist_viewer_window(device, request, options, owner).await;
+        return controller::run_assist_viewer_window(device, request, options).await;
     }
-    controller::run_saved_viewer_window(device, options, owner, device_id).await
+    controller::run_saved_viewer_window(device, options, device_id).await
 }
 
 async fn print_devices() -> Result<()> {

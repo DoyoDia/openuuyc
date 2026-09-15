@@ -488,7 +488,9 @@ impl Stream {
         }
 
         // NOTE: append is used here instead of push in order to prevent chunks interlacing.
-        self.pending_queue.append(chunks).await;
+        self.pending_queue
+            .append_and_wake(chunks, || self.awake_write_loop())
+            .await;
 
         self.awake_write_loop();
         Ok(())

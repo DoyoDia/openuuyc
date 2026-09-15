@@ -8,6 +8,7 @@ use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::ui::window_manager::{Event as UiEvent, Repaint as UiRepaintEvent};
 use anyhow::{Context, Result, anyhow, bail};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, POINT, RECT, WAIT_OBJECT_0};
 use windows::Win32::Graphics::Direct3D::{
@@ -80,7 +81,7 @@ pub(super) fn run(session: NativeViewerSession) -> Result<()> {
     )
 }
 
-pub(super) struct ConnectingWindowsRunConfig {
+pub(crate) struct ConnectingWindowsRunConfig {
     pub alias: String,
     pub progress: std_mpsc::Receiver<ConnectionProgress>,
     pub session: std_mpsc::Receiver<ViewerWindowEvent>,
@@ -89,13 +90,6 @@ pub(super) struct ConnectingWindowsRunConfig {
 
 pub(super) fn run_connecting(config: ConnectingWindowsRunConfig) -> Result<()> {
     run_player(config, true)
-}
-
-struct UiRepaintEvent {
-    window: WindowId,
-    generation: u64,
-    pass: u64,
-    when: Instant,
 }
 
 fn ui_frame_interval(window: &Window) -> Duration {
@@ -108,14 +102,12 @@ fn ui_frame_interval(window: &Window) -> Duration {
 }
 
 fn run_player(config: ConnectingWindowsRunConfig, needs_display: bool) -> Result<()> {
-    let mut builder = EventLoop::<UiRepaintEvent>::with_user_event();
+    let mut builder = EventLoop::<UiEvent>::with_user_event();
     let router = super::windows_mouse::router().clone();
     builder.with_msg_hook(move |message| {
         super::windows_keyboard::message(message) || router.message(message)
     });
-    let event_loop = builder
-        .build()
-        .context("create Windows connection/player event loop")?;
+    let event_loop = builder.build().context("create player event loop")?;
     event_loop.set_control_flow(ControlFlow::Wait);
     super::windows_keyboard::remove_unused_raw_keyboard()?;
     let _keyboard_hook = super::windows_keyboard::KeyboardHook::install()
@@ -123,42 +115,19 @@ fn run_player(config: ConnectingWindowsRunConfig, needs_display: bool) -> Result
             |error| tracing::warn!(%error, "keyboard hook unavailable; viewing remains available"),
         )
         .ok();
-    let mut runner = ConnectingWindowsRunner {
-        attributes: WindowAttributes::default()
-            .with_visible(false)
-            .with_title(format!("{}{}", crate::VIEWER_TITLE_PREFIX, config.alias))
-            .with_window_icon(Some(crate::ui::branding::window_icon()))
-            .with_decorations(false)
-            .with_inner_size(LogicalSize::new(1280.0, 760.0))
-            .with_min_inner_size(LogicalSize::new(760.0, 520.0)),
-        alias: config.alias,
-        progress: Some(config.progress),
-        session: config.session,
-        display_sender: needs_display.then_some(config.display_sender),
-        window: None,
-        connecting: None,
-        playing: None,
-        fatal_error: None,
-        next_ui_update: Instant::now(),
-        next_repaint: None,
-        last_ui_frame: None,
-        ui_frame_interval: Duration::from_secs_f64(1.0 / 60.0),
-        repaint_proxy: event_loop.create_proxy(),
-        ui_generation: 1,
-        close_requested: false,
-        preferences: ViewerPreferences::default(),
-        screens: None,
-    };
+    let mut runner =
+        ConnectingWindowsRunner::new(config, needs_display, event_loop.create_proxy(), false);
     event_loop
         .run_app(&mut runner)
         .map_err(|error| anyhow!("run Windows connection/player event loop: {error}"))?;
-    if let Some(error) = runner.fatal_error {
+    if let Some(error) = runner.fatal_error.take() {
         bail!(error);
     }
     Ok(())
 }
 
-struct ConnectingWindowsRunner {
+pub(crate) struct ConnectingWindowsRunner {
+    embedded: bool,
     screens: Option<ScreenWindows>,
     preferences: ViewerPreferences,
     close_requested: bool,
@@ -175,11 +144,11 @@ struct ConnectingWindowsRunner {
     next_repaint: Option<Instant>,
     last_ui_frame: Option<Instant>,
     ui_frame_interval: Duration,
-    repaint_proxy: EventLoopProxy<UiRepaintEvent>,
+    repaint_proxy: EventLoopProxy<UiEvent>,
     ui_generation: u64,
 }
 
-impl ApplicationHandler<UiRepaintEvent> for ConnectingWindowsRunner {
+impl ApplicationHandler<UiEvent> for ConnectingWindowsRunner {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         match event_loop.create_window(self.attributes.clone()) {
             Ok(window) => {
@@ -215,7 +184,7 @@ impl ApplicationHandler<UiRepaintEvent> for ConnectingWindowsRunner {
                             // before the first window has finished initializing.
                             // A closed display receiver is not a D3D failure.
                             self.close_requested = true;
-                            event_loop.exit();
+                            self.exit(event_loop);
                             return;
                         }
                         self.window = Some(window);
@@ -258,7 +227,7 @@ impl ApplicationHandler<UiRepaintEvent> for ConnectingWindowsRunner {
                 app.mouse.release(window);
                 app.shutdown.store(true, Ordering::Release);
             }
-            event_loop.exit();
+            self.exit(event_loop);
             return;
         }
         if matches!(
@@ -300,13 +269,22 @@ impl ApplicationHandler<UiRepaintEvent> for ConnectingWindowsRunner {
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        if let Some(window) = &self.window {
+            window.set_visible(false);
+        }
         self.screens.take();
         self.playing.take();
         self.connecting.take();
         self.window.take();
     }
 
-    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UiRepaintEvent) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UiEvent) {
+        let UiEvent::Repaint(event) = event else {
+            return;
+        };
+        if !self.owns(event.window) {
+            return;
+        }
         if let Err(error) = self.receive_session_events() {
             self.fail(event_loop, format!("update player session: {error:#}"));
             return;
@@ -340,7 +318,7 @@ impl ApplicationHandler<UiRepaintEvent> for ConnectingWindowsRunner {
                 .as_ref()
                 .is_some_and(|app| app.close_requested || app.shutdown.load(Ordering::Acquire))
         {
-            event_loop.exit();
+            self.exit(event_loop);
         }
     }
 
@@ -350,16 +328,18 @@ impl ApplicationHandler<UiRepaintEvent> for ConnectingWindowsRunner {
             return;
         }
         if self.close_requested {
-            event_loop.exit();
+            self.exit(event_loop);
             return;
         }
         if let Some(screens) = self.screens.as_mut() {
-            screens.update(event_loop);
+            if !screens.update(event_loop) {
+                self.exit(event_loop);
+            }
             return;
         }
         if let Some(app) = self.playing.as_mut() {
             if app.close_requested {
-                event_loop.exit();
+                self.exit(event_loop);
                 return;
             }
             if let Some(window) = &self.window {
@@ -369,7 +349,7 @@ impl ApplicationHandler<UiRepaintEvent> for ConnectingWindowsRunner {
                 if let Some(error) = mutex_lock(&app.fatal_error).clone() {
                     self.fatal_error = Some(error);
                 }
-                event_loop.exit();
+                self.exit(event_loop);
                 return;
             }
         } else if self.connecting.is_none() {
@@ -380,7 +360,7 @@ impl ApplicationHandler<UiRepaintEvent> for ConnectingWindowsRunner {
             .as_ref()
             .is_some_and(|app| app.close_requested)
         {
-            event_loop.exit();
+            self.exit(event_loop);
             return;
         }
         let now = Instant::now();
@@ -408,6 +388,64 @@ impl ApplicationHandler<UiRepaintEvent> for ConnectingWindowsRunner {
 }
 
 impl ConnectingWindowsRunner {
+    pub(crate) fn new(
+        config: ConnectingWindowsRunConfig,
+        needs_display: bool,
+        proxy: EventLoopProxy<UiEvent>,
+        embedded: bool,
+    ) -> Self {
+        Self {
+            attributes: WindowAttributes::default()
+                .with_visible(false)
+                .with_title(format!("{}{}", crate::VIEWER_TITLE_PREFIX, config.alias))
+                .with_window_icon(Some(crate::ui::branding::window_icon()))
+                .with_decorations(false)
+                .with_inner_size(LogicalSize::new(1280.0, 760.0))
+                .with_min_inner_size(LogicalSize::new(760.0, 520.0)),
+            alias: config.alias,
+            progress: Some(config.progress),
+            session: config.session,
+            display_sender: needs_display.then_some(config.display_sender),
+            window: None,
+            connecting: None,
+            playing: None,
+            fatal_error: None,
+            next_ui_update: Instant::now(),
+            next_repaint: None,
+            last_ui_frame: None,
+            ui_frame_interval: Duration::from_secs_f64(1.0 / 60.0),
+            repaint_proxy: proxy,
+            embedded,
+            ui_generation: 1,
+            close_requested: false,
+            preferences: ViewerPreferences::default(),
+            screens: None,
+        }
+    }
+    fn exit(&mut self, event_loop: &ActiveEventLoop) {
+        self.close_requested = true;
+        if !self.embedded {
+            event_loop.exit();
+        }
+    }
+    pub(crate) fn closed(&self) -> bool {
+        self.close_requested
+    }
+    pub(crate) fn error(&self) -> Option<String> {
+        self.fatal_error.clone()
+    }
+    pub(crate) fn owns(&self, id: WindowId) -> bool {
+        self.window.as_ref().is_some_and(|w| w.id() == id)
+            || self.screens.as_ref().is_some_and(|s| s.owns(id))
+    }
+    pub(crate) fn focus(&self) {
+        if let Some(window) = &self.window {
+            window.set_visible(true);
+            window.focus_window();
+        } else if let Some(screens) = &self.screens {
+            screens.focus();
+        }
+    }
     fn receive_session_events(&mut self) -> Result<()> {
         while let Ok(event) = self.session.try_recv() {
             if self.close_requested {
@@ -490,7 +528,7 @@ impl ConnectingWindowsRunner {
         if let Some(app) = self.playing.as_ref() {
             app.shutdown.store(true, Ordering::Release);
         }
-        event_loop.exit();
+        self.exit(event_loop);
     }
 }
 
@@ -508,7 +546,7 @@ impl WindowsConnectionApp {
         window: &Window,
         alias: String,
         receiver: std_mpsc::Receiver<ConnectionProgress>,
-        repaint_proxy: EventLoopProxy<UiRepaintEvent>,
+        repaint_proxy: EventLoopProxy<UiEvent>,
         generation: u64,
     ) -> Result<(Self, ViewerDisplayHandle)> {
         let egui_context = egui::Context::default();
@@ -517,12 +555,12 @@ impl WindowsConnectionApp {
             if info.viewport_id == egui::ViewportId::ROOT
                 && let Some(when) = Instant::now().checked_add(info.delay)
             {
-                let _ = repaint_proxy.send_event(UiRepaintEvent {
+                let _ = repaint_proxy.send_event(UiEvent::Repaint(UiRepaintEvent {
                     window: window_id,
                     generation,
                     pass: info.current_cumulative_pass_nr,
                     when,
-                });
+                }));
             }
         });
         install_system_cjk_font(&egui_context);

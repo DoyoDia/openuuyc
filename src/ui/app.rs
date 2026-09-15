@@ -10,7 +10,7 @@ pub(crate) struct WindowConfig {
     pub centered: bool,
 }
 
-pub(super) type AppFactory = Box<dyn FnOnce(&egui::Context, Option<String>) -> Box<dyn App>>;
+pub(crate) type AppFactory = Box<dyn FnOnce(&egui::Context, Option<String>) -> Box<dyn App> + Send>;
 
 pub(super) struct AppSession(pub(super) Box<dyn App>);
 

@@ -35,7 +35,17 @@ mod windows_keyboard;
 
 mod windows_mouse;
 
-mod windows_presenter;
+pub(crate) mod windows_presenter;
+pub(crate) struct DesktopInputHook {
+    _hook: windows_keyboard::KeyboardHook,
+}
+pub(crate) fn desktop_input_message(message: *const std::ffi::c_void) -> bool {
+    windows_keyboard::message(message) || windows_mouse::router().message(message)
+}
+pub(crate) fn desktop_input_hook() -> Result<DesktopInputHook> {
+    windows_keyboard::remove_unused_raw_keyboard()?;
+    windows_keyboard::KeyboardHook::install().map(|hook| DesktopInputHook { _hook: hook })
+}
 
 mod windows_ui;
 
@@ -1405,6 +1415,9 @@ fn show_compact_performance(
     ctx.request_repaint_after(Duration::from_millis(50));
     egui::Window::new("性能简报")
         .id(egui::Id::new("performance-compact"))
+        // This HUD has no controls. In particular, it must not become the
+        // foreground layer used by the raw-mouse and annotation hit tests.
+        .interactable(false)
         .anchor(egui::Align2::RIGHT_BOTTOM, [-12.0, -44.0])
         .min_width(COMPACT_HUD_WIDTH)
         .max_width(COMPACT_HUD_WIDTH)
@@ -1488,11 +1501,10 @@ fn compact_audio_meter(ui: &mut egui::Ui, audio: &crate::audio::AudioPlayback, h
         data.insert_temp(peak_id, peaks);
         peaks
     });
-    let (rect, response) = ui.allocate_exact_size(
+    let (rect, _) = ui.allocate_exact_size(
         egui::vec2(COMPACT_METER_WIDTH, height),
         egui::Sense::hover(),
     );
-    response.on_hover_text("L / R · dBFS");
     let painter = ui.painter();
     let ink = crate::ui::theme::MUTED;
     let font = egui::FontId::monospace(7.5);
@@ -1579,8 +1591,7 @@ fn compact_hud_line(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
                 .color(color.gamma_multiply(0.78)),
         )
         .truncate(),
-    )
-    .on_hover_text(text);
+    );
 }
 
 fn connection_color(connection: &str) -> egui::Color32 {

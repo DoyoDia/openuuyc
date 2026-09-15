@@ -2,6 +2,7 @@
   {
     "platform": 1,
     "abilitys": [
+      { "feature": "port_mapping", "original_version": "4.21.0", "final_version": "" },
       {
         "feature": "controlled_update",
         "original_version": "2.5.0",
@@ -57,6 +58,7 @@
   {
     "platform": 4,
     "abilitys": [
+      { "feature": "port_mapping", "original_version": "4.32.0", "final_version": "" },
       {
         "feature": "manual_transfer",
         "final_version": "",

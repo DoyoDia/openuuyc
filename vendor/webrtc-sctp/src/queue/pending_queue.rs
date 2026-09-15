@@ -75,14 +75,15 @@ impl PendingQueue {
             if c.unordered {
                 let mut unordered_queue = self.unordered_queue.write();
                 unordered_queue.push_back(c);
+                self.n_bytes.fetch_add(user_data_len, Ordering::SeqCst);
+                self.queue_len.fetch_add(1, Ordering::SeqCst);
             } else {
                 let mut ordered_queue = self.ordered_queue.write();
                 ordered_queue.push_back(c);
+                self.n_bytes.fetch_add(user_data_len, Ordering::SeqCst);
+                self.queue_len.fetch_add(1, Ordering::SeqCst);
             }
         }
-
-        self.n_bytes.fetch_add(user_data_len, Ordering::SeqCst);
-        self.queue_len.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Appends chunks to the back of the pending queue.
@@ -90,7 +91,16 @@ impl PendingQueue {
     /// # Panics
     ///
     /// If it's a mix of unordered and ordered chunks.
+    #[cfg(test)]
     pub(crate) async fn append(&self, chunks: Vec<ChunkPayloadData>) {
+        self.append_and_wake(chunks, || {}).await;
+    }
+
+    pub(crate) async fn append_and_wake(
+        &self,
+        chunks: Vec<ChunkPayloadData>,
+        mut wake: impl FnMut(),
+    ) {
         if chunks.is_empty() {
             return;
         }
@@ -98,7 +108,7 @@ impl PendingQueue {
         let total_user_data_len = chunks.iter().fold(0, |acc, c| acc + c.user_data.len());
 
         if total_user_data_len >= QUEUE_APPEND_LARGE {
-            self.append_large(chunks).await
+            self.append_large(chunks, &mut wake).await
         } else {
             let _sem_lock = self.semaphore_lock.lock().await;
             let permits = self
@@ -108,11 +118,12 @@ impl PendingQueue {
             // unwrap ok because we never close the semaphore unless we have dropped self
             permits.unwrap().forget();
             self.append_unlimited(chunks, total_user_data_len);
+            wake();
         }
     }
 
     // If this is a very large message we append chunks one by one to allow progress while we are appending
-    async fn append_large(&self, chunks: Vec<ChunkPayloadData>) {
+    async fn append_large(&self, chunks: Vec<ChunkPayloadData>, wake: &mut impl FnMut()) {
         // lock this for the whole duration
         let _sem_lock = self.semaphore_lock.lock().await;
 
@@ -125,12 +136,17 @@ impl PendingQueue {
             if chunk.unordered {
                 let mut unordered_queue = self.unordered_queue.write();
                 unordered_queue.push_back(chunk);
+                self.n_bytes.fetch_add(user_data_len, Ordering::SeqCst);
+                self.queue_len.fetch_add(1, Ordering::SeqCst);
             } else {
                 let mut ordered_queue = self.ordered_queue.write();
                 ordered_queue.push_back(chunk);
+                self.n_bytes.fetch_add(user_data_len, Ordering::SeqCst);
+                self.queue_len.fetch_add(1, Ordering::SeqCst);
             }
-            self.n_bytes.fetch_add(user_data_len, Ordering::SeqCst);
-            self.queue_len.fetch_add(1, Ordering::SeqCst);
+            // A message can exceed the pending queue capacity. Let the writer
+            // drain published fragments before waiting for more permits.
+            wake();
         }
     }
 
@@ -148,6 +164,9 @@ impl PendingQueue {
                 "expected all chunks to be unordered"
             );
             unordered_queue.extend(chunks);
+            self.n_bytes
+                .fetch_add(total_user_data_len, Ordering::SeqCst);
+            self.queue_len.fetch_add(chunks_len, Ordering::SeqCst);
         } else {
             let mut ordered_queue = self.ordered_queue.write();
             assert!(
@@ -155,11 +174,10 @@ impl PendingQueue {
                 "expected all chunks to be ordered"
             );
             ordered_queue.extend(chunks);
+            self.n_bytes
+                .fetch_add(total_user_data_len, Ordering::SeqCst);
+            self.queue_len.fetch_add(chunks_len, Ordering::SeqCst);
         }
-
-        self.n_bytes
-            .fetch_add(total_user_data_len, Ordering::SeqCst);
-        self.queue_len.fetch_add(chunks_len, Ordering::SeqCst);
     }
 
     pub(crate) fn peek(&self) -> Option<ChunkPayloadData> {

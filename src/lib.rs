@@ -34,6 +34,7 @@ mod official_version;
 pub mod performance;
 
 pub mod plugins;
+mod port_mapping;
 mod power;
 mod presence;
 mod remote_cursor;
@@ -53,7 +54,6 @@ mod uu_kcp;
 mod video_color;
 mod video_format;
 pub mod viewer;
-mod viewer_owner;
 mod viewer_shortcuts;
 mod viewing_settings;
 mod virtual_hardware;

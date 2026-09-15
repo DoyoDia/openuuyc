@@ -221,7 +221,7 @@ pub(super) struct ScreenWindows {
     factory: ScreenPlayback,
     shutdown: Arc<AtomicBool>,
     preferences: ViewerPreferences,
-    proxy: EventLoopProxy<UiRepaintEvent>,
+    proxy: EventLoopProxy<UiEvent>,
     generation: u64,
     next_refresh: Instant,
     catalog: Vec<RemoteScreen>,
@@ -231,12 +231,21 @@ pub(super) struct ScreenWindows {
 }
 
 impl ScreenWindows {
+    pub fn owns(&self, id: WindowId) -> bool {
+        self.windows.contains_key(&id)
+    }
+    pub fn focus(&self) {
+        if let Some(slot) = self.windows.values().next() {
+            slot.window.set_visible(true);
+            slot.window.focus_window();
+        }
+    }
     pub fn new(
         window: Window,
         mut session: NativeViewerSession,
         connecting: WindowsConnectionApp,
         preferences: ViewerPreferences,
-        proxy: EventLoopProxy<UiRepaintEvent>,
+        proxy: EventLoopProxy<UiEvent>,
         generation: u64,
     ) -> Result<Self> {
         let factory = session
@@ -482,6 +491,7 @@ impl ScreenWindows {
         let Some(mut slot) = self.windows.remove(&id) else {
             return;
         };
+        slot.window.set_visible(false);
         slot.pending.take();
         if let Some(app) = slot.app.as_mut() {
             app.stream_control
@@ -814,10 +824,9 @@ impl ScreenWindows {
         }
     }
 
-    pub fn update(&mut self, event_loop: &ActiveEventLoop) {
+    pub fn update(&mut self, event_loop: &ActiveEventLoop) -> bool {
         if self.shutdown.load(Ordering::Acquire) || self.windows.is_empty() {
-            event_loop.exit();
-            return;
+            return false;
         }
         let ids: Vec<_> = self.windows.keys().copied().collect();
         for id in &ids {
@@ -955,9 +964,10 @@ impl ScreenWindows {
             }
         }
         if self.windows.is_empty() {
-            event_loop.exit();
+            false
         } else {
             event_loop.set_control_flow(ControlFlow::WaitUntil(wake));
+            true
         }
     }
 }
@@ -965,6 +975,7 @@ impl ScreenWindows {
 impl Drop for ScreenWindows {
     fn drop(&mut self) {
         for slot in self.windows.values_mut() {
+            slot.window.set_visible(false);
             if let Some(app) = slot.app.as_mut() {
                 app.mouse.release(&slot.window);
             }

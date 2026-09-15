@@ -81,6 +81,17 @@ impl DeviceSync {
     pub fn refresh(&mut self, reconnect: bool) {
         self.list_requested |= reconnect || self.list_read.is_none();
         self.groups_requested |= reconnect || self.group_read.is_none();
+        // A failed/empty hardware read cannot classify a device. Allow a user
+        // refresh to retry it, while retaining successful classifications.
+        if let Some(catalog) = &mut self.catalog {
+            catalog.details.retain(|_, detail| {
+                detail
+                    .value
+                    .as_ref()
+                    .is_ok_and(|value| !value.details.is_empty())
+            });
+        }
+        self.queue_missing();
     }
     pub fn refresh_status(&mut self) {
         self.list_requested = true;

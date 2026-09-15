@@ -34,9 +34,7 @@ fn digest(bytes: &[u8]) -> String {
 
 impl AuthenticatedClient {
     pub(super) fn schedule_wallpaper(&self, list: &DeviceList) {
-        let AccountDevice::Managed(device) = &self.device else {
-            return;
-        };
+        let device = &self.device;
         let Ok(identity) = device.identity().client_identity() else {
             return;
         };

@@ -260,10 +260,7 @@ impl RTCDataChannel {
 
     /// on_message sets an event handler which is invoked on a binary
     /// message arrival over the sctp transport from a remote peer.
-    /// OnMessage can currently receive messages up to 16384 bytes
-    /// in size. Check out the detach API if you want to use larger
-    /// message sizes. Note that browser support for larger messages
-    /// is also limited.
+    /// The callback receive size is configured through SettingEngine.
     pub fn on_message(&self, f: OnMessageHdlrFn) {
         self.on_message_handler.store(Some(Arc::new(Mutex::new(f))));
     }
@@ -290,6 +287,10 @@ impl RTCDataChannel {
             let on_close_handler = Arc::clone(&self.on_close_handler);
             let on_error_handler = Arc::clone(&self.on_error_handler);
             let notify_rx = self.notify_tx.clone();
+            let receive_limit = self
+                .setting_engine
+                .data_channel_receive_limit
+                .unwrap_or(DATA_CHANNEL_BUFFER_SIZE as usize);
             tokio::spawn(async move {
                 RTCDataChannel::read_loop(
                     notify_rx,
@@ -298,6 +299,7 @@ impl RTCDataChannel {
                     on_message_handler,
                     on_close_handler,
                     on_error_handler,
+                    receive_limit,
                 )
                 .await;
             });
@@ -317,8 +319,9 @@ impl RTCDataChannel {
         on_message_handler: Arc<ArcSwapOption<Mutex<OnMessageHdlrFn>>>,
         on_close_handler: Arc<ArcSwapOption<Mutex<OnCloseHdlrFn>>>,
         on_error_handler: Arc<ArcSwapOption<Mutex<OnErrorHdlrFn>>>,
+        receive_limit: usize,
     ) {
-        let mut buffer = vec![0u8; DATA_CHANNEL_BUFFER_SIZE as usize];
+        let mut buffer = vec![0u8; receive_limit];
         loop {
             let (n, is_string) = tokio::select! {
                 _ = notify_rx.notified() => {

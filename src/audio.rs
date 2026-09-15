@@ -43,6 +43,7 @@ struct Shared {
     settings: AtomicU32,
     generation: AtomicU64,
     started: AtomicBool,
+    audible: AtomicBool,
     stopped: AtomicBool,
     retry: AtomicBool,
     receiving: AtomicBool,
@@ -137,6 +138,7 @@ impl AudioPlayback {
                 settings: AtomicU32::new(100),
                 generation: AtomicU64::new(0),
                 started: AtomicBool::new(false),
+                audible: AtomicBool::new(false),
                 stopped: AtomicBool::new(false),
                 retry: AtomicBool::new(false),
                 receiving: AtomicBool::new(false),
@@ -187,7 +189,9 @@ impl AudioPlayback {
     /// Unity-gain reference at the device-channel mix, before volume/mute.
     /// This is a current display peak, not the lifetime diagnostic `peak`.
     pub fn input_levels(&self) -> [f32; 2] {
-        if self.0.shared.stopped.load(Ordering::Acquire) {
+        if self.0.shared.stopped.load(Ordering::Acquire)
+            || !self.0.shared.audible.load(Ordering::Acquire)
+        {
             return [0.0; 2];
         }
         let meter = &self.0.shared.input_level;
@@ -196,7 +200,11 @@ impl AudioPlayback {
 
     pub fn output_levels(&self) -> [f32; 2] {
         let settings = self.settings();
-        if settings.muted || settings.volume == 0 || self.0.shared.stopped.load(Ordering::Acquire) {
+        if settings.muted
+            || settings.volume == 0
+            || self.0.shared.stopped.load(Ordering::Acquire)
+            || !self.0.shared.audible.load(Ordering::Acquire)
+        {
             return [0.0; 2];
         }
         let meter = &self.0.shared.output_level;
@@ -266,6 +274,7 @@ impl AudioPlayback {
     }
 
     pub fn start(&self) -> Result<()> {
+        self.0.shared.audible.store(true, Ordering::Release);
         let mut worker = lock(&self.0.worker);
         if worker.is_some() || self.0.shared.stopped.load(Ordering::Acquire) {
             return Ok(());
@@ -294,6 +303,10 @@ impl AudioPlayback {
             worker.thread().unpark();
             let _ = tokio::task::spawn_blocking(move || worker.join()).await;
         }
+    }
+    pub(crate) fn suspend(&self) {
+        self.0.shared.audible.store(false, Ordering::Release);
+        self.0.shared.clear_levels();
     }
 }
 
@@ -498,7 +511,10 @@ fn build_stream<T: cpal::SizedSample + cpal::FromSample<f32>>(
             move |output: &mut [T], _info| {
                 shared.callbacks.fetch_add(1, Ordering::Relaxed);
                 let bits = shared.settings.load(Ordering::Relaxed);
-                let gain = if bits & 256 != 0 || shared.stopped.load(Ordering::Acquire) {
+                let gain = if bits & 256 != 0
+                    || shared.stopped.load(Ordering::Acquire)
+                    || !shared.audible.load(Ordering::Acquire)
+                {
                     0.0
                 } else {
                     (bits & 255) as f32 / 100.0

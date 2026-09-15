@@ -7,6 +7,7 @@ mod device_details;
 mod device_visuals;
 mod devices;
 mod logs;
+mod port_mapping;
 mod power;
 mod update_dialog;
 
@@ -1216,7 +1217,7 @@ impl DeviceCenterApp {
                             ui.label(format!("{codec}   {value}"));
                         }
                     }
-                    if let Some(info) = self.active_session.as_ref().and_then(|s| s.owner.info()) {
+                    if let Some(info) = self.active_session.as_ref().and_then(|s| s.handle.info()) {
                         ui.add_space(8.0);
                         ui.label("当前观看");
                         for (label, value) in [

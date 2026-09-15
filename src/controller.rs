@@ -23,7 +23,12 @@ use crate::{
 };
 
 pub type ConnectionProgressReporter = Arc<dyn Fn(ConnectionProgress) + Send + Sync>;
+pub(crate) fn has_gui_connection(controller: &str, target: &str) -> bool {
+    shared::get(&shared::key(controller, target)).is_some()
+}
 mod assist;
+mod shared;
+pub(crate) mod windows;
 
 fn report_progress(
     reporter: Option<&ConnectionProgressReporter>,
@@ -37,10 +42,8 @@ fn report_progress(
 }
 
 pub struct ControllerConnection {
-    signal_shutdown: Option<oneshot::Sender<()>>,
-    signal_task: tokio::task::JoinHandle<Result<()>>,
     peer: Arc<NativePeer>,
-    forwarder: RtpForwarder,
+    forwarder: shared::ForwarderLease,
     profile: ConnectionMediaProfile,
     preference_writer: Option<crate::viewing_settings::PreferenceWriter>,
     audio_preference_writer: Option<crate::viewing_settings::PreferenceWriter>,
@@ -99,6 +102,51 @@ impl ResolvedConnection {
         cancel: &CancellationToken,
         retries: &mut u32,
     ) -> Result<ControllerConnection> {
+        let key = shared::key(&self.controller_device_id, &self.target_device_id);
+        let _gate = shared::connection_gate(&key).lock_owned().await;
+        if self.assist.is_none()
+            && let Some(session) = shared::get(&key)
+        {
+            let mut connection = ControllerConnection::from_shared(session, self.profile, true)?;
+            let handle = connection.stream_control_handle();
+            let store = self.client.viewing_settings_store(&self.target_device_id)?;
+            if let Some(saved) = store.load().await? {
+                let preferences = crate::stream_control::StreamControlPreferences::from_saved(
+                    saved,
+                    self.profile,
+                );
+                if !handle.snapshot().ready {
+                    let _ = handle.restore_preferences(preferences);
+                }
+            }
+            let mut audio = store
+                .load_audio()
+                .await?
+                .unwrap_or(crate::audio::AudioSettings {
+                    volume: 100,
+                    muted: false,
+                });
+            audio.muted |= self.profile.muted;
+            handle.audio().set_settings(audio);
+            handle.set_feature_policy(
+                self.client
+                    .feature_catalog()
+                    .policy(self.target_platform, &self.target_version),
+            );
+            if self.target_platform == 1 {
+                handle.set_remote_upgrade(crate::remote_upgrade::RemoteUpgrade::new(
+                    Arc::clone(&self.client),
+                    self.target_device_id.clone(),
+                    self.summary.alias.clone(),
+                    self.target_version.clone(),
+                    cancel,
+                ));
+            }
+            connection.preference_writer = Some(store.clone().bind(handle.clone()));
+            connection.audio_preference_writer = Some(store.bind_audio(handle));
+            connection.activate_viewing().await?;
+            return Ok(connection);
+        }
         self.client.schedule_feature_refresh(true);
         if self.target_device_id == self.controller_device_id {
             bail!("cannot connect the virtual device to itself");
@@ -252,9 +300,13 @@ impl ResolvedConnection {
             self.audio_preferences.expect("resolved audio settings"),
             reporter,
             cancel,
+            crate::control::ControlPurpose::Viewing,
         )
         .await?;
         let handle = connection.stream_control_handle();
+        if self.assist.is_none() {
+            shared::register(key, &connection.forwarder.session, self.client.ended());
+        }
         if self.assist.is_none() && self.target_platform == 1 {
             handle.set_remote_upgrade(crate::remote_upgrade::RemoteUpgrade::new(
                 Arc::clone(&self.client),
@@ -277,37 +329,30 @@ impl ResolvedConnection {
 pub async fn run_saved_viewer_window(
     alias: String,
     options: ConnectionMediaOptions,
-    owner: Option<String>,
     target_id: Option<String>,
 ) -> Result<()> {
-    run_viewer_window(alias, options, owner, target_id, None).await
+    run_viewer_window(alias, options, target_id, None, None).await
 }
 
 pub async fn run_assist_viewer_window(
     alias: String,
     request: crate::assist::AssistRequest,
     options: ConnectionMediaOptions,
-    owner: Option<String>,
 ) -> Result<()> {
     request.validate()?;
-    run_viewer_window(alias, options, owner, None, Some(request)).await
+    run_viewer_window(alias, options, None, Some(request), None).await
 }
 
 async fn run_viewer_window(
     alias: String,
     options: ConnectionMediaOptions,
-    owner: Option<String>,
     target_id: Option<String>,
     assist: Option<crate::assist::AssistRequest>,
+    hosted: Option<windows::WindowContext>,
 ) -> Result<()> {
-    let owns_presence = owner.is_none();
-    let (owner, background) = match owner {
-        Some(descriptor) => {
-            let (stream, background) = crate::viewer_owner::connect(&descriptor).await?;
-            (Some(stream), background)
-        }
-        None => (None, None),
-    };
+    let owns_presence = hosted.is_none();
+    let background = hosted.as_ref().and_then(|h| h.background.clone());
+    let window_key = hosted.as_ref().map(|h| h.key.clone());
     let (progress_sender, progress_receiver) = std::sync::mpsc::channel();
     let (viewer_sender, viewer_receiver) = std::sync::mpsc::channel();
     let reporter: ConnectionProgressReporter = Arc::new(move |progress| {
@@ -320,24 +365,24 @@ async fn run_viewer_window(
     }
     let task_alias = alias.clone();
     let (display_sender, display_receiver) = oneshot::channel();
-    let cancel = CancellationToken::new();
+    let cancel = hosted
+        .as_ref()
+        .map(|h| h.cancel.clone())
+        .unwrap_or_default();
     let owner_cancel = cancel.clone();
     let close_sender = viewer_sender.clone();
-    let (monitor_sender, monitor_receiver) = tokio::sync::watch::channel(None);
-    let (target_sender, target_receiver) = tokio::sync::watch::channel(None);
+    let (monitor_sender, _monitor_receiver) = hosted
+        .as_ref()
+        .map(|h| (h.monitor.clone(), h.monitor.subscribe()))
+        .unwrap_or_else(|| tokio::sync::watch::channel(None));
+    let (target_sender, _target_receiver) = hosted
+        .as_ref()
+        .map(|h| (h.target.clone(), h.target.subscribe()))
+        .unwrap_or_else(|| tokio::sync::watch::channel(None));
     let owner_task = tokio::spawn(async move {
         tokio::select! {
             biased;
-            _ = owner_cancel.cancelled() => {},
-            _ = async {
-                if let Some(owner) = owner {
-                    crate::viewer_owner::report_until_owner_closes(owner, monitor_receiver, target_receiver).await;
-                } else { std::future::pending::<()>().await; }
-            } => {
-                tracing::info!("device-center owner ended; closing viewer gracefully");
-                owner_cancel.cancel();
-                let _ = close_sender.send(ViewerWindowEvent::Close);
-            },
+            _ = owner_cancel.cancelled() => {let _=close_sender.send(ViewerWindowEvent::Close);},
             _ = async {
                 if let Err(error) = tokio::signal::ctrl_c().await {
                     tracing::warn!(%error, "Ctrl+C listener unavailable");
@@ -363,6 +408,7 @@ async fn run_viewer_window(
                 target: target_sender,
                 target_id,
                 assist,
+                client: hosted.map(|h| h.client),
             },
             &task_cancel,
             &mut reporter,
@@ -376,9 +422,22 @@ async fn run_viewer_window(
         result
     });
 
-    let window_result = tokio::task::block_in_place(|| {
-        run_connecting_viewer_window(alias, progress_receiver, viewer_receiver, display_sender)
-    });
+    let window_result = if let Some(key) = window_key {
+        crate::ui::window_manager::viewer(
+            key,
+            crate::viewer::windows_presenter::ConnectingWindowsRunConfig {
+                alias,
+                progress: progress_receiver,
+                session: viewer_receiver,
+                display_sender,
+            },
+        )
+        .await
+    } else {
+        tokio::task::block_in_place(|| {
+            run_connecting_viewer_window(alias, progress_receiver, viewer_receiver, display_sender)
+        })
+    };
     cancel.cancel();
     let _ = owner_task.await;
     // The owner observes cancellation in every network wait and joins cleanup;
@@ -393,11 +452,12 @@ async fn run_viewer_window(
 }
 
 struct ViewerConnectionWindow {
+    client: Option<Arc<AuthenticatedClient>>,
     sender: std::sync::mpsc::Sender<ViewerWindowEvent>,
     display: oneshot::Receiver<ViewerDisplayHandle>,
     owns_presence: bool,
     monitor: tokio::sync::watch::Sender<Option<crate::performance::PerformanceMonitor>>,
-    target: tokio::sync::watch::Sender<Option<crate::viewer_owner::ViewerTarget>>,
+    target: tokio::sync::watch::Sender<Option<windows::ViewerTarget>>,
     target_id: Option<String>,
     assist: Option<crate::assist::AssistRequest>,
 }
@@ -417,16 +477,13 @@ async fn run_viewer_connection_owner(
         target,
         target_id,
         assist,
+        client: hosted_client,
     } = window;
     let presence_stop = CancellationToken::new();
     let mut presence_task = None;
     let mut account_owner = None;
     let result = async {
-        let client = Arc::new(if owns_presence {
-            AuthenticatedClient::from_saved_session()?
-        } else {
-            AuthenticatedClient::from_parent_session()?
-        });
+        let client = if let Some(client)=hosted_client.clone(){client}else{Arc::new(AuthenticatedClient::from_saved_session()?)};
         account_owner = Some(Arc::clone(&client));
         let mut resolved = if let Some(request) = assist {
             cancellable(cancel, assist::resolve(client, &alias, options, request, Some(reporter))).await?
@@ -472,7 +529,7 @@ async fn run_viewer_connection_owner(
         let mut retries = 0;
         loop {
             monitor.send_replace(None);
-            target.send_replace(Some(crate::viewer_owner::ViewerTarget {
+            target.send_replace(Some(windows::ViewerTarget {
                 device_id: resolved.target_device_id.clone(), alias: resolved.summary.alias.clone(),
             }));
             let mut controller = match resolved.connect(Some(reporter), cancel, &mut retries).await {
@@ -649,7 +706,9 @@ async fn run_viewer_connection_owner(
     if let Some(task) = presence_task {
         let _ = task.await;
     }
-    if let Some(client) = account_owner {
+    if hosted_client.is_none()
+        && let Some(client) = account_owner
+    {
         client.close().await;
     }
     if cancel.is_cancelled() {
@@ -660,6 +719,98 @@ async fn run_viewer_connection_owner(
 }
 
 impl ControllerConnection {
+    pub(crate) async fn connect_mapping(
+        client: &AuthenticatedClient,
+        device: &crate::api::DeviceInfo,
+        policy: crate::feature_ability::FeaturePolicy,
+        options: ConnectionMediaOptions,
+        cancel: &CancellationToken,
+    ) -> Result<Self> {
+        let key = shared::key(&client.device_id(), &device.device_id);
+        let _gate = shared::connection_gate(&key).lock_owned().await;
+        let display = detect_local_display().unwrap_or(LocalDisplayInfo::FALLBACK);
+        let mut profile = options.resolve(display)?;
+        if let Ok(store) = client.viewing_settings_store(&device.device_id)
+            && let Ok(Some(saved)) = store.load().await
+            && let Some(settings) = saved.settings
+        {
+            profile.stream_fps = settings.frame_rate.value(display);
+            profile.decoder_fps_cap = display.refresh_hz.max(profile.stream_fps);
+        }
+        if let Some(session) = shared::get(&key) {
+            return Self::from_shared(session, profile, false);
+        }
+        anyhow::ensure!(
+            device.participant_count() == 0,
+            "设备已有其他连接，不能抢占"
+        );
+        let room = cancellable(cancel, client.join_device(&device.device_id, false)).await?;
+        let connection = Self::establish(
+            room,
+            &client.device_id(),
+            profile,
+            policy,
+            crate::control::ControlConnectType::Normal,
+            options.transport,
+            None,
+            crate::audio::AudioSettings {
+                volume: 0,
+                muted: true,
+            },
+            None,
+            cancel,
+            crate::control::ControlPurpose::PortMapping,
+        )
+        .await?;
+        shared::register(key, &connection.forwarder.session, client.ended());
+        Ok(connection)
+    }
+    fn from_shared(
+        session: Arc<shared::Session>,
+        profile: ConnectionMediaProfile,
+        viewing: bool,
+    ) -> Result<Self> {
+        Ok(Self {
+            peer: Arc::clone(&session.peer),
+            forwarder: session.lease(viewing)?,
+            profile,
+            preference_writer: None,
+            audio_preference_writer: None,
+        })
+    }
+    async fn activate_viewing(&self) -> Result<()> {
+        self.wait_port_mapping_ready().await?;
+        let handle = self.stream_control_handle();
+        let snapshot = handle.snapshot();
+        let screen = snapshot
+            .screens
+            .first()
+            .context("被控端尚未提供显示器列表")?;
+        handle.set_screen_capture(screen.id, true).await?;
+        handle.set_viewing_enabled(true);
+        Ok(())
+    }
+    pub(crate) fn port_mapping_transport(&self) -> Arc<crate::port_mapping::Transport> {
+        self.peer.port_mapping()
+    }
+    pub(crate) async fn wait_port_mapping_ready(&self) -> Result<()> {
+        let control = self.stream_control_handle();
+        let changed = control.protocol_notifications();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let wake = changed.notified();
+                tokio::pin!(wake);
+                wake.as_mut().enable();
+                if control.handshake_status().connected {
+                    break;
+                }
+                wake.await;
+            }
+        })
+        .await
+        .context("端口转发协议握手未完成")?;
+        self.port_mapping_transport().wait_ready().await
+    }
     pub fn stream_control_handle(&self) -> StreamControlHandle {
         self.peer.stream_control_handle()
     }
@@ -671,11 +822,14 @@ impl ControllerConnection {
     async fn select_video_track(&mut self) -> Result<(ForwardedTrack, VideoCodec)> {
         let video = tokio::time::timeout(Duration::from_secs(12), async {
             loop {
-                let track = self
-                    .forwarder
-                    .next_track()
-                    .await
-                    .ok_or_else(|| anyhow!("remote RTP track channel closed"))?;
+                let track = if let Some(track) = self.forwarder.selected_metadata() {
+                    track
+                } else {
+                    self.forwarder
+                        .next_track()
+                        .await
+                        .ok_or_else(|| anyhow!("remote RTP track channel closed"))?
+                };
                 match track.kind {
                     MediaKind::Audio => {}
                     MediaKind::Video => return Ok::<_, anyhow::Error>(track),
@@ -714,6 +868,7 @@ impl ControllerConnection {
         audio_settings: crate::audio::AudioSettings,
         reporter: Option<&ConnectionProgressReporter>,
         cancel: &CancellationToken,
+        purpose: crate::control::ControlPurpose,
     ) -> Result<Self> {
         tracing::info!(?profile, ?transport, "establishing controller connection");
         report_progress(
@@ -743,7 +898,13 @@ impl ControllerConnection {
         );
         let control = match cancellable(
             cancel,
-            signal.start_control(controller_device_id, profile, connect_type, preferences),
+            signal.start_control(
+                controller_device_id,
+                profile,
+                connect_type,
+                preferences,
+                purpose,
+            ),
         )
         .await
         {
@@ -801,6 +962,8 @@ impl ControllerConnection {
             }
         };
         peer.stream_control_handle().set_feature_policy(features);
+        peer.stream_control_handle()
+            .set_viewing_enabled(purpose == crate::control::ControlPurpose::Viewing);
         peer.stream_control_handle()
             .set_display_connection_type(connect_type);
         if let Some(preferences) = preferences
@@ -925,15 +1088,12 @@ impl ControllerConnection {
             Some(signal_control),
         ));
         tracing::info!("controller WebRTC negotiation complete");
-        Ok(Self {
-            signal_shutdown: Some(signal_shutdown),
-            signal_task,
-            peer,
-            forwarder,
+        let session = shared::Session::new(peer, forwarder, signal_shutdown, signal_task);
+        Self::from_shared(
+            session,
             profile,
-            preference_writer: None,
-            audio_preference_writer: None,
-        })
+            purpose == crate::control::ControlPurpose::Viewing,
+        )
     }
 
     pub async fn start_native_viewer(
@@ -1094,16 +1254,34 @@ impl ControllerConnection {
 
     pub async fn keep_alive(mut self, mut shutdown: oneshot::Receiver<()>) -> Result<()> {
         let result = tokio::select! {
-            result = &mut self.signal_task => {
-                self.signal_shutdown.take();
-                flatten_signal_task(result)
+            result = self.forwarder.session.ended() => result,
+            _ = &mut shutdown => Ok(()),
+        };
+        if let Some(writer) = &mut self.preference_writer {
+            writer.finish().await;
+        }
+        if let Some(writer) = &mut self.audio_preference_writer {
+            writer.finish().await;
+        }
+        let closed = self.close().await;
+        result.and(closed)
+    }
+
+    pub async fn close(mut self) -> Result<()> {
+        if self.forwarder.viewing && Arc::strong_count(&self.forwarder.session) > 1 {
+            let handle = self.stream_control_handle();
+            handle.mouse().disable();
+            handle.audio().suspend();
+            for screen in handle.snapshot().screens {
+                let _ = handle.set_screen_capture(screen.id, false).await;
             }
-            _ = &mut shutdown => {
-                if let Some(signal_shutdown) = self.signal_shutdown.take() {
-                    let _ = signal_shutdown.send(());
-                }
-                flatten_signal_task((&mut self.signal_task).await)
-            }
+            handle.set_viewing_enabled(false);
+        }
+        let result = if Arc::strong_count(&self.forwarder.session) == 1 {
+            self.forwarder.session.request_close();
+            self.forwarder.session.ended().await
+        } else {
+            Ok(())
         };
         if let Some(writer) = &mut self.preference_writer {
             writer.finish().await;
@@ -1112,28 +1290,6 @@ impl ControllerConnection {
             writer.finish().await;
         }
         result
-    }
-
-    pub async fn close(mut self) -> Result<()> {
-        if let Some(signal_shutdown) = self.signal_shutdown.take() {
-            let _ = signal_shutdown.send(());
-        }
-        let result = flatten_signal_task((&mut self.signal_task).await);
-        if let Some(writer) = &mut self.preference_writer {
-            writer.finish().await;
-        }
-        if let Some(writer) = &mut self.audio_preference_writer {
-            writer.finish().await;
-        }
-        result
-    }
-}
-
-impl Drop for ControllerConnection {
-    fn drop(&mut self) {
-        if let Some(shutdown) = self.signal_shutdown.take() {
-            let _ = shutdown.send(());
-        }
     }
 }
 
@@ -1257,7 +1413,12 @@ async fn resolve_connection_with_client(
     if !device.controlled_support || !device.controllable {
         bail!("device `{alias}` does not currently allow control");
     }
-    if device.participant_count() != 0 {
+    let _gate = shared::connection_gate(&shared::key(&client.device_id(), &device.device_id))
+        .lock_owned()
+        .await;
+    if device.participant_count() != 0
+        && shared::get(&shared::key(&client.device_id(), &device.device_id)).is_none()
+    {
         bail!(
             "device `{alias}` already has {} participant(s); refusing to force takeover",
             device.participant_count()

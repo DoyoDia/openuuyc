@@ -357,6 +357,14 @@ impl DeviceCenterApp {
         ui.spacing_mut().item_spacing.y = 0.0;
         let mut back = false;
         let mut refresh = false;
+        let mut ports = false;
+        let has_ports = self.devices.as_ref().is_some_and(|list| {
+            list.my_binded_devices.iter().any(|d| {
+                d.device_id == id
+                    && d.device_id != list.current_device.device_id
+                    && matches!(d.platform, 1 | 4)
+            })
+        });
         let (header, _) = ui.allocate_exact_size(vec2(viewport.x, 48.0), Sense::hover());
         let mut header_ui = ui.new_child(
             egui::UiBuilder::new()
@@ -489,7 +497,7 @@ impl DeviceCenterApp {
                 let card_y = hero_h - 24.0;
                 let has_power = owned && !current && matches!(device.platform, 1 | 4);
                 let power_y = card_y + card_h + 16.0;
-                let info_y = if has_power {
+                let info_y = if has_power || has_ports {
                     power_y + theme::CONTROL_HEIGHT + 24.0
                 } else {
                     card_y + card_h + 24.0
@@ -609,14 +617,18 @@ impl DeviceCenterApp {
                         vec2(156.0, theme::CONTROL_HEIGHT),
                     );
                     let mut button_ui = ui.new_child(egui::UiBuilder::new().max_rect(rect));
-                    let issue = if self.active_session.is_some() {
-                        Some("请先关闭当前观看窗口".into())
-                    } else {
-                        connectability_error(&device).err()
-                    };
+                    let issue = self.viewer_action_issue(&device);
+                    let own_session = self
+                        .active_session
+                        .as_ref()
+                        .is_some_and(|session| session.device_id.as_deref() == Some(id.as_str()));
                     let button = detail_button(
                         &mut button_ui,
-                        "连接设备",
+                        if own_session {
+                            "打开观看窗口"
+                        } else {
+                            "连接设备"
+                        },
                         Glyph::Monitor,
                         !self.mutation_pending && !self.logout_pending && issue.is_none(),
                         rect.size(),
@@ -627,15 +639,17 @@ impl DeviceCenterApp {
                         button.on_disabled_hover_text(issue);
                     }
                 }
+                let action_count = usize::from(has_power) * 3 + usize::from(has_ports);
+                let gap = 16.0;
+                let button_w = (card.width() - action_count.saturating_sub(1) as f32 * gap)
+                    / action_count.max(1) as f32;
                 if has_power {
                     let mut progress_ui =
                         ui.new_child(egui::UiBuilder::new().max_rect(egui::Rect::from_min_size(
                             at(pad, power_y),
-                            vec2(card.width(), theme::CONTROL_HEIGHT),
+                            vec2(button_w * 3.0 + gap * 2.0, theme::CONTROL_HEIGHT),
                         )));
                     if !self.detail_power_result(&mut progress_ui, &id) {
-                        let gap = 16.0;
-                        let button_w = (card.width() - 2.0 * gap) / 3.0;
                         for (i, action) in crate::power::PowerAction::ALL.into_iter().enumerate() {
                             let rect = egui::Rect::from_min_size(
                                 at(pad + i as f32 * (button_w + gap), power_y),
@@ -663,6 +677,44 @@ impl DeviceCenterApp {
                             }
                         }
                     }
+                }
+                if has_ports {
+                    let rect = egui::Rect::from_min_size(
+                        at(
+                            pad + if has_power {
+                                3.0 * (button_w + gap)
+                            } else {
+                                0.0
+                            },
+                            power_y,
+                        ),
+                        vec2(button_w, theme::CONTROL_HEIGHT),
+                    );
+                    let mut button_ui = ui.new_child(egui::UiBuilder::new().max_rect(rect));
+                    let service = self.devices.as_ref().and_then(|list| {
+                        crate::port_mapping::service::status(&list.current_device.device_id, &id)
+                    });
+                    let running = service.as_ref().is_some_and(|s| s.enabled);
+                    ui.ctx().request_repaint_after(Duration::from_millis(200));
+                    let available = !self.logout_pending
+                        && (service.is_some()
+                            || (device.is_connected()
+                                && device.controllable
+                                && device.controlled_support));
+                    ports = detail_button(
+                        &mut button_ui,
+                        "端口转发",
+                        Glyph::Monitor,
+                        available,
+                        rect.size(),
+                        if running {
+                            ButtonTone::Primary
+                        } else {
+                            ButtonTone::Normal
+                        },
+                    )
+                    .on_disabled_hover_text("设备需要在线且允许连接")
+                    .clicked();
                 }
                 let left = card.left() + 12.0;
                 let middle = card.center().x;
@@ -802,6 +854,9 @@ impl DeviceCenterApp {
                     ui.label("正在处理设备操作…");
                 }
             });
+        if ports {
+            self.open_port_mapping(id.clone());
+        }
         if connect {
             self.selected_device_id = Some(id);
             self.start_viewer();

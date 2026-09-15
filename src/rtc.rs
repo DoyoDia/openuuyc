@@ -123,6 +123,7 @@ pub struct NativePeer {
 
 #[derive(Clone)]
 struct DataChannels {
+    port_mapping: Arc<crate::port_mapping::Transport>,
     _local_channels: Arc<Vec<Arc<RTCDataChannel>>>,
     incoming_channels: Arc<std::sync::Mutex<Vec<Arc<RTCDataChannel>>>>,
     performance: PerformanceMonitor,
@@ -209,7 +210,24 @@ impl DataChannels {
         let streamer_sender_started = Arc::new(AtomicBool::new(false));
         let (stream_control, control_messages, echo_responses) =
             StreamControlHandle::new(profile, performance.clone());
+        let port_mapping = Arc::new(crate::port_mapping::Transport::default());
         for channel in &local_channels {
+            if channel.label() == "FILE_DATA_CHANNEL" {
+                port_mapping.bind(channel);
+                let binary = Arc::clone(channel);
+                let mapping = Arc::clone(&port_mapping);
+                workers.spawn(async move {
+                    binary
+                        .set_buffered_amount_low_threshold(4 * 1024 * 1024)
+                        .await;
+                    binary
+                        .on_buffered_amount_low(Box::new(move || {
+                            mapping.wake();
+                            Box::pin(async {})
+                        }))
+                        .await;
+                });
+            }
             Self::install_handlers(
                 channel,
                 performance.clone(),
@@ -218,6 +236,7 @@ impl DataChannels {
                 true,
                 uu_kcp.clone(),
                 &workers,
+                Arc::clone(&port_mapping),
             );
         }
         let control_channel = local_channels
@@ -246,6 +265,7 @@ impl DataChannels {
         ));
         Self {
             _local_channels: Arc::new(local_channels),
+            port_mapping,
             incoming_channels: Arc::new(std::sync::Mutex::new(Vec::new())),
             performance,
             streamer_sender_started,
@@ -263,6 +283,7 @@ impl DataChannels {
         local_channel: bool,
         uu_kcp: UuKcpControl,
         workers: &Arc<SessionWorkers>,
+        port_mapping: Arc<crate::port_mapping::Transport>,
     ) {
         if !local_channel && channel.label() == "CONTROL_DATA_CHANNEL" {
             uu_kcp.set_control_stream(channel.id(), true);
@@ -273,7 +294,9 @@ impl DataChannels {
         let open_stream_control = stream_control.clone();
         let open_kcp = uu_kcp.clone();
         let open_workers = Arc::downgrade(workers);
+        let open_mapping = Arc::clone(&port_mapping);
         channel.on_open(Box::new(move || {
+            open_mapping.wake();
             let label = label.clone();
             let stats_channel = stats_channel.clone();
             let stats_performance = stats_performance.clone();
@@ -310,7 +333,11 @@ impl DataChannels {
         let label = channel.label().to_owned();
         let close_stream_control = stream_control.clone();
         let closed_channel = Arc::downgrade(channel);
+        let close_mapping = Arc::clone(&port_mapping);
         channel.on_close(Box::new(move || {
+            if local_channel && label == "FILE_DATA_CHANNEL" {
+                close_mapping.close();
+            }
             let label = label.clone();
             let stream_control = close_stream_control.clone();
             let closed_channel = closed_channel.clone();
@@ -341,10 +368,13 @@ impl DataChannels {
         let label = channel.label().to_owned();
         let message_stream_control = stream_control;
         channel.on_message(Box::new(move |message| {
+            let mapping=Arc::clone(&port_mapping);
             let label = label.clone();
             let stream_control = message_stream_control.clone();
             Box::pin(async move {
-                if label == "STREAMER_DATA_CHANNEL" {
+                if label=="FILE_DATA_CHANNEL" {
+                    if let Err(error)=mapping.receive(&message.data) {tracing::warn!(%error,"invalid port mapping message");}
+                } else if label == "STREAMER_DATA_CHANNEL" {
                     // Peer media_inbounds describe the peer's receive direction.
                     // This read-only client has no UU video sender. Do not use
                     // those reports as measurements of our local video pipeline.
@@ -379,6 +409,7 @@ impl DataChannels {
             false,
             self.uu_kcp.clone(),
             &self.workers,
+            Arc::clone(&self.port_mapping),
         );
         std_mutex_lock(&self.incoming_channels).push(channel);
     }
@@ -951,6 +982,9 @@ pub(crate) struct PlayoutDelay {
 }
 
 impl RtpForwarder {
+    pub(crate) fn selected_metadata(&self) -> Option<ForwardedTrack> {
+        self.selected_video.as_ref().map(|v| v.metadata.clone())
+    }
     pub async fn next_track(&mut self) -> Option<ForwardedTrack> {
         let track = self.announcements.recv().await?;
         if track.kind == MediaKind::Video && self.selected_video.is_none() {
@@ -2001,6 +2035,9 @@ fn uu_transport_feedback_interval(send_bitrate_bps: u64) -> Duration {
 }
 
 impl NativePeer {
+    pub(crate) fn port_mapping(&self) -> Arc<crate::port_mapping::Transport> {
+        Arc::clone(&self.data_channels.port_mapping)
+    }
     pub async fn new(ice_servers: Vec<IceServer>, transport: TransportChoice) -> Result<Self> {
         let profile = crate::media::ConnectionMediaOptions::default()
             .resolve(crate::media::LocalDisplayInfo::FALLBACK)?;
@@ -2061,6 +2098,10 @@ impl NativePeer {
         )
         .context("register WebRTC transport feedback interceptors")?;
         let mut setting_engine = SettingEngine::default();
+        setting_engine.set_sctp_max_message_size_can_send(
+            webrtc::api::setting_engine::SctpMaxMessageSize::Bounded(524_288),
+        );
+        setting_engine.set_data_channel_receive_limit(524_288);
         // UU uses separate replay policies: SRTP has a 1024-packet window,
         // while SRTCP's non-wrapping 31-bit index has a 128-packet window.
         setting_engine.set_srtp_replay_protection_window(1024);
@@ -2865,6 +2906,7 @@ impl NativePeer {
     }
 
     pub async fn close(&self) -> Result<()> {
+        self.data_channels.port_mapping.close();
         self.data_channels.stream_control.mouse().close().await;
         self.data_channels.workers.close().await;
         self.data_channels.stream_control.audio().close().await;

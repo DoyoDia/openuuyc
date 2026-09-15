@@ -487,6 +487,7 @@ impl SignalSession {
         profile: ConnectionMediaProfile,
         connect_type: crate::control::ControlConnectType,
         preferences: Option<crate::stream_control::StreamControlPreferences>,
+        purpose: crate::control::ControlPurpose,
     ) -> Result<ControlSessionInfo> {
         tracing::debug!(?profile, "starting control handshake");
         let decoder_support = detect_native_decoder_support(profile)?;
@@ -501,6 +502,7 @@ impl SignalSession {
             profile,
             connect_type,
             preferences,
+            purpose,
         )?;
         let app_control_id = frames.app_control_id;
         self.send_binary_packet(frames.header, frames.attachment)?;

@@ -411,6 +411,7 @@ struct StreamControlState {
     pb_connected: bool,
     peer_capture_setting: u32,
     initial_capture_sync_sent: bool,
+    viewing_enabled: bool,
     next_sequence: i64,
     pending_sequences: VecDeque<i64>,
     last_applied_sequence: Option<i64>,
@@ -507,6 +508,7 @@ impl StreamControlHandle {
             pb_connected: false,
             peer_capture_setting: 0,
             initial_capture_sync_sent: false,
+            viewing_enabled: true,
             next_sequence: 1,
             pending_sequences: VecDeque::new(),
             last_applied_sequence: None,
@@ -830,7 +832,7 @@ impl StreamControlHandle {
         let (complete, done) = tokio::sync::oneshot::channel();
         {
             let mut state = lock(&self.shared);
-            ensure_ready(&state)?;
+            ensure_business_ready(&state)?;
             if screen_id < 0 || !state.screens.iter().any(|screen| screen.id == screen_id) {
                 bail!("显示器已不可用");
             }
@@ -882,7 +884,7 @@ impl StreamControlHandle {
     async fn ensure_video_tracks_registered(&self) -> Result<()> {
         {
             let mut state = lock(&self.shared);
-            ensure_ready(&state)?;
+            ensure_business_ready(&state)?;
             if state.available_video_tracks.is_empty() {
                 bail!("被控端未协商可用的视频轨道");
             }
@@ -1420,6 +1422,17 @@ impl StreamControlHandle {
         Arc::clone(&self.protocol_changed)
     }
 
+    pub(crate) fn set_viewing_enabled(&self, enabled: bool) {
+        let mut state = lock(&self.shared);
+        if enabled && !state.viewing_enabled {
+            state.initial_capture_sync_sent = false;
+        }
+        state.viewing_enabled = enabled;
+        if enabled {
+            self.maybe_send_initial_capture_sync(&mut state);
+        }
+    }
+
     pub(crate) fn handshake_status(&self) -> PbHandshakeStatus {
         let state = lock(&self.shared);
         PbHandshakeStatus {
@@ -1698,6 +1711,9 @@ impl StreamControlHandle {
     }
 
     fn refresh_mouse_policy(&self, state: &mut StreamControlState) {
+        if !state.viewing_enabled {
+            return;
+        }
         let mode = state.mouse.mode();
         let (relative, wanted) = mouse_policy(state, mode);
         if mode == MouseMode::Smart && state.mouse.relative_mode() != relative {
@@ -1722,6 +1738,9 @@ impl StreamControlHandle {
     }
 
     fn maybe_send_initial_capture_sync(&self, state: &mut StreamControlState) {
+        if !state.viewing_enabled {
+            return;
+        }
         self.maybe_register_video_tracks(state);
         let outgoing = match prepare_initial_capture_sync(state) {
             Ok(Some(outgoing)) => outgoing,
@@ -2068,6 +2087,17 @@ fn constrain_auto_quality(state: &mut StreamControlState) {
 }
 
 fn ensure_ready(state: &StreamControlState) -> Result<()> {
+    ensure_business_ready(state)?;
+    if state.remote_display.is_none() {
+        bail!("尚未收到活动屏幕基线，已阻止发送不完整的串流设置");
+    }
+    if state.baseline.codec_type == 0 {
+        bail!("视频编码尚未完成协商");
+    }
+    Ok(())
+}
+
+fn ensure_business_ready(state: &StreamControlState) -> Result<()> {
     if !state.control_channel_open {
         bail!("UU CONTROL 通道尚未打开");
     }
@@ -2079,12 +2109,6 @@ fn ensure_ready(state: &StreamControlState) -> Result<()> {
     }
     if protocol(state) == StreamControlProtocol::Unsupported {
         bail!("对端不支持当前串流协议（需要CaptureSetting RPC）");
-    }
-    if state.remote_display.is_none() {
-        bail!("尚未收到活动屏幕基线，已阻止发送不完整的串流设置");
-    }
-    if state.baseline.codec_type == 0 {
-        bail!("视频编码尚未完成协商");
     }
     Ok(())
 }
@@ -2563,6 +2587,22 @@ struct PbControlMessage {
         tags = "3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28"
     )]
     payload: Option<PbPayload>,
+}
+
+pub(crate) fn encode_port_mapping(payload: Vec<u8>) -> Vec<u8> {
+    PbControlMessage {
+        seq: 0,
+        timestamp: 0,
+        payload: Some(PbPayload::PortMappingFrame(payload)),
+    }
+    .encode_to_vec()
+}
+
+pub(crate) fn decode_port_mapping(bytes: &[u8]) -> Result<Option<Vec<u8>>> {
+    Ok(match PbControlMessage::decode(bytes)?.payload {
+        Some(PbPayload::PortMappingFrame(frame)) => Some(frame),
+        _ => None,
+    })
 }
 
 // main.proto's complete oneof range, read from the shipped descriptor.

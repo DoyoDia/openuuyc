@@ -3,6 +3,7 @@ use anyhow::Result;
 
 pub(crate) mod d3d11;
 
+pub(crate) mod window_manager;
 mod windows;
 
 mod app;
