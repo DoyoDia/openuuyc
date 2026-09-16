@@ -93,12 +93,26 @@ impl DeviceCenterApp {
                 ui.label(RichText::new("未保存").small().color(AMBER));
             }
         });
-        if let Some((ok, message)) = &state.message {
-            ui.label(RichText::new(message).color(if *ok { GREEN } else { RED }));
+        if let Some((ok, message)) = state.message.take() {
+            crate::ui::controls::notice(
+                ui.ctx(),
+                "log-settings-result",
+                "日志设置",
+                if ok {
+                    crate::ui::controls::DialogIcon::Ready
+                } else {
+                    crate::ui::controls::DialogIcon::Error
+                },
+                message,
+            );
         }
-        if let Some(error) = &snapshot.error {
-            ui.label(RichText::new(error).color(RED));
-        }
+        crate::ui::controls::observe_notice(
+            ui.ctx(),
+            "log-settings-error",
+            "日志设置",
+            crate::ui::controls::DialogIcon::Error,
+            snapshot.error.as_deref(),
+        );
         if let Some(filter) = &snapshot.override_filter {
             ui.label(RichText::new("命令行级别生效中").color(AMBER))
                 .on_hover_text(filter);

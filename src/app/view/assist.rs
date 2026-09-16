@@ -117,21 +117,42 @@ impl DeviceCenterApp {
                 ui.ctx().request_repaint_after(remaining);
             }
         }
-        if !favorites && let Some((message, _)) = &self.assist.connect_error {
-            ui.add_space(12.0);
-            ui.label(RichText::new(message).color(AMBER));
-        }
-        if !self.assist.message.is_empty() || self.assist.querying {
-            ui.add_space(12.0);
-            ui.horizontal_wrapped(|ui| {
-                if self.assist.busy {
-                    ui.spinner();
-                }
-                ui.label(RichText::new(&self.assist.message).color(MUTED));
-                if self.assist.querying && ui.button("取消").clicked() {
-                    self.cancel_assist_check();
-                }
-            });
+        crate::ui::controls::observe_notice(
+            ui.ctx(),
+            "assist-connect-error",
+            "远程协助",
+            crate::ui::controls::DialogIcon::Warning,
+            self.assist
+                .connect_error
+                .as_ref()
+                .map(|(message, _)| message.as_str())
+                .filter(|_| !favorites),
+        );
+        if self.assist.querying {
+            if crate::ui::controls::observe_notice_action(
+                ui.ctx(),
+                "assist-query",
+                "检查对端设备",
+                crate::ui::controls::DialogIcon::Waiting,
+                Some(&self.assist.message),
+                "取消连接",
+            )
+            .is_some()
+            {
+                self.cancel_assist_check();
+            }
+        } else {
+            crate::ui::controls::clear_notice(ui.ctx(), "assist-query");
+            if !self.assist.busy && !self.assist.message.is_empty() {
+                crate::ui::controls::notice(
+                    ui.ctx(),
+                    "assist-result",
+                    "远程协助",
+                    crate::ui::controls::DialogIcon::Info,
+                    std::mem::take(&mut self.assist.message),
+                );
+                self.assist.message_until = None;
+            }
         }
         ui.add_space(22.0);
         ui.horizontal(|ui| {
@@ -361,17 +382,19 @@ impl DeviceCenterApp {
                 .frame(dialog_frame())
                 .show(ctx, |ui| {
                     ui.set_width(400.0);
-                    ui.label(
-                        RichText::new("操作未完成")
-                            .size(crate::ui::theme::DIALOG_TITLE)
-                            .strong(),
+                    close = crate::ui::controls::dialog_header(
+                        ui,
+                        "操作未完成",
+                        crate::ui::controls::DialogIcon::Error,
+                        true,
                     );
-                    ui.add_space(16.0);
                     ui.add(egui::Label::new(message).wrap());
-                    ui.add_space(20.0);
-                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                        close = ui.add(login_button("知道了").fill(BLUE)).clicked();
-                    });
+                    close |= crate::ui::controls::dialog_actions(
+                        ui,
+                        Some(crate::ui::controls::DialogAction::new("知道了")),
+                        None,
+                    )
+                    .0;
                 });
             if close || response.should_close() {
                 self.assist.error_dialog = None;
@@ -385,15 +408,16 @@ impl DeviceCenterApp {
                 .frame(dialog_frame())
                 .show(ctx, |ui| {
                     ui.set_width(360.0);
-                    ui.label(
-                        RichText::new("设备验证码")
-                            .size(crate::ui::theme::DIALOG_TITLE)
-                            .strong(),
+                    cancel = crate::ui::controls::dialog_header(
+                        ui,
+                        "设备验证码",
+                        crate::ui::controls::DialogIcon::Info,
+                        true,
                     );
                     ui.label(RichText::new(&pending.id).color(MUTED));
                     ui.add_space(18.0);
                     let input = ui.add_sized(
-                        [360.0, 40.0],
+                        [360.0, theme::CONTROL_HEIGHT],
                         singleline_input(&mut self.assist.code)
                             .hint_text("输入对端设备验证码")
                             .char_limit(256),
@@ -408,16 +432,16 @@ impl DeviceCenterApp {
                     {
                         submit = true;
                     }
-                    ui.add_space(18.0);
-                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                        submit |= ui
-                            .add_enabled(
-                                !self.assist.code.is_empty(),
-                                login_button("连接").fill(BLUE),
-                            )
-                            .clicked();
-                        cancel = ui.button("取消").clicked();
-                    });
+                    let (accept, dismiss) = crate::ui::controls::dialog_actions(
+                        ui,
+                        Some(
+                            crate::ui::controls::DialogAction::new("连接")
+                                .enabled(!self.assist.code.is_empty()),
+                        ),
+                        Some("取消"),
+                    );
+                    submit |= accept;
+                    cancel |= dismiss;
                 });
             if submit {
                 let code = std::mem::take(&mut self.assist.code);
@@ -435,20 +459,23 @@ impl DeviceCenterApp {
                 .frame(dialog_frame())
                 .show(ctx, |ui| {
                     ui.set_width(380.0);
-                    ui.label(
-                        RichText::new(if edit.editing {
+                    cancel = crate::ui::controls::dialog_header(
+                        ui,
+                        if edit.editing {
                             "编辑收藏"
                         } else {
                             "添加收藏"
-                        })
-                        .size(crate::ui::theme::DIALOG_TITLE)
-                        .strong(),
+                        },
+                        crate::ui::controls::DialogIcon::Edit,
+                        true,
                     );
-                    ui.add_space(16.0);
                     ui.label(RichText::new("设备 ID").color(MUTED));
                     ui.add_enabled_ui(!edit.editing, |ui| {
                         if ui
-                            .add_sized([380.0, 36.0], singleline_input(&mut edit.id).char_limit(24))
+                            .add_sized(
+                                [380.0, theme::CONTROL_HEIGHT],
+                                singleline_input(&mut edit.id).char_limit(24),
+                            )
                             .changed()
                         {
                             edit.code.clear();
@@ -458,7 +485,7 @@ impl DeviceCenterApp {
                     ui.add_space(10.0);
                     ui.label(RichText::new("备注").color(MUTED));
                     ui.add_sized(
-                        [380.0, 36.0],
+                        [380.0, theme::CONTROL_HEIGHT],
                         singleline_input(&mut edit.remark)
                             .hint_text("可选")
                             .char_limit(128),
@@ -467,22 +494,22 @@ impl DeviceCenterApp {
                     ui.label(RichText::new("设备验证码").color(MUTED));
                     edit.code_changed |= ui
                         .add_sized(
-                            [380.0, 36.0],
+                            [380.0, theme::CONTROL_HEIGHT],
                             singleline_input(&mut edit.code)
                                 .hint_text("可选，仅保存在本机")
                                 .char_limit(256),
                         )
                         .changed();
-                    ui.add_space(18.0);
-                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                        submit = ui
-                            .add_enabled(
+                    let (accept, dismiss) =
+                        crate::ui::controls::dialog_actions(
+                            ui,
+                            Some(crate::ui::controls::DialogAction::new("保存").enabled(
                                 normalize_connect_id(&edit.id).is_ok() && !self.assist.busy,
-                                login_button("保存").fill(BLUE),
-                            )
-                            .clicked();
-                        cancel = ui.button("取消").clicked();
-                    });
+                            )),
+                            Some("取消"),
+                        );
+                    submit = accept;
+                    cancel |= dismiss;
                 });
             if submit {
                 self.request_assist_operation(AssistOperation::Save {
@@ -506,26 +533,27 @@ impl DeviceCenterApp {
                         DeletePrompt::Device(SavedKind::Recent, _) => "移除这条记录？",
                         DeletePrompt::Device(SavedKind::Favorites, _) => "取消收藏？",
                     };
-                    ui.label(
-                        RichText::new(title)
-                            .size(crate::ui::theme::DIALOG_TITLE)
-                            .strong(),
+                    cancel = crate::ui::controls::dialog_header(
+                        ui,
+                        title,
+                        crate::ui::controls::DialogIcon::Warning,
+                        true,
                     );
-                    ui.add_space(14.0);
                     if let DeletePrompt::Device(_, item) = &prompt {
                         ui.label(item.title());
                         ui.label(RichText::new(&item.connect_id).color(MUTED));
                     }
-                    ui.add_space(18.0);
-                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                        submit = ui
-                            .add_enabled(
-                                !self.assist.busy,
-                                login_button("确认").fill(crate::ui::theme::DANGER_FILL),
-                            )
-                            .clicked();
-                        cancel = ui.button("取消").clicked();
-                    });
+                    let (accept, dismiss) = crate::ui::controls::dialog_actions(
+                        ui,
+                        Some(
+                            crate::ui::controls::DialogAction::new("确认")
+                                .enabled(!self.assist.busy)
+                                .danger(true),
+                        ),
+                        Some("取消"),
+                    );
+                    submit = accept;
+                    cancel |= dismiss;
                 });
             if submit {
                 let operation = match prompt {

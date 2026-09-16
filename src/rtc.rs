@@ -212,10 +212,12 @@ impl DataChannels {
             StreamControlHandle::new(profile, performance.clone());
         let port_mapping = Arc::new(crate::port_mapping::Transport::default());
         for channel in &local_channels {
+            stream_control.file_transfer().bind(channel);
             if channel.label() == "FILE_DATA_CHANNEL" {
                 port_mapping.bind(channel);
                 let binary = Arc::clone(channel);
                 let mapping = Arc::clone(&port_mapping);
+                let files = Arc::clone(stream_control.file_transfer());
                 workers.spawn(async move {
                     binary
                         .set_buffered_amount_low_threshold(4 * 1024 * 1024)
@@ -223,6 +225,7 @@ impl DataChannels {
                     binary
                         .on_buffered_amount_low(Box::new(move || {
                             mapping.wake();
+                            files.wake();
                             Box::pin(async {})
                         }))
                         .await;
@@ -340,6 +343,10 @@ impl DataChannels {
         let closed_channel = Arc::downgrade(channel);
         let close_mapping = Arc::clone(&port_mapping);
         channel.on_close(Box::new(move || {
+            if local_channel && matches!(label.as_str(), "TEXT_DATA_CHANNEL" | "FILE_DATA_CHANNEL")
+            {
+                close_stream_control.file_transfer().close();
+            }
             if local_channel && label == "FILE_DATA_CHANNEL" {
                 close_mapping.close();
             }
@@ -377,7 +384,12 @@ impl DataChannels {
             let label = label.clone();
             let stream_control = message_stream_control.clone();
             Box::pin(async move {
-                if label=="FILE_DATA_CHANNEL" {
+                if matches!(label.as_str(), "TEXT_DATA_CHANNEL" | "FILE_DATA_CHANNEL") && !message.data.starts_with(b"{")
+                    && stream_control.file_transfer().receive(&message.data).await.unwrap_or_else(|error| {
+                        tracing::warn!(%error,"invalid file transfer message"); false
+                    }) {
+                    // Only solicited transfer RPCs reach their registered task.
+                } else if label=="FILE_DATA_CHANNEL" {
                     if let Err(error)=mapping.receive(&message.data) {tracing::warn!(%error,"invalid port mapping message");}
                 } else if label == "TEXT_DATA_CHANNEL" && !message.data.starts_with(b"{")
                     && stream_control.clipboard().receive(&message.data).unwrap_or_else(|error| {
@@ -2917,6 +2929,7 @@ impl NativePeer {
     }
 
     pub async fn close(&self) -> Result<()> {
+        self.data_channels.stream_control.file_transfer().close();
         self.data_channels.stream_control.clipboard().suspend();
         self.data_channels.port_mapping.close();
         self.data_channels.stream_control.mouse().close().await;

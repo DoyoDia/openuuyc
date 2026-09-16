@@ -269,6 +269,7 @@ impl DesktopWindow {
                 );
             }
             self.app.0.ui(ui);
+            super::controls::show_notices(ui.ctx());
         });
         let (drawing, platform, mut viewports) = egui_directx11::split_output(output);
         self.input.handle_platform_output(&self.window, platform);

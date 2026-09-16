@@ -227,17 +227,13 @@ fn version_prompt(
     let mut chosen = None;
     let mut dismiss = false;
     let response = egui::Modal::new(egui::Id::new("remote-version-too-low"))
-        .frame(controls::update_dialog_frame())
+        .frame(controls::dialog_frame())
         .show(ctx, |ui| {
             ui.set_width(
                 theme::REMOTE_UPGRADE_WIDTH.min((ctx.content_rect().width() - 80.0).max(260.0)),
             );
-            dismiss = controls::update_dialog_header(
-                ui,
-                "被控端需要更新",
-                controls::UpdateIcon::Required,
-                true,
-            );
+            dismiss =
+                controls::dialog_header(ui, "被控端需要更新", controls::DialogIcon::Required, true);
             ui.label(format!("当前被控端不支持{feature}，请先更新。"));
             ui.add_space(12.0);
             controls::update_device_row(ui, alias, version);
@@ -268,17 +264,13 @@ fn version_prompt(
 fn result_prompt(ctx: &egui::Context, message: &str) -> bool {
     let mut close = false;
     let response = egui::Modal::new(egui::Id::new("remote-update-request-result"))
-        .frame(controls::update_dialog_frame())
+        .frame(controls::dialog_frame())
         .show(ctx, |ui| {
             ui.set_width(
                 theme::REMOTE_UPGRADE_WIDTH.min((ctx.content_rect().width() - 80.0).max(260.0)),
             );
-            close = controls::update_dialog_header(
-                ui,
-                "未能确认更新结果",
-                controls::UpdateIcon::Error,
-                true,
-            );
+            close =
+                controls::dialog_header(ui, "未能确认更新结果", controls::DialogIcon::Error, true);
             egui::ScrollArea::vertical()
                 .id_salt(("remote-update-error-message", message))
                 .max_height(theme::UPDATE_MESSAGE_HEIGHT)
@@ -293,17 +285,12 @@ fn result_prompt(ctx: &egui::Context, message: &str) -> bool {
 fn progress_prompt(ctx: &egui::Context, started: Instant) -> bool {
     let mut close = false;
     egui::Modal::new(egui::Id::new("remote-upgrade-progress"))
-        .frame(controls::update_dialog_frame())
+        .frame(controls::dialog_frame())
         .show(ctx, |ui| {
             ui.set_width(
                 theme::REMOTE_UPGRADE_WIDTH.min((ctx.content_rect().width() - 80.0).max(260.0)),
             );
-            controls::update_dialog_header(
-                ui,
-                "正在更新被控端",
-                controls::UpdateIcon::Waiting,
-                false,
-            );
+            controls::dialog_header(ui, "正在更新被控端", controls::DialogIcon::Waiting, false);
             ui.label(RichText::new("连接会暂时中断，请稍候。").color(theme::MUTED));
             ui.add_space(16.0);
             controls::update_countdown(ui, 20_u64.saturating_sub(started.elapsed().as_secs()));

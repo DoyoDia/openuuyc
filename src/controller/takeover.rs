@@ -62,12 +62,14 @@ pub(crate) fn confirmation(ctx: &egui::Context, device: &DeviceInfo) -> Option<b
         .frame(crate::ui::controls::dialog_frame())
         .show(ctx, |ui| {
             ui.set_width(crate::ui::theme::TAKEOVER_DIALOG_WIDTH);
-            ui.label(
-                egui::RichText::new("接管设备？")
-                    .size(crate::ui::theme::DIALOG_TITLE)
-                    .strong(),
-            );
-            ui.add_space(14.0);
+            if crate::ui::controls::dialog_header(
+                ui,
+                "接管设备？",
+                crate::ui::controls::DialogIcon::Warning,
+                true,
+            ) {
+                choice = Some(false);
+            }
             let alias = if device.alias.is_empty() {
                 "未命名设备"
             } else {
@@ -82,15 +84,17 @@ pub(crate) fn confirmation(ctx: &egui::Context, device: &DeviceInfo) -> Option<b
                     .size(crate::ui::theme::SMALL)
                     .color(crate::ui::theme::MUTED),
             );
-            ui.add_space(24.0);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.add(crate::ui::controls::primary("强制接管")).clicked() {
-                    choice = Some(true);
-                }
-                if ui.add(crate::ui::controls::secondary("取消")).clicked() {
-                    choice = Some(false);
-                }
-            });
+
+            let (accept, cancel) = crate::ui::controls::dialog_actions(
+                ui,
+                Some(crate::ui::controls::DialogAction::new("强制接管")),
+                Some("取消"),
+            );
+            if accept {
+                choice = Some(true);
+            } else if cancel {
+                choice = Some(false);
+            }
         });
     choice.or_else(|| response.should_close().then_some(false))
 }

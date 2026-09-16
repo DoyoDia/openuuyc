@@ -323,7 +323,13 @@ impl Editor {
             }
         }
         if !self.message.is_empty() {
-            ui.label(&self.message);
+            crate::ui::controls::notice(
+                ui.ctx(),
+                "plugin-editor",
+                "节点图",
+                crate::ui::controls::DialogIcon::Info,
+                std::mem::take(&mut self.message),
+            );
         }
         if self.document.is_none() || self.catalog.is_none() {
             return;
@@ -372,18 +378,20 @@ impl Editor {
             .frame(crate::ui::controls::dialog_frame())
             .show(ctx, |ui| {
                 ui.set_width(360.0);
-                ui.label(
-                    egui::RichText::new("节点图尚未保存")
-                        .size(crate::ui::theme::DIALOG_TITLE)
-                        .strong(),
+                cancel = crate::ui::controls::dialog_header(
+                    ui,
+                    "节点图尚未保存",
+                    crate::ui::controls::DialogIcon::Warning,
+                    true,
                 );
-                ui.add_space(12.0);
                 ui.label("切换会丢弃当前修改。可以先继续编辑并保存，再切换节点图。");
-                ui.add_space(18.0);
-                ui.horizontal(|ui| {
-                    cancel = ui.add(crate::ui::controls::primary("继续编辑")).clicked();
-                    discard = ui.button("放弃修改并切换").clicked();
-                });
+                let (accept, dismiss) = crate::ui::controls::dialog_actions(
+                    ui,
+                    Some(crate::ui::controls::DialogAction::new("继续编辑")),
+                    Some("放弃修改并切换"),
+                );
+                cancel |= accept;
+                discard = dismiss;
             });
         if discard {
             self.switch_document(next);

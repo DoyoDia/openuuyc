@@ -24,6 +24,7 @@ mod device_change;
 mod device_session;
 mod display_hdr;
 mod feature_ability;
+mod file_transfer;
 mod flexfec;
 pub mod logging;
 pub mod login;

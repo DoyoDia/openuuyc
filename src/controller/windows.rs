@@ -98,6 +98,7 @@ pub(crate) async fn shutdown() {
         done.cancelled().await;
     }
     crate::port_mapping::service::shutdown_all().await;
+    crate::file_transfer::service::shutdown_all().await;
     super::shared::shutdown_all().await;
 }
 pub(crate) fn start(

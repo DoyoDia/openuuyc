@@ -382,9 +382,14 @@ impl Controller {
                         .show(ui, |ui| analysis.controller.menu(ui));
                 });
             }
-            if self.shared.video_failed.load(Ordering::Acquire) == active.revision {
-                ui.colored_label(egui::Color32::LIGHT_RED, "视频节点已旁路");
-            }
+            crate::ui::controls::observe_notice(
+                ui.ctx(),
+                "plugin-video-bypass",
+                "视频节点异常",
+                crate::ui::controls::DialogIcon::Error,
+                (self.shared.video_failed.load(Ordering::Acquire) == active.revision)
+                    .then_some("视频节点已旁路"),
+            );
             let generated = self.shared.generated.load(Ordering::Relaxed);
             if generated > 0 {
                 ui.weak(format!(
@@ -393,12 +398,19 @@ impl Controller {
                 ));
             }
         }
-        if self.pending.is_some() {
-            ui.weak("正在准备新图…");
-        }
-        if let Some(error) = &self.error {
-            ui.colored_label(egui::Color32::LIGHT_RED, error);
-        }
+        crate::ui::controls::progress_notice(
+            ui.ctx(),
+            "plugin-prepare",
+            "准备节点图",
+            self.pending.is_some().then_some("正在准备新图…"),
+        );
+        crate::ui::controls::observe_notice(
+            ui.ctx(),
+            "plugin-runtime",
+            "节点图运行失败",
+            crate::ui::controls::DialogIcon::Error,
+            self.error.as_deref(),
+        );
         ui.horizontal(|ui| {
             if ui.button("刷新列表").clicked() {
                 match super::graph::list() {

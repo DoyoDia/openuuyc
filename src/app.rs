@@ -1053,7 +1053,10 @@ impl crate::ui::App for DeviceCenterApp {
                 .active_session
                 .as_ref()
                 .is_some_and(|session| session.handle.result().is_none());
-        if has_viewer || crate::port_mapping::service::active_service_count() > 0 {
+        if has_viewer
+            || crate::port_mapping::service::active_service_count() > 0
+            || crate::file_transfer::service::active_count() > 0
+        {
             self.close_confirmation = true;
             false
         } else {
@@ -1151,6 +1154,11 @@ enum GuiCommand {
         takeover: Option<crate::controller::takeover::Approval>,
     },
     Ports {
+        generation: u64,
+        device: DeviceInfo,
+        options: ConnectionMediaOptions,
+    },
+    Files {
         generation: u64,
         device: DeviceInfo,
         options: ConnectionMediaOptions,
@@ -1386,6 +1394,22 @@ async fn gui_worker_loop(
                     {
                         if let Err(error) =
                             crate::port_mapping::ui::open(Arc::clone(client), device, options)
+                        {
+                            let _ = events.send(GuiEvent::Error(error.to_string()));
+                        }
+                    }
+                }
+                GuiCommand::Files {
+                    generation,
+                    device,
+                    options,
+                } => {
+                    if generation == catalog_generation
+                        && logout_task.is_none()
+                        && let Some(client) = &client
+                    {
+                        if let Err(error) =
+                            crate::file_transfer::ui::open(Arc::clone(client), device, options)
                         {
                             let _ = events.send(GuiEvent::Error(error.to_string()));
                         }

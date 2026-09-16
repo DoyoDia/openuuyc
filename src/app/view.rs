@@ -514,22 +514,30 @@ fn qr_form(
 ) -> QrAction {
     login_qr_area(ui, texture, running);
     ui.add_space(12.0);
-    let message = if status.is_empty() {
-        "使用 UU 远程手机端扫码"
-    } else {
-        status
-    };
-    let response = ui.add_sized(
+    ui.add_sized(
         [320.0, 20.0],
         egui::Label::new(
-            RichText::new(message)
-                .size(crate::ui::theme::COMPACT_TEXT)
-                .color(if error.is_some() { AMBER } else { MUTED }),
+            RichText::new(if error.is_some() || status.is_empty() {
+                "使用 UU 远程手机端扫码"
+            } else {
+                status
+            })
+            .size(theme::COMPACT_TEXT)
+            .color(MUTED),
         )
         .truncate(),
     );
-    if let Some(error) = error {
-        response.on_hover_text(error);
+    if crate::ui::controls::observe_notice_action(
+        ui.ctx(),
+        "qr-login-error",
+        "扫码登录",
+        crate::ui::controls::DialogIcon::Error,
+        error,
+        "刷新二维码",
+    ) == Some(true)
+        && enabled
+    {
+        return QrAction::Start;
     }
     ui.add_space(10.0);
     if !running && error.is_some() {
@@ -968,44 +976,21 @@ impl DeviceCenterApp {
 
     fn alert(&mut self, ui: &mut egui::Ui) {
         self.power_results(ui);
-        if !self.status.kind.is_alert() {
-            return;
-        }
-        let color = match self.status.kind {
-            StatusKind::Notice => BLUE,
-            StatusKind::Error => RED,
-            _ => AMBER,
-        };
-        let mut dismiss = false;
-        egui::Frame::new()
-            .fill(if matches!(self.status.kind, StatusKind::Notice) {
-                crate::ui::theme::SURFACE
-            } else {
-                crate::ui::theme::WARNING_BG
-            })
-            .corner_radius(5.0)
-            .inner_margin(egui::Margin::symmetric(12, 8))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    let (rect, _) = ui.allocate_exact_size(vec2(22.0, 24.0), Sense::hover());
-                    paint_icon(ui.painter(), rect, Icon::Info, color);
-                    ui.add_sized(
-                        [ui.available_width() - 40.0, 26.0],
-                        egui::Label::new(
-                            RichText::new(&self.status.text)
-                                .size(crate::ui::theme::COMPACT_TEXT)
-                                .color(TEXT),
-                        )
-                        .truncate(),
-                    )
-                    .on_hover_text(&self.status.text);
-                    dismiss = icon_button(ui, Icon::Close, "关闭提示").clicked();
-                });
-            });
-        if dismiss {
+        if self.status.kind.is_alert() {
+            let icon = match self.status.kind {
+                StatusKind::Notice => crate::ui::controls::DialogIcon::Info,
+                StatusKind::Error => crate::ui::controls::DialogIcon::Error,
+                _ => crate::ui::controls::DialogIcon::Warning,
+            };
+            crate::ui::controls::notice(
+                ui.ctx(),
+                "device-center-status",
+                "操作提示",
+                icon,
+                self.status.text.clone(),
+            );
             self.status = StatusMessage::info("");
         }
-        ui.add_space(12.0);
     }
 
     fn active_view(&mut self, ui: &mut egui::Ui) {
@@ -1288,12 +1273,12 @@ impl DeviceCenterApp {
             .frame(dialog_frame())
             .show(ctx, |ui| {
                 ui.set_width(theme::CLOSE_CENTER_DIALOG_WIDTH);
-                ui.label(
-                    RichText::new("关闭控制中心？")
-                        .size(theme::DIALOG_TITLE)
-                        .strong(),
+                cancel = crate::ui::controls::dialog_header(
+                    ui,
+                    "关闭控制中心？",
+                    crate::ui::controls::DialogIcon::Warning,
+                    true,
                 );
-                ui.add_space(14.0);
                 ui.label("关闭后将结束观看连接，并停止已开启的端口转发服务。");
                 if let Some(session) = &self.active_session {
                     ui.add_space(10.0);
@@ -1303,15 +1288,25 @@ impl DeviceCenterApp {
                     ui.label(RichText::new("正在建立观看连接").color(MUTED));
                 }
                 let services = crate::port_mapping::service::active_service_count();
+                let files = crate::file_transfer::service::active_count();
+                if files > 0 {
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(format!("文件传输连接：{files} 个，未完成任务将暂停"))
+                            .color(MUTED),
+                    );
+                }
                 if services > 0 {
                     ui.add_space(6.0);
                     ui.label(RichText::new(format!("端口转发服务：{services} 个")).color(MUTED));
                 }
-                ui.add_space(24.0);
-                ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                    confirm = ui.add(primary("关闭程序")).clicked();
-                    cancel = ui.add(crate::ui::controls::secondary("取消")).clicked();
-                });
+                let (accept, dismiss) = crate::ui::controls::dialog_actions(
+                    ui,
+                    Some(crate::ui::controls::DialogAction::new("关闭程序")),
+                    Some("取消"),
+                );
+                confirm = accept;
+                cancel |= dismiss;
             });
         if confirm {
             self.close_confirmed = true;
@@ -1362,16 +1357,20 @@ impl DeviceCenterApp {
             .frame(dialog_frame())
             .show(ctx, |ui| {
                 ui.set_width(450.0);
-                ui.label(
-                    RichText::new(if rename {
+                cancel = crate::ui::controls::dialog_header(
+                    ui,
+                    if rename {
                         "重命名设备"
                     } else {
                         "从账号移除设备？"
-                    })
-                    .size(crate::ui::theme::DIALOG_TITLE)
-                    .strong(),
+                    },
+                    if rename {
+                        crate::ui::controls::DialogIcon::Edit
+                    } else {
+                        crate::ui::controls::DialogIcon::Warning
+                    },
+                    true,
                 );
-                ui.add_space(12.0);
                 ui.add(egui::Label::new(display_alias(&edit.device)).wrap());
                 ui.label(
                     RichText::new(&edit.device.device_id)
@@ -1385,9 +1384,16 @@ impl DeviceCenterApp {
                         [ui.available_width(), theme::CONTROL_HEIGHT],
                         singleline_input(&mut edit.alias).hint_text("设备名称"),
                     );
-                    if edit.alias.chars().any(char::is_control) {
-                        ui.colored_label(AMBER, "名称不能包含换行或控制字符");
-                    }
+                    crate::ui::controls::observe_form_notice(
+                        ui.ctx(),
+                        "device-name-validation",
+                        "名称无效",
+                        crate::ui::controls::DialogIcon::Warning,
+                        edit.alias
+                            .chars()
+                            .any(char::is_control)
+                            .then_some("名称不能包含换行或控制字符"),
+                    );
                     if let Some(catalog) = &self.catalog
                         && edit.device.device_id == catalog.groups.current_device_id
                         && ui
@@ -1405,25 +1411,27 @@ impl DeviceCenterApp {
                         ui.colored_label(AMBER, "当前观看将结束。");
                     }
                 }
-                ui.add_space(18.0);
-                ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                    commit = ui
-                        .add_enabled(
+                let (accept, dismiss) = crate::ui::controls::dialog_actions(
+                    ui,
+                    Some(
+                        crate::ui::controls::DialogAction::new(if rename {
+                            "保存名称"
+                        } else {
+                            "确认移除"
+                        })
+                        .enabled(
                             !self.mutation_pending
                                 && (!rename
                                     || (!edit.alias.trim().is_empty()
                                         && edit.alias != edit.device.alias
                                         && !edit.alias.chars().any(char::is_control))),
-                            if rename {
-                                primary("保存名称")
-                            } else {
-                                egui::Button::new(RichText::new("确认移除").color(Color32::WHITE))
-                                    .fill(crate::ui::theme::DANGER_FILL)
-                            },
                         )
-                        .clicked();
-                    cancel = ui.button("取消").clicked();
-                });
+                        .danger(!rename),
+                    ),
+                    Some("取消"),
+                );
+                commit = accept;
+                cancel |= dismiss;
             });
         if commit {
             let change = match edit.action {
@@ -1630,15 +1638,14 @@ fn phone_form(
         ui.add_enabled_ui(!busy, |ui| {
             ui.horizontal(|ui| {
                 ui.add_sized(
-                    [64.0, 40.0],
+                    [64.0, theme::CONTROL_HEIGHT],
                     singleline_input(&mut phone.country)
                         .hint_text("+86")
                         .char_limit(6)
-                        .horizontal_align(Align::Center)
-                        .margin(egui::Margin::symmetric(8, 8)),
+                        .horizontal_align(Align::Center),
                 );
                 ui.add_sized(
-                    [248.0, 40.0],
+                    [248.0, theme::CONTROL_HEIGHT],
                     singleline_input(&mut phone.mobile)
                         .hint_text("请输入手机号")
                         .char_limit(24),
@@ -1655,7 +1662,7 @@ fn phone_form(
         ui.horizontal(|ui| {
             ui.add_enabled_ui(!busy, |ui| {
                 let response = ui.add_sized(
-                    [184.0, 40.0],
+                    [184.0, theme::CONTROL_HEIGHT],
                     singleline_input(&mut phone.code)
                         .hint_text("6位短信验证码")
                         .char_limit(6),
@@ -1715,22 +1722,18 @@ fn phone_form(
             })
             .inner
             .clicked();
-        ui.add_space(6.0);
-        let message = if phone.status.is_empty() {
-            " "
-        } else {
-            phone.status.as_str()
-        };
-        let response = ui.add(
-            egui::Label::new(
-                RichText::new(message)
-                    .size(crate::ui::theme::COMPACT_TEXT)
-                    .color(if phone.error.is_some() { AMBER } else { MUTED }),
-            )
-            .truncate(),
-        );
-        if let Some(error) = &phone.error {
-            response.on_hover_text(error.as_str());
+        if !busy && !phone.status.is_empty() {
+            crate::ui::controls::notice(
+                ui.ctx(),
+                "phone-login-result",
+                "登录提示",
+                if phone.error.is_some() {
+                    crate::ui::controls::DialogIcon::Error
+                } else {
+                    crate::ui::controls::DialogIcon::Info
+                },
+                std::mem::take(&mut phone.status),
+            );
         }
         if can_cancel {
             ui.add_space(8.0);
@@ -1750,24 +1753,20 @@ impl DeviceCenterApp {
             .frame(dialog_frame())
             .show(ctx, |ui| {
                 ui.set_width(410.0);
-                ui.label(
-                    RichText::new("退出登录？")
-                        .size(crate::ui::theme::DIALOG_TITLE)
-                        .strong(),
+                cancel = crate::ui::controls::dialog_header(
+                    ui,
+                    "退出登录？",
+                    crate::ui::controls::DialogIcon::Warning,
+                    true,
                 );
-                ui.add_space(14.0);
                 ui.label("当前观看将结束，本虚拟设备也会从账号中移除。");
-                ui.add_space(24.0);
-                ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                    confirm = ui
-                        .add(
-                            egui::Button::new(RichText::new("退出登录").color(Color32::WHITE))
-                                .fill(crate::ui::theme::DANGER_FILL)
-                                .min_size(vec2(100.0, 34.0)),
-                        )
-                        .clicked();
-                    cancel = ui.button("取消").clicked();
-                });
+                let (accept, dismiss) = crate::ui::controls::dialog_actions(
+                    ui,
+                    Some(crate::ui::controls::DialogAction::new("退出登录").danger(true)),
+                    Some("取消"),
+                );
+                confirm = accept;
+                cancel |= dismiss;
             });
         if confirm {
             self.logout_confirmation = false;

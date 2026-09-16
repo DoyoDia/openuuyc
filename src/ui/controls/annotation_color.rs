@@ -220,7 +220,8 @@ pub(super) fn show(ui: &mut Ui, rgb: &mut [u8; 3], opacity: &mut u8) {
             pos2(r.left() + *opacity as f32 / 100. * r.width(), r.center().y),
             4.,
         );
-        ui.add_sized(
+        super::number_input(
+            ui,
             vec2(52., theme::COMPACT_HEIGHT),
             egui::DragValue::new(opacity)
                 .range(1..=100)
@@ -235,10 +236,10 @@ pub(super) fn show(ui: &mut Ui, rgb: &mut [u8; 3], opacity: &mut u8) {
                 .color(theme::MUTED),
         );
         let response = ui.add(
-            egui::TextEdit::singleline(&mut editor.hex)
+            super::singleline(&mut editor.hex, theme::COMPACT_HEIGHT)
                 .desired_width(width - 40.)
                 .char_limit(7)
-                .font(egui::TextStyle::Monospace),
+                .font(egui::FontId::monospace(theme::COMPACT_TEXT)),
         );
         if response.lost_focus()
             || (response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
@@ -253,13 +254,13 @@ pub(super) fn show(ui: &mut Ui, rgb: &mut [u8; 3], opacity: &mut u8) {
             }
         }
     });
-    if editor.invalid_hex {
-        ui.label(
-            egui::RichText::new("请输入六位十六进制颜色")
-                .size(theme::SMALL)
-                .color(theme::RED),
-        );
-    }
+    crate::ui::controls::observe_notice(
+        ui.ctx(),
+        "annotation-color-error",
+        "颜色格式无效",
+        crate::ui::controls::DialogIcon::Error,
+        editor.invalid_hex.then_some("请输入六位十六进制颜色"),
+    );
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 10.;
         for preset in theme::ANNOTATION_COLORS {

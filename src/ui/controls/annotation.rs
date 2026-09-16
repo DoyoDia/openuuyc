@@ -153,12 +153,9 @@ pub(crate) fn annotation_clear_dialog(ctx: &egui::Context, uncertain: bool) -> O
             ui.set_width(
                 theme::ANNOTATION_CLEAR_WIDTH.min((ctx.content_rect().width() - 64.).max(160.)),
             );
-            ui.label(
-                RichText::new("清空批注？")
-                    .size(theme::DIALOG_TITLE)
-                    .strong(),
-            );
-            ui.add_space(12.);
+            if dialog_header(ui, "清空批注？", DialogIcon::Warning, true) {
+                action = Some(false);
+            }
             ui.add(
                 egui::Label::new(
                     RichText::new(if uncertain {
@@ -171,15 +168,16 @@ pub(crate) fn annotation_clear_dialog(ctx: &egui::Context, uncertain: bool) -> O
                 )
                 .wrap(),
             );
-            ui.add_space(18.);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.add(primary("清空").fill(theme::DANGER_FILL)).clicked() {
-                    action = Some(true);
-                }
-                if ui.add(secondary("取消")).clicked() {
-                    action = Some(false);
-                }
-            });
+            let (accept, cancel) = dialog_actions(
+                ui,
+                Some(DialogAction::new("清空").danger(true)),
+                Some("取消"),
+            );
+            if accept {
+                action = Some(true);
+            } else if cancel {
+                action = Some(false);
+            }
         });
     if action.is_none() && modal.should_close() {
         action = Some(false);

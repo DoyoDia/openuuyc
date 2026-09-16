@@ -366,10 +366,7 @@ impl Fields {
                     serde_json::Value::Number(n) => {
                         let range = field.min.unwrap_or(-f64::MAX)..=field.max.unwrap_or(f64::MAX);
                         if let Some(mut v) = n.as_i64() {
-                            if ui
-                                .add_sized(
-                                    [width, height],
-                                    egui::DragValue::new(&mut v)
+                            if crate::ui::controls::number_input(ui, egui::vec2(width, height), egui::DragValue::new(&mut v)
                                         .speed(field.step.unwrap_or(1.0))
                                         .range(range),
                                 )
@@ -378,10 +375,7 @@ impl Fields {
                                 *n = v.into();
                             }
                         } else if let Some(mut v) = n.as_u64() {
-                            if ui
-                                .add_sized(
-                                    [width, height],
-                                    egui::DragValue::new(&mut v)
+                            if crate::ui::controls::number_input(ui, egui::vec2(width, height), egui::DragValue::new(&mut v)
                                         .speed(field.step.unwrap_or(1.0))
                                         .range(range),
                                 )
@@ -390,10 +384,7 @@ impl Fields {
                                 *n = v.into();
                             }
                         } else if let Some(mut v) = n.as_f64()
-                            && ui
-                                .add_sized(
-                                    [width, height],
-                                    egui::DragValue::new(&mut v)
+                            && crate::ui::controls::number_input(ui, egui::vec2(width, height), egui::DragValue::new(&mut v)
                                         .speed(field.step.unwrap_or(0.01))
                                         .range(range),
                                 )

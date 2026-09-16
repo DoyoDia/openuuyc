@@ -1,6 +1,17 @@
 //! Shared control appearance for the center, viewer menus and node editor.
 use super::theme::{self, HOVER, LINE, MUTED, SURFACE, TEXT};
 use egui::{Color32, RichText, Stroke, vec2};
+mod dialogs;
+mod inputs;
+mod notices;
+pub(crate) use inputs::{number_input, singleline};
+pub(crate) use notices::{
+    clear_notice, notice, observe_form_notice, observe_notice, observe_notice_action,
+    progress_notice, show_notices,
+};
+pub(crate) mod files;
+use dialogs::dialog_icon;
+pub(crate) use dialogs::{DialogAction, DialogIcon, dialog_actions, dialog_header};
 mod mapping;
 mod performance;
 mod updates;
@@ -12,14 +23,39 @@ pub(crate) use performance::{
     PerformanceTrace, metric_pair, performance_frame, performance_header, performance_trace,
 };
 pub(crate) use updates::{
-    UpdateIcon, update_actions, update_countdown, update_device_row, update_dialog_frame,
-    update_dialog_header, update_prepared_notice,
+    update_actions, update_countdown, update_device_row, update_prepared_notice,
 };
 pub(crate) use viewer_caption::{ViewerCaptionIcon, viewer_caption_button};
 
 pub const HEIGHT: f32 = theme::CONTROL_HEIGHT;
 pub const COMPACT_HEIGHT: f32 = theme::COMPACT_HEIGHT;
 pub const ACCENT: Color32 = theme::ACCENT;
+
+pub(crate) fn paint_file_icon(p: &egui::Painter, r: egui::Rect, color: Color32, folder: bool) {
+    let c = r.center();
+    let s = Stroke::new(theme::ICON_STROKE, color);
+    let points = if folder {
+        vec![
+            c + vec2(-8., -5.),
+            c + vec2(-2., -5.),
+            c + vec2(0., -2.),
+            c + vec2(8., -2.),
+            c + vec2(8., 7.),
+            c + vec2(-8., 7.),
+            c + vec2(-8., -5.),
+        ]
+    } else {
+        vec![
+            c + vec2(-6., -8.),
+            c + vec2(2., -8.),
+            c + vec2(6., -4.),
+            c + vec2(6., 8.),
+            c + vec2(-6., 8.),
+            c + vec2(-6., -8.),
+        ]
+    };
+    p.add(egui::Shape::line(points, s));
+}
 
 pub(crate) fn device_status_badge(
     ui: &mut egui::Ui,
@@ -628,6 +664,7 @@ pub fn device_menu_row(
 
 pub fn configure(style: &mut egui::Style, height: f32) {
     theme::typography(style, height);
+    style.drag_value_text_style = egui::TextStyle::Body;
     style.spacing.interact_size.y = height;
     style.spacing.button_padding = if height >= HEIGHT {
         vec2(12.0, 6.0)
@@ -663,32 +700,12 @@ pub fn configure(style: &mut egui::Style, height: f32) {
     active.corner_radius = theme::CONTROL_RADIUS.into();
 }
 
-pub fn singleline(value: &mut String, height: f32) -> egui::TextEdit<'_> {
-    egui::TextEdit::singleline(value)
-        .font(egui::TextStyle::Body)
-        // TextEdit's current atom layout does not use min_size.y. An empty
-        // prefix reserves the inner height for both values and placeholders.
-        .prefix(egui::Atom {
-            size: Some(vec2(
-                0.0,
-                height - if height >= HEIGHT { 12.0 } else { 8.0 },
-            )),
-            ..Default::default()
-        })
-        .vertical_align(egui::Align::Center)
-        .margin(if height >= HEIGHT {
-            egui::Margin::symmetric(12, 6)
-        } else {
-            egui::Margin::symmetric(8, 4)
-        })
-}
-
 pub fn dialog_frame() -> egui::Frame {
     egui::Frame::new()
         .fill(theme::BG)
         .stroke(Stroke::new(1.0, LINE))
         .corner_radius(theme::PANEL_RADIUS)
-        .inner_margin(egui::Margin::same(20))
+        .inner_margin(egui::Margin::same(theme::DIALOG_MARGIN))
 }
 
 /// Release text is displayed locally; it never loads remote images or HTML.

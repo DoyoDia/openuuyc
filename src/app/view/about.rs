@@ -142,12 +142,22 @@ impl DeviceCenterApp {
     }
 
     fn about_updates(&mut self, ui: &mut egui::Ui) {
+        crate::ui::controls::observe_notice(
+            ui.ctx(),
+            "client-update-error",
+            "检查更新失败",
+            crate::ui::controls::DialogIcon::Error,
+            match &self.updates.state {
+                State::Failed(error) => Some(error.as_str()),
+                _ => None,
+            },
+        );
         let (message, color, destination) = match &self.updates.state {
             State::Checking => ("正在检查最新正式版…".into(), MUTED, None),
             State::Current => ("已是最新正式版".into(), GREEN, None),
             State::Ahead => ("当前版本高于已发布的最新正式版".into(), MUTED, None),
             State::NoRelease => ("暂无公开正式版本".into(), MUTED, None),
-            State::Failed(error) => (format!("检查失败：{error}"), AMBER, None),
+            State::Failed(_) => ("未能检查更新".into(), MUTED, None),
             State::Available { version, url, .. } => {
                 (format!("发现新版本 v{version}"), BLUE, Some(url.clone()))
             }

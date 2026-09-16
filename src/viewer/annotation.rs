@@ -121,6 +121,27 @@ impl AnnotationUi {
     ) {
         let ctx = ui.ctx().clone();
         let snapshot = self.control.annotation_snapshot();
+        crate::ui::controls::observe_notice(
+            ui.ctx(),
+            "annotation-error",
+            "批注操作失败",
+            crate::ui::controls::DialogIcon::Error,
+            self.error
+                .as_deref()
+                .or(snapshot.error.as_deref().filter(|_| self.open)),
+        );
+        crate::ui::controls::progress_notice(
+            &ctx,
+            "annotation-progress",
+            "批注操作",
+            if snapshot.board_busy {
+                Some("正在更新白板…")
+            } else if snapshot.toggling {
+                Some("正在切换批注…")
+            } else {
+                None
+            },
+        );
         let board_color = self.control.annotation_board_color(screen);
         if snapshot.generation != self.generation {
             self.gesture = None;
@@ -308,15 +329,6 @@ impl AnnotationUi {
                                 },
                             );
                         });
-                        if snapshot.board_busy {
-                            ui.label(egui::RichText::new("正在更新白板…").color(theme::MUTED));
-                        }
-                        if snapshot.toggling {
-                            ui.label(egui::RichText::new("正在切换批注…").color(theme::MUTED));
-                        }
-                        if let Some(error) = self.error.as_ref().or(snapshot.error.as_ref()) {
-                            ui.label(egui::RichText::new(error).color(theme::RED));
-                        }
                     });
                 });
             self.panel_size = panel.response.rect.size();

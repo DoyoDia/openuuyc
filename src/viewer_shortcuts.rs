@@ -605,9 +605,13 @@ impl Editor {
         } else {
             None
         };
-        if let Some(error) = validation.as_ref().or(self.error.as_ref()) {
-            ui.colored_label(crate::ui::theme::RED, error);
-        }
+        crate::ui::controls::observe_notice(
+            ui.ctx(),
+            "shortcut-settings-error",
+            "快捷键设置",
+            crate::ui::controls::DialogIcon::Error,
+            validation.as_deref().or(self.error.as_deref()),
+        );
         let dirty = self.draft != self.baseline;
         ui.horizontal(|ui| {
             if ui

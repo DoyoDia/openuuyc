@@ -139,8 +139,7 @@ pub(super) fn show(
     egui::Modal::new(egui::Id::new("display-topology-modal")).frame(crate::ui::controls::dialog_frame()).show(ctx, |ui| {
         crate::ui::controls::configure(ui.style_mut(), crate::ui::theme::CONTROL_HEIGHT);
         ui.set_width(340.0);
-        ui.label(RichText::new(pending.action.label()).size(crate::ui::theme::SECTION));
-        ui.add_space(12.0);
+        close = crate::ui::controls::dialog_header(ui,pending.action.label(),crate::ui::controls::DialogIcon::Warning,true);
         let description = match pending.action {
             Action::Create { .. } => "将在远端添加一个UU虚拟显示器，并打开新增屏幕。".to_owned(),
             Action::Remove { .. } => format!("删除远端的“{}”？该屏幕上的窗口可能移到其他显示器。", pending.target.name),
@@ -151,10 +150,10 @@ pub(super) fn show(
         };
         ui.label(description);
         if !valid { ui.add_space(8.0); ui.label(RichText::new("显示状态或连接已变化，请重新选择操作").color(crate::ui::theme::MUTED)); }
-        ui.add_space(16.0);
-        ui.horizontal(|ui| {
-            if ui.add(crate::ui::controls::secondary("取消")).clicked() { close = true; }
-            if ui.add_enabled(valid, crate::ui::controls::primary("确认")).clicked() {
+        let (apply,cancel) = crate::ui::controls::dialog_actions(ui,Some(crate::ui::controls::DialogAction::new("确认").enabled(valid)),Some("取消"));
+        close |= cancel;
+        {
+            if apply {
                 if let Err(error) = handle.apply_display_topology(pending.origin, {
                         let (width, height, dpi) = local_parameters(ctx, handle, local_size);
                         match pending.action {
@@ -168,7 +167,7 @@ pub(super) fn show(
                 }
                 close = true;
             }
-        });
+        }
     });
     if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
         close = true;
@@ -191,11 +190,20 @@ pub(super) fn show_error(ctx: &egui::Context, handle: &StreamControlHandle) {
             .frame(crate::ui::controls::dialog_frame())
             .show(ctx, |ui| {
                 ui.set_width(340.0);
-                ui.label(RichText::new("显示器操作").size(crate::ui::theme::SECTION));
-                ui.add_space(12.0);
+                let close = crate::ui::controls::dialog_header(
+                    ui,
+                    "显示器操作",
+                    crate::ui::controls::DialogIcon::Error,
+                    true,
+                );
                 ui.label(error);
-                ui.add_space(16.0);
-                if ui.add(crate::ui::controls::secondary("确定")).clicked() {
+                let accept = crate::ui::controls::dialog_actions(
+                    ui,
+                    Some(crate::ui::controls::DialogAction::new("确定")),
+                    None,
+                )
+                .0;
+                if close || accept {
                     handle.dismiss_display_topology();
                     ctx.data_mut(|d| d.remove::<String>(local_id));
                 }

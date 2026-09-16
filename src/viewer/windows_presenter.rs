@@ -618,6 +618,7 @@ impl WindowsConnectionApp {
                 self.close_requested |= window_title_bar(ui, window, &self.progress.alias, None);
             });
             self.progress.draw(ui);
+            crate::ui::controls::show_notices(ui.ctx());
         });
         let (renderer_output, platform_output, viewports) = egui_directx11::split_output(output);
         let immediate = viewports
@@ -1880,6 +1881,7 @@ impl ThreadedWindowsApp {
             if let Some(upgrade) = self.stream_control.remote_upgrade() {
                 upgrade.show(&ctx, window.id(), &self.stream_control);
             }
+            crate::ui::controls::show_notices(&ctx);
         });
         self.performance_mode = view.performance_mode;
         if self.intercept_shortcuts != view.intercept_shortcuts {

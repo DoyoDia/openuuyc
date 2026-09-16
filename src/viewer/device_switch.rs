@@ -173,17 +173,19 @@ impl DeviceSwitcher {
                     self.refresh(ui.ctx());
                 }
                 ui.add_space(4.0);
-                if let Some(error) = &state.error {
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(error).color(ui.visuals().error_fg_color),
-                        )
-                        .wrap(),
-                    );
-                }
-                if state.switching {
-                    ui.weak("正在检查目标设备…");
-                }
+                crate::ui::controls::observe_notice(
+                    ui.ctx(),
+                    "viewer-device-switch",
+                    "切换设备失败",
+                    crate::ui::controls::DialogIcon::Error,
+                    state.error.as_deref(),
+                );
+                crate::ui::controls::progress_notice(
+                    ui.ctx(),
+                    "switch-device-progress",
+                    "切换设备",
+                    state.switching.then_some("正在检查目标设备…"),
+                );
                 if state.devices.is_empty() && !state.loading {
                     ui.weak("没有其他在线电脑");
                 }

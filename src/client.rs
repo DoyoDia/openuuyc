@@ -123,6 +123,12 @@ impl AuthenticatedClient {
     ) -> Result<crate::port_mapping::store::Store> {
         crate::port_mapping::store::Store::new(self.session.user_id(), publisher_id)
     }
+    pub(crate) fn file_transfer_store(
+        &self,
+        publisher_id: &str,
+    ) -> Result<crate::file_transfer::Store> {
+        crate::file_transfer::Store::new(self.session.user_id(), publisher_id)
+    }
     pub fn ended(&self) -> CancellationToken {
         self.ended.clone()
     }

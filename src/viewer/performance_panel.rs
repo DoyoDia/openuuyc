@@ -455,9 +455,13 @@ fn media(ui: &mut Ui, s: &PerformanceSnapshot) {
         ] {
             controls::metric_pair(ui, label, ms(value));
         }
-        if let Some(error) = &v.error {
-            ui.colored_label(theme::RED, error);
-        }
+        crate::ui::controls::observe_notice(
+            ui.ctx(),
+            "performance-switch-error",
+            "画面切换异常",
+            crate::ui::controls::DialogIcon::Error,
+            v.error.as_deref(),
+        );
     } else {
         controls::metric_pair(ui, "切换记录", "暂无");
     }

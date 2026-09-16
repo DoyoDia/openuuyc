@@ -498,20 +498,53 @@ pub(super) fn show_stream_control_window(
 ) {
     topology_menu::show(ctx, handle, local_size);
     topology_menu::show_error(ctx, handle);
+    let audio = handle.audio();
+    crate::ui::controls::progress_notice(
+        ctx,
+        "audio-device-query",
+        "音频设备",
+        (state.open && state.page == Page::Audio && !audio.output_devices().loaded)
+            .then_some("正在读取输出设备…"),
+    );
+    let audio_error = audio
+        .output_devices()
+        .error
+        .or_else(|| audio.snapshot().error);
+    if crate::ui::controls::observe_notice_action(
+        ctx,
+        "audio-output-error",
+        "音频输出异常",
+        crate::ui::controls::DialogIcon::Error,
+        audio_error.as_deref().filter(|_| state.open),
+        "重试",
+    ) == Some(true)
+    {
+        audio.retry();
+        let _ = audio.refresh_output_devices();
+    }
     let snapshot = handle.snapshot();
     state.display.select_screen(screen_id);
-    if let Some(notice) = snapshot.remote_notice {
-        egui::Area::new(egui::Id::new("remote-session-notice"))
-            .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -48.0])
-            .order(egui::Order::Foreground)
-            .interactable(false)
-            .show(ctx, |ui| {
-                egui::Frame::popup(ui.style()).show(ui, |ui| {
-                    ui.label(notice);
-                });
-            });
-        ctx.request_repaint_after(std::time::Duration::from_millis(100));
-    }
+    crate::ui::controls::progress_notice(
+        ctx,
+        "network-switch-progress",
+        "切换连接线路",
+        (state.open && snapshot.network.pending).then_some("正在切换线路…"),
+    );
+    crate::ui::controls::observe_notice(
+        ctx,
+        "network-switch-result",
+        "连接线路",
+        crate::ui::controls::DialogIcon::Info,
+        snapshot.network.notice.as_deref().filter(|_| state.open),
+    );
+
+    crate::ui::controls::observe_notice(
+        ctx,
+        "remote-session-notice",
+        "远端提示",
+        crate::ui::controls::DialogIcon::Info,
+        snapshot.remote_notice.as_deref(),
+    );
     let multi_screen = snapshot.screens.len() > 1;
     if !state.open {
         state.page = Page::Quality;
@@ -801,14 +834,6 @@ pub(super) fn show_stream_control_window(
                                     volume_response.on_hover_text(format!("输出：{}", audio_status.device));
                                 }
                                 audio.set_settings(audio_settings);
-                                if let Some(error) = audio_status.error {
-                                    ui.horizontal_wrapped(|ui| {
-                                        ui.colored_label(crate::ui::theme::AMBER, error);
-                                        if ui.small_button("重试").clicked() {
-                                            audio.retry();
-                                        }
-                                    });
-                                }
                             });
                     }
                     Page::Audio => {
@@ -830,23 +855,11 @@ pub(super) fn show_stream_control_window(
                                         audio.set_output_device(Some(output.id.clone()));
                                     }
                                 }
-                                if !outputs.loaded {
-                                    ui.label(RichText::new("正在读取输出设备…").color(MUTED));
-                                } else if outputs.devices.is_empty() && outputs.error.is_none() {
+                                if outputs.loaded && outputs.devices.is_empty() && outputs.error.is_none() {
                                     ui.label(RichText::new("未找到输出设备").color(MUTED));
                                 }
-                                if selected.as_ref().is_some_and(|id| !outputs.devices.iter().any(|device| &device.id == id)) {
-                                    ui.label(RichText::new("所选设备已断开，请选择其他输出设备").color(crate::ui::theme::AMBER));
-                                }
+crate::ui::controls::observe_notice(ui.ctx(), "audio-output-disconnected", "音频设备已断开", crate::ui::controls::DialogIcon::Warning, (outputs.loaded && selected.as_ref().is_some_and(|id| !outputs.devices.iter().any(|device| &device.id == id))).then_some("所选设备已断开，请选择其他输出设备"));
                             });
-                        if let Some(error) = outputs.error.or_else(|| audio.snapshot().error) {
-                            ui.add_space(SECTION_GAP);
-                            ui.label(RichText::new(error).size(crate::ui::theme::TINY).color(crate::ui::theme::AMBER));
-                            if ui.small_button("重试").clicked() {
-                                audio.retry();
-                                let _ = audio.refresh_output_devices();
-                            }
-                        }
                     }
                     Page::Advanced => {
                         egui::ScrollArea::vertical()
@@ -930,12 +943,8 @@ pub(super) fn show_stream_control_window(
                                     if switch_row(ui, "文件复制", &mut files).changed() {
                                         clipboard.set_files(files);
                                     }
-                                    if !clip.active && snapshot.mouse_mode != MouseMode::View {
-                                        ui.label(RichText::new("等待剪贴板通道就绪").size(crate::ui::theme::TINY).color(MUTED));
-                                    }
-                                    if let Some(error) = clip.error {
-                                        ui.label(RichText::new(error).size(crate::ui::theme::TINY).color(crate::ui::theme::RED));
-                                    }
+                                    crate::ui::controls::progress_notice(ui.ctx(),"clipboard-wait","剪贴板同步",(!clip.active && snapshot.mouse_mode != MouseMode::View).then_some("等待剪贴板通道就绪"));
+crate::ui::controls::observe_notice(ui.ctx(), "clipboard-error", "剪贴板同步失败", crate::ui::controls::DialogIcon::Error, clip.error.as_deref());
                                 }
                                 let can_send = snapshot.ready
                                     && !snapshot.mouse_pending
@@ -951,14 +960,6 @@ pub(super) fn show_stream_control_window(
                                     .clicked()
                                 {
                                     view.send_ctrl_alt_del = true;
-                                }
-                                if snapshot.network.pending {
-                                    ui.horizontal(|ui| {
-                                        ui.spinner();
-                                        ui.label(RichText::new("正在切换线路…").size(crate::ui::theme::TINY).color(MUTED));
-                                    });
-                                } else if let Some(notice) = snapshot.network.notice {
-                                    ui.label(RichText::new(notice).size(crate::ui::theme::TINY).color(MUTED));
                                 }
                             });
                     }
@@ -1057,45 +1058,8 @@ pub(super) fn show_stream_control_window(
                     }
                 }
                 if state.page != Page::Display {
-                    if let Some(error) = state
-                        .local_error
-                        .as_ref()
-                        .or(snapshot.mouse_error.as_ref())
-                        .or(snapshot.cursor_error.as_ref())
-                        .or(snapshot.last_error.as_ref())
-                        .or(snapshot.network.error.as_ref())
-                    {
-                        ui.add_space(9.0);
-                        ui.add(egui::Label::new(
-                            RichText::new("设置未生效")
-                                .size(crate::ui::theme::TINY)
-                                .color(super::bad_color()),
-                        ))
-                        .on_hover_text(error);
-                    } else if let Some(error) = snapshot.persistence_error.as_ref() {
-                        ui.add_space(9.0);
-                        ui.label(
-                            RichText::new("设置未保存")
-                                .size(crate::ui::theme::TINY)
-                                .color(super::bad_color()),
-                        )
-                        .on_hover_text(error);
-                    } else if let Some(waiting) = snapshot.waiting_for {
-                        ui.add_space(9.0);
-                        ui.label(
-                            RichText::new("等待串流就绪…")
-                                .size(crate::ui::theme::TINY)
-                                .color(MUTED),
-                        )
-                        .on_hover_text(waiting);
-                    } else if snapshot.pending_sequence.is_some() {
-                        ui.add_space(9.0);
-                        ui.label(
-                            RichText::new("正在应用…")
-                                .size(crate::ui::theme::TINY)
-                                .color(MUTED),
-                        );
-                    }
+                    crate::ui::controls::observe_notice(ui.ctx(), "stream-settings-error", "设置未生效", crate::ui::controls::DialogIcon::Error, state.local_error.as_deref().or(snapshot.mouse_error.as_deref()).or(snapshot.cursor_error.as_deref()).or(snapshot.last_error.as_deref()).or(snapshot.network.error.as_deref()));
+                    crate::ui::controls::observe_notice(ui.ctx(), "stream-settings-save", "设置未保存", crate::ui::controls::DialogIcon::Error, snapshot.persistence_error.as_deref());
                 }
             });
         });
@@ -1105,8 +1069,12 @@ pub(super) fn show_stream_control_window(
             .frame(crate::ui::controls::dialog_frame())
             .show(ctx, |ui| {
                 ui.set_width(340.0);
-                ui.label(RichText::new("调整显示效果？").size(crate::ui::theme::SECTION));
-                ui.add_space(12.0);
+                let close = crate::ui::controls::dialog_header(
+                    ui,
+                    "调整显示效果？",
+                    crate::ui::controls::DialogIcon::Info,
+                    true,
+                );
                 ui.label("双方设备需要使用以下组合：");
                 ui.label(format!(
                     "{} · {} · {}",
@@ -1121,12 +1089,16 @@ pub(super) fn show_stream_control_window(
                 if proposed.quality != current.quality {
                     ui.label("画质会一并调整。");
                 }
-                ui.add_space(16.0);
-                ui.horizontal(|ui| {
-                    if ui.add(crate::ui::controls::secondary("取消")).clicked() {
+                let (apply, cancel) = crate::ui::controls::dialog_actions(
+                    ui,
+                    Some(crate::ui::controls::DialogAction::new("应用")),
+                    Some("取消"),
+                );
+                {
+                    if close || cancel {
                         state.format_confirm = None;
                     }
-                    if ui.add(crate::ui::controls::primary("应用")).clicked() {
+                    if apply {
                         state.local_error = handle
                             .apply_format(target, proposed)
                             .err()
@@ -1135,7 +1107,7 @@ pub(super) fn show_stream_control_window(
                         settings = handle.snapshot().settings;
                         state.dirty = false;
                     }
-                });
+                }
             });
         if response.should_close() {
             state.format_confirm = None;

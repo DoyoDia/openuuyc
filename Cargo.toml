@@ -1,6 +1,6 @@
 [package]
 name = "openuuyc"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2024"
 description = "Third-party Rust client for UU Remote protocol interoperability"
 license-file = "LICENSE"
@@ -44,7 +44,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 semver = "1.0"
 sha2 = "0.10.9"
-tokio = { version = "1.49", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
+tokio = { version = "1.49", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time", "fs"] }
 tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-native-roots"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
 tokio-util = { version = "0.7", features = ["rt"] }

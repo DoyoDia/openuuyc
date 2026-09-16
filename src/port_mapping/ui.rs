@@ -217,13 +217,21 @@ impl Editor {
                 }
             });
         });
-        if let Some(error) = snapshot
-            .error
-            .as_ref()
-            .or(self.error.as_ref().filter(|_| self.form.is_none()))
-        {
-            ui.add_space(8.0);
-            ui.colored_label(theme::RED, error);
+        crate::ui::controls::observe_notice(
+            ui.ctx(),
+            "mapping-service",
+            "端口转发",
+            crate::ui::controls::DialogIcon::Error,
+            snapshot.error.as_deref(),
+        );
+        if let Some(error) = self.error.take() {
+            crate::ui::controls::notice(
+                ui.ctx(),
+                "mapping-operation",
+                "端口转发",
+                crate::ui::controls::DialogIcon::Error,
+                error,
+            );
         }
         ui.add_space(10.0);
         let body_height = (ui.available_height() - 32.0).max(180.0);
@@ -360,13 +368,13 @@ impl Editor {
                                             self.delete = Some(rule.clone());
                                         }
                                     }
-                                    if let Some(error) = &status.error {
-                                        ui.horizontal(|ui| {
-                                            ui.add_space(14.0);
-                                            ui.colored_label(theme::RED, error);
-                                        });
-                                        ui.add_space(8.0);
-                                    }
+                                    crate::ui::controls::observe_notice(
+                                        ui.ctx(),
+                                        ("mapping-rule", rule.id),
+                                        "转发规则异常",
+                                        crate::ui::controls::DialogIcon::Error,
+                                        status.error.as_deref(),
+                                    );
                                 });
                             }
                         });
@@ -408,16 +416,16 @@ impl Editor {
                 .frame(controls::dialog_frame())
                 .show(ctx, |ui| {
                     ui.set_width(theme::MAPPING_DIALOG_WIDTH);
-                    ui.label(
-                        RichText::new(if form.new {
+                    cancel = crate::ui::controls::dialog_header(
+                        ui,
+                        if form.new {
                             "添加规则"
                         } else {
                             "编辑规则"
-                        })
-                        .size(theme::DIALOG_TITLE)
-                        .strong(),
+                        },
+                        crate::ui::controls::DialogIcon::Edit,
+                        true,
                     );
-                    ui.add_space(16.0);
                     field(ui, "规则名称", &mut form.name, "例如：开发服务");
                     ui.add_space(16.0);
                     ui.columns(2, |columns| {
@@ -459,22 +467,26 @@ impl Editor {
                             });
                     });
                     ui.add_space(12.0);
-                    if let Some(error) = &self.error {
-                        ui.colored_label(theme::RED, error);
+                    if let Some(error) = self.error.take() {
+                        crate::ui::controls::notice(
+                            ui.ctx(),
+                            "mapping-operation",
+                            "端口转发",
+                            crate::ui::controls::DialogIcon::Error,
+                            error,
+                        );
                     }
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            save = ui
-                                .add(controls::primary(if form.new {
-                                    "添加规则"
-                                } else {
-                                    "保存更改"
-                                }))
-                                .clicked();
-                            cancel = ui.button("取消").clicked();
-                        });
-                    });
+                    let (accept, dismiss) = crate::ui::controls::dialog_actions(
+                        ui,
+                        Some(crate::ui::controls::DialogAction::new(if form.new {
+                            "添加规则"
+                        } else {
+                            "保存更改"
+                        })),
+                        Some("取消"),
+                    );
+                    save = accept;
+                    cancel |= dismiss;
                 });
             if save {
                 match form.rule() {
@@ -497,22 +509,20 @@ impl Editor {
                 .frame(controls::dialog_frame())
                 .show(ctx, |ui| {
                     ui.set_width(theme::MAPPING_DIALOG_WIDTH);
-                    ui.label(
-                        RichText::new("删除转发规则？")
-                            .size(theme::DIALOG_TITLE)
-                            .strong(),
+                    cancel = crate::ui::controls::dialog_header(
+                        ui,
+                        "删除转发规则？",
+                        crate::ui::controls::DialogIcon::Warning,
+                        true,
                     );
-                    ui.add_space(12.0);
                     ui.label(format!("将删除“{}”，并关闭它的现有连接。", rule.name));
-                    ui.add_space(20.0);
-                    ui.horizontal(|ui| {
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            confirm = ui
-                                .add(egui::Button::new("删除").fill(theme::DANGER_FILL))
-                                .clicked();
-                            cancel = ui.button("取消").clicked();
-                        });
-                    });
+                    let (accept, dismiss) = crate::ui::controls::dialog_actions(
+                        ui,
+                        Some(crate::ui::controls::DialogAction::new("删除").danger(true)),
+                        Some("取消"),
+                    );
+                    confirm = accept;
+                    cancel |= dismiss;
                 });
             if confirm {
                 self.submit(handle, Command::Delete(rule.id));

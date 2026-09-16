@@ -815,6 +815,45 @@ impl ControllerConnection {
         cancel: &CancellationToken,
         takeover: Option<takeover::Approval>,
     ) -> Result<Self> {
+        Self::connect_business(
+            client,
+            device,
+            policy,
+            options,
+            cancel,
+            takeover,
+            crate::control::ControlPurpose::PortMapping,
+        )
+        .await
+    }
+    pub(crate) async fn connect_files(
+        client: &AuthenticatedClient,
+        device: &crate::api::DeviceInfo,
+        policy: crate::feature_ability::FeaturePolicy,
+        options: ConnectionMediaOptions,
+        cancel: &CancellationToken,
+        takeover: Option<takeover::Approval>,
+    ) -> Result<Self> {
+        Self::connect_business(
+            client,
+            device,
+            policy,
+            options,
+            cancel,
+            takeover,
+            crate::control::ControlPurpose::FileTransfer,
+        )
+        .await
+    }
+    async fn connect_business(
+        client: &AuthenticatedClient,
+        device: &crate::api::DeviceInfo,
+        policy: crate::feature_ability::FeaturePolicy,
+        options: ConnectionMediaOptions,
+        cancel: &CancellationToken,
+        takeover: Option<takeover::Approval>,
+        purpose: crate::control::ControlPurpose,
+    ) -> Result<Self> {
         let key = shared::key(&client.device_id(), &device.device_id);
         let _gate = shared::connection_gate(&key).lock_owned().await;
         let display = detect_local_display().unwrap_or(LocalDisplayInfo::FALLBACK);
@@ -860,7 +899,7 @@ impl ControllerConnection {
             },
             None,
             cancel,
-            crate::control::ControlPurpose::PortMapping,
+            purpose,
         )
         .await?;
         shared::register(key, &connection.forwarder.session, client.ended());

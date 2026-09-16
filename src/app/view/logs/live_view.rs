@@ -116,13 +116,17 @@ impl LiveView {
         });
         ui.horizontal(|ui| {
             ui.label("缓冲区");
-            ui.add(
+            crate::ui::controls::number_input(
+                ui,
+                egui::vec2(112., theme::CONTROL_HEIGHT),
                 egui::DragValue::new(&mut self.draft_capacity.lines)
                     .range(100..=100_000)
                     .speed(100)
                     .suffix(" 条"),
             );
-            ui.add(
+            crate::ui::controls::number_input(
+                ui,
+                egui::vec2(96., theme::CONTROL_HEIGHT),
                 egui::DragValue::new(&mut self.draft_capacity.mib)
                     .range(1..=64)
                     .suffix(" MiB"),
@@ -171,9 +175,13 @@ impl LiveView {
                 ui.ctx().copy_text(filtered.join("\n"));
             }
         });
-        if let Some(error) = &self.error {
-            ui.label(RichText::new(error).color(RED));
-        }
+        crate::ui::controls::observe_notice(
+            ui.ctx(),
+            "live-log-error",
+            "实时日志",
+            crate::ui::controls::DialogIcon::Error,
+            self.error.as_deref(),
+        );
         ui.separator();
         self.wrapped.show(
             ui,

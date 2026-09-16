@@ -36,6 +36,7 @@ pub(crate) enum ControlConnectType {
 pub(crate) enum ControlPurpose {
     Viewing,
     PortMapping,
+    FileTransfer,
 }
 
 pub(crate) fn build_control_frames(
@@ -185,6 +186,7 @@ fn encode_connect_options(
         match purpose {
             ControlPurpose::Viewing => 1,
             ControlPurpose::PortMapping => 9,
+            ControlPurpose::FileTransfer => 5,
         },
     );
     push_signed_int32_field(&mut options, 2, -1);

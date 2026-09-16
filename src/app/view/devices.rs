@@ -197,26 +197,24 @@ impl DeviceCenterApp {
         let sort = state.sort;
         ui.add_space(16.0);
         self.alert(ui);
-        if management && let Some(error) = &self.catalog_error {
-            ui.colored_label(AMBER, "完整清单暂未更新，显示已有设备")
-                .on_hover_text(error);
-        }
-        if unresolved > 0 {
-            ui.horizontal(|ui| {
-                ui.colored_label(
-                    AMBER,
-                    format!("{unresolved} 台设备的信息未能确认，请刷新重试"),
-                );
-                if ui
-                    .add(crate::ui::controls::quiet_button("查看全部设备"))
-                    .clicked()
-                {
-                    self.center_ui.page = Page::Management;
-                }
-            });
-        } else if pending > 0 && count > 0 {
-            ui.label(RichText::new("正在读取其余设备信息…").color(MUTED));
-        }
+        crate::ui::controls::observe_notice(
+            ui.ctx(),
+            "catalog-error",
+            "设备清单未更新",
+            crate::ui::controls::DialogIcon::Warning,
+            self.catalog_error.as_deref().filter(|_| management),
+        );
+        crate::ui::controls::observe_notice(
+            ui.ctx(),
+            "unresolved-devices",
+            "设备信息不完整",
+            crate::ui::controls::DialogIcon::Warning,
+            (unresolved > 0)
+                .then(|| {
+                    format!("{unresolved} 台设备的信息未能确认，请刷新重试，也可在全部设备中查看。")
+                })
+                .as_deref(),
+        );
         let Some(mut rows) = rows else {
             self.empty_state(ui, "正在读取设备清单…", None);
             return;

@@ -245,19 +245,26 @@ impl DisplayMenu {
             },
         );
         if let Some(status) = status {
-            if status.error {
-                ui.colored_label(super::super::bad_color(), "显示设置未确认")
-                    .on_hover_text(&status.message);
-            }
+            crate::ui::controls::observe_notice(
+                ui.ctx(),
+                ("display-settings-remote", screen_id),
+                "显示设置未确认",
+                crate::ui::controls::DialogIcon::Error,
+                status.error.then_some(status.message.as_str()),
+            );
             if dpi_pending {
                 ui.ctx()
                     .request_repaint_after(std::time::Duration::from_millis(100));
             }
         }
         super::topology_menu::entries(ui, handle, screen_id, local_size);
-        if let Some(error) = &self.error {
-            ui.colored_label(super::super::bad_color(), error);
-        }
+        crate::ui::controls::observe_notice(
+            ui.ctx(),
+            "display-settings-local",
+            "显示设置失败",
+            crate::ui::controls::DialogIcon::Error,
+            self.error.as_deref(),
+        );
     }
 }
 

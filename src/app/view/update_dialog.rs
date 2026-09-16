@@ -47,18 +47,12 @@ fn release_prompt(
             ui.set_width(
                 theme::UPDATE_DIALOG_WIDTH.min((ctx.content_rect().width() - 80.0).max(240.0)),
             );
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new("发现新版本")
-                        .size(theme::DIALOG_TITLE)
-                        .strong(),
-                );
-                ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                    dismiss = crate::ui::controls::close_button(ui, "关闭", theme::COMPACT_HEIGHT)
-                        .clicked();
-                });
-            });
-            ui.add_space(12.0);
+            dismiss = crate::ui::controls::dialog_header(
+                ui,
+                "发现新版本",
+                crate::ui::controls::DialogIcon::Required,
+                true,
+            );
             ui.label(
                 RichText::new(format!("OpenUUYC v{version}"))
                     .size(theme::SECTION)
@@ -80,14 +74,13 @@ fn release_prompt(
                 )
                 .auto_shrink([false, true])
                 .show(ui, |ui| crate::ui::controls::release_notes(ui, notes));
-            ui.add_space(24.0);
-            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                download = ui
-                    .add(primary("前往下载"))
-                    .on_hover_text("打开此版本的 GitHub Release 页面")
-                    .clicked();
-                dismiss |= ui.button("稍后").clicked();
-            });
+            let (accept, later) = crate::ui::controls::dialog_actions(
+                ui,
+                Some(crate::ui::controls::DialogAction::new("前往下载")),
+                Some("稍后"),
+            );
+            download = accept;
+            dismiss |= later;
         });
     (dismiss || response.should_close(), download)
 }

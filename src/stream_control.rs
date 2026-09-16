@@ -303,6 +303,7 @@ pub struct StreamControlSnapshot {
 #[derive(Clone)]
 pub struct StreamControlHandle {
     clipboard: crate::clipboard::Clipboard,
+    files: Arc<crate::file_transfer::Transport>,
     mouse: crate::remote_input::RemoteInput,
     cursor: crate::remote_cursor::RemoteCursorState,
     audio: crate::audio::AudioPlayback,
@@ -548,6 +549,7 @@ impl StreamControlHandle {
         (
             Self {
                 clipboard: crate::clipboard::Clipboard::new(),
+                files: Arc::new(crate::file_transfer::Transport::default()),
                 mouse,
                 cursor,
                 audio,
@@ -571,6 +573,10 @@ impl StreamControlHandle {
 
     pub(crate) fn clipboard(&self) -> &crate::clipboard::Clipboard {
         &self.clipboard
+    }
+
+    pub(crate) fn file_transfer(&self) -> &Arc<crate::file_transfer::Transport> {
+        &self.files
     }
 
     pub(crate) fn set_mouse_transport_ready(&self, connected: bool) {
@@ -1479,6 +1485,9 @@ impl StreamControlHandle {
         }
         let message = PbControlMessage::decode(payload)
             .map_err(|error| anyhow!("decode UU protobuf domain message: {error}"))?;
+        if let Some(PbPayload::SystemMetrics(bytes)) = &message.payload {
+            self.files.metrics(bytes)?;
+        }
         if let Some(PbPayload::SystemStateChange(bytes)) = &message.payload {
             if let Some(files) = ClipboardPermissionState::decode(bytes.as_slice())?.files {
                 lock(&self.shared).clipboard_files_allowed = files.enabled;
@@ -1509,6 +1518,8 @@ impl StreamControlHandle {
                 match action.action {
                     ACTION_TYPE_ECHO_REQUEST | ACTION_TYPE_ECHO_RESPONSE => {
                         if let Some(PbSimpleActionParams::FeatureFlag(flags)) = action.params {
+                            self.files
+                                .capabilities(flags.file_transfer_ftp, flags.file_transfer_ftp2);
                             state.peer_clipboard = flags.clipboard;
                             state.peer_capture_setting = flags.capture_setting.max(0) as u32;
                         }
@@ -2793,8 +2804,8 @@ impl PbFeatureFlag {
             system_metrics: 0,
             private_screen: 0,
             update_acquire: 0,
-            file_transfer_ftp: 0,
-            file_transfer_ftp2: 0,
+            file_transfer_ftp: 2,
+            file_transfer_ftp2: 2,
             clipboard: 3,
             qos_stat: 1,
             mumu_control: 0,

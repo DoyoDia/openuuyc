@@ -165,11 +165,23 @@ impl Manager {
         if !self.loaded {
             self.refresh();
         }
-        if let Some(error) = &self.error {
-            ui.colored_label(crate::ui::theme::RED, error);
+        if let Some(error) = self.error.take() {
+            crate::ui::controls::notice(
+                ui.ctx(),
+                "plugin-manager-error",
+                "插件管理",
+                crate::ui::controls::DialogIcon::Error,
+                error,
+            );
         }
-        if let Some(notice) = &self.notice {
-            ui.weak(notice);
+        if let Some(message) = self.notice.take() {
+            crate::ui::controls::notice(
+                ui.ctx(),
+                "plugin-manager-notice",
+                "插件管理",
+                crate::ui::controls::DialogIcon::Info,
+                message,
+            );
         }
         if self.edit.is_some() {
             self.edit_ui(ui);
@@ -428,9 +440,13 @@ impl Manager {
                                 .fill(crate::ui::theme::BG)
                                 .show(ui, |ui| {
                                     ui.set_width(ui.available_width());
-                                    if let Some(error) = &entry.error {
-                                        ui.colored_label(crate::ui::theme::AMBER, error);
-                                    }
+                                    crate::ui::controls::observe_notice(
+                                        ui.ctx(),
+                                        ("plugin-entry-error", &entry.path),
+                                        "插件检查失败",
+                                        crate::ui::controls::DialogIcon::Error,
+                                        entry.error.as_deref(),
+                                    );
                                     if let Some(m) = &entry.manifest {
                                         if !m.dependencies.is_empty() {
                                             ui.label(format!(
@@ -446,14 +462,16 @@ impl Manager {
                                             ));
                                         }
                                         for node in &m.nodes {
-                                            if let Some(error) =
-                                                entry.node_errors.get(&node.type_id)
-                                            {
-                                                ui.colored_label(
-                                                    crate::ui::theme::AMBER,
-                                                    format!("{}：{error}", node.name),
-                                                );
-                                            }
+                                            crate::ui::controls::observe_notice(
+                                                ui.ctx(),
+                                                ("plugin-node-error", &entry.path, &node.type_id),
+                                                "插件节点检查失败",
+                                                crate::ui::controls::DialogIcon::Error,
+                                                entry
+                                                    .node_errors
+                                                    .get(&node.type_id)
+                                                    .map(String::as_str),
+                                            );
                                             ui.horizontal_wrapped(|ui| {
                                                 ui.label(&node.name);
                                                 ui.weak(&node.description);

@@ -178,16 +178,27 @@ impl ScreenTabBar {
                 });
             });
         if let Some(error) = self.error.clone() {
-            egui::Modal::new(ui.id().with("screen-error")).show(ui.ctx(), |ui| {
-                ui.set_width(300.0);
-                ui.heading("显示器操作失败");
-                ui.add_space(12.0);
-                ui.label(error);
-                ui.add_space(16.0);
-                if ui.button("确定").clicked() {
-                    self.error = None;
-                }
-            });
+            egui::Modal::new(ui.id().with("screen-error"))
+                .frame(crate::ui::controls::dialog_frame())
+                .show(ui.ctx(), |ui| {
+                    ui.set_width(300.0);
+                    let close = crate::ui::controls::dialog_header(
+                        ui,
+                        "显示器操作失败",
+                        crate::ui::controls::DialogIcon::Error,
+                        true,
+                    );
+                    ui.label(error);
+                    let accept = crate::ui::controls::dialog_actions(
+                        ui,
+                        Some(crate::ui::controls::DialogAction::new("确定")),
+                        None,
+                    )
+                    .0;
+                    if close || accept {
+                        self.error = None;
+                    }
+                });
         }
     }
 }

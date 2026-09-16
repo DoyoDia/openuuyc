@@ -4,6 +4,7 @@ use super::*;
 enum Glyph {
     Monitor,
     PortMapping,
+    Files,
     Power,
     Restart,
     Board,
@@ -232,6 +233,7 @@ fn paint_glyph(p: &egui::Painter, r: egui::Rect, g: Glyph, color: Color32) {
         }
         Glyph::Monitor => paint_icon(p, r, Icon::Monitor, color),
         Glyph::PortMapping => crate::ui::controls::paint_port_mapping_icon(p, r, color),
+        Glyph::Files => crate::ui::controls::paint_file_icon(p, r, color, true),
         Glyph::Edit => paint_icon(p, r, Icon::Edit, color),
         Glyph::System => {
             for y in [-7.0, 1.0] {
@@ -360,6 +362,7 @@ impl DeviceCenterApp {
         let mut back = false;
         let mut refresh = false;
         let mut ports = false;
+        let mut files = false;
         let has_ports = self.devices.as_ref().is_some_and(|list| {
             list.my_binded_devices.iter().any(|d| {
                 d.device_id == id
@@ -475,19 +478,26 @@ impl DeviceCenterApp {
         let mut power = None;
         let mut exit_account = false;
         self.alert(ui);
-        if let Some(Err(error)) = &detail {
-            ui.colored_label(AMBER, "硬件信息读取失败，请刷新详情重试")
-                .on_hover_text(error);
-        }
-        if let Some(error) = self
-            .catalog
-            .as_ref()
-            .and_then(|c| c.details.get(&id))
-            .and_then(|d| d.refresh_error.as_deref())
-        {
-            ui.colored_label(AMBER, "硬件信息刷新失败，已保留上次结果")
-                .on_hover_text(error);
-        }
+        crate::ui::controls::observe_notice(
+            ui.ctx(),
+            ("device-detail-error", &id),
+            "硬件信息读取失败",
+            crate::ui::controls::DialogIcon::Warning,
+            detail
+                .as_ref()
+                .and_then(|result| result.as_ref().err())
+                .map(String::as_str),
+        );
+        crate::ui::controls::observe_notice(
+            ui.ctx(),
+            ("device-detail-refresh", &id),
+            "硬件信息刷新失败",
+            crate::ui::controls::DialogIcon::Warning,
+            self.catalog
+                .as_ref()
+                .and_then(|c| c.details.get(&id))
+                .and_then(|d| d.refresh_error.as_deref()),
+        );
         egui::ScrollArea::vertical()
             .id_salt(("device-details-page", &id))
             .auto_shrink([false, false])
@@ -647,50 +657,66 @@ impl DeviceCenterApp {
                     crate::power::PowerAction::Reboot,
                 ];
                 let power_count = if has_power { power_actions.len() } else { 0 };
-                let action_count = power_count + usize::from(has_ports);
+                let action_count = power_count + 2 * usize::from(has_ports);
                 let gap = 16.0;
                 let button_w = (card.width() - action_count.saturating_sub(1) as f32 * gap)
                     / action_count.max(1) as f32;
                 if has_power {
-                    let mut progress_ui =
-                        ui.new_child(egui::UiBuilder::new().max_rect(egui::Rect::from_min_size(
-                            at(pad, power_y),
-                            vec2(
-                                button_w * power_count as f32
-                                    + gap * power_count.saturating_sub(1) as f32,
-                                theme::CONTROL_HEIGHT,
-                            ),
-                        )));
-                    if !self.detail_power_result(&mut progress_ui, &id) {
-                        for (i, action) in power_actions.into_iter().enumerate() {
-                            let rect = egui::Rect::from_min_size(
-                                at(pad + i as f32 * (button_w + gap), power_y),
-                                vec2(button_w, theme::CONTROL_HEIGHT),
-                            );
-                            let mut button_ui = ui.new_child(egui::UiBuilder::new().max_rect(rect));
-                            let issue = self.power_available(&device, action).err();
-                            let button = detail_button(
-                                &mut button_ui,
-                                action.label(),
-                                if action == crate::power::PowerAction::Reboot {
-                                    Glyph::Restart
-                                } else {
-                                    Glyph::Power
-                                },
-                                issue.is_none(),
-                                rect.size(),
-                                ButtonTone::Normal,
-                            );
-                            if button.clicked() {
-                                power = Some(action);
-                            }
-                            if let Some(issue) = issue {
-                                button.on_disabled_hover_text(issue.to_string());
-                            }
+                    for (i, action) in power_actions.into_iter().enumerate() {
+                        let rect = egui::Rect::from_min_size(
+                            at(pad + i as f32 * (button_w + gap), power_y),
+                            vec2(button_w, theme::CONTROL_HEIGHT),
+                        );
+                        let mut button_ui = ui.new_child(egui::UiBuilder::new().max_rect(rect));
+                        let issue = self.power_available(&device, action).err();
+                        let button = detail_button(
+                            &mut button_ui,
+                            action.label(),
+                            if action == crate::power::PowerAction::Reboot {
+                                Glyph::Restart
+                            } else {
+                                Glyph::Power
+                            },
+                            issue.is_none(),
+                            rect.size(),
+                            ButtonTone::Normal,
+                        );
+                        if button.clicked() {
+                            power = Some(action);
+                        }
+                        if let Some(issue) = issue {
+                            button.on_disabled_hover_text(issue.to_string());
                         }
                     }
                 }
                 if has_ports {
+                    let file_rect = egui::Rect::from_min_size(
+                        at(pad + (power_count + 1) as f32 * (button_w + gap), power_y),
+                        vec2(button_w, theme::CONTROL_HEIGHT),
+                    );
+                    let transferring = self.devices.as_ref().is_some_and(|list| {
+                        crate::file_transfer::service::is_transferring(
+                            &list.current_device.device_id,
+                            &id,
+                        )
+                    });
+                    let mut file_ui = ui.new_child(egui::UiBuilder::new().max_rect(file_rect));
+                    files = detail_button(
+                        &mut file_ui,
+                        "文件传输",
+                        Glyph::Files,
+                        !self.logout_pending
+                            && device.is_connected()
+                            && device.controllable
+                            && device.controlled_support,
+                        file_rect.size(),
+                        if transferring {
+                            ButtonTone::Primary
+                        } else {
+                            ButtonTone::Normal
+                        },
+                    )
+                    .clicked();
                     let rect = egui::Rect::from_min_size(
                         at(pad + power_count as f32 * (button_w + gap), power_y),
                         vec2(button_w, theme::CONTROL_HEIGHT),
@@ -854,13 +880,18 @@ impl DeviceCenterApp {
                         }
                     });
                 }
-                if self.mutation_pending {
-                    ui.spinner();
-                    ui.label("正在处理设备操作…");
-                }
+                crate::ui::controls::progress_notice(
+                    ui.ctx(),
+                    "device-operation-progress",
+                    "设备操作",
+                    self.mutation_pending.then_some("正在处理设备操作…"),
+                );
             });
         if ports {
             self.open_port_mapping(id.clone());
+        }
+        if files {
+            self.open_file_transfer(id.clone());
         }
         if connect {
             self.selected_device_id = Some(id);
