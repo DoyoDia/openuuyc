@@ -46,6 +46,15 @@ struct PortWindow {
     handle: Handle,
     editor: Editor,
 }
+impl Drop for PortWindow {
+    fn drop(&mut self) {
+        // Closing a confirmation is cancellation, not takeover consent.
+        // An already running service still outlives its management window.
+        if self.handle.snapshot().takeover.is_some() {
+            self.handle.set_enabled(false);
+        }
+    }
+}
 impl crate::ui::App for PortWindow {
     fn ui(&mut self, ui: &mut egui::Ui) {
         if !self.client.is_active() {
@@ -171,6 +180,8 @@ impl Editor {
                     ("服务已关闭", theme::MUTED)
                 } else if snapshot.busy {
                     ("连接中…", theme::MUTED)
+                } else if snapshot.takeover.is_some() {
+                    ("等待确认", theme::MUTED)
                 } else if snapshot.connected {
                     ("服务运行中", theme::GREEN)
                 } else {
@@ -369,7 +380,25 @@ impl Editor {
                     .color(theme::MUTED),
             );
         });
-        self.dialogs(ui.ctx(), handle);
+        if snapshot.enabled
+            && let Some(request) = &snapshot.takeover
+        {
+            match crate::controller::takeover::confirmation(ui.ctx(), &request.device) {
+                Some(true) => {
+                    self.submit(
+                        handle,
+                        Command::Takeover(
+                            request.id,
+                            crate::controller::takeover::Approval::confirmed(&request.device),
+                        ),
+                    );
+                }
+                Some(false) => handle.set_enabled(false),
+                None => {}
+            }
+        } else {
+            self.dialogs(ui.ctx(), handle);
+        }
     }
     fn dialogs(&mut self, ctx: &egui::Context, handle: &Handle) {
         if let Some(form) = &mut self.form {

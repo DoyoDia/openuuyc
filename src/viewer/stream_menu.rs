@@ -49,13 +49,15 @@ pub(super) struct StreamControlUi {
     settings: Option<StreamControlSettings>,
     dirty: bool,
     display: display_menu::DisplayMenu,
-    local_error: Option<String>,
+    pub(super) local_error: Option<String>,
     format_confirm: Option<(i32, StreamControlSettings)>,
 }
 
 pub(super) struct LocalViewSettings {
     pub aspect_locked: bool,
     pub performance_mode: super::PerformancePanelMode,
+    pub intercept_shortcuts: bool,
+    pub send_ctrl_alt_del: bool,
 }
 
 enum Action {
@@ -750,6 +752,23 @@ pub(super) fn show_stream_control_window(
                                 if menu_row(ui, "鼠标模式", mode_label, None, true, true).clicked()
                                 {
                                     state.page = Page::Mouse;
+                                }
+                                switch_row(ui, "拦截本机快捷键", &mut view.intercept_shortcuts)
+                                    .on_hover_text("仅当前播放窗口。开启后，控制时优先将按键交给远端；关闭后允许本机快捷键响应。播放器自身快捷键始终保留。");
+                                let can_send = snapshot.ready
+                                    && !snapshot.mouse_pending
+                                    && snapshot.mouse_mode != MouseMode::View
+                                    && handle.mouse().keyboard_supported()
+                                    && !handle.mouse().waiting_for_neutral();
+                                if menu_row(ui, "发送 Ctrl+Alt+Del", "", None, can_send, false)
+                                    .on_hover_text(if can_send {
+                                        "打开远端 Windows 安全选项"
+                                    } else {
+                                        "请先开启 Windows 设备的键鼠控制并松开按键"
+                                    })
+                                    .clicked()
+                                {
+                                    view.send_ctrl_alt_del = true;
                                 }
                                 let audio = handle.audio();
                                 let mut audio_settings = audio.settings();

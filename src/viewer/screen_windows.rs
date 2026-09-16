@@ -2,6 +2,9 @@ use super::*;
 use crate::stream_control::RemoteScreen;
 use crate::viewer::screens::ScreenPlayback;
 use std::collections::HashMap;
+use windows::Win32::Foundation::POINT;
+use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
+use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
 
 #[derive(Clone, Copy)]
 enum TabCommand {
@@ -300,6 +303,7 @@ impl ScreenWindows {
             .and_then(|slot| slot.app.as_ref())
             .map_or(self.preferences, |app| ViewerPreferences {
                 performance_mode: app.performance_mode,
+                intercept_shortcuts: app.intercept_shortcuts,
                 aspect_locked: app.aspect_locked,
             })
     }
@@ -494,6 +498,9 @@ impl ScreenWindows {
         slot.window.set_visible(false);
         slot.pending.take();
         if let Some(app) = slot.app.as_mut() {
+            if let Some(switcher) = &app.screen_tabs.device_switch {
+                switcher.cancel_takeover(id);
+            }
             app.stream_control
                 .cancel_display_change(app._session.screen_id());
             app.mouse.release(&slot.window);

@@ -19,6 +19,7 @@ use crate::presence::{ActivePresence, PresenceEvent, PresenceState};
 
 mod assist;
 mod catalog;
+pub(crate) mod device_status;
 mod device_sync;
 mod diagnostics;
 
@@ -149,7 +150,10 @@ struct DeviceCenterApp {
     active_session: Option<ViewingSession>,
     opening_viewer: bool,
     closing_session: bool,
+    close_confirmation: bool,
+    close_confirmed: bool,
     logout_confirmation: bool,
+    takeover_confirmation: Option<(u64, DeviceInfo)>,
     logout_pending: bool,
     logout_sent: bool,
     login_generation: u64,
@@ -202,7 +206,10 @@ impl DeviceCenterApp {
             refresh_pending: true,
             active_session: None,
             closing_session: false,
+            close_confirmation: false,
+            close_confirmed: false,
             logout_confirmation: false,
+            takeover_confirmation: None,
             logout_pending: false,
             logout_sent: false,
             login_generation: 0,
@@ -597,19 +604,26 @@ impl DeviceCenterApp {
             session
                 .handle
                 .result()
-                .map(|result| (session.alias.clone(), result.is_ok(), result.err()))
+                .map(|result| (session.alias.clone(), result))
         });
-        if let Some((alias, success, code)) = finished {
-            tracing::info!(device = %alias, success, error = ?code, "viewing window ended");
+        if let Some((alias, result)) = finished {
+            tracing::info!(device = %alias, outcome = ?result, "viewing window ended");
             self.active_session = None;
             self.closing_session = false;
-            self.status = if success {
-                StatusMessage::success(format!("{alias} 的观看窗口已关闭"))
-            } else {
-                StatusMessage::error(format!(
-                    "{alias} 的观看窗口已停止{}，请查看诊断日志",
-                    code.map_or_else(String::new, |value| format!("（{value}）"))
-                ))
+            self.status = match result {
+                Ok(crate::controller::windows::ViewerEnd::Closed) => {
+                    StatusMessage::success(format!("{alias} 的观看窗口已关闭"))
+                }
+                Ok(crate::controller::windows::ViewerEnd::RoomReleased) => StatusMessage::notice(
+                    format!("与 {alias} 的连接已结束，可能已被其他设备断开或接管"),
+                ),
+                Ok(crate::controller::windows::ViewerEnd::TakeoverRequired(device)) => {
+                    self.takeover_confirmation = Some((self.login_generation, *device));
+                    StatusMessage::info("等待确认接管")
+                }
+                Err(error) => StatusMessage::error(format!(
+                    "{alias} 的观看窗口已停止（{error}），请查看诊断日志"
+                )),
             };
             if self.devices.is_some() && !self.logout_pending {
                 self.refresh_pending = self.worker.commands.send(GuiCommand::Refresh).is_ok();
@@ -924,6 +938,10 @@ impl DeviceCenterApp {
             return;
         }
 
+        if self.needs_takeover(&device) {
+            self.takeover_confirmation = Some((self.login_generation, device));
+            return;
+        }
         self.spawn_viewer(
             display_alias(&device).to_owned(),
             Some(device.device_id.clone()),
@@ -960,11 +978,32 @@ impl DeviceCenterApp {
         }
         connectability_error(device)
     }
+
+    fn needs_takeover(&self, device: &DeviceInfo) -> bool {
+        device.participant_count() > 0
+            && !self.devices.as_ref().is_some_and(|list| {
+                crate::controller::has_gui_connection(
+                    &list.current_device.device_id,
+                    &device.device_id,
+                )
+            })
+    }
+
     fn spawn_viewer(
         &mut self,
         alias: String,
         device_id: Option<String>,
         assist_request: Option<crate::assist::AssistRequest>,
+    ) {
+        self.spawn_viewer_with_takeover(alias, device_id, assist_request, None);
+    }
+
+    fn spawn_viewer_with_takeover(
+        &mut self,
+        alias: String,
+        device_id: Option<String>,
+        assist_request: Option<crate::assist::AssistRequest>,
+        takeover: Option<crate::controller::takeover::Approval>,
     ) {
         if self.opening_viewer {
             return;
@@ -988,6 +1027,7 @@ impl DeviceCenterApp {
                 assist: assist_request,
                 options: self.media,
                 background,
+                takeover,
             })
             .is_err()
         {
@@ -1004,6 +1044,23 @@ impl DeviceCenterApp {
 }
 
 impl crate::ui::App for DeviceCenterApp {
+    fn on_close_requested(&mut self) -> bool {
+        if self.close_confirmed {
+            return true;
+        }
+        let has_viewer = self.opening_viewer
+            || self
+                .active_session
+                .as_ref()
+                .is_some_and(|session| session.handle.result().is_none());
+        if has_viewer || crate::port_mapping::service::active_service_count() > 0 {
+            self.close_confirmation = true;
+            false
+        } else {
+            true
+        }
+    }
+
     fn on_focus_changed(&mut self, focused: bool) {
         if !focused {
             self.center_ui.shortcuts.cancel_recording();
@@ -1025,7 +1082,7 @@ impl crate::ui::App for DeviceCenterApp {
         self.tick_power();
         self.draw_center(ui);
         self.draw_dialogs(&ctx);
-        if !self.login_restoring && !self.login_running {
+        if !self.close_confirmation && !self.login_restoring && !self.login_running {
             self.update_dialog(&ctx);
         }
         ui.ctx().request_repaint_after(WORKER_TICK);
@@ -1091,6 +1148,7 @@ enum GuiCommand {
         assist: Option<crate::assist::AssistRequest>,
         options: ConnectionMediaOptions,
         background: Option<crate::wallpaper::Source>,
+        takeover: Option<crate::controller::takeover::Approval>,
     },
     Ports {
         generation: u64,
@@ -1295,6 +1353,7 @@ async fn gui_worker_loop(
                     assist,
                     options,
                     background,
+                    takeover,
                 } => {
                     let result = if generation == catalog_generation && logout_task.is_none() {
                         client
@@ -1307,6 +1366,7 @@ async fn gui_worker_loop(
                                     assist,
                                     options,
                                     background,
+                                    takeover,
                                 )
                             })
                             .ok_or_else(|| "请先登录".to_owned())
@@ -1962,6 +2022,7 @@ struct StatusMessage {
 #[derive(Clone, Copy)]
 enum StatusKind {
     Info,
+    Notice,
     Success,
     Warning,
     Error,
@@ -1969,11 +2030,17 @@ enum StatusKind {
 
 impl StatusKind {
     fn is_alert(self) -> bool {
-        matches!(self, Self::Warning | Self::Error)
+        matches!(self, Self::Notice | Self::Warning | Self::Error)
     }
 }
 
 impl StatusMessage {
+    fn notice(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            kind: StatusKind::Notice,
+        }
+    }
     fn info(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),
@@ -2016,13 +2083,6 @@ fn connectability_error(device: &DeviceInfo) -> std::result::Result<(), String> 
     }
     if !device.controlled_support || !device.controllable {
         return Err(format!("{} 当前没有开放远程控制", display_alias(device)));
-    }
-    if device.participant_count() != 0 {
-        return Err(format!(
-            "{} 已有 {} 名参与者，程序不会强制抢占",
-            display_alias(device),
-            device.participant_count()
-        ));
     }
     Ok(())
 }

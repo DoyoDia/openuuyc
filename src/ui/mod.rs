@@ -1,6 +1,7 @@
 //! Windows GUI ownership and shared application controls.
 use anyhow::Result;
 
+pub(crate) mod chrome;
 pub(crate) mod d3d11;
 
 pub(crate) mod window_manager;

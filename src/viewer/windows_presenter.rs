@@ -1,3 +1,11 @@
+pub(super) use crate::ui::chrome::title_bar_height_pixels;
+use crate::ui::chrome::{
+    WindowMoveState, WindowResizeState, update_nonmodal_window_move, update_nonmodal_window_resize,
+};
+use crate::ui::chrome::{
+    configure_dwm_window, handle_title_drag, paint_brand_logo, title_bar_height, title_bar_panel,
+    window_buttons, window_title_bar,
+};
 use crate::ui::controls::{
     ViewerCaptionIcon as TitleIcon, viewer_caption_button as title_icon_button,
 };
@@ -10,16 +18,12 @@ use std::time::{Duration, Instant};
 
 use crate::ui::window_manager::{Event as UiEvent, Repaint as UiRepaintEvent};
 use anyhow::{Context, Result, anyhow, bail};
-use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, POINT, RECT, WAIT_OBJECT_0};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, RECT, WAIT_OBJECT_0};
 use windows::Win32::Graphics::Direct3D::{
     D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP, D3D_SRV_DIMENSION_TEXTURE2D,
     D3D_SRV_DIMENSION_TEXTURE2DARRAY,
 };
 use windows::Win32::Graphics::Direct3D11::*;
-use windows::Win32::Graphics::Dwm::{
-    DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE, DWMWA_USE_IMMERSIVE_DARK_MODE,
-    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DWMWCP_ROUNDSMALL, DwmSetWindowAttribute,
-};
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::Graphics::Gdi::{
@@ -28,8 +32,6 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::Threading::{
     GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL, WaitForSingleObjectEx,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
-use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
 use windows::core::{BOOL, Interface};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
@@ -470,6 +472,7 @@ impl ConnectingWindowsRunner {
                     if let Some(playing) = self.playing.as_ref() {
                         self.preferences = ViewerPreferences {
                             performance_mode: playing.performance_mode,
+                            intercept_shortcuts: playing.intercept_shortcuts,
                             aspect_locked: playing.aspect_locked,
                         };
                         tracing::debug!(?self.preferences, "preserved local viewer preferences across room replacement");
@@ -613,7 +616,7 @@ impl WindowsConnectionApp {
         let output = self.egui_context.run_ui(input, |ui| {
             resize = borderless_resize(ui, window, None);
             title_bar_panel(ui, "connection-window-chrome", title_bar_height(), |ui| {
-                self.close_requested |= connection_title_bar(ui, window, &self.progress.alias);
+                self.close_requested |= window_title_bar(ui, window, &self.progress.alias, None);
             });
             self.progress.draw(ui);
         });
@@ -654,95 +657,6 @@ impl WindowsConnectionApp {
     }
 }
 
-fn title_bar_frame() -> egui::Frame {
-    egui::Frame::new()
-        .fill(crate::ui::theme::SIDEBAR)
-        .inner_margin(crate::ui::theme::VIEWER_TITLE_MARGIN)
-        .stroke(egui::Stroke::new(
-            crate::ui::theme::VIEWER_TITLE_STROKE,
-            crate::ui::theme::LINE,
-        ))
-}
-
-fn title_bar_height() -> f32 {
-    crate::ui::theme::VIEWER_TITLE_CONTENT_HEIGHT + title_bar_frame().total_margin().sum().y
-}
-
-fn title_bar_panel<R>(
-    ui: &mut egui::Ui,
-    id: &'static str,
-    height: f32,
-    contents: impl FnOnce(&mut egui::Ui) -> R,
-) -> egui::InnerResponse<R> {
-    let clip = ui.clip_rect();
-    let bottom = ui.available_rect_before_wrap().top() + height;
-    // The native video child starts exactly at this boundary. Frame-edge
-    // antialiasing must not escape into its first row at fractional DPI.
-    ui.set_clip_rect(clip.intersect(egui::Rect::from_min_max(
-        clip.min,
-        egui::pos2(clip.right(), bottom),
-    )));
-    let result = egui::Panel::top(id)
-        .frame(title_bar_frame())
-        .exact_size(height)
-        .show(ui, contents);
-    ui.set_clip_rect(clip);
-    result
-}
-
-fn connection_title_bar(ui: &mut egui::Ui, window: &Window, alias: &str) -> bool {
-    ui.set_min_height(crate::ui::theme::VIEWER_TITLE_CONTENT_HEIGHT);
-    let rect = egui::Rect::from_min_size(
-        ui.available_rect_before_wrap().min,
-        egui::vec2(
-            ui.available_width(),
-            crate::ui::theme::VIEWER_TITLE_CONTENT_HEIGHT,
-        ),
-    );
-    let (caption_rect, controls_rect) = connection_title_regions(rect);
-    let drag = ui.interact(
-        caption_rect,
-        ui.id().with("connection-title-drag"),
-        egui::Sense::click_and_drag(),
-    );
-    if handle_title_drag(window, &drag) {
-        let _ = window.drag_window();
-    }
-    let mut caption = ui.new_child(
-        egui::UiBuilder::new()
-            .max_rect(caption_rect)
-            .layout(egui::Layout::left_to_right(egui::Align::Center)),
-    );
-    caption.set_clip_rect(caption_rect);
-    paint_brand_logo(&mut caption);
-    caption.add(
-        egui::Label::new(
-            egui::RichText::new(alias)
-                .size(crate::ui::theme::SMALL)
-                .color(crate::ui::theme::TEXT),
-        )
-        .truncate(),
-    );
-    let mut controls = ui.new_child(
-        egui::UiBuilder::new()
-            .max_rect(controls_rect.shrink2(egui::vec2(4.0, 0.0)))
-            .layout(egui::Layout::left_to_right(egui::Align::Center)),
-    );
-    controls.spacing_mut().item_spacing.x = 4.0;
-    let close = window_buttons(&mut controls, window);
-    ui.allocate_rect(rect, egui::Sense::hover());
-    close
-}
-
-fn connection_title_regions(rect: egui::Rect) -> (egui::Rect, egui::Rect) {
-    let controls_left =
-        (rect.right() - crate::ui::theme::VIEWER_WINDOW_CONTROLS_WIDTH).max(rect.left());
-    (
-        egui::Rect::from_min_max(rect.min, egui::pos2(controls_left, rect.bottom())),
-        egui::Rect::from_min_max(egui::pos2(controls_left, rect.top()), rect.max),
-    )
-}
-
 struct PlayerTitleBar<'a> {
     screens: &'a mut ScreenTabBar,
     window: &'a Window,
@@ -755,14 +669,14 @@ struct PlayerTitleBar<'a> {
 }
 
 fn player_title_bar(ui: &mut egui::Ui, mut bar: PlayerTitleBar<'_>) -> PlayerChromeAction {
-    ui.set_min_height(crate::ui::theme::VIEWER_TITLE_CONTENT_HEIGHT);
+    ui.set_min_height(crate::ui::theme::WINDOW_TITLE_CONTENT_HEIGHT);
     let mut action = PlayerChromeAction::default();
     let stats = bar.performance.snapshot();
     let rect = egui::Rect::from_min_size(
         ui.available_rect_before_wrap().min,
         egui::vec2(
             ui.available_width(),
-            crate::ui::theme::VIEWER_TITLE_CONTENT_HEIGHT,
+            crate::ui::theme::WINDOW_TITLE_CONTENT_HEIGHT,
         ),
     );
     const VIEW_ACTIONS_WIDTH: f32 = 180.0;
@@ -780,11 +694,11 @@ fn player_title_bar(ui: &mut egui::Ui, mut bar: PlayerTitleBar<'_>) -> PlayerChr
             .x
     };
     let identity_width =
-        (crate::ui::theme::VIEWER_LOGO_SIZE + ui.spacing().item_spacing.x + title_width)
+        (crate::ui::theme::WINDOW_LOGO_SIZE + ui.spacing().item_spacing.x + title_width)
             .min(crate::ui::theme::VIEWER_IDENTITY_MAX_WIDTH);
     let controls_rect = egui::Rect::from_min_max(
         egui::pos2(
-            rect.max.x - crate::ui::theme::VIEWER_WINDOW_CONTROLS_WIDTH,
+            rect.max.x - crate::ui::theme::WINDOW_CONTROLS_WIDTH,
             rect.min.y,
         ),
         rect.max,
@@ -1033,180 +947,6 @@ struct PlayerChromeAction {
     drag_window: bool,
 }
 
-fn paint_brand_logo(ui: &mut egui::Ui) {
-    let key = egui::Id::new("viewer-brand-logo");
-    let texture = ui
-        .ctx()
-        .data(|data| data.get_temp::<egui::TextureHandle>(key))
-        .unwrap_or_else(|| {
-            let texture = crate::ui::branding::load_texture(ui.ctx());
-            ui.ctx()
-                .data_mut(|data| data.insert_temp(key, texture.clone()));
-            texture
-        });
-    let (rect, _) = ui.allocate_exact_size(
-        egui::Vec2::splat(crate::ui::theme::VIEWER_LOGO_SIZE),
-        egui::Sense::hover(),
-    );
-    crate::ui::branding::paint(ui.painter(), rect, &texture);
-}
-
-fn handle_title_drag(window: &Window, response: &egui::Response) -> bool {
-    if window.fullscreen().is_some() {
-        return false;
-    }
-    if response.double_clicked() {
-        window.set_maximized(!window.is_maximized());
-        false
-    } else {
-        response.drag_started()
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct WindowMoveState {
-    start: Option<(POINT, PhysicalPosition<i32>)>,
-}
-
-fn update_nonmodal_window_move(
-    ctx: &egui::Context,
-    window: &Window,
-    response: &egui::Response,
-    state: &mut WindowMoveState,
-) {
-    if window.fullscreen().is_some() {
-        state.start = None;
-        return;
-    }
-    if response.double_clicked() {
-        state.start = None;
-        let _ = unsafe { ReleaseCapture() };
-        window.set_maximized(!window.is_maximized());
-        return;
-    }
-    if response.drag_started() {
-        let mut cursor = POINT::default();
-        if unsafe { GetCursorPos(&raw mut cursor) }.is_ok()
-            && let Ok(origin) = window.outer_position()
-        {
-            if window.is_maximized() {
-                window.set_maximized(false);
-            }
-            state.start = Some((cursor, origin));
-            tracing::debug!(x = origin.x, y = origin.y, "local title drag started");
-            if let Ok(hwnd) = window_hwnd(window) {
-                unsafe { SetCapture(hwnd) };
-            }
-        }
-    }
-    let primary_down = ctx.input(|input| input.pointer.primary_down());
-    if primary_down && let Some((start_cursor, origin)) = state.start {
-        let mut cursor = POINT::default();
-        if unsafe { GetCursorPos(&raw mut cursor) }.is_ok() {
-            let started = Instant::now();
-            window.set_outer_position(PhysicalPosition::new(
-                origin.x.saturating_add(cursor.x - start_cursor.x),
-                origin.y.saturating_add(cursor.y - start_cursor.y),
-            ));
-            let elapsed = started.elapsed();
-            if elapsed >= Duration::from_millis(50) {
-                tracing::warn!(
-                    elapsed_ms = elapsed.as_secs_f64() * 1000.0,
-                    "moving local viewer HWND blocked"
-                );
-            }
-        }
-    }
-    if response.drag_stopped() || !primary_down {
-        if state.start.is_some() {
-            tracing::debug!("local title drag ended");
-        }
-        state.start = None;
-        let _ = unsafe { ReleaseCapture() };
-    }
-}
-
-fn window_buttons(ui: &mut egui::Ui, window: &Window) -> bool {
-    let expanded = window.is_maximized() || window.fullscreen().is_some();
-    let minimize = title_icon_button(ui, TitleIcon::Minimize, false, "最小化");
-    if minimize.clicked() {
-        window.set_minimized(true);
-    }
-    let maximize = title_icon_button(
-        ui,
-        if expanded {
-            TitleIcon::Restore
-        } else {
-            TitleIcon::Maximize
-        },
-        false,
-        if expanded { "还原" } else { "最大化" },
-    );
-    if maximize.clicked() {
-        if window.fullscreen().is_some() {
-            window.set_fullscreen(None);
-        } else {
-            window.set_maximized(!window.is_maximized());
-        }
-    }
-    title_icon_button(ui, TitleIcon::Close, false, "关闭").clicked()
-}
-
-pub(super) fn title_bar_height_pixels(window: &Window) -> u32 {
-    if window.fullscreen().is_some() {
-        0
-    } else {
-        // Include the egui frame's padding and stroke. Round outward so a
-        // fractional-DPI border cannot paint over the first video row.
-        title_bar_height_at_scale(window.scale_factor())
-    }
-}
-
-fn title_bar_height_at_scale(scale: f64) -> u32 {
-    (f64::from(title_bar_height()) * scale).ceil().max(1.0) as u32
-}
-
-fn configure_dwm_window(window: &Window) {
-    if let Err(error) = super::windows_ui::prepare_window_background(window) {
-        tracing::warn!(%error, "prepare player background");
-    }
-    let Ok(hwnd) = window_hwnd(window) else {
-        return;
-    };
-    let dark_mode = 1_i32;
-    let fullscreen = window.fullscreen().is_some();
-    let border_color = if fullscreen {
-        DWMWA_COLOR_NONE
-    } else {
-        0x008B654E_u32
-    };
-    let corner = if fullscreen {
-        DWMWCP_DONOTROUND
-    } else {
-        DWMWCP_ROUNDSMALL
-    };
-    unsafe {
-        let _ = DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_USE_IMMERSIVE_DARK_MODE,
-            (&raw const dark_mode).cast(),
-            std::mem::size_of_val(&dark_mode) as u32,
-        );
-        let _ = DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_BORDER_COLOR,
-            (&raw const border_color).cast(),
-            std::mem::size_of_val(&border_color) as u32,
-        );
-        let _ = DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_WINDOW_CORNER_PREFERENCE,
-            (&raw const corner).cast(),
-            std::mem::size_of_val(&corner) as u32,
-        );
-    }
-}
-
 fn monitor_work_area(window: &Window) -> Option<RECT> {
     let hwnd = window_hwnd(window).ok()?;
     let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
@@ -1340,233 +1080,20 @@ fn resize_window_one_to_one(
     let _ = window.request_inner_size(target);
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-struct WindowResizeState {
-    start: Option<WindowResizeStart>,
-    requested_render_size: Option<PhysicalSize<u32>>,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct WindowResizeStart {
-    cursor: POINT,
-    origin: PhysicalPosition<i32>,
-    size: PhysicalSize<u32>,
-    direction: ResizeDirection,
-}
-
-fn update_nonmodal_window_resize(
-    ctx: &egui::Context,
-    window: &Window,
-    response: &egui::Response,
-    direction: ResizeDirection,
-    state: &mut WindowResizeState,
-    aspect: Option<(u32, u32)>,
-) {
-    if response.drag_started() {
-        let mut cursor = POINT::default();
-        if unsafe { GetCursorPos(&raw mut cursor) }.is_ok()
-            && let Ok(origin) = window.outer_position()
-        {
-            state.start = Some(WindowResizeStart {
-                cursor,
-                origin,
-                size: window.inner_size(),
-                direction,
-            });
-            if let Ok(hwnd) = window_hwnd(window) {
-                unsafe { SetCapture(hwnd) };
-            }
-        }
-    }
-    let primary_down = ctx.input(|input| input.pointer.primary_down());
-    if primary_down && let Some(start) = state.start {
-        let mut cursor = POINT::default();
-        if unsafe { GetCursorPos(&raw mut cursor) }.is_ok() {
-            state.requested_render_size = Some(apply_absolute_resize(
-                window,
-                start,
-                cursor.x - start.cursor.x,
-                cursor.y - start.cursor.y,
-                aspect,
-            ));
-        }
-    }
-    if response.drag_stopped() || !primary_down {
-        state.start = None;
-        let _ = unsafe { ReleaseCapture() };
-    }
-}
-
-fn apply_absolute_resize(
-    window: &Window,
-    start: WindowResizeStart,
-    dx: i32,
-    dy: i32,
-    aspect: Option<(u32, u32)>,
-) -> PhysicalSize<u32> {
-    let west = matches!(
-        start.direction,
-        ResizeDirection::West | ResizeDirection::NorthWest | ResizeDirection::SouthWest
-    );
-    let east = matches!(
-        start.direction,
-        ResizeDirection::East | ResizeDirection::NorthEast | ResizeDirection::SouthEast
-    );
-    let north = matches!(
-        start.direction,
-        ResizeDirection::North | ResizeDirection::NorthEast | ResizeDirection::NorthWest
-    );
-    let south = matches!(
-        start.direction,
-        ResizeDirection::South | ResizeDirection::SouthEast | ResizeDirection::SouthWest
-    );
-    let mut width = start.size.width as i32
-        + if east {
-            dx
-        } else if west {
-            -dx
-        } else {
-            0
-        };
-    let mut height = start.size.height as i32
-        + if south {
-            dy
-        } else if north {
-            -dy
-        } else {
-            0
-        };
-    const MIN_WIDTH: i32 = 640;
-    const MIN_HEIGHT: i32 = 400;
-    width = width.max(MIN_WIDTH);
-    height = height.max(MIN_HEIGHT);
-
-    if let Some((video_width, video_height)) = aspect {
-        let title_height = title_bar_height_pixels(window) as i32;
-        let horizontal_only = (west || east) && !north && !south;
-        let vertical_only = (north || south) && !west && !east;
-        let width_drives = horizontal_only
-            || (!vertical_only
-                && i64::from(dx.abs()) * i64::from(video_height)
-                    >= i64::from(dy.abs()) * i64::from(video_width));
-        if width_drives {
-            height = ((i64::from(width) * i64::from(video_height) + i64::from(video_width) / 2)
-                / i64::from(video_width)) as i32
-                + title_height;
-            height = height.max(MIN_HEIGHT);
-        } else {
-            let content_height = (height - title_height).max(1);
-            width = ((i64::from(content_height) * i64::from(video_width)
-                + i64::from(video_height) / 2)
-                / i64::from(video_height)) as i32;
-            width = width.max(MIN_WIDTH);
-        }
-    }
-
-    let left = if west {
-        start.origin.x + start.size.width as i32 - width
-    } else {
-        start.origin.x
-    };
-    let top = if north {
-        start.origin.y + start.size.height as i32 - height
-    } else {
-        start.origin.y
-    };
-    window.set_outer_position(PhysicalPosition::new(left, top));
-    let target = PhysicalSize::new(width as u32, height as u32);
-    let _ = window.request_inner_size(target);
-    target
-}
-
 fn borderless_resize(
     ui: &mut egui::Ui,
     window: &Window,
     mut manual: Option<(&mut WindowResizeState, Option<(u32, u32)>)>,
 ) -> Option<ResizeDirection> {
-    if window.is_maximized() || window.fullscreen().is_some() {
-        return None;
-    }
-    let rect = ui.max_rect();
-    let edge = 6.0;
-    let corner = 12.0;
-    let regions = [
-        (
-            egui::Rect::from_min_max(
-                rect.min,
-                egui::pos2(rect.min.x + corner, rect.min.y + corner),
-            ),
-            ResizeDirection::NorthWest,
-            egui::CursorIcon::ResizeNwSe,
-        ),
-        (
-            egui::Rect::from_min_max(
-                egui::pos2(rect.max.x - corner, rect.min.y),
-                egui::pos2(rect.max.x, rect.min.y + corner),
-            ),
-            ResizeDirection::NorthEast,
-            egui::CursorIcon::ResizeNeSw,
-        ),
-        (
-            egui::Rect::from_min_max(
-                egui::pos2(rect.min.x, rect.max.y - corner),
-                egui::pos2(rect.min.x + corner, rect.max.y),
-            ),
-            ResizeDirection::SouthWest,
-            egui::CursorIcon::ResizeNeSw,
-        ),
-        (
-            egui::Rect::from_min_max(
-                egui::pos2(rect.max.x - corner, rect.max.y - corner),
-                rect.max,
-            ),
-            ResizeDirection::SouthEast,
-            egui::CursorIcon::ResizeNwSe,
-        ),
-        (
-            egui::Rect::from_min_max(
-                egui::pos2(rect.min.x + corner, rect.min.y),
-                egui::pos2(rect.max.x - corner, rect.min.y + edge),
-            ),
-            ResizeDirection::North,
-            egui::CursorIcon::ResizeVertical,
-        ),
-        (
-            egui::Rect::from_min_max(
-                egui::pos2(rect.min.x + corner, rect.max.y - edge),
-                egui::pos2(rect.max.x - corner, rect.max.y),
-            ),
-            ResizeDirection::South,
-            egui::CursorIcon::ResizeVertical,
-        ),
-        (
-            egui::Rect::from_min_max(
-                egui::pos2(rect.min.x, rect.min.y + corner),
-                egui::pos2(rect.min.x + edge, rect.max.y - corner),
-            ),
-            ResizeDirection::West,
-            egui::CursorIcon::ResizeHorizontal,
-        ),
-        (
-            egui::Rect::from_min_max(
-                egui::pos2(rect.max.x - edge, rect.min.y + corner),
-                egui::pos2(rect.max.x, rect.max.y - corner),
-            ),
-            ResizeDirection::East,
-            egui::CursorIcon::ResizeHorizontal,
-        ),
-    ];
+    let ctx = ui.ctx().clone();
     let mut requested = None;
-    for (index, (region, direction, cursor)) in regions.into_iter().enumerate() {
-        let response = ui
-            .interact(region, ui.id().with(("resize", index)), egui::Sense::drag())
-            .on_hover_cursor(cursor);
+    crate::ui::chrome::resize_regions(ui, window, |response, direction| {
         if let Some((state, aspect)) = manual.as_mut() {
-            update_nonmodal_window_resize(ui.ctx(), window, &response, direction, state, *aspect);
+            update_nonmodal_window_resize(&ctx, window, response, direction, state, *aspect);
         } else if response.drag_started() {
             requested = Some(direction);
         }
-    }
+    });
     requested
 }
 
@@ -1933,6 +1460,7 @@ struct ThreadedWindowsApp {
     egui_context: egui::Context,
     egui_winit: egui_winit::State,
     performance_mode: PerformancePanelMode,
+    intercept_shortcuts: bool,
     startup_backdrop: Option<ConnectionProgressApp>,
     aspect_locked: bool,
     last_window_size: PhysicalSize<u32>,
@@ -2037,6 +1565,7 @@ impl ThreadedWindowsApp {
             egui_context: connecting.egui_context,
             egui_winit: connecting.egui_winit,
             performance_mode: preferences.performance_mode,
+            intercept_shortcuts: preferences.intercept_shortcuts,
             startup_backdrop: Some(connecting.progress),
             aspect_locked: preferences.aspect_locked,
             last_window_size: window.inner_size(),
@@ -2224,6 +1753,7 @@ impl ThreadedWindowsApp {
             &self.stream_control,
             self._session.track_index,
             &self.renderer.current_video_size,
+            self.intercept_shortcuts,
             self.stream_control_ui.open
                 || self.plugin_menu_open
                 || self.screen_tabs.is_pending()
@@ -2243,6 +1773,8 @@ impl ThreadedWindowsApp {
         let input = self.egui_winit.take_egui_input(window);
         let mut view = super::stream_menu::LocalViewSettings {
             performance_mode: self.performance_mode,
+            intercept_shortcuts: self.intercept_shortcuts,
+            send_ctrl_alt_del: false,
             aspect_locked: self.aspect_locked,
         };
         let mut chrome_action = PlayerChromeAction::default();
@@ -2362,6 +1894,23 @@ impl ThreadedWindowsApp {
             }
         });
         self.performance_mode = view.performance_mode;
+        if self.intercept_shortcuts != view.intercept_shortcuts {
+            self.mouse.release(window);
+            self.intercept_shortcuts = view.intercept_shortcuts;
+        }
+        if view.send_ctrl_alt_del && window.has_focus() {
+            self.mouse.release(window);
+            let result = window_hwnd(window)
+                .and_then(|hwnd| self.stream_control.mouse().send_ctrl_alt_del(hwnd.0 as u64));
+            match result {
+                Ok(()) => {
+                    self.stream_control_ui.local_error = None;
+                    self.stream_control_ui.open = false;
+                }
+                Err(error) => self.stream_control_ui.local_error = Some(error.to_string()),
+            }
+            window.request_redraw();
+        }
         if let Ok(hwnd) = window_hwnd(window) {
             crate::viewer_shortcuts::set_text_owner(
                 hwnd.0 as u64,

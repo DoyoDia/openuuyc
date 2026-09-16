@@ -17,7 +17,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::remote_input::{MouseMode, RemoteInput};
 
 /// Winit registers mouse AND keyboard raw devices at event-loop creation.
-/// This client uses only RAWMOUSE; keyboard uses window messages and a narrow hook.
+/// This client uses only RAWMOUSE; keyboard uses a hook plus window state events.
 /// Remove just the unused keyboard class before showing/focusing a window.
 pub(super) fn remove_unused_raw_keyboard() -> Result<()> {
     use windows::Win32::UI::Input::{RAWINPUTDEVICE, RIDEV_REMOVE, RegisterRawInputDevices};
@@ -38,6 +38,7 @@ struct Target {
     input: RemoteInput,
     generation: u64,
     activation: u64,
+    intercept_shortcuts: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -120,23 +121,24 @@ fn blocked_modifiers(blocked: &[bool; 256]) -> bool {
         .any(|key| blocked[key])
 }
 
-fn intercept_key(key: u16, _scan: u32, held: &[bool; 256]) -> bool {
-    if crate::viewer_shortcuts::suspended() {
+fn windows_state_key(key: u16) -> bool {
+    matches!(key, 16..=18 | 20 | 144..=145 | 160..=165)
+}
+
+fn intercept_key(key: u16, held: &[bool; 256], intercept_shortcuts: bool) -> bool {
+    // Capture ordinary keys before local RegisterHotKey/IME handling can take
+    // them away from the viewer. A list of known system chords misses arbitrary
+    // application hotkeys (including single-key bindings such as PrintScreen).
+    // Like official UU, let Ctrl/Shift/Alt and lock keys update Windows state;
+    // their window events remain ordered before the intercepted primary key.
+    if crate::viewer_shortcuts::suspended() || windows_state_key(key) {
         return false;
     }
-    let ctrl = held[162] || held[163];
-    let shift = held[160] || held[161];
-    let alt = held[164] || held[165];
-    let win = held[91] || held[92];
-    matches!(key, 91 | 92)
-        || win
-        || (alt && matches!(key, 9 | 27))
-        || (ctrl && key == 27)
-        || crate::viewer_shortcuts::match_key(
-            key,
-            u8::from(ctrl) | (u8::from(shift) << 1) | (u8::from(alt) << 2) | (u8::from(win) << 3),
-        )
-        .is_some()
+    let modifiers = u8::from(held[162] || held[163])
+        | (u8::from(held[160] || held[161]) << 1)
+        | (u8::from(held[164] || held[165]) << 2)
+        | (u8::from(held[91] || held[92]) << 3);
+    intercept_shortcuts || crate::viewer_shortcuts::match_key(key, modifiers).is_some()
 }
 
 pub(super) struct SessionNotifications {
@@ -474,12 +476,10 @@ impl Router {
                 })
                 .map(|t| t.owner);
             self.routes[i] = if let Some(owner) = owner {
-                if self
-                    .target
-                    .as_ref()
-                    .is_some_and(|t| t.input.keyboard_supported())
-                    && intercept_key(edge.key, edge.scan, &self.observed)
-                {
+                if self.target.as_ref().is_some_and(|t| {
+                    t.input.keyboard_supported()
+                        && intercept_key(edge.key, &self.observed, t.intercept_shortcuts)
+                }) {
                     Route::Hook(owner)
                 } else {
                     Route::Window(owner)
@@ -538,12 +538,26 @@ impl Router {
                 && p.edge.down == edge.down
         });
         let mut owned = self.window_owned[i] == Some(owner);
-        if let Some(position) = position {
+        if let Some(mut position) = position {
             // A missing earlier window event cannot be bypassed by a later
-            // intercepted key. Stop safely instead of replaying stale presses.
-            if self.pending.iter().take(position).any(|p| !p.ready) {
+            // intercepted key, except an unclaimed ordinary key: interception
+            // is off (or was suspended) and a local hotkey/IME may consume it.
+            // A later window key message proves such a marker can be retired;
+            // don't guess from WM_NULL, which can precede queued input.
+            if self
+                .pending
+                .iter()
+                .take(position)
+                .any(|p| !p.ready && (p.route == Route::Local || windows_state_key(p.edge.key)))
+            {
                 self.stop_ordering();
             } else {
+                for previous in (0..position).rev() {
+                    if !self.pending[previous].ready {
+                        self.pending.remove(previous);
+                        position -= 1;
+                    }
+                }
                 let injected = self.pending[position].edge.injected;
                 self.pending[position].edge = KeyEdge { injected, ..edge };
                 self.pending[position].ready = true;
@@ -732,11 +746,14 @@ impl Router {
     }
 }
 
-pub(super) fn set_target(owner: u64, input: &RemoteInput) {
+pub(super) fn set_target(owner: u64, input: &RemoteInput, intercept_shortcuts: bool) {
     with_router(|r| {
         let activation = input.activation_generation();
         if r.target.as_ref().is_some_and(|t| {
-            t.owner == owner && t.activation == activation && t.input.same_session(input)
+            t.owner == owner
+                && t.activation == activation
+                && t.input.same_session(input)
+                && t.intercept_shortcuts == intercept_shortcuts
         }) {
             return;
         }
@@ -762,6 +779,7 @@ pub(super) fn set_target(owner: u64, input: &RemoteInput) {
             input: input.clone(),
             generation: input.keyboard_generation(),
             activation,
+            intercept_shortcuts,
         });
         r.finish_neutral();
     });

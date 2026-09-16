@@ -209,6 +209,42 @@ impl RemoteInput {
         self.lock().keyboard_platform == 1
     }
 
+    /// Explicit viewer command, never injected into the local Windows desktop.
+    pub fn send_ctrl_alt_del(&self, owner: u64) -> Result<()> {
+        let mut s = self.lock();
+        if s.keyboard_platform != 1 {
+            bail!("仅支持向 Windows 设备发送 Ctrl+Alt+Del");
+        }
+        if !s.ready || s.stopping || s.mode == MouseMode::View || s.waiting_for_neutral {
+            bail!("请先开启键鼠控制并松开按键");
+        }
+        // Retire physical input before the command, keeping any release owed
+        // to transport. The entire finite sequence enters the same queue/epoch.
+        Self::release_locked(&mut s);
+        s.owner = Some(owner);
+        for (key, down) in [
+            (162, true),
+            (164, true),
+            (46, true),
+            (46, false),
+            (164, false),
+            (162, false),
+        ] {
+            s.queue.push_back(InputEvent::Key {
+                key,
+                down,
+                lock: None,
+                // A finite menu command has no physical key/heartbeat owner.
+                interrupt: false,
+            });
+        }
+        // next() tracks potentially submitted presses in remote_keys, so
+        // cancellation/failure still releases them without replaying Delete.
+        drop(s);
+        self.wake.notify_one();
+        Ok(())
+    }
+
     /// Native adapters supply Windows VKs only for a verified Windows peer.
     /// Other target encodings are separate adapters, never a cast of local keys.
     pub fn key(&self, owner: u64, key: u16, down: bool, lock: Option<u8>) -> bool {

@@ -15,6 +15,12 @@ use reqwest::{Client, Method, StatusCode, header::HeaderMap};
 pub(crate) const PRIMARY: &str = "https://api.nrd.nie.163.com";
 const SECONDARY: &str = "https://api-dcdn.nrd.nie.163.com";
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RetryPolicy {
+    Recovery { replay_ambiguous: bool },
+    Never,
+}
+
 #[derive(Default)]
 struct Route {
     index: usize,
@@ -55,7 +61,7 @@ impl NrdHttp {
         headers: HeaderMap,
         body: Vec<u8>,
         timeout: Duration,
-        replay_ambiguous: bool,
+        retry: RetryPolicy,
     ) -> Result<(StatusCode, Bytes)> {
         let generation = {
             let mut route = self
@@ -96,6 +102,7 @@ impl NrdHttp {
                     match response.bytes().await {
                         Ok(bytes) => {
                             if status == StatusCode::NOT_FOUND
+                                && retry != RetryPolicy::Never
                                 && self.advance(index, generation, attempt)
                             {
                                 tracing::warn!(
@@ -114,7 +121,13 @@ impl NrdHttp {
                 Err(error) => (error, true),
             };
             let (error, before_response) = outcome;
-            if (replay_ambiguous || error.is_connect())
+            if retry != RetryPolicy::Never
+                && (matches!(
+                    retry,
+                    RetryPolicy::Recovery {
+                        replay_ambiguous: true
+                    }
+                ) || error.is_connect())
                 && retryable_transport_error(&error, before_response)
                 && self.advance(index, generation, attempt)
             {

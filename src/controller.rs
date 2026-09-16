@@ -26,8 +26,19 @@ pub type ConnectionProgressReporter = Arc<dyn Fn(ConnectionProgress) + Send + Sy
 pub(crate) fn has_gui_connection(controller: &str, target: &str) -> bool {
     shared::get(&shared::key(controller, target)).is_some()
 }
+pub(crate) struct LocalConnectionActivity {
+    pub viewing: bool,
+    pub controlling: bool,
+}
+pub(crate) fn gui_connection_activity(
+    controller: &str,
+    target: &str,
+) -> Option<LocalConnectionActivity> {
+    shared::get(&shared::key(controller, target)).map(|session| session.activity())
+}
 mod assist;
 mod shared;
+pub(crate) mod takeover;
 pub(crate) mod windows;
 
 fn report_progress(
@@ -79,6 +90,24 @@ fn retry_session_failure(error: &anyhow::Error) -> bool {
     matches!(error.downcast_ref::<SignalFailure>(), Some(failure) if !matches!(failure, SignalFailure::Kicked))
 }
 
+fn room_released(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<SignalFailure>(),
+        Some(SignalFailure::Kicked)
+    )
+}
+
+async fn await_media_startup<T>(
+    ended: impl std::future::Future<Output = Result<()>>,
+    startup: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    tokio::select! {
+        biased;
+        result = ended => Err(result.err().unwrap_or_else(|| anyhow!("设备连接已结束"))),
+        result = startup => result,
+    }
+}
+
 struct ResolvedConnection {
     client: Arc<AuthenticatedClient>,
     target_device_id: String,
@@ -93,6 +122,7 @@ struct ResolvedConnection {
     target_version: String,
     refresh_after_upgrade: bool,
     background: Option<crate::wallpaper::Source>,
+    takeover: Option<takeover::Approval>,
 }
 
 impl ResolvedConnection {
@@ -107,6 +137,7 @@ impl ResolvedConnection {
         if self.assist.is_none()
             && let Some(session) = shared::get(&key)
         {
+            self.takeover = None;
             let mut connection = ControllerConnection::from_shared(session, self.profile, true)?;
             let handle = connection.stream_control_handle();
             let store = self.client.viewing_settings_store(&self.target_device_id)?;
@@ -164,17 +195,33 @@ impl ResolvedConnection {
             }
             RoomSession::from_assist(&reply)
         } else {
+            // Consume before dispatch. Neither API failure nor a later room
+            // reconnect may reuse this user confirmation.
+            let force_join = if let Some(approval) = self.takeover.take() {
+                cancellable(
+                    cancel,
+                    approval.verify(&self.client, &self.target_device_id),
+                )
+                .await?
+            } else {
+                false
+            };
             loop {
                 match cancellable(
                     cancel,
-                    self.client.join_device(&self.target_device_id, false),
+                    self.client.join_device(&self.target_device_id, force_join),
                 )
                 .await
                 {
                     Ok(room) => break room,
                     Err(error) => {
+                        if force_join {
+                            return Err(error).context(
+                                "接管请求未确认成功，未自动重试；请刷新设备状态后重新确认",
+                            );
+                        }
                         // F890D0: only retry the API outcomes classified by the
-                        // official device-join owner; never force another viewer out.
+                        // official device-join owner; retries never force a takeover.
                         let retryable = error.downcast_ref::<ApiFailure>().is_some_and(|failure| {
                             !matches!(failure.code, -1 | 1120 | 2002 | 2006 | 2007 | 4042)
                         });
@@ -348,10 +395,11 @@ async fn run_viewer_window(
     options: ConnectionMediaOptions,
     target_id: Option<String>,
     assist: Option<crate::assist::AssistRequest>,
-    hosted: Option<windows::WindowContext>,
+    mut hosted: Option<windows::WindowContext>,
 ) -> Result<()> {
     let owns_presence = hosted.is_none();
     let background = hosted.as_ref().and_then(|h| h.background.clone());
+    let takeover = hosted.as_mut().and_then(|h| h.takeover.take());
     let window_key = hosted.as_ref().map(|h| h.key.clone());
     let (progress_sender, progress_receiver) = std::sync::mpsc::channel();
     let (viewer_sender, viewer_receiver) = std::sync::mpsc::channel();
@@ -395,6 +443,7 @@ async fn run_viewer_window(
         }
     });
     let task_cancel = cancel.clone();
+    let terminal_sender = viewer_sender.clone();
     let connection_task = tokio::spawn(async move {
         let mut reporter = reporter;
         let result = run_viewer_connection_owner(
@@ -409,6 +458,7 @@ async fn run_viewer_window(
                 target_id,
                 assist,
                 client: hosted.map(|h| h.client),
+                takeover,
             },
             &task_cancel,
             &mut reporter,
@@ -417,7 +467,13 @@ async fn run_viewer_window(
         if !task_cancel.is_cancelled()
             && let Err(error) = &result
         {
-            reporter(ConnectionProgress::failed(format!("{error:#}")));
+            if room_released(error) || error.downcast_ref::<takeover::Required>().is_some() {
+                // Return terminal leave / explicit takeover confirmation to
+                // the owning UI without presenting a decoder/connection error.
+                let _ = terminal_sender.send(ViewerWindowEvent::Close);
+            } else {
+                reporter(ConnectionProgress::failed(format!("{error:#}")));
+            }
         }
         result
     });
@@ -460,6 +516,7 @@ struct ViewerConnectionWindow {
     target: tokio::sync::watch::Sender<Option<windows::ViewerTarget>>,
     target_id: Option<String>,
     assist: Option<crate::assist::AssistRequest>,
+    takeover: Option<takeover::Approval>,
 }
 
 async fn run_viewer_connection_owner(
@@ -478,6 +535,7 @@ async fn run_viewer_connection_owner(
         target_id,
         assist,
         client: hosted_client,
+        takeover,
     } = window;
     let presence_stop = CancellationToken::new();
     let mut presence_task = None;
@@ -488,7 +546,7 @@ async fn run_viewer_connection_owner(
         let mut resolved = if let Some(request) = assist {
             cancellable(cancel, assist::resolve(client, &alias, options, request, Some(reporter))).await?
         } else {
-            cancellable(cancel, resolve_connection_with_client(client, &alias, options, Some(reporter), target_id.as_deref())).await?
+            cancellable(cancel, resolve_connection_with_client(client, &alias, options, Some(reporter), target_id.as_deref(), takeover)).await?
         };
         // Standalone processes keep the host presence room (设备在线状态；
         // 被控权限开关已从界面移除，不开放被控). The account-ended token
@@ -544,23 +602,33 @@ async fn run_viewer_connection_owner(
             // F94230 resets the full-session retry budget on peer connected.
             monitor.send_replace(Some(controller.performance_monitor()));
             retries = 0;
-            let prepared = cancellable(cancel, async {
-                controller.start_native_viewer_with_progress(
-                    &resolved.summary.alias, Some(reporter), display,
-                ).await
-            }).await;
+            let prepared = {
+                let startup_session = Arc::clone(&controller.forwarder.session);
+                cancellable(cancel, await_media_startup(
+                    startup_session.ended(),
+                    controller.start_native_viewer_with_progress(
+                        &resolved.summary.alias, Some(reporter), display,
+                    ),
+                )).await
+            };
             let (mut viewer, playback) = match prepared {
                 Ok(prepared) => prepared,
-                Err(error) => { let _ = controller.close().await; return Err(error); }
+                Err(error) => return Err(controller.close_after_startup_error(error).await),
             };
             // The decoder opened against the first frame's parameter sets after
             // the RTP forwarder started; only then is presentation known.
-            if let Err(error) = cancellable(cancel, async {
-                tokio::time::timeout(Duration::from_secs(30), viewer.startup())
-                    .await.context("first-frame decoder startup timeout")?
-            }).await {
-                let _ = controller.close().await;
-                return Err(error);
+            let started = {
+                let startup_session = Arc::clone(&controller.forwarder.session);
+                cancellable(cancel, await_media_startup(
+                    startup_session.ended(),
+                    async {
+                        tokio::time::timeout(Duration::from_secs(30), viewer.startup())
+                            .await.context("first-frame decoder startup timeout")?
+                    },
+                )).await
+            };
+            if let Err(error) = started {
+                return Err(controller.close_after_startup_error(error).await);
             }
             let route = controller.peer.selected_route_details().await.unwrap_or_else(|| "安全媒体通道已建立".into());
             reporter(ConnectionProgress::ready(format!("{route} · {} · {}", playback.codec, controller.performance_monitor().snapshot().decoder)));
@@ -610,10 +678,17 @@ async fn run_viewer_connection_owner(
                         // Revalidate the real ID while the old room continues playing.
                         let next = cancellable(cancel, resolve_connection_with_client(
                             Arc::clone(&resolved.client), &request.device.alias, options, None,
-                            Some(&request.device.device_id))).await;
+                            Some(&request.device.device_id), request.takeover)).await;
                         let next = match next {
                             Ok(next) => next,
-                            Err(error) => { switcher.failed(format!("无法切换：{error}")); continue; }
+                            Err(error) => {
+                                if let Some(required) = error.downcast_ref::<takeover::Required>() {
+                                    switcher.require_takeover(required.0.clone(), request.window);
+                                } else {
+                                    switcher.failed(format!("无法切换：{error}"));
+                                }
+                                continue;
+                            }
                         };
                         let (progress_tx, progress_rx) = std::sync::mpsc::channel();
                         let (display_tx, display_rx) = oneshot::channel();
@@ -643,7 +718,12 @@ async fn run_viewer_connection_owner(
             };
             if cancel.is_cancelled() {
                 close.close();
-                return Ok(());
+                // Closing the HWND can race the observed server leave. Keep
+                // that reason for the main window instead of losing it here.
+                return match result {
+                    Err(error) if room_released(&error) => Err(error),
+                    _ => Ok(()),
+                };
             }
             if let Some((next, new_display)) = next_connection {
                 if let Some(upgrade) = &upgrade { upgrade.retire(); }
@@ -711,7 +791,7 @@ async fn run_viewer_connection_owner(
     {
         client.close().await;
     }
-    if cancel.is_cancelled() {
+    if cancel.is_cancelled() && !result.as_ref().is_err_and(|error| room_released(error)) {
         Ok(())
     } else {
         result
@@ -719,12 +799,21 @@ async fn run_viewer_connection_owner(
 }
 
 impl ControllerConnection {
+    async fn close_after_startup_error(self, error: anyhow::Error) -> anyhow::Error {
+        // Peer teardown can close RTP/decoder input before the signal task has
+        // finished cleanup. Preserve the explicit leave instead of that symptom.
+        match self.close().await {
+            Err(ended) if room_released(&ended) => ended,
+            _ => error,
+        }
+    }
     pub(crate) async fn connect_mapping(
         client: &AuthenticatedClient,
         device: &crate::api::DeviceInfo,
         policy: crate::feature_ability::FeaturePolicy,
         options: ConnectionMediaOptions,
         cancel: &CancellationToken,
+        takeover: Option<takeover::Approval>,
     ) -> Result<Self> {
         let key = shared::key(&client.device_id(), &device.device_id);
         let _gate = shared::connection_gate(&key).lock_owned().await;
@@ -740,11 +829,23 @@ impl ControllerConnection {
         if let Some(session) = shared::get(&key) {
             return Self::from_shared(session, profile, false);
         }
-        anyhow::ensure!(
-            device.participant_count() == 0,
-            "设备已有其他连接，不能抢占"
-        );
-        let room = cancellable(cancel, client.join_device(&device.device_id, false)).await?;
+        if device.participant_count() > 0 && takeover.is_none() {
+            return Err(takeover::Required(device.clone()).into());
+        }
+        let force_join = if let Some(approval) = takeover {
+            cancellable(cancel, approval.verify(client, &device.device_id)).await?
+        } else {
+            false
+        };
+        let room = cancellable(cancel, client.join_device(&device.device_id, force_join))
+            .await
+            .map_err(|error| {
+                if force_join {
+                    error.context("接管请求未确认成功，未自动重试；请检查设备状态后重新确认")
+                } else {
+                    error
+                }
+            })?;
         let connection = Self::establish(
             room,
             &client.device_id(),
@@ -1354,7 +1455,8 @@ async fn resolve_saved_connection(
 ) -> Result<ResolvedConnection> {
     let client = Arc::new(AuthenticatedClient::from_saved_session()?);
     let result =
-        resolve_connection_with_client(Arc::clone(&client), alias, options, reporter, None).await;
+        resolve_connection_with_client(Arc::clone(&client), alias, options, reporter, None, None)
+            .await;
     if result.is_err() {
         client.close().await;
     }
@@ -1367,6 +1469,7 @@ async fn resolve_connection_with_client(
     options: ConnectionMediaOptions,
     reporter: Option<&ConnectionProgressReporter>,
     target_id: Option<&str>,
+    takeover: Option<takeover::Approval>,
 ) -> Result<ResolvedConnection> {
     report_progress(
         reporter,
@@ -1418,11 +1521,11 @@ async fn resolve_connection_with_client(
         .await;
     if device.participant_count() != 0
         && shared::get(&shared::key(&client.device_id(), &device.device_id)).is_none()
+        && !takeover
+            .as_ref()
+            .is_some_and(|a| a.permits(&device.device_id))
     {
-        bail!(
-            "device `{alias}` already has {} participant(s); refusing to force takeover",
-            device.participant_count()
-        );
+        return Err(takeover::Required(device.clone()).into());
     }
 
     let (display, display_detection_warning) = match detect_local_display() {
@@ -1470,5 +1573,6 @@ async fn resolve_connection_with_client(
         target_version: device.version_name.clone(),
         refresh_after_upgrade: false,
         background: Some(background),
+        takeover,
     })
 }

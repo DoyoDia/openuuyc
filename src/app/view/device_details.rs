@@ -3,6 +3,7 @@ use super::*;
 #[derive(Clone, Copy)]
 enum Glyph {
     Monitor,
+    PortMapping,
     Power,
     Restart,
     Board,
@@ -230,6 +231,7 @@ fn paint_glyph(p: &egui::Painter, r: egui::Rect, g: Glyph, color: Color32) {
             }
         }
         Glyph::Monitor => paint_icon(p, r, Icon::Monitor, color),
+        Glyph::PortMapping => crate::ui::controls::paint_port_mapping_icon(p, r, color),
         Glyph::Edit => paint_icon(p, r, Icon::Edit, color),
         Glyph::System => {
             for y in [-7.0, 1.0] {
@@ -393,6 +395,8 @@ impl DeviceCenterApp {
         if self.center_ui.edit.is_none()
             && self.center_ui.power.is_none()
             && !self.logout_confirmation
+            && !self.close_confirmation
+            && self.takeover_confirmation.is_none()
             && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
         {
             back = true;
@@ -490,7 +494,6 @@ impl DeviceCenterApp {
             .show(ui, |ui| {
                 let width = ui.available_width();
                 // Heights and spacing are logical pixels, independent of the viewport.
-                let font = theme::BODY;
                 let pad = 20.0;
                 let hero_h = 220.0;
                 let card_h = 116.0;
@@ -579,21 +582,15 @@ impl DeviceCenterApp {
                     .truncate(),
                 )
                 .on_hover_text(display_alias(&device));
-                let status = if device.is_connected() && device.participant_count() > 0 {
-                    "使用中"
-                } else {
-                    device.status_label()
-                };
-                let color = if device.is_connected() { GREEN } else { MUTED };
-                let status_y = card.top() + 61.0;
-                ui.painter()
-                    .circle_filled(egui::pos2(title_x + 5.0, status_y), 5.0, color);
-                ui.painter().text(
-                    egui::pos2(title_x + 20.0, status_y),
-                    egui::Align2::LEFT_CENTER,
-                    format!("{status}{}", if current { " · 本机" } else { "" }),
-                    FontId::proportional(font),
-                    color,
+                let status = self.device_status(&device);
+                crate::ui::controls::device_status_badge(
+                    ui,
+                    egui::Rect::from_min_size(
+                        egui::pos2(title_x, card.top() + 48.0),
+                        theme::DEVICE_STATUS_SIZE.into(),
+                    ),
+                    status.label(),
+                    status.color(),
                 );
                 let mut summary =
                     ui.new_child(egui::UiBuilder::new().max_rect(egui::Rect::from_min_max(
@@ -626,6 +623,8 @@ impl DeviceCenterApp {
                         &mut button_ui,
                         if own_session {
                             "打开观看窗口"
+                        } else if self.needs_takeover(&device) {
+                            "接管设备"
                         } else {
                             "连接设备"
                         },
@@ -639,7 +638,16 @@ impl DeviceCenterApp {
                         button.on_disabled_hover_text(issue);
                     }
                 }
-                let action_count = usize::from(has_power) * 3 + usize::from(has_ports);
+                let power_actions = [
+                    if device.is_connected() {
+                        crate::power::PowerAction::Shutdown
+                    } else {
+                        crate::power::PowerAction::Wake
+                    },
+                    crate::power::PowerAction::Reboot,
+                ];
+                let power_count = if has_power { power_actions.len() } else { 0 };
+                let action_count = power_count + usize::from(has_ports);
                 let gap = 16.0;
                 let button_w = (card.width() - action_count.saturating_sub(1) as f32 * gap)
                     / action_count.max(1) as f32;
@@ -647,10 +655,14 @@ impl DeviceCenterApp {
                     let mut progress_ui =
                         ui.new_child(egui::UiBuilder::new().max_rect(egui::Rect::from_min_size(
                             at(pad, power_y),
-                            vec2(button_w * 3.0 + gap * 2.0, theme::CONTROL_HEIGHT),
+                            vec2(
+                                button_w * power_count as f32
+                                    + gap * power_count.saturating_sub(1) as f32,
+                                theme::CONTROL_HEIGHT,
+                            ),
                         )));
                     if !self.detail_power_result(&mut progress_ui, &id) {
-                        for (i, action) in crate::power::PowerAction::ALL.into_iter().enumerate() {
+                        for (i, action) in power_actions.into_iter().enumerate() {
                             let rect = egui::Rect::from_min_size(
                                 at(pad + i as f32 * (button_w + gap), power_y),
                                 vec2(button_w, theme::CONTROL_HEIGHT),
@@ -680,14 +692,7 @@ impl DeviceCenterApp {
                 }
                 if has_ports {
                     let rect = egui::Rect::from_min_size(
-                        at(
-                            pad + if has_power {
-                                3.0 * (button_w + gap)
-                            } else {
-                                0.0
-                            },
-                            power_y,
-                        ),
+                        at(pad + power_count as f32 * (button_w + gap), power_y),
                         vec2(button_w, theme::CONTROL_HEIGHT),
                     );
                     let mut button_ui = ui.new_child(egui::UiBuilder::new().max_rect(rect));
@@ -704,7 +709,7 @@ impl DeviceCenterApp {
                     ports = detail_button(
                         &mut button_ui,
                         "端口转发",
-                        Glyph::Monitor,
+                        Glyph::PortMapping,
                         available,
                         rect.size(),
                         if running {

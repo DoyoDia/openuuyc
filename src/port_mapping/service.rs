@@ -8,6 +8,12 @@ pub(crate) struct Snapshot {
     pub connected: bool,
     pub busy: bool,
     pub error: Option<String>,
+    pub takeover: Option<TakeoverRequest>,
+}
+#[derive(Clone)]
+pub(crate) struct TakeoverRequest {
+    pub id: u64,
+    pub device: crate::api::DeviceInfo,
 }
 pub(crate) enum Command {
     Save(Rule),
@@ -15,6 +21,7 @@ pub(crate) enum Command {
     Enable(u64, bool),
     Probe(u64),
     Retry,
+    Takeover(u64, crate::controller::takeover::Approval),
 }
 #[derive(Clone)]
 pub(crate) struct Handle {
@@ -31,7 +38,11 @@ impl Handle {
     }
     pub(crate) fn set_enabled(&self, enabled: bool) {
         self.enabled.send_replace(enabled);
-        lock(&self.state).enabled = enabled;
+        let mut state = lock(&self.state);
+        state.enabled = enabled;
+        if !enabled {
+            state.takeover = None;
+        }
     }
     pub(crate) fn snapshot(&self) -> Snapshot {
         lock(&self.state).clone()
@@ -74,6 +85,19 @@ pub(crate) fn status(controller: &str, target: &str) -> Option<Snapshot> {
         .get(&key(controller, target))
         .filter(|h| !h.stop.is_cancelled())
         .map(Handle::snapshot)
+}
+
+pub(crate) fn active_service_count() -> usize {
+    lock(services())
+        .values()
+        .filter(|handle| {
+            if handle.stop.is_cancelled() || handle.commands.is_closed() {
+                return false;
+            }
+            let state = lock(&handle.state);
+            state.enabled || state.busy || state.connected
+        })
+        .count()
 }
 fn jobs() -> &'static Mutex<Vec<(CancellationToken, CancellationToken)>> {
     static JOBS: std::sync::OnceLock<Mutex<Vec<(CancellationToken, CancellationToken)>>> =
@@ -147,6 +171,7 @@ async fn connect(
     device: &crate::api::DeviceInfo,
     transport: crate::media::ConnectionMediaOptions,
     stop: &CancellationToken,
+    takeover: Option<crate::controller::takeover::Approval>,
 ) -> Result<ControllerConnection> {
     let list = tokio::select! {biased;_=stop.cancelled()=>anyhow::bail!("已取消连接"),result=client.list_devices()=>result?};
     let current = list
@@ -172,7 +197,7 @@ async fn connect(
         policy.supports(crate::feature_ability::Feature::PortMapping),
         "被控端版本不支持端口转发，请更新被控端"
     );
-    ControllerConnection::connect_mapping(client, current, policy, transport, stop).await
+    ControllerConnection::connect_mapping(client, current, policy, transport, stop, takeover).await
 }
 
 async fn run(
@@ -195,6 +220,7 @@ async fn run(
     let mut attempt = stop.child_token();
     let mut active = false;
     let mut retry = false;
+    let mut takeover = None;
     let mut tick = tokio::time::interval(Duration::from_millis(200));
     loop {
         if !active || stop.is_cancelled() {
@@ -219,6 +245,8 @@ async fn run(
             }
             connection = None;
             retry = false;
+            takeover = None;
+            lock(&state).takeover = None;
             lock(&state).busy = false;
             if stop.is_cancelled() {
                 break;
@@ -232,8 +260,10 @@ async fn run(
             let device = device.clone();
             lock(&state).busy = true;
             lock(&state).error = None;
+            lock(&state).takeover = None;
+            let approval = takeover.take();
             pending = Some(tokio::spawn(async move {
-                let controller = connect(&client, &device, network, &cancel).await?;
+                let controller = connect(&client, &device, network, &cancel, approval).await?;
                 let ready = tokio::select! {
                     biased;
                     _=cancel.cancelled()=>Err(anyhow::anyhow!("已取消连接")),
@@ -255,7 +285,20 @@ async fn run(
                     alive = Some(tokio::spawn(controller.keep_alive(rx)));
                     connection = Some(wire);
                 }
-                Ok(Err(error)) => lock(&state).error = Some(format!("{error:#}")),
+                Ok(Err(error)) => {
+                    let mut snapshot = lock(&state);
+                    if let Some(required) =
+                        error.downcast_ref::<crate::controller::takeover::Required>()
+                    {
+                        snapshot.takeover = Some(TakeoverRequest {
+                            id: new_id(),
+                            device: required.0.clone(),
+                        });
+                        snapshot.error = None;
+                    } else {
+                        snapshot.error = Some(format!("{error:#}"));
+                    }
+                }
                 Err(error) => lock(&state).error = Some(error.to_string()),
             }
             lock(&state).busy = false;
@@ -373,6 +416,17 @@ async fn run(
             _=tick.tick()=>{},
             command=commands.recv()=>{
                 let Some(command)=command else {stop.cancel();continue;};
+                if let Command::Takeover(id, approval) = command {
+                    if active && *enabled.borrow() && pending.is_none() && connection.is_none() {
+                        let mut snapshot = lock(&state);
+                        if snapshot.takeover.as_ref().is_some_and(|request| request.id == id) {
+                            snapshot.takeover = None;
+                            takeover = Some(approval);
+                            retry = true;
+                        }
+                    }
+                    continue;
+                }
                 if matches!(command,Command::Retry) {if active && connection.is_none(){retry=true;}continue;}
                 if let Command::Probe(id)=command {if let Some(r)=running.get(&id){r.probe.notify_one();}continue;}
                 let mut next=rules.clone();
@@ -388,7 +442,7 @@ async fn run(
                         },
                         Command::Delete(id)=>next.retain(|r|r.id!=id),
                         Command::Enable(id,value)=>{next.iter_mut().find(|r|r.id==id).context("规则不存在")?.enabled=value;},
-                        Command::Retry|Command::Probe(_)=>{},
+                        Command::Retry|Command::Probe(_)|Command::Takeover(..)=>{},
                     }
                     store.save(&next)?;rules=next;Ok(())
                 })();
@@ -400,6 +454,7 @@ async fn run(
     s.enabled = false;
     s.connected = false;
     s.busy = false;
+    s.takeover = None;
     Ok(())
 }
 pub(crate) fn new_id() -> u64 {

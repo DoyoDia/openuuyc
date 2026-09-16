@@ -68,6 +68,10 @@ struct DesktopWindow {
     input: egui_winit::State,
     viewport: egui::ViewportInfo,
     close_requested: bool,
+    show_after_present: bool,
+    window_move: super::chrome::WindowMoveState,
+    window_resize: super::chrome::WindowResizeState,
+    min_inner_size: Option<egui::Vec2>,
     next_repaint: Option<Instant>,
     last_frame: Option<Instant>,
     interval: Duration,
@@ -98,11 +102,26 @@ impl Runner {
         }
         let context = egui::Context::default();
         context.set_embed_viewports(true);
+        // WindowConfig sizes describe page content; the shared caption occupies
+        // client space now, so preserve the page's requested and minimum size.
+        let mut viewport_builder = self.config.viewport.clone();
+        let caption_height = super::chrome::title_bar_height();
+        if let Some(size) = &mut viewport_builder.inner_size {
+            size.y += caption_height;
+        }
+        if let Some(size) = &mut viewport_builder.min_inner_size {
+            size.y += caption_height;
+        }
+        if let Some(size) = &mut viewport_builder.max_inner_size {
+            size.y += caption_height;
+        }
+        let min_inner_size = viewport_builder.min_inner_size;
         let window = egui_winit::create_window(
             &context,
             event_loop,
-            &self.config.viewport.clone().with_visible(false),
+            &viewport_builder.with_visible(false).with_decorations(false),
         )?;
+        super::chrome::configure_dwm_window(&window);
         super::branding::set_taskbar_icon(&window);
         if self.root {
             crate::app::instance::register_window(super::d3d11::window_hwnd(&window)?)?;
@@ -161,6 +180,10 @@ impl Runner {
             input,
             viewport,
             close_requested: false,
+            show_after_present: self.config.viewport.visible.unwrap_or(true),
+            window_move: Default::default(),
+            window_resize: Default::default(),
+            min_inner_size,
             next_repaint: Some(Instant::now()),
             last_frame: None,
             interval: Duration::from_secs_f64(1000.0 / f64::from(refresh)),
@@ -168,11 +191,22 @@ impl Runner {
         });
         let state = self.state.as_mut().expect("created desktop state");
         state.render()?;
-        state
-            .window
-            .set_visible(self.config.viewport.visible.unwrap_or(true));
         state.app.0.on_focus_changed(state.window.has_focus());
+        self.finish_close(event_loop);
         Ok(())
+    }
+
+    fn finish_close(&mut self, event_loop: &ActiveEventLoop) {
+        if self
+            .state
+            .as_ref()
+            .is_some_and(|state| state.close_requested)
+        {
+            self.closed = true;
+            if self.root {
+                event_loop.exit();
+            }
+        }
     }
 }
 
@@ -201,7 +235,40 @@ impl DesktopWindow {
                 .push(egui::ViewportEvent::Close);
         }
         self.viewport.events.clear();
-        let output = self.context.run_ui(input, |ui| self.app.0.ui(ui));
+        self.window_resize.min_size = self.min_inner_size.map(|size| {
+            winit::dpi::LogicalSize::new(size.x, size.y).to_physical(self.window.scale_factor())
+        });
+        let output = self.context.run_ui(input, |ui| {
+            let ctx = ui.ctx().clone();
+            super::chrome::resize_regions(ui, &self.window, |response, direction| {
+                super::chrome::update_nonmodal_window_resize(
+                    &ctx,
+                    &self.window,
+                    response,
+                    direction,
+                    &mut self.window_resize,
+                    None,
+                );
+            });
+            if self.window.fullscreen().is_none() {
+                super::chrome::title_bar_panel(
+                    ui,
+                    "desktop-window-chrome",
+                    super::chrome::title_bar_height(),
+                    |ui| {
+                        if super::chrome::window_title_bar(
+                            ui,
+                            &self.window,
+                            &self.window.title(),
+                            Some(&mut self.window_move),
+                        ) {
+                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                    },
+                );
+            }
+            self.app.0.ui(ui);
+        });
         let (drawing, platform, mut viewports) = egui_directx11::split_output(output);
         self.input.handle_platform_output(&self.window, platform);
         if let Some(root) = viewports.remove(&egui::ViewportId::ROOT) {
@@ -247,8 +314,21 @@ impl DesktopWindow {
                 self.schedule(when);
             }
         }
+        // Both native CloseRequested/Alt+F4 and the custom caption command
+        // reach this point before any resources or business windows are closed.
+        if self.close_requested && !self.app.0.on_close_requested() {
+            self.close_requested = false;
+            self.context.request_repaint();
+        }
+        if let Some(size) = self.window_resize.requested_render_size.take() {
+            self.presenter.resize(size)?;
+        }
         if !self.close_requested && self.window.is_minimized() != Some(true) {
-            self.presenter.render(&self.context, drawing, false)?;
+            let presented = self.presenter.render(&self.context, drawing, false)?;
+            if presented && self.show_after_present {
+                self.show_after_present = false;
+                self.window.set_visible(true);
+            }
         } else if !self.close_requested {
             // QR/font updates must survive a minimized window and upload on restore.
             self.presenter.defer_output(drawing);
@@ -271,6 +351,12 @@ impl ApplicationHandler<Event> for Runner {
         let response = state.input.on_window_event(&state.window, &event);
         let result = match event {
             WindowEvent::Focused(focused) => {
+                if !focused {
+                    super::chrome::cancel_pointer_operation(
+                        &mut state.window_move,
+                        &mut state.window_resize,
+                    );
+                }
                 state.app.0.on_focus_changed(focused);
                 state.schedule(Instant::now());
                 Ok(())
@@ -302,16 +388,7 @@ impl ApplicationHandler<Event> for Runner {
             self.fail(event_loop, error);
             return;
         }
-        if self
-            .state
-            .as_ref()
-            .is_some_and(|state| state.close_requested)
-        {
-            self.closed = true;
-            if self.root {
-                event_loop.exit();
-            }
-        }
+        self.finish_close(event_loop);
     }
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: Event) {
@@ -334,8 +411,21 @@ impl ApplicationHandler<Event> for Runner {
             if let Some(when) = state.next_repaint {
                 if when <= Instant::now() {
                     state.next_repaint = None;
-                    state.window.request_redraw();
-                    event_loop.set_control_flow(ControlFlow::Wait);
+                    if state.show_after_present {
+                        // Hidden HWNDs need not receive WM_PAINT. Retry a busy
+                        // first Present directly, at the regular repaint deadline.
+                        if let Err(error) = state.render() {
+                            self.fail(event_loop, error);
+                            return;
+                        }
+                    } else {
+                        state.window.request_redraw();
+                    }
+                    event_loop.set_control_flow(
+                        state
+                            .next_repaint
+                            .map_or(ControlFlow::Wait, ControlFlow::WaitUntil),
+                    );
                 } else {
                     event_loop.set_control_flow(ControlFlow::WaitUntil(when));
                 }
@@ -343,6 +433,7 @@ impl ApplicationHandler<Event> for Runner {
                 event_loop.set_control_flow(ControlFlow::Wait);
             }
         }
+        self.finish_close(event_loop);
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
@@ -385,6 +476,11 @@ impl Windows {
     }
     fn focus(&self, key: &str) {
         if let Some(window) = self.windows.get(key).and_then(|r| r.state.as_ref()) {
+            if window.show_after_present {
+                window.window.request_redraw();
+                return;
+            }
+            window.window.set_minimized(false);
             window.window.set_visible(true);
             window.window.focus_window();
         }

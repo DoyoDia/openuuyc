@@ -21,6 +21,49 @@ pub const HEIGHT: f32 = theme::CONTROL_HEIGHT;
 pub const COMPACT_HEIGHT: f32 = theme::COMPACT_HEIGHT;
 pub const ACCENT: Color32 = theme::ACCENT;
 
+pub(crate) fn device_status_badge(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    label: &str,
+    color: Color32,
+) {
+    ui.painter()
+        .rect_filled(rect, theme::CONTROL_RADIUS, color.gamma_multiply(0.09));
+    ui.painter()
+        .circle_filled(rect.left_center() + vec2(10.0, 0.0), 2.5, color);
+    let mut badge = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(egui::Rect::from_min_max(
+                rect.min + vec2(18.0, 2.0),
+                rect.max - vec2(4.0, 2.0),
+            ))
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    badge.add(egui::Label::new(RichText::new(label).size(theme::SMALL).color(color)).truncate());
+}
+
+pub(crate) fn paint_port_mapping_icon(p: &egui::Painter, rect: egui::Rect, color: Color32) {
+    let center = rect.center();
+    let scale = rect.width().min(rect.height()) / 20.0;
+    let point = |x, y| center + vec2(x, y) * scale;
+    let stroke = Stroke::new(theme::ICON_STROKE, color);
+    for direction in [1.0, -1.0] {
+        let y = -4.0 * direction;
+        p.line_segment(
+            [point(-8.0 * direction, y), point(8.0 * direction, y)],
+            stroke,
+        );
+        p.add(egui::Shape::line(
+            vec![
+                point(4.0 * direction, y - 4.0),
+                point(8.0 * direction, y),
+                point(4.0 * direction, y + 4.0),
+            ],
+            stroke,
+        ));
+    }
+}
+
 pub(crate) fn switch(ui: &mut egui::Ui, value: &mut bool) -> egui::Response {
     sized_switch(ui, value, vec2(34.0, 20.0))
 }
@@ -501,6 +544,7 @@ pub fn device_menu_row(
     ui: &mut egui::Ui,
     label: &str,
     status: &str,
+    status_color: Color32,
     selected: bool,
     enabled: bool,
 ) -> egui::Response {
@@ -540,7 +584,7 @@ pub fn device_menu_row(
             .layout_no_wrap(
                 status.into(),
                 egui::FontId::proportional(theme::TINY),
-                MUTED,
+                status_color,
             )
             .size()
             .x
@@ -575,7 +619,7 @@ pub fn device_menu_row(
             egui::Align2::RIGHT_CENTER,
             status,
             egui::FontId::proportional(theme::TINY),
-            MUTED,
+            status_color,
         );
     }
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));

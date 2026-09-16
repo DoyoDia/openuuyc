@@ -39,11 +39,11 @@ struct Entry {
     viewing: bool,
     own_session: bool,
     connect_issue: Option<String>,
-    power_waiting: bool,
+    takeover: bool,
+    status: crate::app::device_status::DeviceStatus,
 }
 
 enum Action {
-    PortMapping,
     Details,
     Connect,
 }
@@ -97,7 +97,8 @@ impl DeviceCenterApp {
                         viewing: !management && self.is_viewing_target(id),
                         own_session,
                         connect_issue,
-                        power_waiting: self.power_progress.get(id).is_some_and(|p| p.waiting),
+                        takeover: self.needs_takeover(device),
+                        status: self.device_status(device),
                     }
                 })
                 .collect(),
@@ -217,7 +218,7 @@ impl DeviceCenterApp {
             ui.label(RichText::new("正在读取其余设备信息…").color(MUTED));
         }
         let Some(mut rows) = rows else {
-            self.empty_state(ui, "正在读取设备清单…", "");
+            self.empty_state(ui, "正在读取设备清单…", None);
             return;
         };
         rows.retain(|e| {
@@ -256,7 +257,7 @@ impl DeviceCenterApp {
                 .then_with(|| a.device.device_id.cmp(&b.device.device_id))
         });
         if rows.is_empty() {
-            self.empty_state(
+            let clear_filters = self.empty_state(
                 ui,
                 if count == 0 && pending > 0 {
                     "正在读取设备信息…"
@@ -267,9 +268,9 @@ impl DeviceCenterApp {
                 } else {
                     "没有符合条件的设备"
                 },
-                "",
+                (count > 0).then_some("清除搜索和筛选"),
             );
-            if count > 0 && ui.button("清除搜索和筛选").clicked() {
+            if clear_filters {
                 let state = &mut self.center_ui.device_lists[index];
                 state.search.clear();
                 state.filter = Filter::All;
@@ -316,7 +317,6 @@ impl DeviceCenterApp {
             });
         if let Some((id, action)) = picked {
             match action {
-                Action::PortMapping => self.open_port_mapping(id),
                 Action::Details => self.open_details(id),
                 Action::Connect => {
                     self.selected_device_id = Some(id);
@@ -413,45 +413,16 @@ fn row(
         .truncate(),
     )
     .on_hover_text(&device.device_id);
-    let (status, color) = if entry.power_waiting {
-        ("等待电源操作", AMBER)
-    } else if entry.own_session {
-        ("观看中", BLUE)
-    } else if !device.is_connected() {
-        (device.status_label(), MUTED)
-    } else if device.participant_count() > 0 {
-        ("使用中", AMBER)
-    } else if entry.viewing && (!device.controllable || !device.controlled_support) {
-        ("未开放连接", AMBER)
-    } else {
-        ("在线", GREEN)
-    };
     let status_rect = egui::Rect::from_min_size(
         egui::pos2(status_x, rect.top() + if wide { 30.0 } else { 77.0 }),
-        vec2(106.0, 26.0),
+        crate::ui::theme::DEVICE_STATUS_SIZE.into(),
     );
-    ui.painter()
-        .rect_filled(status_rect, 5.0, color.gamma_multiply(0.09));
-    ui.painter()
-        .circle_filled(status_rect.left_center() + vec2(10.0, 0.0), 2.5, color);
-    let mut badge = ui.new_child(
-        egui::UiBuilder::new()
-            .max_rect(egui::Rect::from_min_max(
-                status_rect.min + vec2(18.0, 2.0),
-                status_rect.max - vec2(4.0, 2.0),
-            ))
-            .layout(egui::Layout::left_to_right(Align::Center)),
+    crate::ui::controls::device_status_badge(
+        ui,
+        status_rect,
+        entry.status.label(),
+        entry.status.color(),
     );
-    badge
-        .add(
-            egui::Label::new(
-                RichText::new(status)
-                    .size(crate::ui::theme::SMALL)
-                    .color(color),
-            )
-            .truncate(),
-        )
-        .on_hover_text(status);
     let mut metadata = ui.new_child(egui::UiBuilder::new().max_rect(egui::Rect::from_min_max(
         egui::pos2(metadata_x, rect.top() + if wide { 22.0 } else { 82.0 }),
         egui::pos2(
@@ -512,6 +483,8 @@ fn row(
             entry.connect_issue.is_none(),
             primary(if entry.own_session {
                 "已打开"
+            } else if entry.takeover {
+                "接管"
             } else {
                 "连接"
             }),
@@ -526,20 +499,5 @@ fn row(
     if buttons.button("详情").clicked() {
         action = Some(Action::Details);
     }
-    response.context_menu(|ui| {
-        if ui
-            .add_enabled(
-                matches!(device.platform, 1 | 4)
-                    && !entry.current
-                    && device.controllable
-                    && device.is_connected(),
-                egui::Button::new("端口转发"),
-            )
-            .clicked()
-        {
-            action = Some(Action::PortMapping);
-            ui.close();
-        }
-    });
     action.or_else(|| response.clicked().then_some(Action::Details))
 }

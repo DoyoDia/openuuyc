@@ -3,12 +3,9 @@
 //! our egui UI the equivalent independent layer above that child window.
 
 use anyhow::{Context, Result};
-use windows::Win32::Foundation::{COLORREF, GetLastError, HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{
-    BLACK_BRUSH, DC_BRUSH, FillRect, GetDC, GetStockObject, HBRUSH, HDC, ReleaseDC, SetDCBrushColor,
-};
+use windows::Win32::Foundation::{GetLastError, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Graphics::Gdi::{BLACK_BRUSH, FillRect, GetStockObject, HBRUSH, HDC};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::w;
 use winit::dpi::PhysicalSize;
@@ -17,8 +14,6 @@ use winit::window::Window;
 use super::windows_presenter::title_bar_height_pixels;
 use crate::ui::d3d11::window_hwnd;
 pub(super) use crate::ui::d3d11::{UiPresenter, UiTimingAudit};
-
-const BACKDROP_SUBCLASS: usize = 0x4f555542;
 
 fn video_window_class() -> Result<()> {
     static REGISTERED: std::sync::OnceLock<std::result::Result<(), u32>> =
@@ -60,70 +55,6 @@ unsafe extern "system" fn video_window_proc(
             return LRESULT(1);
         }
         DefWindowProcW(hwnd, message, wparam, lparam)
-    }
-}
-
-pub(super) fn prepare_window_background(window: &Window) -> Result<()> {
-    anyhow::ensure!(
-        unsafe {
-            SetWindowSubclass(
-                window_hwnd(window)?,
-                Some(backdrop_proc),
-                BACKDROP_SUBCLASS,
-                0,
-            )
-            .as_bool()
-        },
-        "install player window background"
-    );
-    unsafe {
-        let hwnd = window_hwnd(window)?;
-        let dc = GetDC(Some(hwnd));
-        paint_backdrop(hwnd, dc);
-        ReleaseDC(Some(hwnd), dc);
-    }
-    Ok(())
-}
-
-unsafe extern "system" fn backdrop_proc(
-    hwnd: HWND,
-    message: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-    id: usize,
-    _data: usize,
-) -> LRESULT {
-    unsafe {
-        match message {
-            WM_ERASEBKGND => {
-                paint_backdrop(hwnd, HDC(wparam.0 as _));
-                return LRESULT(1);
-            }
-            WM_NCDESTROY => {
-                let _ = RemoveWindowSubclass(hwnd, Some(backdrop_proc), id);
-            }
-            _ => {}
-        }
-        DefSubclassProc(hwnd, message, wparam, lparam)
-    }
-}
-
-unsafe fn paint_backdrop(hwnd: HWND, dc: HDC) {
-    unsafe {
-        let mut rect = RECT::default();
-        if GetClientRect(hwnd, &mut rect).is_ok() {
-            let color = crate::ui::theme::BG;
-            let old = SetDCBrushColor(
-                dc,
-                COLORREF(
-                    u32::from(color.r())
-                        | (u32::from(color.g()) << 8)
-                        | (u32::from(color.b()) << 16),
-                ),
-            );
-            FillRect(dc, &rect, HBRUSH(GetStockObject(DC_BRUSH).0));
-            SetDCBrushColor(dc, old);
-        }
     }
 }
 

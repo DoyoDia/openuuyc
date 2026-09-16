@@ -137,6 +137,7 @@ pub(super) async fn resolve(
         target_version: String::new(),
         refresh_after_upgrade: false,
         background: None,
+        takeover: None,
     })
 }
 

@@ -147,6 +147,7 @@ pub(crate) enum ViewerWindowEvent {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct ViewerPreferences {
     performance_mode: PerformancePanelMode,
+    intercept_shortcuts: bool,
 
     aspect_locked: bool,
 }
@@ -155,7 +156,7 @@ impl Default for ViewerPreferences {
     fn default() -> Self {
         Self {
             performance_mode: PerformancePanelMode::Compact,
-
+            intercept_shortcuts: true,
             aspect_locked: true,
         }
     }

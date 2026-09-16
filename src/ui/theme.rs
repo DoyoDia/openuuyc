@@ -14,6 +14,7 @@ pub const AMBER: Color32 = Color32::from_rgb(238, 190, 111);
 pub const RED: Color32 = Color32::from_rgb(241, 125, 132);
 pub const DANGER_FILL: Color32 = Color32::from_rgb(161, 56, 67);
 pub const HOVER: Color32 = Color32::from_rgb(44, 54, 69);
+pub const WINDOW_BORDER: Color32 = Color32::from_rgb(78, 101, 139);
 pub const BORDER_FOCUS: Color32 = Color32::from_rgb(81, 107, 142);
 pub const SELECTED: Color32 = Color32::from_rgb(33, 51, 77);
 pub const SELECTION: Color32 = Color32::from_rgb(40, 70, 112);
@@ -35,6 +36,9 @@ pub const MICRO: f32 = 10.0;
 pub const SECTION: f32 = 16.0;
 pub const DIALOG_TITLE: f32 = 21.0;
 pub const UPDATE_DIALOG_WIDTH: f32 = 520.0;
+pub const TAKEOVER_DIALOG_WIDTH: f32 = 440.0;
+pub const CLOSE_CENTER_DIALOG_WIDTH: f32 = 440.0;
+pub const DEVICE_STATUS_SIZE: [f32; 2] = [106.0, 26.0];
 pub const REMOTE_UPGRADE_WIDTH: f32 = 408.0;
 pub const UPDATE_DIALOG_MARGIN: i8 = 24;
 pub const UPDATE_DIALOG_TITLE: f32 = 18.0;
@@ -65,16 +69,23 @@ pub const PERFORMANCE_WIDTH: f32 = 540.0;
 pub const PERFORMANCE_LABEL_WIDTH: f32 = 102.0;
 pub const PERFORMANCE_ROW_HEIGHT: f32 = 44.0;
 pub const SCREEN_TAB_HEIGHT: f32 = 30.0;
-pub const VIEWER_TITLE_CONTENT_HEIGHT: f32 = 36.0;
-pub const VIEWER_TITLE_MARGIN: egui::Margin = egui::Margin::symmetric(10, 3);
-pub const VIEWER_TITLE_STROKE: f32 = 1.0;
-pub const VIEWER_WINDOW_CONTROLS_WIDTH: f32 = 106.0;
+pub const WINDOW_TITLE_CONTENT_HEIGHT: f32 = 36.0;
+// The controls add 4 px at the right; together with the frame stroke this
+// matches the 7 px above/below a 30 px button in the 36 px caption content.
+pub const WINDOW_TITLE_MARGIN: egui::Margin = egui::Margin {
+    left: 10,
+    right: 2,
+    top: 3,
+    bottom: 3,
+};
+pub const WINDOW_TITLE_STROKE: f32 = 1.0;
+pub const WINDOW_CONTROLS_WIDTH: f32 = 106.0;
 pub const CONNECTION_CONTENT_WIDTH: f32 = 440.0;
 pub const CONNECTION_STAGE_WIDTH: f32 = 224.0;
 pub const CONNECTION_DETAIL_TIME_WIDTH: f32 = 64.0;
 pub const CONNECTION_DETAIL_TITLE_WIDTH: f32 = 160.0;
 pub const VIEWER_IDENTITY_MAX_WIDTH: f32 = 200.0;
-pub const VIEWER_LOGO_SIZE: f32 = 24.0;
+pub const WINDOW_LOGO_SIZE: f32 = 24.0;
 pub const VIEWER_IDENTITY_GAP: f32 = 16.0;
 pub const DEVICE_MENU_WIDTH: f32 = 248.0;
 pub const DEVICE_MENU_ROW_HEIGHT: f32 = 40.0;

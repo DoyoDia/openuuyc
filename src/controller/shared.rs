@@ -68,6 +68,13 @@ pub(super) async fn shutdown_all() {
     }
 }
 impl Session {
+    pub(super) fn activity(&self) -> super::LocalConnectionActivity {
+        super::LocalConnectionActivity {
+            viewing: self.viewing.load(Ordering::Acquire),
+            controlling: self.peer.stream_control_handle().mouse().mode()
+                != crate::remote_input::MouseMode::View,
+        }
+    }
     pub fn new(
         peer: Arc<NativePeer>,
         forwarder: RtpForwarder,

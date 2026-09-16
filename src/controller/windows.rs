@@ -11,6 +11,7 @@ pub(crate) struct ViewerInfo {
     pub video_format: String,
     pub remote_encoder: String,
     pub remote_capture: String,
+    pub playing: bool,
 }
 #[derive(Clone)]
 pub(crate) struct ViewerTarget {
@@ -24,13 +25,41 @@ pub(super) struct WindowContext {
     pub target: watch::Sender<Option<ViewerTarget>>,
     pub key: String,
     pub background: Option<crate::wallpaper::Source>,
+    pub takeover: Option<super::takeover::Approval>,
 }
 pub(crate) struct ViewerHandle {
     cancel: CancellationToken,
     info: Arc<Mutex<ViewerInfo>>,
-    result: Arc<Mutex<Option<std::result::Result<(), String>>>>,
+    result: Arc<Mutex<Option<std::result::Result<ViewerEnd, String>>>>,
     key: String,
 }
+
+#[derive(Clone, Debug)]
+pub(crate) enum ViewerEnd {
+    Closed,
+    RoomReleased,
+    TakeoverRequired(Box<crate::api::DeviceInfo>),
+}
+
+impl ViewerEnd {
+    fn from_result(result: Result<()>) -> std::result::Result<Self, String> {
+        match result {
+            Ok(()) => Ok(Self::Closed),
+            Err(error) if super::room_released(&error) => Ok(Self::RoomReleased),
+            Err(error) if error.downcast_ref::<super::takeover::Required>().is_some() => {
+                Ok(Self::TakeoverRequired(Box::new(
+                    error
+                        .downcast_ref::<super::takeover::Required>()
+                        .unwrap()
+                        .0
+                        .clone(),
+                )))
+            }
+            Err(error) => Err(format!("{error:#}")),
+        }
+    }
+}
+
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -41,7 +70,7 @@ impl ViewerHandle {
     pub fn info(&self) -> Option<ViewerInfo> {
         Some(lock(&self.info).clone())
     }
-    pub fn result(&self) -> Option<std::result::Result<(), String>> {
+    pub fn result(&self) -> Option<std::result::Result<ViewerEnd, String>> {
         lock(&self.result).clone()
     }
     pub fn focus(&self) {
@@ -78,6 +107,7 @@ pub(crate) fn start(
     assist: Option<crate::assist::AssistRequest>,
     options: ConnectionMediaOptions,
     background: Option<crate::wallpaper::Source>,
+    takeover: Option<super::takeover::Approval>,
 ) -> ViewerHandle {
     let cancel = client.ended().child_token();
     let done = CancellationToken::new();
@@ -114,6 +144,7 @@ pub(crate) fn start(
                 info.video_format = s.video_format.clone();
                 info.remote_encoder = s.remote_encoder.clone();
                 info.remote_capture = s.remote_capture.clone();
+                info.playing = s.total_rendered_frames > 0;
             }
             *lock(&job_info) = info;
         }
@@ -126,11 +157,12 @@ pub(crate) fn start(
         target,
         key: key.clone(),
         background,
+        takeover,
     };
     tokio::spawn(async move {
         let _done = done.clone().drop_guard();
         let outcome = super::run_viewer_window(alias, options, id, assist, Some(context)).await;
-        *lock(&job_result) = Some(outcome.map_err(|e| format!("{e:#}")));
+        *lock(&job_result) = Some(ViewerEnd::from_result(outcome));
         done.cancel();
         let _ = information.await;
     });

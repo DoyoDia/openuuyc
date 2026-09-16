@@ -978,10 +978,11 @@ impl NrdApi {
             bail!("device_id must be a lowercase alphanumeric identifier");
         }
         let path = format!("{}/{device_id}", ROOM_JOIN_BY_DEVICE.path);
-        self.post_json(
+        self.send_with_policy(
             ROOM_JOIN_BY_DEVICE,
             &path,
-            &JoinByDeviceRequest { force_join },
+            serde_json::to_vec(&JoinByDeviceRequest { force_join })?,
+            force_join,
         )
         .await
     }
@@ -1001,6 +1002,19 @@ impl NrdApi {
     }
 
     async fn send<T>(&self, contract: Contract, path: &str, body: Vec<u8>) -> Result<ApiEnvelope<T>>
+    where
+        T: DeserializeOwned,
+    {
+        self.send_with_policy(contract, path, body, false).await
+    }
+
+    async fn send_with_policy<T>(
+        &self,
+        contract: Contract,
+        path: &str,
+        body: Vec<u8>,
+        single_attempt: bool,
+    ) -> Result<ApiEnvelope<T>>
     where
         T: DeserializeOwned,
     {
@@ -1030,13 +1044,19 @@ impl NrdApi {
                 headers,
                 body,
                 contract.timeout,
-                contract != DEVICE_RENAME
-                    && contract != DEVICE_UNBIND
-                    && contract != LOGIN_SMS_CODE
-                    && contract != LOGIN_BY_MOBILE
-                    && !assist::is_write(contract)
-                    && !power::is_write(contract)
-                    && contract != wallpaper::BIND,
+                if single_attempt {
+                    crate::nrd_http::RetryPolicy::Never
+                } else {
+                    crate::nrd_http::RetryPolicy::Recovery {
+                        replay_ambiguous: contract != DEVICE_RENAME
+                            && contract != DEVICE_UNBIND
+                            && contract != LOGIN_SMS_CODE
+                            && contract != LOGIN_BY_MOBILE
+                            && !assist::is_write(contract)
+                            && !power::is_write(contract)
+                            && contract != wallpaper::BIND,
+                    }
+                },
             )
             .await?;
         let envelope: ApiEnvelope<serde_json::Value> = serde_json::from_slice(&bytes)

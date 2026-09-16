@@ -2,6 +2,10 @@
 pub(crate) trait App {
     fn ui(&mut self, ui: &mut egui::Ui);
     fn on_focus_changed(&mut self, _focused: bool) {}
+    /// Return false to keep the window alive (for example, while confirming exit).
+    fn on_close_requested(&mut self) -> bool {
+        true
+    }
     fn on_exit(&mut self) {}
 }
 

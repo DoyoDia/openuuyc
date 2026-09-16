@@ -11,6 +11,7 @@ pub(crate) struct SwitchRequest {
     pub from: String,
     pub device: DeviceInfo,
     pub window: WindowId,
+    pub takeover: Option<crate::controller::takeover::Approval>,
 }
 
 #[derive(Clone)]
@@ -29,6 +30,7 @@ struct PickerState {
     loading: bool,
     switching: bool,
     error: Option<String>,
+    takeover: Option<(WindowId, DeviceInfo)>,
 }
 
 impl DeviceSwitcher {
@@ -54,8 +56,54 @@ impl DeviceSwitcher {
         state.error = Some(message);
     }
 
+    pub(crate) fn require_takeover(&self, device: DeviceInfo, window: WindowId) {
+        let mut state = super::mutex_lock(&self.state);
+        state.switching = false;
+        state.error = None;
+        state.takeover = Some((window, device));
+    }
+
+    pub(super) fn cancel_takeover(&self, window: WindowId) {
+        let mut state = super::mutex_lock(&self.state);
+        if state
+            .takeover
+            .as_ref()
+            .is_some_and(|(owner, _)| *owner == window)
+        {
+            state.takeover = None;
+        }
+    }
+
+    fn request_switch(
+        &self,
+        device: DeviceInfo,
+        window: WindowId,
+        takeover: Option<crate::controller::takeover::Approval>,
+    ) {
+        let mut state = super::mutex_lock(&self.state);
+        if state.switching || self.cancel.is_cancelled() {
+            return;
+        }
+        state.switching = true;
+        state.error = None;
+        if self
+            .sender
+            .try_send(SwitchRequest {
+                from: self.current.clone(),
+                device,
+                window,
+                takeover,
+            })
+            .is_err()
+        {
+            state.switching = false;
+            state.error = Some("连接已结束，请重新打开观看窗口".into());
+        }
+    }
+
     pub(super) fn is_switching(&self) -> bool {
-        super::mutex_lock(&self.state).switching
+        let state = super::mutex_lock(&self.state);
+        state.switching || state.takeover.is_some()
     }
 
     fn refresh(&self, ctx: &egui::Context) {
@@ -98,6 +146,18 @@ impl DeviceSwitcher {
     }
 
     pub(super) fn menu(&self, response: &egui::Response, window: WindowId) {
+        let takeover = super::mutex_lock(&self.state).takeover.clone();
+        if let Some((owner, device)) = takeover
+            && owner == window
+            && let Some(confirmed) =
+                crate::controller::takeover::confirmation(&response.ctx, &device)
+        {
+            super::mutex_lock(&self.state).takeover = None;
+            if confirmed {
+                let approval = crate::controller::takeover::Approval::confirmed(&device);
+                self.request_switch(device, window, Some(approval));
+            }
+        }
         if response.clicked() {
             self.refresh(&response.ctx);
         }
@@ -148,8 +208,6 @@ impl DeviceSwitcher {
                                 let unavailable =
                                     if !device.controlled_support || !device.controllable {
                                         Some("暂不可连接")
-                                    } else if device.participant_count() != 0 && !selected {
-                                        Some("使用中")
                                     } else {
                                         None
                                     };
@@ -173,13 +231,24 @@ impl DeviceSwitcher {
                                 } else {
                                     alias.to_owned()
                                 };
-                                let detail = unavailable.unwrap_or("");
+                                let occupied = device.participant_count() > 0
+                                    && !selected
+                                    && !crate::controller::has_gui_connection(
+                                        &self.client.device_id(),
+                                        &device.device_id,
+                                    );
+                                let device_status = crate::app::device_status::connection_status(
+                                    device,
+                                    &self.client.device_id(),
+                                );
+                                let detail = device_status.label();
                                 let response = ui
                                     .push_id(&device.device_id, |ui| {
                                         crate::ui::controls::device_menu_row(
                                             ui,
                                             &label,
                                             detail,
+                                            device_status.color(),
                                             selected,
                                             !selected
                                                 && unavailable.is_none()
@@ -187,30 +256,13 @@ impl DeviceSwitcher {
                                                 && !state.switching,
                                         )
                                     })
-                                    .inner
-                                    .on_hover_text(format!(
-                                        "{} · {}",
-                                        device.platform_label(),
-                                        device.device_id
-                                    ));
+                                    .inner;
                                 if response.clicked() {
-                                    let mut state = super::mutex_lock(&self.state);
-                                    if !state.switching {
-                                        state.switching = true;
-                                        state.error = None;
-                                        if self
-                                            .sender
-                                            .try_send(SwitchRequest {
-                                                from: self.current.clone(),
-                                                device: device.clone(),
-                                                window,
-                                            })
-                                            .is_err()
-                                        {
-                                            state.switching = false;
-                                            state.error =
-                                                Some("连接已结束，请重新打开观看窗口".into());
-                                        }
+                                    if occupied {
+                                        self.require_takeover(device.clone(), window);
+                                        ui.close();
+                                    } else {
+                                        self.request_switch(device.clone(), window, None);
                                     }
                                 }
                             }

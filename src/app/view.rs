@@ -971,14 +971,18 @@ impl DeviceCenterApp {
         if !self.status.kind.is_alert() {
             return;
         }
-        let color = if matches!(self.status.kind, StatusKind::Error) {
-            RED
-        } else {
-            AMBER
+        let color = match self.status.kind {
+            StatusKind::Notice => BLUE,
+            StatusKind::Error => RED,
+            _ => AMBER,
         };
         let mut dismiss = false;
         egui::Frame::new()
-            .fill(crate::ui::theme::WARNING_BG)
+            .fill(if matches!(self.status.kind, StatusKind::Notice) {
+                crate::ui::theme::SURFACE
+            } else {
+                crate::ui::theme::WARNING_BG
+            })
             .corner_radius(5.0)
             .inner_margin(egui::Margin::symmetric(12, 8))
             .show(ui, |ui| {
@@ -1042,7 +1046,7 @@ impl DeviceCenterApp {
         .on_hover_text(text);
     }
 
-    fn empty_state(&mut self, ui: &mut egui::Ui, title: &str, detail: &str) {
+    fn empty_state(&mut self, ui: &mut egui::Ui, title: &str, action: Option<&str>) -> bool {
         ui.add_space(56.0);
         ui.vertical_centered(|ui| {
             let (rect, _) = ui.allocate_exact_size(vec2(48.0, 48.0), Sense::hover());
@@ -1053,11 +1057,10 @@ impl DeviceCenterApp {
                     .size(crate::ui::theme::DIALOG_TITLE)
                     .strong(),
             );
-            ui.label(
-                RichText::new(detail)
-                    .size(crate::ui::theme::BODY)
-                    .color(MUTED),
-            );
+            let clicked = action.is_some_and(|label| {
+                ui.add_space(16.0);
+                ui.add(crate::ui::controls::secondary(label)).clicked()
+            });
             if self.devices.is_none() && !self.refresh_pending {
                 ui.add_space(16.0);
                 if ui
@@ -1072,7 +1075,9 @@ impl DeviceCenterApp {
                     self.request_refresh();
                 }
             }
-        });
+            clicked
+        })
+        .inner
     }
 
     fn shortcuts_page(&mut self, ui: &mut egui::Ui) {
@@ -1246,8 +1251,17 @@ impl DeviceCenterApp {
     }
 
     pub(super) fn draw_dialogs(&mut self, ctx: &egui::Context) {
+        if self.close_confirmation {
+            self.close_center_dialog(ctx);
+            return;
+        }
         if self.needs_login() {
             self.logout_confirmation = false;
+            self.takeover_confirmation = None;
+            return;
+        }
+        if self.takeover_confirmation.is_some() {
+            self.takeover_dialog(ctx);
             return;
         }
         if self.center_ui.power.is_some() {
@@ -1264,6 +1278,76 @@ impl DeviceCenterApp {
             && !self.logout_confirmation
         {
             self.assist_dialogs(ctx);
+        }
+    }
+
+    fn close_center_dialog(&mut self, ctx: &egui::Context) {
+        let mut confirm = false;
+        let mut cancel = false;
+        let response = egui::Modal::new(egui::Id::new("close-control-center"))
+            .frame(dialog_frame())
+            .show(ctx, |ui| {
+                ui.set_width(theme::CLOSE_CENTER_DIALOG_WIDTH);
+                ui.label(
+                    RichText::new("关闭控制中心？")
+                        .size(theme::DIALOG_TITLE)
+                        .strong(),
+                );
+                ui.add_space(14.0);
+                ui.label("关闭后将结束观看连接，并停止已开启的端口转发服务。");
+                if let Some(session) = &self.active_session {
+                    ui.add_space(10.0);
+                    ui.label(RichText::new(format!("观看设备：{}", session.alias)).color(MUTED));
+                } else if self.opening_viewer {
+                    ui.add_space(10.0);
+                    ui.label(RichText::new("正在建立观看连接").color(MUTED));
+                }
+                let services = crate::port_mapping::service::active_service_count();
+                if services > 0 {
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(format!("端口转发服务：{services} 个")).color(MUTED));
+                }
+                ui.add_space(24.0);
+                ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                    confirm = ui.add(primary("关闭程序")).clicked();
+                    cancel = ui.add(crate::ui::controls::secondary("取消")).clicked();
+                });
+            });
+        if confirm {
+            self.close_confirmed = true;
+            self.close_confirmation = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        } else if cancel || response.should_close() {
+            self.close_confirmation = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
+    }
+
+    fn takeover_dialog(&mut self, ctx: &egui::Context) {
+        let Some((generation, device)) = self.takeover_confirmation.take() else {
+            return;
+        };
+        if generation != self.login_generation || self.logout_pending || self.mutation_pending {
+            return;
+        }
+        match crate::controller::takeover::confirmation(ctx, &device) {
+            Some(true) => {
+                if !self.is_viewing_target(&device.device_id) {
+                    self.status = StatusMessage::warning("设备已不在可观看清单中，请刷新后重试");
+                } else if let Some(issue) = self.viewer_action_issue(&device) {
+                    self.status = StatusMessage::warning(issue);
+                } else {
+                    let approval = crate::controller::takeover::Approval::confirmed(&device);
+                    self.spawn_viewer_with_takeover(
+                        display_alias(&device).to_owned(),
+                        Some(device.device_id),
+                        None,
+                        Some(approval),
+                    );
+                }
+            }
+            Some(false) => {}
+            None => self.takeover_confirmation = Some((generation, device)),
         }
     }
 

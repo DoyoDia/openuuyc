@@ -424,6 +424,7 @@ impl WindowMouse {
         control: &StreamControlHandle,
         track: i32,
         video_size: &VideoSize,
+        intercept_shortcuts: bool,
         menu_open: bool,
         event_loop: &ActiveEventLoop,
     ) {
@@ -662,7 +663,7 @@ impl WindowMouse {
         window.set_cursor_visible(!relative && (!hovering || !control.remote_cursor_hidden()));
         self.using_cursor |= relative;
         router().install(target);
-        super::windows_keyboard::set_target(self.owner, &self.input);
+        super::windows_keyboard::set_target(self.owner, &self.input, intercept_shortcuts);
     }
 }
 

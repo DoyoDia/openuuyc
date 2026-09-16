@@ -10,8 +10,6 @@ pub(crate) enum PowerAction {
 }
 
 impl PowerAction {
-    pub const ALL: [Self; 3] = [Self::Wake, Self::Shutdown, Self::Reboot];
-
     pub fn label(self) -> &'static str {
         match self {
             Self::Wake => "开机",
