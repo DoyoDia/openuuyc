@@ -304,7 +304,6 @@ impl ScreenWindows {
             .map_or(self.preferences, |app| ViewerPreferences {
                 performance_mode: app.performance_mode,
                 intercept_shortcuts: app.intercept_shortcuts,
-                aspect_locked: app.aspect_locked,
             })
     }
 

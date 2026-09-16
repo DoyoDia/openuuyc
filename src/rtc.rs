@@ -249,6 +249,11 @@ impl DataChannels {
             .find(|channel| channel.label() == "TEXT_DATA_CHANNEL")
             .expect("the official data-channel set always includes TEXT_DATA_CHANNEL")
             .clone();
+        let clipboard = stream_control.clipboard().clone();
+        let clipboard_channel = text_channel.clone();
+        workers.spawn(async move {
+            clipboard.run_sender(clipboard_channel).await;
+        });
         workers.spawn(send_remote_input(
             control_channel.clone(),
             uu_kcp.clone(),
@@ -374,6 +379,12 @@ impl DataChannels {
             Box::pin(async move {
                 if label=="FILE_DATA_CHANNEL" {
                     if let Err(error)=mapping.receive(&message.data) {tracing::warn!(%error,"invalid port mapping message");}
+                } else if label == "TEXT_DATA_CHANNEL" && !message.data.starts_with(b"{")
+                    && stream_control.clipboard().receive(&message.data).unwrap_or_else(|error| {
+                        stream_control.clipboard().protocol_error(error.to_string());
+                        tracing::warn!(%error,"invalid clipboard message"); true
+                    }) {
+                    // Clipboard owns only its RPC fields, independently of video requests.
                 } else if label == "STREAMER_DATA_CHANNEL" {
                     // Peer media_inbounds describe the peer's receive direction.
                     // This read-only client has no UU video sender. Do not use
@@ -2906,6 +2917,7 @@ impl NativePeer {
     }
 
     pub async fn close(&self) -> Result<()> {
+        self.data_channels.stream_control.clipboard().suspend();
         self.data_channels.port_mapping.close();
         self.data_channels.stream_control.mouse().close().await;
         self.data_channels.workers.close().await;
@@ -2920,6 +2932,7 @@ impl NativePeer {
 
 impl Drop for NativePeer {
     fn drop(&mut self) {
+        self.data_channels.stream_control.clipboard().suspend();
         self.data_channels.stream_control.mouse().set_ready(false);
         // Normal paths await close(). This also retires application tasks on
         // an exceptional owner drop instead of leaving them to hold the peer.

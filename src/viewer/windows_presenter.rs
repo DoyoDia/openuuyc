@@ -473,7 +473,6 @@ impl ConnectingWindowsRunner {
                         self.preferences = ViewerPreferences {
                             performance_mode: playing.performance_mode,
                             intercept_shortcuts: playing.intercept_shortcuts,
-                            aspect_locked: playing.aspect_locked,
                         };
                         tracing::debug!(?self.preferences, "preserved local viewer preferences across room replacement");
                     }
@@ -966,15 +965,10 @@ fn constrain_window_aspect(
     window: &Window,
     size: PhysicalSize<u32>,
     video_size: Option<(u32, u32)>,
-    aspect_locked: bool,
     last_window_size: &mut PhysicalSize<u32>,
     pending_aspect_size: &mut Option<PhysicalSize<u32>>,
 ) {
-    if size.width == 0
-        || size.height == 0
-        || !aspect_locked
-        || window.is_maximized()
-        || window.fullscreen().is_some()
+    if size.width == 0 || size.height == 0 || window.is_maximized() || window.fullscreen().is_some()
     {
         *last_window_size = size;
         return;
@@ -1462,7 +1456,6 @@ struct ThreadedWindowsApp {
     performance_mode: PerformancePanelMode,
     intercept_shortcuts: bool,
     startup_backdrop: Option<ConnectionProgressApp>,
-    aspect_locked: bool,
     last_window_size: PhysicalSize<u32>,
     pending_aspect_size: Option<PhysicalSize<u32>>,
     last_aspect_video_size: Option<(u32, u32)>,
@@ -1567,7 +1560,6 @@ impl ThreadedWindowsApp {
             performance_mode: preferences.performance_mode,
             intercept_shortcuts: preferences.intercept_shortcuts,
             startup_backdrop: Some(connecting.progress),
-            aspect_locked: preferences.aspect_locked,
             last_window_size: window.inner_size(),
             pending_aspect_size: None,
             last_aspect_video_size: None,
@@ -1775,7 +1767,6 @@ impl ThreadedWindowsApp {
             performance_mode: self.performance_mode,
             intercept_shortcuts: self.intercept_shortcuts,
             send_ctrl_alt_del: false,
-            aspect_locked: self.aspect_locked,
         };
         let mut chrome_action = PlayerChromeAction::default();
         let fullscreen = window.fullscreen().is_some();
@@ -1784,10 +1775,7 @@ impl ThreadedWindowsApp {
             self.stream_control_ui.open = false;
         }
         let mut resize = None;
-        let resize_aspect = self
-            .aspect_locked
-            .then(|| self.current_video_size())
-            .flatten();
+        let resize_aspect = self.current_video_size();
         let plugin_video_size = self.current_video_size();
         let output = self.egui_context.run_ui(input, |ui| {
             let ctx = ui.ctx().clone();
@@ -1949,10 +1937,7 @@ impl ThreadedWindowsApp {
             self.resize_targets(window, size)?;
         }
         let current_video_size = self.current_video_size();
-        if self.aspect_locked
-            && current_video_size.is_some()
-            && current_video_size != self.last_aspect_video_size
-        {
+        if current_video_size.is_some() && current_video_size != self.last_aspect_video_size {
             self.fit_window_to_current_aspect(window);
         }
         self.last_aspect_video_size = current_video_size;
@@ -1987,12 +1972,6 @@ impl ThreadedWindowsApp {
             };
             if let Err(error) = self.stream_control.set_mouse_mode(mode) {
                 self.stream_control.mouse().fail(error.to_string());
-            }
-        }
-        if view.aspect_locked != self.aspect_locked {
-            self.aspect_locked = view.aspect_locked;
-            if self.aspect_locked {
-                self.fit_window_to_current_aspect(window);
             }
         }
         if chrome_action.one_to_one {
@@ -2038,7 +2017,6 @@ impl ThreadedWindowsApp {
             window,
             size,
             self.current_video_size(),
-            self.aspect_locked,
             &mut self.last_window_size,
             &mut self.pending_aspect_size,
         );

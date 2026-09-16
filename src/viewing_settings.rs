@@ -110,7 +110,7 @@ impl ViewingSettingsStore {
             };
             let record: AudioRecord = serde_json::from_slice(&bytes)
                 .map_err(|_| anyhow::anyhow!("已保存的音量设置格式无效"))?;
-            if record.schema != 1 || record.settings.volume > 100 {
+            if record.schema != 1 || record.settings.volume > crate::audio::MAX_VOLUME {
                 bail!("已保存的音量设置无效");
             }
             Ok(Some(record.settings))

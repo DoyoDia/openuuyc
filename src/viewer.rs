@@ -148,8 +148,6 @@ pub(crate) enum ViewerWindowEvent {
 pub(super) struct ViewerPreferences {
     performance_mode: PerformancePanelMode,
     intercept_shortcuts: bool,
-
-    aspect_locked: bool,
 }
 
 impl Default for ViewerPreferences {
@@ -157,7 +155,6 @@ impl Default for ViewerPreferences {
         Self {
             performance_mode: PerformancePanelMode::Compact,
             intercept_shortcuts: true,
-            aspect_locked: true,
         }
     }
 }

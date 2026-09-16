@@ -18,6 +18,7 @@ const RATE: u32 = 48_000;
 const BLOCK: usize = 480;
 const MAX_SAMPLES: usize = 5_760;
 const MAX_PACKET: usize = 65_535;
+pub(crate) const MAX_VOLUME: u8 = 200;
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct AudioSettings {
     pub volume: u8,
@@ -29,6 +30,19 @@ pub(crate) struct AudioSnapshot {
     pub device: String,
     pub error: Option<String>,
     pub receiving: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct OutputDevice {
+    pub id: cpal::DeviceId,
+    pub name: String,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct OutputDevices {
+    pub devices: Vec<OutputDevice>,
+    pub error: Option<String>,
+    pub loaded: bool,
 }
 
 struct Packet {
@@ -46,6 +60,9 @@ struct Shared {
     audible: AtomicBool,
     stopped: AtomicBool,
     retry: AtomicBool,
+    refresh_devices: AtomicBool,
+    selected_output: Mutex<Option<cpal::DeviceId>>,
+    output_devices: Mutex<OutputDevices>,
     receiving: AtomicBool,
     output_thread: OnceLock<std::thread::Thread>,
     status: Mutex<(String, Option<String>)>,
@@ -141,6 +158,9 @@ impl AudioPlayback {
                 audible: AtomicBool::new(false),
                 stopped: AtomicBool::new(false),
                 retry: AtomicBool::new(false),
+                refresh_devices: AtomicBool::new(false),
+                selected_output: Mutex::new(None),
+                output_devices: Mutex::new(OutputDevices::default()),
                 receiving: AtomicBool::new(false),
                 output_thread: OnceLock::new(),
                 status: Mutex::new((String::new(), None)),
@@ -166,7 +186,7 @@ impl AudioPlayback {
 
     pub fn set_settings(&self, settings: AudioSettings) {
         let settings = AudioSettings {
-            volume: settings.volume.min(100),
+            volume: settings.volume.min(MAX_VOLUME),
             ..settings
         };
         let bits = u32::from(settings.volume) | (u32::from(settings.muted) << 8);
@@ -227,6 +247,32 @@ impl AudioPlayback {
         self.0.shared.notify_output();
     }
 
+    pub fn output_devices(&self) -> OutputDevices {
+        lock(&self.0.shared.output_devices).clone()
+    }
+
+    pub fn selected_output(&self) -> Option<cpal::DeviceId> {
+        lock(&self.0.shared.selected_output).clone()
+    }
+
+    pub fn refresh_output_devices(&self) -> Result<()> {
+        self.ensure_worker()?;
+        self.0.shared.refresh_devices.store(true, Ordering::Release);
+        self.0.shared.notify_output();
+        Ok(())
+    }
+
+    pub fn set_output_device(&self, device: Option<cpal::DeviceId>) {
+        let mut selected = lock(&self.0.shared.selected_output);
+        if *selected == device {
+            return;
+        }
+        *selected = device;
+        drop(selected);
+        self.0.shared.retry.store(true, Ordering::Release);
+        self.0.shared.notify_output();
+    }
+
     pub fn select_source(&self, codec: &str, rate: u32, channels: u16) -> Option<u64> {
         let shared = &self.0.shared;
         let generation = shared.generation.fetch_add(1, Ordering::AcqRel) + 1;
@@ -275,6 +321,10 @@ impl AudioPlayback {
 
     pub fn start(&self) -> Result<()> {
         self.0.shared.audible.store(true, Ordering::Release);
+        self.ensure_worker()
+    }
+
+    fn ensure_worker(&self) -> Result<()> {
         let mut worker = lock(&self.0.worker);
         if worker.is_some() || self.0.shared.stopped.load(Ordering::Acquire) {
             return Ok(());
@@ -598,26 +648,61 @@ fn output_worker(shared: Arc<Shared>) {
     let failed = Arc::new(AtomicBool::new(false));
     let mut stream = None;
     let mut current_id = None;
+    let mut current_selection = None;
     let mut current_generation = 0;
     let mut failures = 0;
     let mut next_check = Instant::now();
     while !shared.stopped.load(Ordering::Acquire) {
         let retry = shared.retry.swap(false, Ordering::AcqRel);
+        let refresh = shared.refresh_devices.swap(false, Ordering::AcqRel);
         let generation = shared.generation.load(Ordering::Acquire);
         if next_check <= Instant::now()
             || retry
+            || refresh
             || failed.load(Ordering::Acquire)
             || generation != current_generation
             || (stream.is_none() && failures == 0 && shared.receiving.load(Ordering::Acquire))
         {
-            let device = host.default_output_device();
+            let available = host.output_devices().map(|devices| {
+                devices
+                    .filter_map(|device| {
+                        Some(OutputDevice {
+                            id: device.id().ok()?,
+                            name: device.description().ok()?.name().to_owned(),
+                        })
+                    })
+                    .collect()
+            });
+            *lock(&shared.output_devices) = match available {
+                Ok(devices) => OutputDevices {
+                    devices,
+                    error: None,
+                    loaded: true,
+                },
+                Err(error) => OutputDevices {
+                    error: Some(format!("读取输出设备失败：{error}")),
+                    loaded: true,
+                    ..Default::default()
+                },
+            };
+            let selection = lock(&shared.selected_output).clone();
+            let device = match &selection {
+                Some(id) => host.device_by_id(id).filter(DeviceTrait::supports_output),
+                None => host.default_output_device(),
+            };
             let id = device.as_ref().and_then(|device| device.id().ok());
-            if id != current_id || retry || generation != current_generation {
+            if id != current_id
+                || selection != current_selection
+                || retry
+                || generation != current_generation
+            {
                 failures = 0;
                 stream = None;
                 shared.clear_levels();
                 current_id = id;
+                current_selection = selection.clone();
                 current_generation = generation;
+                *lock(&shared.status) = (String::new(), None);
             }
             if failed.swap(false, Ordering::AcqRel) {
                 stream = None;
@@ -631,7 +716,13 @@ fn output_worker(shared: Arc<Shared>) {
                 // Old audio collected while no output was available must not be replayed.
                 while shared.packets.pop().is_some() {}
                 match device.as_ref().map_or_else(
-                    || Err(anyhow!("未找到音频输出设备")),
+                    || {
+                        Err(anyhow!(if selection.is_some() {
+                            "所选音频输出设备不可用"
+                        } else {
+                            "未找到音频输出设备"
+                        }))
+                    },
                     |device| open_output(device, Arc::clone(&shared), Arc::clone(&failed)),
                 ) {
                     Ok(output) => {

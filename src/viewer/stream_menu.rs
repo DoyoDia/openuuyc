@@ -27,6 +27,8 @@ enum Page {
     #[default]
     Quality,
     Custom,
+    Advanced,
+    Audio,
     Mouse,
     Display,
 }
@@ -36,6 +38,8 @@ impl Page {
         match self {
             Self::Quality => "画质",
             Self::Custom => "自定义码率",
+            Self::Advanced => "高级设置",
+            Self::Audio => "音频输出",
             Self::Mouse => "鼠标模式",
             Self::Display => "显示设置",
         }
@@ -54,7 +58,6 @@ pub(super) struct StreamControlUi {
 }
 
 pub(super) struct LocalViewSettings {
-    pub aspect_locked: bool,
     pub performance_mode: super::PerformancePanelMode,
     pub intercept_shortcuts: bool,
     pub send_ctrl_alt_del: bool,
@@ -236,19 +239,67 @@ fn volume_bar(
     volume: &mut u8,
     muted: &mut bool,
     audio: &crate::audio::AudioPlayback,
-) -> egui::Response {
+) -> (egui::Response, bool) {
     ui.horizontal(|ui| {
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_millis(33));
         speaker_button(ui, *volume, muted);
-        ui.spacing_mut().slider_width = ui.available_width();
+        ui.spacing_mut().slider_width =
+            (ui.available_width() - ROW_HEIGHT - ui.spacing().item_spacing.x - 4.0).max(40.0);
         ui.spacing_mut().interact_size.y = ROW_HEIGHT;
+        // Reserve a short extension for amplification; 100% remains a clear stop.
+        let gain_span = 25.0_f32;
+        let gain_range = f32::from(crate::audio::MAX_VOLUME - 100);
+        let mut position = if *volume <= 100 {
+            f32::from(*volume)
+        } else {
+            100.0 + f32::from(*volume - 100) / gain_range * gain_span
+        };
         let response = ui.add(
-            egui::Slider::new(volume, 0..=100)
+            egui::Slider::new(&mut position, 0.0..=100.0 + gain_span)
                 .show_value(false)
+                .step_by(1.0)
                 .smart_aim(false)
                 .handle_shape(egui::style::HandleShape::Rect { aspect_ratio: 0.0 }),
         );
+        // Slider allocates Sense::drag(), which never reports double clicks.
+        let changed = response.changed();
+        let mut response = response.interact(Sense::click_and_drag());
+        let snap_id = response.id.with("volume-unity-snap");
+        let pointer_action = response.is_pointer_button_down_on()
+            || response.dragged()
+            || response.drag_stopped()
+            || response.clicked();
+        if pointer_action && let Some(pointer) = response.interact_pointer_pos() {
+            let unity_x =
+                response.rect.left() + response.rect.width() * 100.0 / (100.0 + gain_span);
+            let was_snapped = ui
+                .ctx()
+                .data(|data| data.get_temp::<bool>(snap_id).unwrap_or(false));
+            let snapped = (pointer.x - unity_x).abs() <= if was_snapped { 8.0 } else { 4.0 };
+            ui.ctx().data_mut(|data| data.insert_temp(snap_id, snapped));
+            if snapped {
+                position = 100.0;
+            }
+        } else {
+            ui.ctx().data_mut(|data| data.remove::<bool>(snap_id));
+        }
+        if response.double_clicked() {
+            position = 100.0;
+            ui.ctx().data_mut(|data| data.remove::<bool>(snap_id));
+        }
+        if changed || pointer_action || response.double_clicked() {
+            let next = if position <= 100.0 {
+                position.round() as u8
+            } else {
+                (100.0 + (position - 100.0) / gain_span * gain_range).round() as u8
+            }
+            .min(crate::audio::MAX_VOLUME);
+            if *volume != next {
+                *volume = next;
+                response.mark_changed();
+            }
+        }
         let input = audio.input_levels().into_iter().fold(0.0_f32, f32::max);
         let output = if *muted || *volume == 0 {
             0.0
@@ -298,6 +349,22 @@ fn volume_bar(
         let track = egui::Rect::from_center_size(rect.center(), vec2(rect.width(), 6.0));
         ui.painter()
             .rect_filled(track, 3.0, crate::ui::theme::SIDEBAR);
+        let normal_width = track.width() * 100.0 / (100.0 + gain_span);
+        let unity_x = track.left() + normal_width;
+        let gain_track = egui::Rect::from_min_max(egui::pos2(unity_x, track.top()), track.max);
+        ui.painter().rect_filled(
+            gain_track,
+            3.0,
+            crate::ui::theme::AMBER.gamma_multiply(0.18),
+        );
+        if *volume > 100 && !*muted {
+            let boost_width = gain_track.width() * f32::from(*volume - 100) / gain_range;
+            ui.painter().rect_filled(
+                egui::Rect::from_min_size(gain_track.min, vec2(boost_width, gain_track.height())),
+                2.0,
+                crate::ui::theme::AMBER,
+            );
+        }
         for (level, color) in [
             (levels[0], crate::ui::theme::MUTED),
             (levels[1], crate::ui::theme::GREEN),
@@ -305,19 +372,30 @@ fn volume_bar(
             if level > 0.0 {
                 let fill = egui::Rect::from_min_max(
                     track.min,
-                    egui::pos2(track.left() + track.width() * level, track.bottom()),
+                    egui::pos2(track.left() + normal_width * level, track.bottom()),
                 );
                 ui.painter()
                     .with_clip_rect(fill.intersect(ui.clip_rect()))
                     .rect_filled(track, 3.0, color);
             }
         }
-        let handle_x = (rect.left() + rect.width() * f32::from(*volume) / 100.0)
+        ui.painter().line_segment(
+            [
+                egui::pos2(unity_x, track.top() - 2.0),
+                egui::pos2(unity_x, track.bottom() + 2.0),
+            ],
+            Stroke::new(1.0, MUTED),
+        );
+        let handle_x = (rect.left() + rect.width() * position / (100.0 + gain_span))
             .clamp(rect.left() + 2.0, rect.right() - 2.0);
         ui.painter().rect_filled(
             egui::Rect::from_center_size(egui::pos2(handle_x, rect.center().y), vec2(2.5, 14.0)),
             1.0,
-            TEXT,
+            if *volume > 100 {
+                crate::ui::theme::AMBER
+            } else {
+                TEXT
+            },
         );
         if response.hovered() || response.dragged() || response.has_focus() {
             ui.painter().rect_stroke(
@@ -327,7 +405,19 @@ fn volume_bar(
                 egui::StrokeKind::Inside,
             );
         }
-        response
+        ui.add_space(4.0);
+        let choose_output =
+            crate::ui::controls::audio_output_button(ui, "选择输出音频设备", ROW_HEIGHT).clicked();
+        let hint = if *volume > 100 {
+            format!(
+                "音量 {}% · 增益 +{:.1} dB\n双击恢复 100%",
+                *volume,
+                20.0 * (f32::from(*volume) / 100.0).log10()
+            )
+        } else {
+            format!("音量 {}%\n双击恢复 100%", *volume)
+        };
+        (response.on_hover_text(hint), choose_output)
     })
     .inner
 }
@@ -464,11 +554,11 @@ pub(super) fn show_stream_control_window(
             ui.horizontal(|ui| {
                 if state.page != Page::Quality {
                     back =
-                        icon_button(ui, Icon::Back, "返回画质菜单；未应用的修改会取消").clicked();
+                        icon_button(ui, Icon::Back, if state.page == Page::Mouse { "返回高级设置" } else { "返回画质菜单；未应用的修改会取消" }).clicked();
                 }
                 let title = if state.page == Page::Display {
                     "显示设置".to_owned()
-                } else if multi_screen {
+                } else if multi_screen && matches!(state.page, Page::Quality | Page::Custom) {
                     format!("{} · 全部屏幕", state.page.title())
                 } else {
                     state.page.title().to_owned()
@@ -689,6 +779,80 @@ pub(super) fn show_stream_control_window(
                                     );
                                 }
                                 section_separator(ui);
+                                if menu_row(ui, "高级设置", "", None, true, true).clicked() {
+                                    state.page = Page::Advanced;
+                                }
+                                let audio = handle.audio();
+                                let mut audio_settings = audio.settings();
+                                let audio_status = audio.snapshot();
+                                let (volume_response, choose_output) = volume_bar(
+                                    ui,
+                                    &mut audio_settings.volume,
+                                    &mut audio_settings.muted,
+                                    &audio,
+                                );
+                                if choose_output {
+                                    state.page = Page::Audio;
+                                    state.local_error = audio.refresh_output_devices().err().map(|error| error.to_string());
+                                }
+                                if audio_status.device.is_empty() && !audio_status.receiving {
+                                    volume_response.on_hover_text("等待音频");
+                                } else if !audio_status.device.is_empty() {
+                                    volume_response.on_hover_text(format!("输出：{}", audio_status.device));
+                                }
+                                audio.set_settings(audio_settings);
+                                if let Some(error) = audio_status.error {
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.colored_label(crate::ui::theme::AMBER, error);
+                                        if ui.small_button("重试").clicked() {
+                                            audio.retry();
+                                        }
+                                    });
+                                }
+                            });
+                    }
+                    Page::Audio => {
+                        let audio = handle.audio();
+                        let selected = audio.selected_output();
+                        let outputs = audio.output_devices();
+                        ctx.request_repaint_after(std::time::Duration::from_millis(250));
+                        if menu_row(ui, "跟随系统默认", "", Some(selected.is_none()), true, false).clicked() {
+                            audio.set_output_device(None);
+                        }
+                        section_separator(ui);
+                        egui::ScrollArea::vertical()
+                            .id_salt("audio-output-devices")
+                            .max_height((ctx.content_rect().height() - 250.0).clamp(100.0, 360.0))
+                            .show(ui, |ui| {
+                                for output in &outputs.devices {
+                                    if menu_row(ui, &output.name, "", Some(selected.as_ref() == Some(&output.id)), true, false)
+                                        .on_hover_text(&output.name).clicked() {
+                                        audio.set_output_device(Some(output.id.clone()));
+                                    }
+                                }
+                                if !outputs.loaded {
+                                    ui.label(RichText::new("正在读取输出设备…").color(MUTED));
+                                } else if outputs.devices.is_empty() && outputs.error.is_none() {
+                                    ui.label(RichText::new("未找到输出设备").color(MUTED));
+                                }
+                                if selected.as_ref().is_some_and(|id| !outputs.devices.iter().any(|device| &device.id == id)) {
+                                    ui.label(RichText::new("所选设备已断开，请选择其他输出设备").color(crate::ui::theme::AMBER));
+                                }
+                            });
+                        if let Some(error) = outputs.error.or_else(|| audio.snapshot().error) {
+                            ui.add_space(SECTION_GAP);
+                            ui.label(RichText::new(error).size(crate::ui::theme::TINY).color(crate::ui::theme::AMBER));
+                            if ui.small_button("重试").clicked() {
+                                audio.retry();
+                                let _ = audio.refresh_output_devices();
+                            }
+                        }
+                    }
+                    Page::Advanced => {
+                        egui::ScrollArea::vertical()
+                            .id_salt("stream-settings-advanced")
+                            .max_height((ctx.content_rect().height() - 150.0).max(140.0))
+                            .show(ui, |ui| {
                                 let mut relay = snapshot.network.relay_enabled;
                                 let response = ui
                                     .add_enabled_ui(snapshot.network.available, |ui| {
@@ -706,8 +870,6 @@ pub(super) fn show_stream_control_window(
                                         "仅本次连接生效；关闭后恢复自动选路，不保证一定直连",
                                     ),
                                 );
-                                switch_row(ui, "按比例缩放", &mut view.aspect_locked)
-                                    .on_hover_text("仅当前播放窗口");
                                 let mut monitoring =
                                     view.performance_mode != super::PerformancePanelMode::Hidden;
                                 if switch_row(ui, "性能监控", &mut monitoring)
@@ -755,6 +917,26 @@ pub(super) fn show_stream_control_window(
                                 }
                                 switch_row(ui, "拦截本机快捷键", &mut view.intercept_shortcuts)
                                     .on_hover_text("仅当前播放窗口。开启后，控制时优先将按键交给远端；关闭后允许本机快捷键响应。播放器自身快捷键始终保留。");
+                                let clipboard = handle.clipboard();
+                                let clip = clipboard.snapshot();
+                                let mut enabled = clip.enabled;
+                                if switch_row(ui, "剪贴板同步", &mut enabled).changed() {
+                                    if let Err(error) = clipboard.set_enabled(enabled) {
+                                        state.local_error = Some(error.to_string());
+                                    }
+                                }
+                                if enabled {
+                                    let mut files = clip.files;
+                                    if switch_row(ui, "文件复制", &mut files).changed() {
+                                        clipboard.set_files(files);
+                                    }
+                                    if !clip.active && snapshot.mouse_mode != MouseMode::View {
+                                        ui.label(RichText::new("等待剪贴板通道就绪").size(crate::ui::theme::TINY).color(MUTED));
+                                    }
+                                    if let Some(error) = clip.error {
+                                        ui.label(RichText::new(error).size(crate::ui::theme::TINY).color(crate::ui::theme::RED));
+                                    }
+                                }
                                 let can_send = snapshot.ready
                                     && !snapshot.mouse_pending
                                     && snapshot.mouse_mode != MouseMode::View
@@ -770,46 +952,13 @@ pub(super) fn show_stream_control_window(
                                 {
                                     view.send_ctrl_alt_del = true;
                                 }
-                                let audio = handle.audio();
-                                let mut audio_settings = audio.settings();
-                                let audio_status = audio.snapshot();
-                                volume_bar(
-                                    ui,
-                                    &mut audio_settings.volume,
-                                    &mut audio_settings.muted,
-                                    &audio,
-                                )
-                                .on_hover_text(
-                                    if audio_status.device.is_empty() && !audio_status.receiving {
-                                        "等待音频"
-                                    } else {
-                                        "音量"
-                                    },
-                                );
-                                audio.set_settings(audio_settings);
-                                if let Some(error) = audio_status.error {
-                                    ui.horizontal_wrapped(|ui| {
-                                        ui.colored_label(crate::ui::theme::AMBER, error);
-                                        if ui.small_button("重试").clicked() {
-                                            audio.retry();
-                                        }
-                                    });
-                                }
                                 if snapshot.network.pending {
                                     ui.horizontal(|ui| {
                                         ui.spinner();
-                                        ui.label(
-                                            RichText::new("正在切换线路…")
-                                                .size(crate::ui::theme::TINY)
-                                                .color(MUTED),
-                                        );
+                                        ui.label(RichText::new("正在切换线路…").size(crate::ui::theme::TINY).color(MUTED));
                                     });
                                 } else if let Some(notice) = snapshot.network.notice {
-                                    ui.label(
-                                        RichText::new(notice)
-                                            .size(crate::ui::theme::TINY)
-                                            .color(MUTED),
-                                    );
+                                    ui.label(RichText::new(notice).size(crate::ui::theme::TINY).color(MUTED));
                                 }
                             });
                     }
@@ -993,7 +1142,11 @@ pub(super) fn show_stream_control_window(
         }
     }
     if back {
-        state.page = Page::Quality;
+        state.page = if state.page == Page::Mouse {
+            Page::Advanced
+        } else {
+            Page::Quality
+        };
         state.display.reset();
         state.dirty = false;
         state.local_error = None;

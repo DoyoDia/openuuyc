@@ -829,6 +829,38 @@ pub fn close_button(ui: &mut egui::Ui, hint: &str, size: f32) -> egui::Response 
     response.on_hover_text(hint)
 }
 
+pub(crate) fn audio_output_button(ui: &mut egui::Ui, hint: &str, size: f32) -> egui::Response {
+    let (rect, response) = icon_button_area(ui, size);
+    response
+        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), hint));
+    let center = rect.center();
+    let color = if !ui.is_enabled() {
+        theme::DISABLED
+    } else if response.hovered() {
+        TEXT
+    } else {
+        MUTED
+    };
+    let stroke = Stroke::new(theme::ICON_STROKE, color);
+    let band = (0..=20)
+        .map(|step| {
+            let angle = std::f32::consts::PI * (1.0 + step as f32 / 20.0);
+            center + vec2(6.0 * angle.cos(), 6.0 * angle.sin() - 1.0)
+        })
+        .collect();
+    ui.painter().add(egui::Shape::line(band, stroke));
+    // Join the band at each earcup's top center, away from its rounded corners.
+    for x in [-6.0, 6.0] {
+        ui.painter().rect_stroke(
+            egui::Rect::from_center_size(center + vec2(x, 2.5), vec2(4.0, 7.0)),
+            1.0,
+            stroke,
+            egui::StrokeKind::Middle,
+        );
+    }
+    response.on_hover_text(hint)
+}
+
 /// Compact display tabs for the viewer caption.
 pub fn screen_tab(
     ui: &mut egui::Ui,

@@ -43,6 +43,7 @@ pub(super) fn run(config: WindowConfig, factory: AppFactory) -> Result<()> {
         .run_app(&mut runner)
         .context("run D3D11 desktop event loop")?;
     window_manager::install(None);
+    crate::clipboard::shutdown();
     if let Some(error) = runner.main.error.take() {
         bail!(error);
     }

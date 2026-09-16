@@ -302,6 +302,7 @@ pub struct StreamControlSnapshot {
 
 #[derive(Clone)]
 pub struct StreamControlHandle {
+    clipboard: crate::clipboard::Clipboard,
     mouse: crate::remote_input::RemoteInput,
     cursor: crate::remote_cursor::RemoteCursorState,
     audio: crate::audio::AudioPlayback,
@@ -373,6 +374,8 @@ struct PendingCapturePreferences {
 }
 
 struct StreamControlState {
+    peer_clipboard: i32,
+    clipboard_files_allowed: bool,
     remote_upgrade: Option<crate::remote_upgrade::RemoteUpgrade>,
     annotation: annotation::Annotation,
     custom_bitrate_limit: u32,
@@ -446,6 +449,8 @@ impl StreamControlHandle {
         let mouse = crate::remote_input::RemoteInput::default();
         let cursor = crate::remote_cursor::RemoteCursorState::default();
         let state = StreamControlState {
+            peer_clipboard: 0,
+            clipboard_files_allowed: true,
             remote_upgrade: None,
             annotation: Default::default(),
             custom_bitrate_limit: MAX_CUSTOM_BITRATE_MBPS,
@@ -542,6 +547,7 @@ impl StreamControlHandle {
         });
         (
             Self {
+                clipboard: crate::clipboard::Clipboard::new(),
                 mouse,
                 cursor,
                 audio,
@@ -563,10 +569,15 @@ impl StreamControlHandle {
         &self.mouse
     }
 
+    pub(crate) fn clipboard(&self) -> &crate::clipboard::Clipboard {
+        &self.clipboard
+    }
+
     pub(crate) fn set_mouse_transport_ready(&self, connected: bool) {
         let mut state = lock(&self.shared);
         state.mouse_transport_connected = connected;
         if !connected {
+            self.clipboard.suspend();
             state.annotation.disconnect();
             state.peer_mouse_relative = None;
             state.cursor_sync_needed = false;
@@ -759,6 +770,8 @@ impl StreamControlHandle {
     }
 
     pub(crate) fn set_feature_policy(&self, policy: crate::feature_ability::FeaturePolicy) {
+        self.clipboard
+            .platform(if policy.is_windows() { 1 } else { 4 });
         lock(&self.shared).features = Some(policy);
     }
 
@@ -1313,6 +1326,8 @@ impl StreamControlHandle {
             _ => return,
         }
         if !open {
+            self.clipboard.suspend();
+            state.peer_clipboard = 0;
             state.annotation.disconnect();
             state.topology.disconnect();
             state
@@ -1428,6 +1443,9 @@ impl StreamControlHandle {
             state.initial_capture_sync_sent = false;
         }
         state.viewing_enabled = enabled;
+        if !enabled {
+            self.clipboard.suspend();
+        }
         if enabled {
             self.maybe_send_initial_capture_sync(&mut state);
         }
@@ -1462,6 +1480,9 @@ impl StreamControlHandle {
         let message = PbControlMessage::decode(payload)
             .map_err(|error| anyhow!("decode UU protobuf domain message: {error}"))?;
         if let Some(PbPayload::SystemStateChange(bytes)) = &message.payload {
+            if let Some(files) = ClipboardPermissionState::decode(bytes.as_slice())?.files {
+                lock(&self.shared).clipboard_files_allowed = files.enabled;
+            }
             let was_hidden = self.cursor.hidden();
             let result = self.cursor.receive(bytes);
             let mut state = lock(&self.shared);
@@ -1488,6 +1509,7 @@ impl StreamControlHandle {
                 match action.action {
                     ACTION_TYPE_ECHO_REQUEST | ACTION_TYPE_ECHO_RESPONSE => {
                         if let Some(PbSimpleActionParams::FeatureFlag(flags)) = action.params {
+                            state.peer_clipboard = flags.clipboard;
                             state.peer_capture_setting = flags.capture_setting.max(0) as u32;
                         }
                         if action.action == ACTION_TYPE_ECHO_REQUEST {
@@ -1711,6 +1733,16 @@ impl StreamControlHandle {
     }
 
     fn refresh_mouse_policy(&self, state: &mut StreamControlState) {
+        self.clipboard.policy(
+            state.viewing_enabled
+                && state.pb_connected
+                && state.control_channel_open
+                && state.text_channel_open
+                && state.mouse_transport_connected
+                && state.peer_clipboard >= 1
+                && state.mouse.mode() != MouseMode::View,
+            state.peer_clipboard >= 2 && state.clipboard_files_allowed,
+        );
         if !state.viewing_enabled {
             return;
         }
@@ -2742,6 +2774,17 @@ struct PbFeatureFlag {
     virtual_mouse_device: i32,
 }
 
+#[derive(Clone, PartialEq, prost::Message)]
+struct ClipboardPermissionState {
+    #[prost(message, optional, tag = "4")]
+    files: Option<ClipboardPermission>,
+}
+#[derive(Clone, PartialEq, prost::Message)]
+struct ClipboardPermission {
+    #[prost(bool, tag = "1")]
+    enabled: bool,
+}
+
 impl PbFeatureFlag {
     fn read_only_viewer() -> Self {
         Self {
@@ -2752,7 +2795,7 @@ impl PbFeatureFlag {
             update_acquire: 0,
             file_transfer_ftp: 0,
             file_transfer_ftp2: 0,
-            clipboard: 0,
+            clipboard: 3,
             qos_stat: 1,
             mumu_control: 0,
             virtual_mouse_device: 0,

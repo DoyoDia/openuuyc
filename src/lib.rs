@@ -13,6 +13,7 @@ mod audio;
 pub mod auth;
 mod capability;
 pub mod client;
+mod clipboard;
 mod codec_parameters;
 mod control;
 pub mod controller;
