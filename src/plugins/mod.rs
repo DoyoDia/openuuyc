@@ -94,9 +94,30 @@ pub(crate) fn root() -> Result<PathBuf> {
 }
 pub(crate) fn open_folder(path: &Path) -> Result<()> {
     std::fs::create_dir_all(path)?;
-    std::process::Command::new("explorer.exe")
-        .arg(path)
-        .spawn()?;
+    let path = std::fs::canonicalize(path)?;
+
+    // Launch the resolved directory through ShellExecute instead of passing it
+    // to explorer.exe as a child-process argument. Explorer may otherwise fall
+    // back to its inherited working directory (typically C:\\Users\\<user>).
+    use std::os::windows::ffi::OsStrExt;
+    use windows::{
+        Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL},
+        core::{PCWSTR, w},
+    };
+    let path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let result = unsafe {
+        ShellExecuteW(
+            None,
+            w!("open"),
+            PCWSTR(path.as_ptr()),
+            None,
+            None,
+            SW_SHOWNORMAL,
+        )
+    };
+    if result.0 as isize <= 32 {
+        anyhow::bail!("打开文件夹失败（{}）", result.0 as isize);
+    }
     Ok(())
 }
 fn valid_id(id: &str) -> bool {
