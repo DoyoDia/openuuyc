@@ -495,9 +495,10 @@ impl ApplicationHandler<UiEvent> for ConnectingWindowsRunner {
             return;
         }
         if let Stage::Playing(player) = &mut self.stage {
+            // Decoded frames arrive without waking the event loop, so playback
+            // keeps its own cadence at the display refresh rate.
             match player.poll() {
-                Ok(true) => self.schedule(Instant::now()),
-                Ok(false) => {}
+                Ok(()) => self.schedule(Instant::now()),
                 Err(error) => {
                     self.fail(event_loop, &error);
                     return;
@@ -546,6 +547,8 @@ struct Player {
     scale: f32,
     /// Last failure from a control request, shown next to the toolbar.
     control_error: Option<String>,
+    /// The remote cursor shape, decoded once per distinct image.
+    cursor: Option<(usize, egui::TextureHandle, [u32; 2], [u32; 2])>,
 }
 
 impl Player {
@@ -567,6 +570,7 @@ impl Player {
             held_keys: Vec::new(),
             scale: window.scale_factor() as f32,
             control_error: None,
+            cursor: None,
         })
     }
 
@@ -578,15 +582,19 @@ impl Player {
         self.session.stream_control.mouse()
     }
 
-    /// True when a repaint is worthwhile: a decoded frame is waiting.
-    fn poll(&mut self) -> Result<bool> {
-        self.session.ensure_running()?;
-        Ok(!mutex_lock(&self.session.frame_queue).is_empty())
+    fn poll(&mut self) -> Result<()> {
+        self.session.ensure_running()
     }
 
+    /// Take the newest decoded frame, dropping anything the UI cadence skipped.
     fn take_frame(&mut self) -> Option<DecodedVideoFrame> {
         let mut queue = mutex_lock(&self.session.frame_queue);
-        take_next_frame(&mut queue, &self.session.performance)
+        let mut frame = take_next_frame(&mut queue, &self.session.performance)?;
+        while let Some(newer) = take_next_frame(&mut queue, &self.session.performance) {
+            self.session.performance.record_dropped_present_frame();
+            frame = newer;
+        }
+        Some(frame)
     }
 
     fn publish(&mut self, frame: &DecodedVideoFrame) {
@@ -631,7 +639,7 @@ impl Player {
         self.scale = scale;
         let placement = self.display_size().map(|(width, height)| {
             let available = content.size();
-            let video_aspect = f32::from(width as u16).max(1.0) / f32::from(height as u16).max(1.0);
+            let video_aspect = (width as f32).max(1.0) / (height as f32).max(1.0);
             let area_aspect = available.x / available.y.max(1.0);
             let size = if video_aspect > area_aspect {
                 egui::vec2(available.x, available.x / video_aspect)
@@ -691,7 +699,56 @@ impl Player {
             );
         }
         self.toolbar(ui, window);
+        self.draw_remote_cursor(ui, window);
         placement
+    }
+
+    /// Paint the remote pointer over the video and hide the local one.
+    ///
+    /// In absolute mode the local pointer already stands for the remote one, so
+    /// the shape is drawn where the local pointer is rather than at the position
+    /// the remote sampled with it.
+    fn draw_remote_cursor(&mut self, ui: &mut egui::Ui, window: &Arc<Window>) {
+        let controlling = self.session.stream_control.mouse().mode() != MouseMode::View;
+        let hidden = self.session.stream_control.remote_cursor_hidden();
+        let pointer = ui.ctx().pointer_latest_pos();
+        let Some((rect, position)) = self.video_rect.zip(pointer) else {
+            window.set_cursor_visible(true);
+            return;
+        };
+        if !controlling || !rect.contains(position) {
+            window.set_cursor_visible(true);
+            return;
+        }
+        window.set_cursor_visible(false);
+        if hidden {
+            return;
+        }
+        let Some(cursor) = self.session.stream_control.remote_cursor() else {
+            return;
+        };
+        let identity = Arc::as_ptr(&cursor.image) as usize;
+        if self.cursor.as_ref().is_none_or(|(id, ..)| *id != identity) {
+            match decode_cursor(ui.ctx(), &cursor.image) {
+                Some(entry) => self.cursor = Some((identity, entry.0, entry.1, entry.2)),
+                None => return,
+            }
+        }
+        let Some((_, texture, size, hotspot)) = &self.cursor else {
+            return;
+        };
+        // The cursor is authored in remote pixels; scale it with the video.
+        let scale = self
+            .session
+            .stream_control
+            .mouse_screen(self.session.track_index)
+            .map_or(1.0, |(_, remote_width, _)| {
+                rect.width() / (remote_width.max(1) as f32)
+            });
+        let size = egui::vec2(size[0] as f32 * scale, size[1] as f32 * scale);
+        let origin = position - egui::vec2(hotspot[0] as f32 * scale, hotspot[1] as f32 * scale);
+        egui::Image::from_texture(egui::load::SizedTexture::new(texture.id(), size))
+            .paint_at(ui, egui::Rect::from_min_size(origin, size));
     }
 
     /// A compact control strip; the Windows title bar hosts the same commands.
@@ -954,4 +1011,25 @@ fn viewer_shortcut(
         crate::viewer_shortcuts::physical_key(key)?,
         crate::viewer_shortcuts::modifiers(modifiers),
     )
+}
+
+/// Decode the remote cursor PNG into a texture, with its size and hotspot.
+fn decode_cursor(
+    ctx: &egui::Context,
+    image: &crate::remote_cursor::CursorImage,
+) -> Option<(egui::TextureHandle, [u32; 2], [u32; 2])> {
+    if image.png.is_empty() {
+        return None;
+    }
+    let decoded = image::load_from_memory_with_format(&image.png, image::ImageFormat::Png)
+        .map_err(|error| tracing::debug!(%error, "远端光标图像无法解码"))
+        .ok()?
+        .to_rgba8();
+    let size = [decoded.width() as usize, decoded.height() as usize];
+    let texture = ctx.load_texture(
+        "remote-cursor",
+        egui::ColorImage::from_rgba_unmultiplied(size, decoded.as_raw()),
+        egui::TextureOptions::LINEAR,
+    );
+    Some((texture, [decoded.width(), decoded.height()], image.hotspot))
 }
