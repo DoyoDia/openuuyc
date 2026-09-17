@@ -578,6 +578,8 @@ struct Player {
     scale: f32,
     /// Last failure from a control request, shown next to the toolbar.
     control_error: Option<String>,
+    /// The panel size the caption button restores; the stream menu picks it.
+    performance_restore: PerformancePanelMode,
     /// The remote cursor shape, decoded once per distinct image.
     cursor: Option<(usize, egui::TextureHandle, [u32; 2], [u32; 2])>,
     /// Whether the pointer is currently locked to the window for raw motion.
@@ -615,6 +617,7 @@ impl Player {
             physical_buttons: 0,
             scale: window.scale_factor() as f32,
             control_error: None,
+            performance_restore: PerformancePanelMode::Compact,
             cursor: None,
             pointer_locked: false,
             focused: true,
@@ -771,7 +774,9 @@ impl Player {
             window.set_cursor_visible(true);
             return;
         };
-        if !controlling || !rect.contains(position) {
+        // Over a panel, menu or the caption the local pointer is the one that
+        // matters, and the remote shape would be painted underneath them.
+        if !controlling || !self.hit_video_at(ui.ctx(), position) {
             window.set_cursor_visible(true);
             return;
         }
@@ -802,8 +807,15 @@ impl Player {
             });
         let size = egui::vec2(size[0] as f32 * scale, size[1] as f32 * scale);
         let origin = position - egui::vec2(hotspot[0] as f32 * scale, hotspot[1] as f32 * scale);
-        egui::Image::from_texture(egui::load::SizedTexture::new(texture.id(), size))
-            .paint_at(ui, egui::Rect::from_min_size(origin, size));
+        // Its own foreground layer, so nothing drawn later can cover it.
+        egui::Area::new(egui::Id::new("remote-cursor"))
+            .order(egui::Order::Tooltip)
+            .fixed_pos(origin)
+            .interactable(false)
+            .show(ui.ctx(), |ui| {
+                egui::Image::from_texture(egui::load::SizedTexture::new(texture.id(), size))
+                    .paint_at(ui, egui::Rect::from_min_size(origin, size));
+            });
     }
 
     /// The player commands, placed in the window caption between the title and
@@ -838,8 +850,21 @@ impl Player {
         if row.button("全屏").clicked() {
             toggle_fullscreen(window);
         }
-        if row.button("性能").clicked() {
-            self.performance_mode = self.performance_mode.next();
+        if row
+            .selectable_label(
+                self.performance_mode != PerformancePanelMode::Hidden,
+                "性能",
+            )
+            .clicked()
+        {
+            // A caption button shows or hides; the stream menu chooses between
+            // the compact and detailed panels.
+            self.performance_mode = if self.performance_mode == PerformancePanelMode::Hidden {
+                self.performance_restore
+            } else {
+                self.performance_restore = self.performance_mode;
+                PerformancePanelMode::Hidden
+            };
         }
         if row.button("串流设置").clicked() {
             self.stream_control_ui.open = !self.stream_control_ui.open;
@@ -1105,12 +1130,16 @@ impl Player {
     }
 
     fn hit_video(&self, context: &egui::Context, position: PhysicalPosition<f64>) -> bool {
-        let Some(rect) = self.video_rect else {
-            return false;
-        };
         let scale = f64::from(context.pixels_per_point());
-        let point = egui::pos2((position.x / scale) as f32, (position.y / scale) as f32);
-        rect.contains(point)
+        self.hit_video_at(
+            context,
+            egui::pos2((position.x / scale) as f32, (position.y / scale) as f32),
+        )
+    }
+
+    /// True when this point lands on the picture and not on any UI layer above it.
+    fn hit_video_at(&self, context: &egui::Context, point: egui::Pos2) -> bool {
+        self.video_rect.is_some_and(|rect| rect.contains(point))
             && context
                 .layer_id_at(point)
                 .is_none_or(|layer| layer.order == egui::Order::Background)
