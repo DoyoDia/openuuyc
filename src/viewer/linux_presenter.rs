@@ -243,6 +243,11 @@ impl ConnectingWindowsRunner {
         let graphics = crate::ui::gfx::create_device()?;
         let presenter = UiPresenter::new(window.clone(), &graphics)?;
         self.ui_frame_interval = ui_frame_interval(&window);
+        tracing::debug!(
+            interval_ms = self.ui_frame_interval.as_secs_f64() * 1000.0,
+            scale = window.scale_factor(),
+            "player window created"
+        );
         self.shell = Some(Shell {
             context,
             input,
@@ -313,11 +318,18 @@ impl ConnectingWindowsRunner {
         }
     }
 
+    /// Pace ordinary UI repaints at the display refresh rate.
     fn schedule(&mut self, when: Instant) {
         let when = self
             .last_frame
             .map_or(when, |last| when.max(last + self.ui_frame_interval));
         self.next_repaint = Some(self.next_repaint.map_or(when, |old| old.min(when)));
+    }
+
+    /// A decoded frame is already late; waiting for the next paced tick costs
+    /// it most of a refresh interval on the way to the screen.
+    fn schedule_now(&mut self) {
+        self.next_repaint = Some(Instant::now());
     }
 
     fn render(&mut self) -> Result<()> {
@@ -364,14 +376,23 @@ impl ConnectingWindowsRunner {
         if let Stage::Playing(player) = &mut self.stage
             && let Some(frame) = player.take_frame()
         {
-            player.publish(&frame);
-            if let RenderSurface::CpuRgba8(pixels) = &frame.surface {
-                shell.presenter.upload_video(
+            let upload = Instant::now();
+            match &frame.surface {
+                RenderSurface::CpuNv12 { data, color } => shell.presenter.upload_video_nv12(
+                    frame.width,
+                    frame.height,
+                    data,
+                    color.transform(8),
+                )?,
+                RenderSurface::CpuRgba8(pixels) => shell.presenter.upload_video(
                     frame.width,
                     frame.height,
                     bytemuck::cast_slice(pixels),
-                )?;
+                )?,
+                // The D3D11 surface type is uninhabited off Windows.
+                RenderSurface::D3D11(surface) => match *surface {},
             }
+            player.publish(&frame, upload.elapsed());
             player.current = Some(frame);
         }
         let placement = placement.filter(|_| shell.presenter.has_video());
@@ -518,10 +539,13 @@ impl ApplicationHandler<UiEvent> for ConnectingWindowsRunner {
             return;
         }
         if let Stage::Playing(player) = &mut self.stage {
-            // Decoded frames arrive without waking the event loop, so playback
-            // keeps its own cadence at the display refresh rate.
             match player.poll() {
-                Ok(()) => self.schedule(Instant::now()),
+                Ok(true) => self.schedule_now(),
+                // Nothing decoded: egui asks for the repaints it needs and the
+                // wake bridge covers the next frame, so the loop can sleep.
+                // Repainting the whole UI at the display rate instead would
+                // leave an arriving frame waiting for the pass in progress.
+                Ok(false) => {}
                 Err(error) => {
                     self.fail(event_loop, &error);
                     return;
@@ -633,9 +657,11 @@ impl Player {
         self.session.stream_control.mouse()
     }
 
-    fn poll(&mut self) -> Result<()> {
+    /// True when a decoded frame is waiting to go up.
+    fn poll(&mut self) -> Result<bool> {
         self.confirm_neutral();
-        self.session.ensure_running()
+        self.session.ensure_running()?;
+        Ok(!mutex_lock(&self.session.frame_queue).is_empty())
     }
 
     /// Take the newest decoded frame, dropping anything the UI cadence skipped.
@@ -649,7 +675,7 @@ impl Player {
         Some(frame)
     }
 
-    fn publish(&mut self, frame: &DecodedVideoFrame) {
+    fn publish(&mut self, frame: &DecodedVideoFrame, transfer: Duration) {
         self.video_size = Some((frame.width, frame.height, frame.rotation));
         self.session
             .performance
@@ -662,9 +688,9 @@ impl Player {
                 assembly: frame.assembly_delay,
                 input_queue: frame.input_queue_delay,
                 decode_pipeline: frame.decode_pipeline_delay,
-                surface_transfer: Duration::ZERO,
+                surface_transfer: transfer,
                 present_wait: Duration::ZERO,
-                render_queue: frame.decoded_at.elapsed(),
+                render_queue: frame.decoded_at.elapsed().saturating_sub(transfer),
                 sender_capture_at: frame.sender_timing.capture_at,
                 sender_capture: frame.sender_timing.capture_delay,
                 sender_encode: frame.sender_timing.encode_delay,

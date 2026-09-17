@@ -1,9 +1,12 @@
 //! The video layer drawn underneath the egui chrome on Linux.
 //!
-//! Frames arrive as CPU RGBA (the software decoder's output, already converted
-//! by `DecodedSurface::prepare`), so this is one upload and one textured quad.
+//! Decoded frames arrive either as NV12, which is converted to RGB by the
+//! fragment shader, or as RGBA when the decoder produced 4:4:4 and the CPU
+//! already converted it. Keeping NV12 on the GPU saves both the conversion and
+//! two thirds of the upload: a 2560x1600 frame is 6 MiB instead of 16 MiB.
+//!
 //! The quad is letterboxed into the content area and can be rotated by the
-//! multiples of 90° the remote display reports.
+//! multiples of 90 degrees the remote display reports.
 use anyhow::{Context, Result};
 use wgpu::util::DeviceExt;
 
@@ -26,15 +29,43 @@ struct Uniform {
     extent: [f32; 2],
     /// Texture-space rotation matrix, column major.
     rotation: [f32; 4],
+    /// Affine YUV to RGB rows, one per colour component.
+    transform: [[f32; 4]; 3],
+}
+
+/// A pipeline and the bind group layout its frames are bound with.
+struct Program {
+    pipeline: wgpu::RenderPipeline,
+    layout: wgpu::BindGroupLayout,
+}
+
+enum Planes {
+    Rgba(wgpu::Texture),
+    Nv12 {
+        luma: wgpu::Texture,
+        chroma: wgpu::Texture,
+    },
+}
+
+struct Frame {
+    planes: Planes,
+    bind_group: wgpu::BindGroup,
+    width: u32,
+    height: u32,
+}
+
+impl Frame {
+    const fn is_nv12(&self) -> bool {
+        matches!(self.planes, Planes::Nv12 { .. })
+    }
 }
 
 pub(crate) struct VideoLayer {
-    pipeline: wgpu::RenderPipeline,
-    layout: wgpu::BindGroupLayout,
+    rgba: Program,
+    nv12: Program,
     sampler: wgpu::Sampler,
     uniform: wgpu::Buffer,
-    texture: Option<(wgpu::Texture, u32, u32)>,
-    bind_group: Option<wgpu::BindGroup>,
+    frame: Option<Frame>,
 }
 
 impl VideoLayer {
@@ -43,76 +74,15 @@ impl VideoLayer {
             label: Some("openuuyc-video"),
             source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(SHADER)),
         });
-        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("openuuyc-video"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        });
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("openuuyc-video"),
-            bind_group_layouts: &[Some(&layout)],
-            immediate_size: 0,
-        });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("openuuyc-video"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &module,
-                entry_point: Some("vs_main"),
-                buffers: &[],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &module,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleStrip,
-                ..Default::default()
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
+        let rgba = Program::new(device, &module, format, "fs_rgba", 1);
+        let nv12 = Program::new(device, &module, format, "fs_nv12", 2);
         let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("openuuyc-video"),
             contents: bytemuck::bytes_of(&Uniform {
                 offset: [0.0, 0.0],
                 extent: [1.0, 1.0],
                 rotation: [1.0, 0.0, 0.0, 1.0],
+                transform: [[0.0; 4]; 3],
             }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -123,26 +93,24 @@ impl VideoLayer {
             ..Default::default()
         });
         Self {
-            pipeline,
-            layout,
+            rgba,
+            nv12,
             sampler,
             uniform,
-            texture: None,
-            bind_group: None,
+            frame: None,
         }
     }
 
     pub(crate) fn has_frame(&self) -> bool {
-        self.texture.is_some()
+        self.frame.is_some()
     }
 
     pub(crate) fn clear(&mut self) {
-        self.texture = None;
-        self.bind_group = None;
+        self.frame = None;
     }
 
     /// `pixels` is tightly packed RGBA8, `width * height` entries.
-    pub(crate) fn upload(
+    pub(crate) fn upload_rgba(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -154,26 +122,16 @@ impl VideoLayer {
             width > 0 && height > 0 && pixels.len() >= (width as usize * height as usize * 4),
             "视频帧尺寸与数据不匹配"
         );
-        let reuse = matches!(self.texture, Some((_, w, h)) if w == width && h == height);
+        let reuse = matches!(
+            &self.frame,
+            Some(frame) if !frame.is_nv12() && frame.width == width && frame.height == height
+        );
         if !reuse {
-            let texture = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("openuuyc-video"),
-                size: wgpu::Extent3d {
-                    width,
-                    height,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8Unorm,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[],
-            });
+            let texture = plane(device, width, height, wgpu::TextureFormat::Rgba8Unorm);
             let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-            self.bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("openuuyc-video"),
-                layout: &self.layout,
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("openuuyc-video-rgba"),
+                layout: &self.rgba.layout,
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
@@ -188,28 +146,102 @@ impl VideoLayer {
                         resource: wgpu::BindingResource::Sampler(&self.sampler),
                     },
                 ],
-            }));
-            self.texture = Some((texture, width, height));
-        }
-        let (texture, _, _) = self.texture.as_ref().context("视频纹理不可用")?;
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &pixels[..width as usize * height as usize * 4],
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(width * 4),
-                rows_per_image: Some(height),
-            },
-            wgpu::Extent3d {
+            });
+            self.frame = Some(Frame {
+                planes: Planes::Rgba(texture),
+                bind_group,
                 width,
                 height,
-                depth_or_array_layers: 1,
-            },
+            });
+        }
+        let Some(Frame {
+            planes: Planes::Rgba(texture),
+            ..
+        }) = self.frame.as_ref()
+        else {
+            anyhow::bail!("视频纹理不可用");
+        };
+        write_plane(queue, texture, width, height, 4, pixels);
+        Ok(())
+    }
+
+    /// `data` is packed NV12: a `width * height` luma plane followed by an
+    /// interleaved CbCr plane at half resolution.
+    pub(crate) fn upload_nv12(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        width: u32,
+        height: u32,
+        data: &[u8],
+    ) -> Result<()> {
+        let chroma_height = height.div_ceil(2);
+        let chroma_width = width.div_ceil(2);
+        let luma_bytes = width as usize * height as usize;
+        anyhow::ensure!(
+            width > 0
+                && height > 0
+                && data.len() >= luma_bytes + chroma_width as usize * chroma_height as usize * 2,
+            "视频帧尺寸与数据不匹配"
+        );
+        let reuse = matches!(
+            &self.frame,
+            Some(frame) if frame.is_nv12() && frame.width == width && frame.height == height
+        );
+        if !reuse {
+            let luma = plane(device, width, height, wgpu::TextureFormat::R8Unorm);
+            let chroma = plane(
+                device,
+                chroma_width,
+                chroma_height,
+                wgpu::TextureFormat::Rg8Unorm,
+            );
+            let luma_view = luma.create_view(&wgpu::TextureViewDescriptor::default());
+            let chroma_view = chroma.create_view(&wgpu::TextureViewDescriptor::default());
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("openuuyc-video-nv12"),
+                layout: &self.nv12.layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.uniform.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&luma_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(&chroma_view),
+                    },
+                ],
+            });
+            self.frame = Some(Frame {
+                planes: Planes::Nv12 { luma, chroma },
+                bind_group,
+                width,
+                height,
+            });
+        }
+        let Some(Frame {
+            planes: Planes::Nv12 { luma, chroma },
+            ..
+        }) = self.frame.as_ref()
+        else {
+            anyhow::bail!("视频纹理不可用");
+        };
+        write_plane(queue, luma, width, height, 1, &data[..luma_bytes]);
+        write_plane(
+            queue,
+            chroma,
+            chroma_width,
+            chroma_height,
+            2,
+            &data[luma_bytes..],
         );
         Ok(())
     }
@@ -220,9 +252,9 @@ impl VideoLayer {
         pass: &mut wgpu::RenderPass<'static>,
         target: (u32, u32),
         placement: VideoPlacement,
+        transform: [[f32; 4]; 3],
     ) {
-        let (Some(bind_group), true) = (self.bind_group.as_ref(), target.0 > 0 && target.1 > 0)
-        else {
+        let (Some(frame), true) = (self.frame.as_ref(), target.0 > 0 && target.1 > 0) else {
             return;
         };
         let width = target.0 as f32;
@@ -243,12 +275,159 @@ impl VideoLayer {
                 offset: [center_x, center_y],
                 extent: [placement.width / width, placement.height / height],
                 rotation,
+                transform,
             }),
         );
-        pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, bind_group, &[]);
+        let program = if frame.is_nv12() {
+            &self.nv12
+        } else {
+            &self.rgba
+        };
+        pass.set_pipeline(&program.pipeline);
+        pass.set_bind_group(0, &frame.bind_group, &[]);
         pass.draw(0..4, 0..1);
     }
+}
+
+impl Program {
+    fn new(
+        device: &wgpu::Device,
+        module: &wgpu::ShaderModule,
+        format: wgpu::TextureFormat,
+        entry_point: &str,
+        planes: u32,
+    ) -> Self {
+        let mut entries = vec![
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+        ];
+        if planes > 1 {
+            entries.push(wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            });
+        }
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("openuuyc-video"),
+            entries: &entries,
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("openuuyc-video"),
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("openuuyc-video"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module,
+                entry_point: Some(entry_point),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleStrip,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        Self { pipeline, layout }
+    }
+}
+
+fn plane(
+    device: &wgpu::Device,
+    width: u32,
+    height: u32,
+    format: wgpu::TextureFormat,
+) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("openuuyc-video"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    })
+}
+
+fn write_plane(
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+    width: u32,
+    height: u32,
+    bytes_per_texel: u32,
+    data: &[u8],
+) {
+    let needed = (width * bytes_per_texel) as usize * height as usize;
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &data[..needed],
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(width * bytes_per_texel),
+            rows_per_image: Some(height),
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
 }
 
 const SHADER: &str = r#"
@@ -256,11 +435,14 @@ struct Uniform {
     offset: vec2<f32>,
     extent: vec2<f32>,
     rotation: vec4<f32>,
+    transform0: vec4<f32>,
+    transform1: vec4<f32>,
+    transform2: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> settings: Uniform;
-@group(0) @binding(1) var frame: texture_2d<f32>;
-@group(0) @binding(2) var frame_sampler: sampler;
+@group(0) @binding(1) var plane0: texture_2d<f32>;
+@group(0) @binding(2) var plane_sampler: sampler;
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -286,7 +468,22 @@ fn vs_main(@builtin(vertex_index) index: u32) -> VertexOutput {
 }
 
 @fragment
-fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    return textureSample(frame, frame_sampler, in.uv);
+fn fs_rgba(in: VertexOutput) -> @location(0) vec4<f32> {
+    return textureSample(plane0, plane_sampler, in.uv);
+}
+
+@group(0) @binding(3) var plane1: texture_2d<f32>;
+
+@fragment
+fn fs_nv12(in: VertexOutput) -> @location(0) vec4<f32> {
+    let luma = textureSample(plane0, plane_sampler, in.uv).r;
+    let chroma = textureSample(plane1, plane_sampler, in.uv).rg;
+    let yuv = vec4<f32>(luma, chroma.r, chroma.g, 1.0);
+    let rgb = vec3<f32>(
+        dot(settings.transform0, yuv),
+        dot(settings.transform1, yuv),
+        dot(settings.transform2, yuv),
+    );
+    return vec4<f32>(clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
 }
 "#;
