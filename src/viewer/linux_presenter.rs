@@ -6,13 +6,12 @@
 //! wgpu shell draws them under the egui chrome, and input comes from the winit
 //! events the compositor delivers to the focused window.
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::sync::mpsc as std_mpsc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use winit::application::ApplicationHandler;
-use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
+use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::window::{Window, WindowAttributes, WindowId};
@@ -21,12 +20,12 @@ use crate::decoder::RenderSurface;
 use crate::remote_input::MouseMode;
 use crate::ui::chrome::{
     WindowMoveState, WindowResizeState, cancel_pointer_operation, configure_dwm_window,
-    resize_regions, title_bar_height, title_bar_panel, update_nonmodal_window_move,
-    update_nonmodal_window_resize, window_title_bar,
+    resize_regions, title_bar_height, title_bar_panel, update_nonmodal_window_resize,
+    window_title_bar,
 };
-use crate::ui::gfx::{UiPresenter, split_output};
-use crate::ui::window_manager::{Event as UiEvent, Repaint as UiRepaintEvent};
+use crate::ui::gfx::{UiPresenter, UiTimingAudit, split_output};
 use crate::ui::wgpu_video::VideoPlacement;
+use crate::ui::window_manager::{Event as UiEvent, Repaint as UiRepaintEvent};
 
 use super::{
     ConnectionProgress, ConnectionProgressApp, DecodedVideoFrame, NativeViewerSession,
@@ -126,6 +125,7 @@ struct Shell {
     presenter: UiPresenter,
     move_state: WindowMoveState,
     resize_state: WindowResizeState,
+    timing_audit: Option<UiTimingAudit>,
 }
 
 impl ConnectingWindowsRunner {
@@ -230,7 +230,7 @@ impl ConnectingWindowsRunner {
         let input = egui_winit::State::new(
             context.clone(),
             egui::ViewportId::ROOT,
-            &*window,
+            &window,
             Some(window.scale_factor() as f32),
             window.theme(),
             None,
@@ -244,6 +244,7 @@ impl ConnectingWindowsRunner {
             presenter,
             move_state: WindowMoveState::default(),
             resize_state: WindowResizeState::default(),
+            timing_audit: None,
         });
         // Only the D3D11 path can hand a decoder its own surfaces; a Linux
         // session always decodes into CPU frames, so the handle stays empty.
@@ -300,9 +301,8 @@ impl ConnectingWindowsRunner {
                     if let Some(shell) = self.shell.as_mut() {
                         shell.presenter.clear_video();
                     }
-                    self.stage = Stage::Connecting(Box::new(ConnectionProgressApp::new(
-                        alias, progress,
-                    )));
+                    self.stage =
+                        Stage::Connecting(Box::new(ConnectionProgressApp::new(alias, progress)));
                 }
             }
         }
@@ -320,11 +320,12 @@ impl ConnectingWindowsRunner {
             return Ok(());
         };
         self.next_repaint = None;
-        self.last_frame = Some(Instant::now());
-        let title = format!("{}", self.alias);
+        let started = Instant::now();
+        self.last_frame = Some(started);
+        let title = self.alias.clone();
         let mut close_requested = false;
         let mut placement = None;
-        let input = shell.input.take_egui_input(&*window);
+        let input = shell.input.take_egui_input(&window);
         let stage = &mut self.stage;
         let output = shell.context.run_ui(input, |ui| {
             let ctx = ui.ctx().clone();
@@ -356,16 +357,18 @@ impl ConnectingWindowsRunner {
         {
             player.publish(&frame);
             if let RenderSurface::CpuRgba8(pixels) = &frame.surface {
-                shell
-                    .presenter
-                    .upload_video(frame.width, frame.height, bytemuck::cast_slice(pixels))?;
+                shell.presenter.upload_video(
+                    frame.width,
+                    frame.height,
+                    bytemuck::cast_slice(pixels),
+                )?;
             }
             player.current = Some(frame);
         }
         let placement = placement.filter(|_| shell.presenter.has_video());
         shell.presenter.set_video_placement(placement);
         let (drawing, platform, viewports) = split_output(output);
-        shell.input.handle_platform_output(&*window, platform);
+        shell.input.handle_platform_output(&window, platform);
         close_requested |= viewports
             .get(&egui::ViewportId::ROOT)
             .is_some_and(|viewport| {
@@ -377,13 +380,24 @@ impl ConnectingWindowsRunner {
         let repaint_at = viewports
             .get(&egui::ViewportId::ROOT)
             .and_then(|viewport| Instant::now().checked_add(viewport.repaint_delay));
+        let layout = started.elapsed();
+        let mut presented = false;
         if window.is_minimized() == Some(true) {
             shell.presenter.defer_output(drawing);
         } else {
-            let presented = shell.presenter.render(&shell.context, drawing, false)?;
+            presented = shell.presenter.render(&shell.context, drawing, false)?;
             if presented && window.is_visible() == Some(false) {
                 window.set_visible(true);
             }
+        }
+        if let Some(audit) = UiTimingAudit::active(&mut shell.timing_audit, started) {
+            audit.record(
+                started,
+                layout,
+                started.elapsed().saturating_sub(layout),
+                repaint_at.is_some_and(|when| when <= started),
+                presented,
+            );
         }
         self.close_requested |= close_requested;
         if let Some(when) = repaint_at {
@@ -416,10 +430,10 @@ impl ApplicationHandler<UiEvent> for ConnectingWindowsRunner {
         let (Some(window), Some(shell)) = (self.window.clone(), self.shell.as_mut()) else {
             return;
         };
-        let response = shell.input.on_window_event(&*window, &event);
-        let mut consumed = response.consumed;
+        let response = shell.input.on_window_event(&window, &event);
+        let consumed = response.consumed;
         if let Stage::Playing(player) = &mut self.stage {
-            consumed |= player.on_window_event(&window, &shell.context, &event, consumed);
+            player.on_window_event(&window, &shell.context, &event, consumed);
         }
         match event {
             WindowEvent::CloseRequested | WindowEvent::Destroyed => {
@@ -662,7 +676,11 @@ impl Player {
         self.performance_mode = view.performance_mode;
         self.intercept_shortcuts = view.intercept_shortcuts;
         if view.send_ctrl_alt_del {
-            let _ = self.session.stream_control.mouse().send_ctrl_alt_del(self.owner);
+            let _ = self
+                .session
+                .stream_control
+                .mouse()
+                .send_ctrl_alt_del(self.owner);
         }
         if self.performance_mode != PerformancePanelMode::Hidden {
             super::performance_panel::show(
@@ -758,9 +776,7 @@ impl Player {
                     return false;
                 }
                 let down = event.state == ElementState::Pressed;
-                if down
-                    && let Some(action) = viewer_shortcut(self.modifiers, event.physical_key)
-                {
+                if down && let Some(action) = viewer_shortcut(self.modifiers, event.physical_key) {
                     self.run_shortcut(action, window);
                     return true;
                 }

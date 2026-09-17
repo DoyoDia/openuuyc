@@ -6,14 +6,24 @@ use winit::dpi::PhysicalSize;
 #[cfg(windows)]
 pub(crate) use super::d3d11::{UiPresenter, create_backbuffer, window_hwnd};
 #[cfg(windows)]
-pub(crate) use egui_directx11::{RendererOutput, split_output};
+pub(crate) use egui_directx11::split_output;
 
 #[cfg(not(windows))]
+#[allow(
+    unused_imports,
+    reason = "The platform-neutral names of the presenter types; not every caller spells them out."
+)]
 pub(crate) use super::wgpu_backend::{RendererOutput, UiPresenter, split_output};
 
 #[cfg(windows)]
-pub(crate) use super::d3d11_device::{Graphics, create_device};
+pub(crate) use super::d3d11_device::Graphics;
+#[cfg(windows)]
+pub(crate) use super::d3d11_device::create_device;
 #[cfg(not(windows))]
+#[allow(
+    unused_imports,
+    reason = "The platform-neutral names of the device types; not every caller spells them out."
+)]
 pub(crate) use super::wgpu_backend::{Graphics, create_device};
 
 /// Opt-in, aggregated UI-only diagnostics. No RTP hot-path counters or HUD.
@@ -88,7 +98,6 @@ impl UiTimingAudit {
         }
     }
 }
-
 
 pub(crate) fn nonzero_size(size: PhysicalSize<u32>) -> PhysicalSize<u32> {
     PhysicalSize::new(size.width.max(1), size.height.max(1))

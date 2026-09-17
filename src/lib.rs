@@ -34,8 +34,8 @@ mod network_control;
 mod nrd_http;
 pub mod official_receiver;
 mod official_version;
-pub mod performance;
 mod paths;
+pub mod performance;
 
 pub mod plugins;
 mod port_mapping;
@@ -56,12 +56,12 @@ mod ui;
 mod ulpfec;
 mod uu_kcp;
 mod video_color;
-#[cfg(not(windows))]
-mod virtual_keys;
 mod video_format;
 pub mod viewer;
 mod viewer_shortcuts;
 mod viewing_settings;
 mod virtual_hardware;
+#[cfg(not(windows))]
+mod virtual_keys;
 mod wallpaper;
 mod xor_fec;

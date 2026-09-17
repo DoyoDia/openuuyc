@@ -13,11 +13,18 @@ mod ui;
 pub mod video;
 mod watch;
 
+// The node-graph video pipeline is driven by the Windows player only; the
+// Linux player has no effect chain yet.
+#[cfg(windows)]
 pub(crate) use chain::Controller;
 pub(crate) use manager::Manager;
+#[cfg(windows)]
 pub(crate) use parameters::capturing as capturing_shortcut;
-pub(crate) use process::{Sample, Shared};
+#[cfg(windows)]
+pub(crate) use process::Sample;
+pub(crate) use process::Shared;
 pub(crate) use ui::paint_plugin_icon;
+#[cfg(windows)]
 pub(crate) use video::{ChainShared, Graph, Tap};
 
 use anyhow::{Context, Result, ensure};
@@ -87,10 +94,7 @@ pub(crate) fn root() -> Result<PathBuf> {
     if adjacent.is_dir() {
         return Ok(adjacent);
     }
-    Ok(
-        crate::paths::require_local_app_data()?
-            .join("OpenUUYC/plugins"),
-    )
+    Ok(crate::paths::require_local_app_data()?.join("OpenUUYC/plugins"))
 }
 pub(crate) fn open_folder(path: &Path) -> Result<()> {
     std::fs::create_dir_all(path)?;
@@ -101,25 +105,25 @@ pub(crate) fn open_folder(path: &Path) -> Result<()> {
     // back to its inherited working directory (typically C:\\Users\\<user>).
     #[cfg(windows)]
     {
-    use std::os::windows::ffi::OsStrExt;
-    use windows::{
-        Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL},
-        core::{PCWSTR, w},
-    };
-    let path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-    let result = unsafe {
-        ShellExecuteW(
-            None,
-            w!("open"),
-            PCWSTR(path.as_ptr()),
-            None,
-            None,
-            SW_SHOWNORMAL,
-        )
-    };
-    if result.0 as isize <= 32 {
-        anyhow::bail!("打开文件夹失败（{}）", result.0 as isize);
-    }
+        use std::os::windows::ffi::OsStrExt;
+        use windows::{
+            Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL},
+            core::{PCWSTR, w},
+        };
+        let path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let result = unsafe {
+            ShellExecuteW(
+                None,
+                w!("open"),
+                PCWSTR(path.as_ptr()),
+                None,
+                None,
+                SW_SHOWNORMAL,
+            )
+        };
+        if result.0 as isize <= 32 {
+            anyhow::bail!("打开文件夹失败（{}）", result.0 as isize);
+        }
     }
     #[cfg(not(windows))]
     {

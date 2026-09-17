@@ -76,10 +76,9 @@ impl SoftwareSlot {
             .map(std::path::PathBuf::from)
             .filter(|path| path.is_dir())
             .unwrap_or_else(std::env::temp_dir);
-        let path = base.join(format!(
-            "openuuyc-software-playback-{}.lock",
-            unsafe { libc::getuid() }
-        ));
+        let path = base.join(format!("openuuyc-software-playback-{}.lock", unsafe {
+            libc::getuid()
+        }));
         let lock = std::fs::OpenOptions::new()
             .read(true)
             .write(true)

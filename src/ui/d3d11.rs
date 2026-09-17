@@ -1,6 +1,6 @@
 //! D3D11 egui composition shared by the device center and playback windows.
-use anyhow::{Context, Result, bail};
 use super::gfx::nonzero_size;
+use anyhow::{Context, Result, bail};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Direct3D11::*;
@@ -237,4 +237,3 @@ pub(crate) fn create_backbuffer(
         target.context("D3D11 did not return a render target")?,
     ))
 }
-

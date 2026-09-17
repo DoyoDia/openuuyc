@@ -45,6 +45,10 @@ pub(crate) enum DecoderOutputIssue {
 }
 
 #[derive(Debug)]
+#[cfg_attr(
+    not(windows),
+    allow(dead_code, reason = "Only the Windows decoder produces GPU surfaces.")
+)]
 pub(crate) enum DecodedSurface {
     CpuNv12(Bytes),
 
@@ -54,6 +58,10 @@ pub(crate) enum DecodedSurface {
 }
 
 #[derive(Debug)]
+#[cfg_attr(
+    not(windows),
+    allow(dead_code, reason = "Only the Windows presenter draws GPU surfaces.")
+)]
 pub(crate) enum RenderSurface {
     CpuRgba8(Vec<Rgba8>),
 
@@ -372,6 +380,13 @@ impl NativeVideoDecoder {
     }
 }
 
+#[cfg_attr(
+    not(windows),
+    allow(
+        unused_variables,
+        reason = "Only the GPU arm, which is Windows-only, reads the frame reader."
+    )
+)]
 fn poll_platform_decoder(
     decoder: &mut PlatformDecoder,
     frame_reader: &mut FrameReader,

@@ -53,7 +53,8 @@ impl LinuxVideoDecoder {
         if config.codec != CodecKind::H264 {
             return Err(DecodeError::Unsupported);
         }
-        if config.width == 0 || config.height == 0 || config.width > 16384 || config.height > 16384 {
+        if config.width == 0 || config.height == 0 || config.width > 16384 || config.height > 16384
+        {
             return Err(DecodeError::InvalidInput);
         }
         let mut decoder = openuuyc_h264::stream::Decoder::new();

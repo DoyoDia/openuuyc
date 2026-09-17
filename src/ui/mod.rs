@@ -6,14 +6,14 @@ pub(crate) mod chrome;
 pub(crate) mod d3d11;
 #[cfg(windows)]
 mod d3d11_device;
+pub(crate) mod gfx;
 #[cfg(not(windows))]
 mod wgpu_backend;
 #[cfg(not(windows))]
 pub(crate) mod wgpu_video;
-pub(crate) mod gfx;
 
-pub(crate) mod window_manager;
 mod shell;
+pub(crate) mod window_manager;
 
 mod app;
 pub(crate) mod branding;
