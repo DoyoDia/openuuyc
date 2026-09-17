@@ -553,7 +553,9 @@ impl ApplicationHandler<UiEvent> for ConnectingWindowsRunner {
 /// The playing half of the window: video, input forwarding and the menus.
 struct Player {
     session: NativeViewerSession,
-    /// Keeps the decoder publishing frames and nudges the event loop.
+    /// Keeps the decoder publishing frames and nudges the event loop; held for
+    /// its lifetime, which is what registers this window with the session.
+    #[allow(dead_code, reason = "Owned for its registration and its Drop.")]
     wake: FrameWakeBridge,
     /// Identifies this window to `RemoteInput`, which arbitrates between windows.
     owner: u64,
