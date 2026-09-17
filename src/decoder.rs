@@ -65,6 +65,14 @@ pub(crate) enum DecodedSurface {
 pub(crate) enum RenderSurface {
     CpuRgba8(Vec<Rgba8>),
 
+    /// Packed NV12 handed to the renderer as-is; the shader converts it.
+    /// Doing that on the GPU saves a full-frame CPU conversion per picture.
+    #[cfg(not(windows))]
+    CpuNv12 {
+        data: Bytes,
+        color: RenderColor,
+    },
+
     D3D11(windows_surface::D3D11Surface),
 }
 
@@ -85,8 +93,15 @@ impl DecodedSurface {
             Self::CpuI444(data) => {
                 i444_to_rgba_pixels(width, height, &data, color).map(RenderSurface::CpuRgba8)
             }
+            #[cfg(windows)]
             Self::CpuNv12(data) => {
                 nv12_to_rgba_pixels(width, height, &data, color).map(RenderSurface::CpuRgba8)
+            }
+            // The Linux renderer samples NV12 directly; only validate the layout.
+            #[cfg(not(windows))]
+            Self::CpuNv12(data) => {
+                nv12_layout(width, height, &data)?;
+                Ok(RenderSurface::CpuNv12 { data, color })
             }
 
             Self::D3D11(surface) => Ok(RenderSurface::D3D11(surface)),

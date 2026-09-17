@@ -109,6 +109,8 @@ pub(crate) struct UiPresenter {
     video: super::wgpu_video::VideoLayer,
     /// Where the next frame goes; `None` leaves the video layer unpainted.
     placement: Option<super::wgpu_video::VideoPlacement>,
+    /// The YUV to RGB rows for an NV12 frame; `None` when the frame is RGBA.
+    transform: Option<[[f32; 4]; 3]>,
     pending_output: Option<RendererOutput>,
     size: PhysicalSize<u32>,
     configured: bool,
@@ -154,16 +156,31 @@ impl UiPresenter {
             renderer,
             video,
             placement: None,
+            transform: None,
             pending_output: None,
             size,
             configured: true,
         })
     }
 
-    /// Replace the video frame drawn under the UI. The pixels are RGBA8.
+    /// Replace the video frame drawn under the UI with packed RGBA8 pixels.
     pub(crate) fn upload_video(&mut self, width: u32, height: u32, pixels: &[u8]) -> Result<()> {
+        self.transform = None;
         self.video
-            .upload(&self.device, &self.queue, width, height, pixels)
+            .upload_rgba(&self.device, &self.queue, width, height, pixels)
+    }
+
+    /// Replace it with packed NV12, converted to RGB by the fragment shader.
+    pub(crate) fn upload_video_nv12(
+        &mut self,
+        width: u32,
+        height: u32,
+        data: &[u8],
+        transform: [[f32; 4]; 3],
+    ) -> Result<()> {
+        self.transform = Some(transform);
+        self.video
+            .upload_nv12(&self.device, &self.queue, width, height, data)
     }
 
     pub(crate) fn set_video_placement(
@@ -284,6 +301,7 @@ impl UiPresenter {
                     &mut pass,
                     (self.config.width, self.config.height),
                     placement,
+                    self.transform.unwrap_or_default(),
                 );
             }
             self.renderer.render(&mut pass, &jobs, &descriptor);
