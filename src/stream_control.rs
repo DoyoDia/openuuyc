@@ -388,6 +388,8 @@ struct StreamControlState {
     /// Set when the viewer explicitly gives control back, so an automatic
     /// hand-over does not fight that choice on the next reconnect.
     auto_mouse_declined: bool,
+    /// Keeps the "still waiting" diagnostic to one line per session.
+    auto_mouse_reported: bool,
     remote_cursor: crate::remote_cursor::RemoteCursorState,
     peer_mouse_relative: Option<bool>,
     cursor_sync_needed: bool,
@@ -454,6 +456,10 @@ impl StreamControlHandle {
             .clamp(1, profile.stream_fps.max(1));
         let mouse = crate::remote_input::RemoteInput::default();
         let cursor = crate::remote_cursor::RemoteCursorState::default();
+        tracing::debug!(
+            auto_mouse_control = profile.auto_mouse_control,
+            "stream control created"
+        );
         let state = StreamControlState {
             peer_clipboard: 0,
             clipboard_files_allowed: true,
@@ -464,6 +470,7 @@ impl StreamControlHandle {
             preferred_mouse_mode: MouseMode::Smart,
             auto_mouse_control: profile.auto_mouse_control,
             auto_mouse_declined: false,
+            auto_mouse_reported: false,
             remote_notice: None,
             remote_cursor: cursor.clone(),
             peer_mouse_relative: None,
@@ -1060,11 +1067,23 @@ impl StreamControlHandle {
         if !state.auto_mouse_control
             || state.auto_mouse_declined
             || state.mouse.mode() != MouseMode::View
-            || !state.viewing_enabled
+        {
+            return;
+        }
+        if !state.viewing_enabled
             || state.annotation.enabled
             || state.annotation.toggling()
             || ensure_ready(state).is_err()
         {
+            if !state.auto_mouse_reported {
+                state.auto_mouse_reported = true;
+                tracing::debug!(
+                    viewing = state.viewing_enabled,
+                    annotation = state.annotation.enabled,
+                    ready = ensure_ready(state).is_ok(),
+                    "自动键鼠控制等待连接就绪"
+                );
+            }
             return;
         }
         let mode = state.preferred_mouse_mode;
@@ -1351,6 +1370,9 @@ impl StreamControlHandle {
         let mut state = lock(&self.shared);
         self.drive_display_changes(&mut state);
         expire_cursor_request(&mut state);
+        // Readiness can complete through several different paths; checking here
+        // means the hand-over does not depend on which one finished last.
+        self.maybe_auto_take_mouse(&mut state);
         self.refresh_mouse_policy(&mut state);
     }
 
