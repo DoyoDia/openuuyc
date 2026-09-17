@@ -582,6 +582,8 @@ struct Player {
     cursor: Option<(usize, egui::TextureHandle, [u32; 2], [u32; 2])>,
     /// Whether the pointer is currently locked to the window for raw motion.
     pointer_locked: bool,
+    /// The compositor only lets a focused window hold the pointer.
+    focused: bool,
     /// Sub-pixel motion carried between raw events.
     motion_remainder: [f64; 2],
 }
@@ -615,6 +617,7 @@ impl Player {
             control_error: None,
             cursor: None,
             pointer_locked: false,
+            focused: true,
             motion_remainder: [0.0, 0.0],
         })
     }
@@ -916,7 +919,7 @@ impl Player {
     /// local cursor cannot wander onto another window mid-game.
     fn update_pointer_lock(&mut self, window: &Arc<Window>) {
         let input = self.input();
-        let wanted = input.relative_mode() && input.mode() != MouseMode::View;
+        let wanted = self.focused && input.relative_mode() && input.mode() != MouseMode::View;
         if wanted == self.pointer_locked {
             return;
         }
@@ -962,6 +965,7 @@ impl Player {
     }
 
     fn on_focus_changed(&mut self, window: &Arc<Window>, focused: bool) {
+        self.focused = focused;
         if !focused {
             self.release_pointer(window);
             // A key released while another window has focus never reaches us.

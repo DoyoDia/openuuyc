@@ -1145,6 +1145,14 @@ impl DeviceCenterApp {
                 });
                 form_row(
                     ui,
+                    "键鼠控制",
+                    "连接后自动接管远端键鼠，可在播放窗口随时切换",
+                    |ui| {
+                        crate::ui::controls::switch(ui, &mut self.media.auto_mouse_control);
+                    },
+                );
+                form_row(
+                    ui,
                     "连接线路",
                     "自动模式支持直连与中转切换",
                     |ui| {
