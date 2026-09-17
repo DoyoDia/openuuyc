@@ -106,7 +106,11 @@ pub(crate) struct NativeVideoDecoder {
 /// Local implementation choices, never serialized as invented UU decoder IDs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DecoderCandidate {
+    #[cfg(windows)]
     WindowsD3d11,
+    /// VA-API through the local driver: NVDEC, Intel or AMD.
+    #[cfg(not(windows))]
+    LinuxVaapi,
 
     SoftwareH264,
 }
@@ -115,7 +119,10 @@ impl DecoderCandidate {
     pub(crate) fn available(codec: VideoCodec, prefer_hardware: bool) -> Vec<Self> {
         let mut candidates = Vec::new();
         if prefer_hardware {
+            #[cfg(windows)]
             candidates.push(Self::WindowsD3d11);
+            #[cfg(not(windows))]
+            candidates.push(Self::LinuxVaapi);
         }
 
         if codec == VideoCodec::H264 {
@@ -198,6 +205,13 @@ impl NativeVideoDecoder {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(
+        not(windows),
+        allow(
+            unused_variables,
+            reason = "The D3D11 writer and its format probe are Windows-only."
+        )
+    )]
     pub(crate) fn open_candidate(
         candidate: DecoderCandidate,
         codec: VideoCodec,
@@ -216,6 +230,29 @@ impl NativeVideoDecoder {
         let depth = format.map_or(8, |f| f.bit_depth_luma);
         let chroma = format.map_or(1, |f| f.chroma_format_idc);
         match candidate {
+            #[cfg(not(windows))]
+            DecoderCandidate::LinuxVaapi => {
+                let config = decoder_config(
+                    codec_kind(codec),
+                    width,
+                    height,
+                    VideoOutputPreference::ZeroCopyGpu,
+                    None,
+                    extra_data,
+                );
+                let decoder = open_platform_decoder(&config)?;
+                Ok(Self {
+                    backend: DecoderBackend::Platform {
+                        decoder: Box::new(decoder),
+                        frame_reader: FrameReader::Cpu,
+                    },
+                    candidate,
+                    label: format!("{} 硬解", platform_label()),
+                    frame_duration,
+                    software_slot: None,
+                })
+            }
+            #[cfg(windows)]
             DecoderCandidate::WindowsD3d11 => {
                 let supports = |writer: &windows_surface::D3D11SurfaceWriter| {
                     PlatformDecoder::probe_format(
@@ -294,6 +331,7 @@ impl NativeVideoDecoder {
         }
     }
 
+    #[cfg(windows)]
     fn open_windows_hardware(
         codec: CodecKind,
         width: u32,
@@ -457,7 +495,7 @@ pub(crate) fn detect_native_decoder_support(
     std::thread::spawn(move || {
         let mut capabilities = Vec::new();
         if profile.hardware_decode
-            && let Ok(writers) = windows_surface::D3D11SurfaceWriter::available()
+            && let Ok(probe) = hardware_probe()
         {
             for (codec, id) in [(VideoCodec::H264, 1), (VideoCodec::H265, 2)] {
                 if matches!(
@@ -470,16 +508,7 @@ pub(crate) fn detect_native_decoder_support(
                 for chroma in [1, 3] {
                     for depth in [8, 10] {
                         for &(width, height) in QUALITY_DIMENSIONS[1..].iter().rev() {
-                            if writers.iter().any(|writer| {
-                                PlatformDecoder::probe_format(
-                                    writer.device_handle(),
-                                    codec_kind(codec),
-                                    width as u32,
-                                    height as u32,
-                                    depth,
-                                    chroma,
-                                )
-                            }) {
+                            if probe(codec, width as u32, height as u32, depth, chroma) {
                                 capabilities.push(CodecCapability {
                                     video_codec: id,
                                     width,
@@ -520,6 +549,38 @@ pub(crate) fn detect_native_decoder_support(
     })
     .join()
     .map_err(|_| anyhow!("native capability probe thread panicked"))?
+}
+
+/// A closure that answers whether the platform decodes a format in hardware.
+/// On Windows every D3D11 device is asked; on Linux the VA-API driver is.
+#[cfg(windows)]
+fn hardware_probe() -> Result<impl Fn(VideoCodec, u32, u32, u8, u8) -> bool> {
+    let writers = windows_surface::D3D11SurfaceWriter::available()?;
+    Ok(move |codec, width, height, depth, chroma| {
+        writers.iter().any(|writer| {
+            PlatformDecoder::probe_format(
+                writer.device_handle(),
+                codec_kind(codec),
+                width,
+                height,
+                depth,
+                chroma,
+            )
+        })
+    })
+}
+
+#[cfg(not(windows))]
+fn hardware_probe() -> Result<impl Fn(VideoCodec, u32, u32, u8, u8) -> bool> {
+    Ok(|codec, width, height, depth, chroma| {
+        crate::decoder::platform::linux::probe_hardware(
+            codec_kind(codec),
+            width,
+            height,
+            depth,
+            chroma,
+        )
+    })
 }
 
 fn decoder_config(
