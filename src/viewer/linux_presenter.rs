@@ -12,7 +12,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{
+    DeviceEvent, DeviceId, ElementState, MouseButton, MouseScrollDelta, WindowEvent,
+};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::window::{Window, WindowAttributes, WindowId};
 
@@ -35,6 +37,9 @@ use super::{
 };
 
 pub(super) use crate::viewer_shortcuts::Action as ViewerShortcut;
+
+/// Space the caption keeps for the brand logo and the device alias.
+const TITLE_CAPTION_WIDTH: f32 = 220.0;
 
 pub(crate) struct ConnectingWindowsRunConfig {
     pub alias: String,
@@ -278,7 +283,7 @@ impl ConnectingWindowsRunner {
                     let Some(window) = self.window.clone() else {
                         return;
                     };
-                    match Player::new(*session, &window) {
+                    match Player::new(*session, &window, self.proxy.clone()) {
                         Ok(player) => {
                             window.set_visible(true);
                             self.stage = Stage::Playing(Box::new(player));
@@ -341,8 +346,12 @@ impl ConnectingWindowsRunner {
             });
             if window.fullscreen().is_none() {
                 title_bar_panel(ui, "player-window-chrome", title_bar_height(), |ui| {
+                    let bar = ui.available_rect_before_wrap();
                     close_requested |=
                         window_title_bar(ui, &window, &title, Some(&mut shell.move_state));
+                    if let Stage::Playing(player) = stage {
+                        player.title_bar_controls(ui, bar, &window);
+                    }
                 });
             }
             match stage {
@@ -478,6 +487,20 @@ impl ApplicationHandler<UiEvent> for ConnectingWindowsRunner {
         }
     }
 
+    fn device_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _device: DeviceId,
+        event: DeviceEvent,
+    ) {
+        // Raw motion is the only pointer source once the pointer is locked.
+        if let Stage::Playing(player) = &mut self.stage
+            && player.on_device_event(&event)
+        {
+            self.schedule(Instant::now());
+        }
+    }
+
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UiEvent) {
         let UiEvent::Repaint(event) = event else {
             return;
@@ -530,6 +553,8 @@ impl ApplicationHandler<UiEvent> for ConnectingWindowsRunner {
 /// The playing half of the window: video, input forwarding and the menus.
 struct Player {
     session: NativeViewerSession,
+    /// Keeps the decoder publishing frames and nudges the event loop.
+    wake: FrameWakeBridge,
     /// Identifies this window to `RemoteInput`, which arbitrates between windows.
     owner: u64,
     stream_control_ui: StreamControlUi,
@@ -543,20 +568,34 @@ struct Player {
     last_position: Option<PhysicalPosition<f64>>,
     modifiers: winit::keyboard::ModifiersState,
     held_keys: Vec<u16>,
+    /// Everything physically down right now, whether or not it was forwarded.
+    /// Entering control waits for this to empty before the remote accepts input.
+    physical_keys: Vec<u16>,
+    physical_buttons: u8,
     /// Pixels per point of the last frame, for pointer mapping.
     scale: f32,
     /// Last failure from a control request, shown next to the toolbar.
     control_error: Option<String>,
     /// The remote cursor shape, decoded once per distinct image.
     cursor: Option<(usize, egui::TextureHandle, [u32; 2], [u32; 2])>,
+    /// Whether the pointer is currently locked to the window for raw motion.
+    pointer_locked: bool,
+    /// Sub-pixel motion carried between raw events.
+    motion_remainder: [f64; 2],
 }
 
 impl Player {
-    fn new(session: NativeViewerSession, window: &Arc<Window>) -> Result<Self> {
+    fn new(
+        session: NativeViewerSession,
+        window: &Arc<Window>,
+        proxy: EventLoopProxy<UiEvent>,
+    ) -> Result<Self> {
         session.ensure_running()?;
         let owner = u64::from(window.id());
+        let wake = FrameWakeBridge::install(&session, proxy, window.id())?;
         Ok(Self {
             session,
+            wake,
             owner,
             stream_control_ui: StreamControlUi::default(),
             performance_mode: PerformancePanelMode::Hidden,
@@ -568,9 +607,13 @@ impl Player {
             last_position: None,
             modifiers: winit::keyboard::ModifiersState::empty(),
             held_keys: Vec::new(),
+            physical_keys: Vec::new(),
+            physical_buttons: 0,
             scale: window.scale_factor() as f32,
             control_error: None,
             cursor: None,
+            pointer_locked: false,
+            motion_remainder: [0.0, 0.0],
         })
     }
 
@@ -583,6 +626,7 @@ impl Player {
     }
 
     fn poll(&mut self) -> Result<()> {
+        self.confirm_neutral();
         self.session.ensure_running()
     }
 
@@ -633,7 +677,9 @@ impl Player {
     }
 
     fn draw(&mut self, ui: &mut egui::Ui, window: &Arc<Window>) -> Option<VideoPlacement> {
-        let content = ui.max_rect();
+        // The title bar is a panel above this ui; max_rect would include it and
+        // push the first rows of the picture underneath it.
+        let content = ui.available_rect_before_wrap();
         self.video_rect = None;
         let scale = ui.ctx().pixels_per_point();
         self.scale = scale;
@@ -698,7 +744,7 @@ impl Player {
                 "linux-player",
             );
         }
-        self.toolbar(ui, window);
+        self.update_pointer_lock(window);
         self.draw_remote_cursor(ui, window);
         placement
     }
@@ -709,6 +755,10 @@ impl Player {
     /// the shape is drawn where the local pointer is rather than at the position
     /// the remote sampled with it.
     fn draw_remote_cursor(&mut self, ui: &mut egui::Ui, window: &Arc<Window>) {
+        if self.pointer_locked {
+            // The remote draws its own pointer into the video in this mode.
+            return;
+        }
         let controlling = self.session.stream_control.mouse().mode() != MouseMode::View;
         let hidden = self.session.stream_control.remote_cursor_hidden();
         let pointer = ui.ctx().pointer_latest_pos();
@@ -751,40 +801,64 @@ impl Player {
             .paint_at(ui, egui::Rect::from_min_size(origin, size));
     }
 
-    /// A compact control strip; the Windows title bar hosts the same commands.
-    fn toolbar(&mut self, ui: &mut egui::Ui, window: &Arc<Window>) {
+    /// The player commands, placed in the window caption between the title and
+    /// the window buttons. The Windows player has the same row.
+    pub(super) fn title_bar_controls(
+        &mut self,
+        ui: &mut egui::Ui,
+        bar: egui::Rect,
+        window: &Arc<Window>,
+    ) {
+        // Leave the logo and alias on the left and the window buttons on the right.
+        let left = bar.left() + TITLE_CAPTION_WIDTH;
+        let right = bar.right() - crate::ui::theme::WINDOW_CONTROLS_WIDTH - 4.0;
+        if right - left < 120.0 {
+            return;
+        }
+        let rect = egui::Rect::from_min_max(
+            egui::pos2(left, bar.top()),
+            egui::pos2(
+                right,
+                bar.top() + crate::ui::theme::WINDOW_TITLE_CONTENT_HEIGHT,
+            ),
+        );
+        let mut row = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(rect)
+                .layout(egui::Layout::right_to_left(egui::Align::Center)),
+        );
+        row.set_clip_rect(rect);
+        row.spacing_mut().item_spacing.x = 6.0;
         let controlling = self.input().mode() != MouseMode::View;
-        egui::Area::new(egui::Id::new("linux-player-toolbar"))
-            .anchor(egui::Align2::CENTER_TOP, [0.0, 8.0])
-            .order(egui::Order::Foreground)
-            .show(ui.ctx(), |ui| {
-                egui::Frame::popup(ui.style()).show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        if ui
-                            .selectable_label(controlling, "键鼠控制")
-                            .on_hover_text(format!(
-                                "退出控制：{}",
-                                crate::viewer_shortcuts::label(ViewerShortcut::ReleaseMouse)
-                            ))
-                            .clicked()
-                        {
-                            self.set_control(!controlling);
-                        }
-                        if ui.button("串流设置").clicked() {
-                            self.stream_control_ui.open = !self.stream_control_ui.open;
-                        }
-                        if ui.button("性能").clicked() {
-                            self.performance_mode = self.performance_mode.next();
-                        }
-                        if ui.button("全屏").clicked() {
-                            toggle_fullscreen(window);
-                        }
-                        if let Some(error) = &self.control_error {
-                            ui.colored_label(crate::ui::theme::DANGER_FILL, error);
-                        }
-                    });
-                });
-            });
+        if row.button("全屏").clicked() {
+            toggle_fullscreen(window);
+        }
+        if row.button("性能").clicked() {
+            self.performance_mode = self.performance_mode.next();
+        }
+        if row.button("串流设置").clicked() {
+            self.stream_control_ui.open = !self.stream_control_ui.open;
+        }
+        if row
+            .selectable_label(controlling, "键鼠控制")
+            .on_hover_text(format!(
+                "退出控制：{}",
+                crate::viewer_shortcuts::label(ViewerShortcut::ReleaseMouse)
+            ))
+            .clicked()
+        {
+            self.set_control(!controlling);
+        }
+        if let Some(error) = &self.control_error {
+            row.add(
+                egui::Label::new(
+                    egui::RichText::new(error)
+                        .size(crate::ui::theme::SMALL)
+                        .color(crate::ui::theme::DANGER_FILL),
+                )
+                .truncate(),
+            );
+        }
     }
 
     fn set_control(&mut self, enabled: bool) {
@@ -801,16 +875,98 @@ impl Player {
         }
     }
 
+    fn release_pointer(&mut self, window: &Arc<Window>) {
+        if self.pointer_locked {
+            let _ = window.set_cursor_grab(winit::window::CursorGrabMode::None);
+            window.set_cursor_visible(true);
+            self.pointer_locked = false;
+        }
+    }
+
+    /// Raw pointer motion, used while the remote drives its own cursor.
+    fn on_device_event(&mut self, event: &DeviceEvent) -> bool {
+        let DeviceEvent::MouseMotion { delta } = event else {
+            return false;
+        };
+        {
+            let input = self.input();
+            if !input.relative_mode()
+                || input.mode() == MouseMode::View
+                || input.waiting_for_neutral()
+            {
+                return false;
+            }
+        }
+        // Whole pixels go out now; the fraction waits for the next event so slow
+        // movement is not rounded away.
+        let x = delta.0 + self.motion_remainder[0];
+        let y = delta.1 + self.motion_remainder[1];
+        self.motion_remainder = [x.fract(), y.fract()];
+        let (x, y) = (x.trunc(), y.trunc());
+        if x == 0.0 && y == 0.0 {
+            return false;
+        }
+        self.input().relative(self.owner, x as i32, y as i32);
+        true
+    }
+
+    /// Keep the pointer inside the window while the remote owns it, so the
+    /// local cursor cannot wander onto another window mid-game.
+    fn update_pointer_lock(&mut self, window: &Arc<Window>) {
+        let input = self.input();
+        let wanted = input.relative_mode() && input.mode() != MouseMode::View;
+        if wanted == self.pointer_locked {
+            return;
+        }
+        if wanted {
+            // X11 only confines; Wayland and Windows can lock in place.
+            let locked = window
+                .set_cursor_grab(winit::window::CursorGrabMode::Locked)
+                .or_else(|_| window.set_cursor_grab(winit::window::CursorGrabMode::Confined));
+            match locked {
+                Ok(()) => {
+                    window.set_cursor_visible(false);
+                    self.pointer_locked = true;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "无法锁定指针，相对模式可能不可用");
+                    self.control_error = Some("当前桌面不允许锁定指针".to_owned());
+                }
+            }
+        } else {
+            let _ = window.set_cursor_grab(winit::window::CursorGrabMode::None);
+            window.set_cursor_visible(true);
+            self.pointer_locked = false;
+            self.motion_remainder = [0.0, 0.0];
+        }
+    }
+
+    /// The remote refuses input until every key and button held when control
+    /// was granted has been released; nothing else reports that on Linux.
+    fn confirm_neutral(&self) {
+        let input = self.input();
+        if !input.waiting_for_neutral() {
+            return;
+        }
+        if self.physical_keys.is_empty() && self.physical_buttons == 0 {
+            input.confirm_neutral(input.activation_generation());
+        }
+    }
+
     fn release_keys(&mut self) {
         for key in std::mem::take(&mut self.held_keys) {
             self.input().key(self.owner, key, false, None);
         }
     }
 
-    fn on_focus_changed(&mut self, _window: &Arc<Window>, focused: bool) {
+    fn on_focus_changed(&mut self, window: &Arc<Window>, focused: bool) {
         if !focused {
+            self.release_pointer(window);
             // A key released while another window has focus never reaches us.
             self.release_keys();
+            self.physical_keys.clear();
+            self.physical_buttons = 0;
+            self.modifiers = winit::keyboard::ModifiersState::empty();
             self.input().pause_owner(self.owner);
         }
     }
@@ -833,6 +989,16 @@ impl Player {
                     return false;
                 }
                 let down = event.state == ElementState::Pressed;
+                if let Some(key) = crate::viewer_shortcuts::physical_key(event.physical_key) {
+                    if down {
+                        if !self.physical_keys.contains(&key) {
+                            self.physical_keys.push(key);
+                        }
+                    } else {
+                        self.physical_keys.retain(|held| *held != key);
+                    }
+                    self.confirm_neutral();
+                }
                 if down && let Some(action) = viewer_shortcut(self.modifiers, event.physical_key) {
                     self.run_shortcut(action, window);
                     return true;
@@ -864,6 +1030,14 @@ impl Player {
                 false
             }
             WindowEvent::MouseInput { state, button, .. } => {
+                if let Some(bit) = mouse_button(*button).map(button_bit) {
+                    if *state == ElementState::Pressed {
+                        self.physical_buttons |= bit;
+                    } else {
+                        self.physical_buttons &= !bit;
+                    }
+                    self.confirm_neutral();
+                }
                 if consumed_by_ui || self.input().mode() == MouseMode::View {
                     return false;
                 }
@@ -981,6 +1155,69 @@ impl Drop for Player {
     }
 }
 
+/// The decoder drops every decoded frame unless a render thread is registered
+/// with the session, which is how the Windows player signals that its window is
+/// showing video. Here the frames are drawn by the UI thread, so this thread
+/// holds that registration and turns each decoded frame into a repaint request.
+struct FrameWakeBridge {
+    wake: super::FrameWake,
+    running: Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl FrameWakeBridge {
+    fn install(
+        session: &NativeViewerSession,
+        proxy: EventLoopProxy<UiEvent>,
+        window: WindowId,
+    ) -> Result<Self> {
+        let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let worker_running = Arc::clone(&running);
+        let thread = std::thread::Builder::new()
+            .name("Video wake".to_owned())
+            .spawn(move || {
+                while worker_running.load(std::sync::atomic::Ordering::Acquire) {
+                    std::thread::park();
+                    if !worker_running.load(std::sync::atomic::Ordering::Acquire) {
+                        break;
+                    }
+                    let _ = proxy.send_event(UiEvent::Repaint(UiRepaintEvent {
+                        window,
+                        generation: 0,
+                        pass: 0,
+                        when: Instant::now(),
+                    }));
+                }
+            })
+            .context("create video wake thread")?;
+        let handle = thread.thread().clone();
+        session.frame_wake.install_render_thread(handle.clone());
+        handle.unpark();
+        Ok(Self {
+            wake: session.frame_wake.clone(),
+            running,
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for FrameWakeBridge {
+    fn drop(&mut self) {
+        // Stop the decoder queueing frames nothing will draw, then release the
+        // registration before the thread goes away.
+        self.wake
+            .visible
+            .store(false, std::sync::atomic::Ordering::Release);
+        *mutex_lock(&self.wake.render_thread) = None;
+        self.running
+            .store(false, std::sync::atomic::Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            thread.thread().unpark();
+            let _ = thread.join();
+        }
+    }
+}
+
 fn toggle_fullscreen(window: &Arc<Window>) {
     if window.fullscreen().is_some() {
         window.set_fullscreen(None);
@@ -989,15 +1226,29 @@ fn toggle_fullscreen(window: &Arc<Window>) {
     }
 }
 
+/// The wire codes `RemoteInput` accepts, which are not the 1..=6 numbering the
+/// plugin hotkeys use.
 fn mouse_button(button: MouseButton) -> Option<u32> {
     Some(match button {
         MouseButton::Left => 1,
         MouseButton::Right => 2,
-        MouseButton::Middle => 4,
-        MouseButton::Back => 5,
-        MouseButton::Forward => 6,
+        MouseButton::Middle => 16,
+        MouseButton::Back => 32,
+        MouseButton::Forward => 64,
         MouseButton::Other(_) => return None,
     })
+}
+
+/// One bit per wire code, for tracking what is physically held.
+fn button_bit(code: u32) -> u8 {
+    match code {
+        1 => 1,
+        2 => 2,
+        16 => 4,
+        32 => 8,
+        64 => 16,
+        _ => 0,
+    }
 }
 
 fn viewer_shortcut(
