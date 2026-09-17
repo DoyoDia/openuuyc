@@ -694,6 +694,10 @@ fn i444_to_rgba_pixels(
     Ok(pixels)
 }
 
+#[cfg_attr(
+    not(windows),
+    allow(dead_code, reason = "The Linux renderer converts NV12 on the GPU.")
+)]
 fn nv12_to_rgba_pixels(
     width: u32,
     height: u32,
@@ -759,6 +763,9 @@ fn platform_label() -> &'static str {
 
 enum FrameReader {
     Cpu,
-
+    #[cfg_attr(
+        not(windows),
+        allow(dead_code, reason = "Only the D3D11 decoder owns surfaces.")
+    )]
     Windows(windows_surface::D3D11SurfaceWriter),
 }

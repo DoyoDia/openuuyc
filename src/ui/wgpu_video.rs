@@ -7,7 +7,7 @@
 //!
 //! The quad is letterboxed into the content area and can be rotated by the
 //! multiples of 90 degrees the remote display reports.
-use anyhow::{Context, Result};
+use anyhow::Result;
 use wgpu::util::DeviceExt;
 
 /// Where the video sits inside the window, in physical pixels.
