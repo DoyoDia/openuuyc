@@ -76,17 +76,19 @@ fn create_graphics() -> Result<Graphics> {
     }))
     .context("没有可用的 GPU 适配器（需要 Vulkan 或 OpenGL）")?;
     let info = adapter.get_info();
-    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-        label: Some("openuuyc-ui"),
-        required_features: wgpu::Features::empty(),
-        // The UI stays within the baseline limits; video upload does too.
-        required_limits: wgpu::Limits::downlevel_defaults()
-            .using_resolution(adapter.limits())
-            .using_alignment(adapter.limits()),
-        memory_hints: wgpu::MemoryHints::MemoryUsage,
-        trace: wgpu::Trace::Off,
-        experimental_features: wgpu::ExperimentalFeatures::disabled(),
-    }))
+    let (device, queue) = pollster::block_on(
+        adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("openuuyc-ui"),
+            required_features: wgpu::Features::empty(),
+            // The UI stays within the baseline limits; video upload does too.
+            required_limits: wgpu::Limits::downlevel_defaults()
+                .using_resolution(adapter.limits())
+                .using_alignment(adapter.limits()),
+            memory_hints: wgpu::MemoryHints::MemoryUsage,
+            trace: wgpu::Trace::Off,
+            experimental_features: wgpu::ExperimentalFeatures::disabled(),
+        }),
+    )
     .context("创建 GPU 设备失败")?;
     let label = format!("{} · {:?}", info.name, info.backend);
     Ok(Graphics {
@@ -242,9 +244,13 @@ impl UiPresenter {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("openuuyc-ui"),
             });
-        let user_buffers =
-            self.renderer
-                .update_buffers(&self.device, &self.queue, &mut encoder, &jobs, &descriptor);
+        let user_buffers = self.renderer.update_buffers(
+            &self.device,
+            &self.queue,
+            &mut encoder,
+            &jobs,
+            &descriptor,
+        );
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -332,7 +338,10 @@ fn surface_format(capabilities: &wgpu::SurfaceCapabilities) -> wgpu::TextureForm
 
 /// Mailbox never blocks the event loop; Fifo is the always-present fallback.
 fn present_mode(capabilities: &wgpu::SurfaceCapabilities) -> wgpu::PresentMode {
-    if capabilities.present_modes.contains(&wgpu::PresentMode::Mailbox) {
+    if capabilities
+        .present_modes
+        .contains(&wgpu::PresentMode::Mailbox)
+    {
         wgpu::PresentMode::Mailbox
     } else {
         wgpu::PresentMode::Fifo

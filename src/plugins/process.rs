@@ -192,8 +192,7 @@ fn run(
         .arg(&spec.instance.path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        ;
+        .stderr(Stdio::piped());
     #[cfg(windows)]
     command.creation_flags(0x08000000);
     crate::logging::configure_child(&mut command);

@@ -34,6 +34,10 @@ fn refresh_hz(frequency: f32) -> Option<u32> {
     (frequency.is_finite() && (1.0..=1000.0).contains(&frequency)).then(|| frequency.round() as u32)
 }
 
+#[allow(
+    dead_code,
+    reason = "Only the Windows presenter picks an HDR swap-chain colour space."
+)]
 pub(crate) fn monitor_is_hdr(_monitor: isize) -> bool {
     false
 }

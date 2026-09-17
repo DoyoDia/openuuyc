@@ -16,7 +16,6 @@ pub(crate) use native::{
     update_nonmodal_window_move, update_nonmodal_window_resize,
 };
 
-
 fn title_bar_frame() -> egui::Frame {
     egui::Frame::new()
         .fill(crate::ui::theme::SIDEBAR)
@@ -271,4 +270,3 @@ pub(crate) fn title_bar_height_pixels(window: &Window) -> u32 {
 fn title_bar_height_at_scale(scale: f64) -> u32 {
     (f64::from(title_bar_height()) * scale).ceil().max(1.0) as u32
 }
-

@@ -190,10 +190,10 @@ fn process(state: &mut State, command: Command) {
             state.published.remove(&id);
         }
         Command::Offer(weak, epoch, formats) => {
-            if let Some(session) = weak.upgrade().filter(|session| session.valid(epoch)) {
-                if let Err(error) = accept_offer(state, &session, epoch, formats) {
-                    session.fail(error.to_string());
-                }
+            if let Some(session) = weak.upgrade().filter(|session| session.valid(epoch))
+                && let Err(error) = accept_offer(state, &session, epoch, formats)
+            {
+                session.fail(error.to_string());
             }
         }
         Command::Text(weak, epoch, id, text) => {
@@ -222,10 +222,10 @@ fn process(state: &mut State, command: Command) {
             }
         }
         Command::Request(weak, epoch, id, kind) => {
-            if let Some(session) = weak.upgrade().filter(|session| session.valid(epoch)) {
-                if let Err(error) = serve(state, &session, epoch, id, kind) {
-                    session.fail(error.to_string());
-                }
+            if let Some(session) = weak.upgrade().filter(|session| session.valid(epoch))
+                && let Err(error) = serve(state, &session, epoch, id, kind)
+            {
+                session.fail(error.to_string());
             }
         }
     }
@@ -277,10 +277,12 @@ fn accept_offer(
 }
 
 fn utf16_text(bytes: &[u8]) -> Result<String> {
-    ensure!(bytes.len() % 2 == 0, "无效的Unicode剪贴板");
+    ensure!(bytes.len().is_multiple_of(2), "无效的Unicode剪贴板");
     let mut words: Vec<u16> = bytes
-        .chunks_exact(2)
-        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u16::from_le_bytes(*pair))
         .collect();
     while words.last() == Some(&0) {
         words.pop();
@@ -391,10 +393,7 @@ fn serve(
     match kind {
         ClipboardRequestKind::FormatDataAsk(ask) => {
             let result = (|| -> Result<Vec<u8>> {
-                let formats = state
-                    .published
-                    .get(&session.id)
-                    .context("原剪贴板已失效")?;
+                let formats = state.published.get(&session.id).context("原剪贴板已失效")?;
                 let format = formats
                     .iter()
                     .find(|format| {
@@ -455,7 +454,10 @@ fn serve(
 fn dib_to_rgba(dib: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
     ensure!(dib.len() >= 40, "位图数据过短");
     let header = u32::from_le_bytes(dib[0..4].try_into()?) as usize;
-    ensure!((40..=124).contains(&header) && dib.len() > header, "不支持的位图头");
+    ensure!(
+        (40..=124).contains(&header) && dib.len() > header,
+        "不支持的位图头"
+    );
     let width = i32::from_le_bytes(dib[4..8].try_into()?);
     let height = i32::from_le_bytes(dib[8..12].try_into()?);
     let depth = u16::from_le_bytes(dib[14..16].try_into()?);
@@ -466,7 +468,10 @@ fn dib_to_rgba(dib: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
     let bottom_up = height > 0;
     let width = u32::try_from(width.abs()).context("位图宽度无效")?;
     let height = u32::try_from(height.abs()).context("位图高度无效")?;
-    ensure!(width > 0 && height > 0 && width <= 32768 && height <= 32768, "位图尺寸无效");
+    ensure!(
+        width > 0 && height > 0 && width <= 32768 && height <= 32768,
+        "位图尺寸无效"
+    );
     let bytes = usize::from(depth / 8);
     let stride = ((width as usize * bytes) + 3) & !3;
     let masks = if compression == 3 { 12 } else { 0 };
@@ -477,7 +482,11 @@ fn dib_to_rgba(dib: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
     );
     let mut rgba = vec![0u8; width as usize * height as usize * 4];
     for row in 0..height as usize {
-        let source = if bottom_up { height as usize - 1 - row } else { row };
+        let source = if bottom_up {
+            height as usize - 1 - row
+        } else {
+            row
+        };
         let line = &dib[start + source * stride..][..stride];
         for column in 0..width as usize {
             let pixel = &line[column * bytes..][..bytes];

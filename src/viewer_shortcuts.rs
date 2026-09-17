@@ -198,6 +198,13 @@ fn foreground_window() -> u64 {
         focused_window()
     }
 }
+#[cfg_attr(
+    not(windows),
+    allow(
+        dead_code,
+        reason = "Only the Windows keyboard hook tracks a typing owner."
+    )
+)]
 pub(crate) fn set_text_owner(owner: u64, active: bool) {
     if active {
         runtime().typing.store(owner, Ordering::Release);
@@ -554,6 +561,10 @@ impl Editor {
                         .next()
                         .filter(|_| symbol.chars().count() == 1)
                         .and_then(ascii_virtual_key);
+                    #[cfg_attr(
+                        not(windows),
+                        allow(unused_mut, reason = "Keypad disambiguation is Windows-only.")
+                    )]
                     if let Some(mut key) = vk.or_else(|| crate::plugins::hotkeys::key_code(key)) {
                         // egui merges keypad digits into the corresponding textual key.
                         #[cfg(windows)]
@@ -622,9 +633,7 @@ impl Editor {
             let released = !keys_down
                 && !mods.any()
                 && !win
-                && [16, 17, 18]
-                    .into_iter()
-                    .all(|vk| modifier_released(vk));
+                && [16, 17, 18].into_iter().all(|vk| modifier_released(vk));
             if !released {
                 self.error = None;
             }

@@ -9,8 +9,8 @@ mod platform {
             Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND, LPARAM},
             System::Threading::CreateMutexW,
             UI::WindowsAndMessaging::{
-                EnumWindows, GetPropW, IsIconic, MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MessageBoxW,
-                SW_RESTORE, SetForegroundWindow, SetPropW, ShowWindowAsync,
+                EnumWindows, GetPropW, IsIconic, MB_ICONERROR, MB_OK, MB_SETFOREGROUND,
+                MessageBoxW, SW_RESTORE, SetForegroundWindow, SetPropW, ShowWindowAsync,
             },
         },
         core::{BOOL, PCWSTR, w},
@@ -113,10 +113,9 @@ mod platform {
             .filter(|path| path.is_dir())
             .unwrap_or_else(std::env::temp_dir);
         // Per-user, so a shared /tmp fallback cannot collide across accounts.
-        base.join(format!(
-            "openuuyc-control-center-{}.lock",
-            unsafe { libc::getuid() }
-        ))
+        base.join(format!("openuuyc-control-center-{}.lock", unsafe {
+            libc::getuid()
+        }))
     }
 
     pub fn acquire() -> Result<Option<Instance>> {

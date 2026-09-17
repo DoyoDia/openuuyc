@@ -241,10 +241,7 @@ impl VideoLayer {
             0,
             bytemuck::bytes_of(&Uniform {
                 offset: [center_x, center_y],
-                extent: [
-                    placement.width / width,
-                    placement.height / height,
-                ],
+                extent: [placement.width / width, placement.height / height],
                 rotation,
             }),
         );

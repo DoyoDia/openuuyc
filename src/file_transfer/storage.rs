@@ -5,19 +5,19 @@ use super::{
 use anyhow::{Context, Result, ensure};
 use prost::Message;
 use sha2::{Digest, Sha256};
+#[cfg(unix)]
+use std::os::unix::{fs::OpenOptionsExt, io::AsRawFd};
+#[cfg(windows)]
+use std::os::windows::{
+    fs::{MetadataExt, OpenOptionsExt},
+    io::AsRawHandle,
+};
 use std::{
     fs::{File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
     time::UNIX_EPOCH,
 };
-#[cfg(windows)]
-use std::os::windows::{
-    fs::{MetadataExt, OpenOptionsExt},
-    io::AsRawHandle,
-};
-#[cfg(unix)]
-use std::os::unix::{fs::OpenOptionsExt, io::AsRawFd};
 use tokio_util::sync::CancellationToken;
 
 pub(super) const MAX_FILES: usize = 100_000;
@@ -498,7 +498,8 @@ impl Store {
         crate::api::validate_device_id(device)?;
         ensure!(!account.is_empty(), "无法确认当前账号");
         Ok(Self(
-            crate::paths::local_app_data().context("本地配置目录不可用")?
+            crate::paths::local_app_data()
+                .context("本地配置目录不可用")?
                 .join("OpenUUYC/file-transfer")
                 .join(format!("{:x}", Sha256::digest(account)))
                 .join(format!("{device}.json")),

@@ -135,7 +135,6 @@ unsafe fn paint_backdrop(hwnd: HWND, dc: HDC) {
     }
 }
 
-
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct WindowMoveState {
     start: Option<(POINT, PhysicalPosition<i32>)>,
@@ -200,7 +199,6 @@ pub(crate) fn update_nonmodal_window_move(
         }
     }
 }
-
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct WindowResizeState {
