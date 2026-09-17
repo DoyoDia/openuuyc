@@ -88,7 +88,7 @@ pub(crate) fn root() -> Result<PathBuf> {
         return Ok(adjacent);
     }
     Ok(
-        PathBuf::from(std::env::var_os("LOCALAPPDATA").context("LOCALAPPDATA unavailable")?)
+        crate::paths::require_local_app_data()?
             .join("OpenUUYC/plugins"),
     )
 }

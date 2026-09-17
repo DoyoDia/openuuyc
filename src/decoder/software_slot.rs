@@ -88,12 +88,14 @@ impl SoftwareSlot {
             .open(&path)
             .with_context(|| format!("创建全客户端软解窗口限制失败：{}", path.display()))?;
         match lock.try_lock() {
-            Ok(true) => Ok(Rc::new(Self {
+            Ok(()) => Ok(Rc::new(Self {
                 lock,
                 _thread_bound: PhantomData,
             })),
-            Ok(false) => Err(SoftwarePlaybackBusy.into()),
-            Err(error) => Err(anyhow::Error::new(error).context("获取软解窗口名额失败")),
+            Err(std::fs::TryLockError::WouldBlock) => Err(SoftwarePlaybackBusy.into()),
+            Err(std::fs::TryLockError::Error(error)) => {
+                Err(anyhow::Error::new(error).context("获取软解窗口名额失败"))
+            }
         }
     }
 }

@@ -31,7 +31,7 @@ pub(crate) fn cancel_pointer_operation(
 
 /// The desktop environment owns titlebar styling; only the icon is ours.
 pub(crate) fn configure_dwm_window(window: &Window) {
-    window.set_window_icon(Some(super::branding::window_icon()));
+    window.set_window_icon(Some(crate::ui::branding::window_icon()));
 }
 
 pub(crate) fn update_nonmodal_window_move(
