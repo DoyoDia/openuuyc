@@ -560,8 +560,10 @@ impl AnalysisSlot {
                 .create(true)
                 .truncate(false)
                 .open(&path)?;
-            if file.try_lock()? {
-                return Ok(Self(file));
+            match file.try_lock() {
+                Ok(()) => return Ok(Self(file)),
+                Err(std::fs::TryLockError::WouldBlock) => {}
+                Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
             }
         }
         anyhow::bail!("同时运行的分析分支已达到4个")

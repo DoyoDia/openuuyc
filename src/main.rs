@@ -1,4 +1,4 @@
-#![windows_subsystem = "windows"]
+#![cfg_attr(windows, windows_subsystem = "windows")]
 #![allow(
     non_snake_case,
     reason = "The executable uses the OpenUUYC product name."
@@ -158,7 +158,10 @@ fn main() -> Result<()> {
             println!(
                 "media: decrypted RTP -> complete Annex-B frames -> native platform decode -> Rust GUI"
             );
+            #[cfg(windows)]
             println!("decode backends: Windows Rust DXVA11 / Rust H.264 software");
+            #[cfg(not(windows))]
+            println!("decode backends: Rust H.264 software");
             println!("signal events: {}", signal::KNOWN_EVENTS.join(", "));
             println!(
                 "signal headers: {}, {}, {}",
@@ -242,12 +245,15 @@ fn main() -> Result<()> {
 }
 
 fn attach_parent_console() {
-    use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
-
     // Attach before printing clap output. Explorer has no parent console;
     // inherited STARTF_USESTDHANDLES pipes/files remain redirected on attach.
     // Never allocate a console just for launching the device center or viewer.
-    let _ = unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
+    #[cfg(windows)]
+    {
+        use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
+        let _ = unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
+    }
+    // A Linux process is started from its terminal and keeps those streams.
 }
 
 async fn connect_device(

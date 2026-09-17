@@ -129,12 +129,12 @@ mod platform {
             .open(&path)
             .with_context(|| format!("创建程序实例保护失败：{}", path.display()))?;
         match file.try_lock() {
-            Ok(true) => Ok(Some(Instance(file))),
-            Ok(false) => {
+            Ok(()) => Ok(Some(Instance(file))),
+            Err(std::fs::TryLockError::WouldBlock) => {
                 eprintln!("OpenUUYC 已在运行，请勿重复启动。");
                 Ok(None)
             }
-            Err(error) => {
+            Err(std::fs::TryLockError::Error(error)) => {
                 eprintln!("无法启动 OpenUUYC：{error}");
                 Err(anyhow::Error::new(error).context("锁定程序实例保护失败"))
             }

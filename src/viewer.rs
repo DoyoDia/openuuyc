@@ -29,24 +29,43 @@ use stream_menu::{StreamControlUi, show_stream_control_window};
 mod annotation;
 mod display_transition;
 
+#[cfg(windows)]
 mod windows_cursor;
 
+#[cfg(windows)]
 mod windows_keyboard;
 
+#[cfg(windows)]
 mod windows_mouse;
 
-pub(crate) mod windows_presenter;
+#[cfg(windows)]
+#[path = "viewer/windows_presenter.rs"]
+pub(crate) mod presenter;
+#[cfg(not(windows))]
+#[path = "viewer/linux_presenter.rs"]
+pub(crate) mod presenter;
+
+/// Windows installs a low-level keyboard hook so system keys reach the remote
+/// desktop. X11 and Wayland deliver keys through the focused window instead.
 pub(crate) struct DesktopInputHook {
+    #[cfg(windows)]
     _hook: windows_keyboard::KeyboardHook,
 }
+#[cfg(windows)]
 pub(crate) fn desktop_input_message(message: *const std::ffi::c_void) -> bool {
     windows_keyboard::message(message) || windows_mouse::router().message(message)
 }
 pub(crate) fn desktop_input_hook() -> Result<DesktopInputHook> {
-    windows_keyboard::remove_unused_raw_keyboard()?;
-    windows_keyboard::KeyboardHook::install().map(|hook| DesktopInputHook { _hook: hook })
+    #[cfg(windows)]
+    {
+        windows_keyboard::remove_unused_raw_keyboard()?;
+        windows_keyboard::KeyboardHook::install().map(|hook| DesktopInputHook { _hook: hook })
+    }
+    #[cfg(not(windows))]
+    Ok(DesktopInputHook {})
 }
 
+#[cfg(windows)]
 mod windows_ui;
 
 const CONNECTION_PROGRESS_STEPS: u8 = 13;
@@ -124,7 +143,7 @@ pub(crate) fn run_connecting_viewer_window(
     display_sender: oneshot::Sender<ViewerDisplayHandle>,
 ) -> Result<()> {
     {
-        windows_presenter::run_connecting(windows_presenter::ConnectingWindowsRunConfig {
+        presenter::run_connecting(presenter::ConnectingWindowsRunConfig {
             alias,
             progress,
             session,
@@ -700,7 +719,7 @@ impl NativeViewerSession {
     }
 
     pub fn run(self) -> Result<()> {
-        windows_presenter::run(self)
+        presenter::run(self)
     }
 }
 
@@ -1687,6 +1706,7 @@ pub(crate) fn install_system_cjk_font(ctx: &egui::Context) {
 fn system_cjk_font_candidates() -> Vec<PathBuf> {
     let mut paths = Vec::new();
 
+    #[cfg(windows)]
     {
         let fonts = std::env::var_os("WINDIR")
             .map(PathBuf::from)
@@ -1694,6 +1714,24 @@ fn system_cjk_font_candidates() -> Vec<PathBuf> {
             .join("Fonts");
         for name in ["msyh.ttc", "msyhbd.ttc", "simhei.ttf", "simsun.ttc"] {
             paths.push(fonts.join(name));
+        }
+    }
+
+    // Distributions place CJK fonts under a few well-known names; fontconfig
+    // is not linked in, so the list is walked directly.
+    #[cfg(not(windows))]
+    {
+        for path in [
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/opentype/source-han-sans/SourceHanSans-Regular.otf",
+            "/usr/share/fonts/truetype/arphic/uming.ttc",
+            "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+            "/usr/share/fonts/wenquanyi/wqy-microhei/wqy-microhei.ttc",
+        ] {
+            paths.push(PathBuf::from(path));
         }
     }
 

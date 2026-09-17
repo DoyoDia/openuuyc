@@ -11,11 +11,7 @@ pub const RETENTION_DAYS: u64 = 14;
 
 pub(super) fn directories() -> Result<(PathBuf, PathBuf)> {
     {
-        let base = std::env::var_os("LOCALAPPDATA")
-            .map(PathBuf::from)
-            .filter(|p| p.is_absolute())
-            .context("LOCALAPPDATA must be an absolute directory")?
-            .join("OpenUUYC");
+        let base = crate::paths::require_local_app_data()?.join("OpenUUYC");
         Ok((base.clone(), base.join("logs")))
     }
 }
