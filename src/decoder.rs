@@ -14,6 +14,10 @@ use crate::video_color::{ColorMatrix, RenderColor};
 
 pub(crate) mod software_slot;
 
+#[cfg(windows)]
+pub(crate) mod windows_surface;
+#[cfg(not(windows))]
+#[path = "decoder/windows_surface_stub.rs"]
 pub(crate) mod windows_surface;
 
 #[derive(Debug)]
@@ -374,7 +378,7 @@ fn poll_platform_decoder(
 ) -> DecodedBatch {
     let mut batch = DecodedBatch::default();
 
-    use crate::decoder::platform::windows::{WindowsCpuFormat, WindowsDecodedFrame};
+    use crate::decoder::platform::{CpuFormat, PlatformDecodedFrame};
     loop {
         let frame = match decoder
             .poll_owned_frame()
@@ -391,7 +395,8 @@ fn poll_platform_decoder(
         };
         let ready_at = std::time::Instant::now();
         let (pts, width, height, surface) = match frame {
-            WindowsDecodedFrame::Gpu(frame) => (
+            #[cfg(windows)]
+            PlatformDecodedFrame::Gpu(frame) => (
                 frame.pts(),
                 frame.width(),
                 frame.height(),
@@ -402,11 +407,11 @@ fn poll_platform_decoder(
                     _ => Err(anyhow!("GPU decoder output has no owning device")),
                 },
             ),
-            WindowsDecodedFrame::Cpu(frame) => {
+            PlatformDecodedFrame::Cpu(frame) => {
                 let surface = match frame.format {
-                    WindowsCpuFormat::Nv12 => nv12_layout(frame.width, frame.height, &frame.data)
+                    CpuFormat::Nv12 => nv12_layout(frame.width, frame.height, &frame.data)
                         .map(|_| DecodedSurface::CpuNv12(frame.data)),
-                    WindowsCpuFormat::I444 => Ok(DecodedSurface::CpuI444(frame.data)),
+                    CpuFormat::I444 => Ok(DecodedSurface::CpuI444(frame.data)),
                 };
                 (frame.pts, frame.width, frame.height, surface)
             }
@@ -644,14 +649,21 @@ enum DecoderBackend {
     },
 }
 
-type PlatformDecoder = crate::decoder::platform::windows::WindowsVideoDecoder;
+type PlatformDecoder = crate::decoder::platform::PlatformVideoDecoder;
 
 fn open_platform_decoder(config: &VideoDecoderConfig) -> Result<PlatformDecoder> {
     PlatformDecoder::open(config).map_err(Into::into)
 }
 
 fn platform_label() -> &'static str {
-    "DXVA11"
+    #[cfg(windows)]
+    {
+        "DXVA11"
+    }
+    #[cfg(not(windows))]
+    {
+        "VA-API"
+    }
 }
 
 enum FrameReader {

@@ -99,6 +99,8 @@ pub(crate) fn open_folder(path: &Path) -> Result<()> {
     // Launch the resolved directory through ShellExecute instead of passing it
     // to explorer.exe as a child-process argument. Explorer may otherwise fall
     // back to its inherited working directory (typically C:\\Users\\<user>).
+    #[cfg(windows)]
+    {
     use std::os::windows::ffi::OsStrExt;
     use windows::{
         Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL},
@@ -118,8 +120,41 @@ pub(crate) fn open_folder(path: &Path) -> Result<()> {
     if result.0 as isize <= 32 {
         anyhow::bail!("打开文件夹失败（{}）", result.0 as isize);
     }
+    }
+    #[cfg(not(windows))]
+    {
+        let status = std::process::Command::new("xdg-open")
+            .arg(&path)
+            .status()
+            .context("启动 xdg-open")?;
+        anyhow::ensure!(status.success(), "打开文件夹失败（{status}）");
+    }
     Ok(())
 }
+
+/// Load a plugin library without letting it pull dependencies from elsewhere:
+/// Windows restricts the search path, Linux resolves eagerly into a local scope.
+pub(super) unsafe fn load_plugin_library(path: &Path) -> Result<libloading::Library> {
+    #[cfg(windows)]
+    {
+        // LOAD_WITH_ALTERED_SEARCH_PATH | LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR
+        Ok(unsafe {
+            libloading::os::windows::Library::load_with_flags(path, 0x00000100 | 0x00000800)
+        }?
+        .into())
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(unsafe {
+            libloading::os::unix::Library::open(
+                Some(path),
+                libloading::os::unix::RTLD_NOW | libloading::os::unix::RTLD_LOCAL,
+            )
+        }?
+        .into())
+    }
+}
+
 fn valid_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 80
@@ -326,11 +361,7 @@ fn load_module(group: &mut Group, m: Manifest) -> Result<usize> {
         library_path.starts_with(directory),
         "插件动态库超出自身目录"
     );
-    let library = unsafe {
-        libloading::os::windows::Library::load_with_flags(&library_path, 0x00000100 | 0x00000800)
-    }?
-    .into();
-    let library: libloading::Library = library;
+    let library: libloading::Library = unsafe { load_plugin_library(&library_path) }?;
     let api = if let Some(node) = &m.selected_node {
         let query: libloading::Symbol<sdk::NodeQuery> =
             unsafe { library.get(b"openuuyc_node_query_v1\0") }?;
