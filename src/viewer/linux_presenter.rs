@@ -373,31 +373,39 @@ impl ConnectingWindowsRunner {
             }
             crate::ui::controls::show_notices(ui.ctx());
         });
+        // A minimised window never submits, and `write_texture` only reaches the
+        // GPU with the next submission, so uploading here would strand the
+        // staging copy inside the device -- one video frame's worth, at the
+        // video's frame rate, until an allocation finally fails. The frame is
+        // still taken, to keep the decoder's queue from growing instead.
+        let drawing = window.is_minimized() != Some(true);
         if let Stage::Playing(player) = &mut self.stage
             && let Some(frame) = player.take_frame()
         {
             let upload = Instant::now();
-            match &frame.surface {
-                RenderSurface::CpuNv12 { data, color } => shell.presenter.upload_video_nv12(
-                    frame.width,
-                    frame.height,
-                    data,
-                    color.transform(8),
-                )?,
-                RenderSurface::CpuRgba8(pixels) => shell.presenter.upload_video(
-                    frame.width,
-                    frame.height,
-                    bytemuck::cast_slice(pixels),
-                )?,
-                // The D3D11 surface type is uninhabited off Windows.
-                RenderSurface::D3D11(surface) => match *surface {},
+            if drawing {
+                match &frame.surface {
+                    RenderSurface::CpuNv12 { data, color } => shell.presenter.upload_video_nv12(
+                        frame.width,
+                        frame.height,
+                        data,
+                        color.transform(8),
+                    )?,
+                    RenderSurface::CpuRgba8(pixels) => shell.presenter.upload_video(
+                        frame.width,
+                        frame.height,
+                        bytemuck::cast_slice(pixels),
+                    )?,
+                    // The D3D11 surface type is uninhabited off Windows.
+                    RenderSurface::D3D11(surface) => match *surface {},
+                }
             }
             player.publish(&frame, upload.elapsed());
             player.current = Some(frame);
         }
         let placement = placement.filter(|_| shell.presenter.has_video());
         shell.presenter.set_video_placement(placement);
-        let (drawing, platform, viewports) = split_output(output);
+        let (ui_output, platform, viewports) = split_output(output);
         shell.input.handle_platform_output(&window, platform);
         close_requested |= viewports
             .get(&egui::ViewportId::ROOT)
@@ -412,10 +420,10 @@ impl ConnectingWindowsRunner {
             .and_then(|viewport| Instant::now().checked_add(viewport.repaint_delay));
         let layout = started.elapsed();
         let mut presented = false;
-        if window.is_minimized() == Some(true) {
-            shell.presenter.defer_output(drawing);
+        if !drawing {
+            shell.presenter.defer_output(ui_output);
         } else {
-            presented = shell.presenter.render(&shell.context, drawing, false)?;
+            presented = shell.presenter.render(&shell.context, ui_output, false)?;
             if presented && window.is_visible() == Some(false) {
                 window.set_visible(true);
             }
