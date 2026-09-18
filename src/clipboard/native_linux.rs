@@ -4,11 +4,15 @@
 //! * X11 and Wayland have no delayed rendering across processes, so an offer
 //!   from the remote is fetched immediately instead of when the user pastes.
 //! * There is no clipboard-change notification, so local changes are polled.
-//! * Files are not offered: serving them needs delayed rendering, and every
-//!   session therefore reports file support as unavailable.
+//! * Files copied here are offered to the remote: it pulls the descriptor list
+//!   and then the contents by offset, so nothing has to be promised in advance.
+//!   The reverse direction still cannot be served, because a local paste needs
+//!   real paths on this machine before the pasting application asks for them.
 use super::formats::{self, Format};
 use super::*;
 use anyhow::Context as _;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 
@@ -33,21 +37,51 @@ struct Worker {
 
 static WORKER: OnceLock<std::result::Result<Worker, String>> = OnceLock::new();
 
+/// One file the local clipboard offers, described the way a Windows peer reads
+/// it: a backslash path relative to the copied root, Windows attribute bits and
+/// a FILETIME.
+struct LocalFile {
+    desc: ClipboardFileDescriptor,
+    /// `None` for a directory, which has no contents to serve.
+    path: Option<PathBuf>,
+    /// The copied item this entry was reached through; contents are refused if
+    /// the path stops resolving inside it.
+    root: PathBuf,
+}
+
+/// A flattened snapshot of everything one local copy put on the clipboard.
+struct LocalFiles {
+    items: Vec<LocalFile>,
+}
+
 /// What this client currently owns locally, as the remote would see it.
 #[derive(Default)]
 struct LocalSnapshot {
     text: Option<String>,
     image: Option<Vec<u8>>,
+    /// The paths a local copy put on the clipboard. They are only walked when
+    /// the remote asks for the list, so copying a large tree locally costs
+    /// nothing until someone pastes it there.
+    sources: Vec<PathBuf>,
 }
 
 impl LocalSnapshot {
     fn is_empty(&self) -> bool {
-        self.text.is_none() && self.image.is_none()
+        self.text.is_none() && self.image.is_none() && self.sources.is_empty()
     }
 
-    /// CF_UNICODETEXT and CF_DIB are what a Windows peer understands.
+    /// CF_UNICODETEXT and CF_DIB are what a Windows peer understands; files
+    /// travel as the descriptor and contents pair, as they do in OLE.
     fn format_ids(&self) -> Vec<(u32, String)> {
         let mut ids = Vec::new();
+        if !self.sources.is_empty() {
+            ids.push((
+                formats::register("FileGroupDescriptorW"),
+                "FileGroupDescriptorW".into(),
+            ));
+            ids.push((formats::register("FileContents"), "FileContents".into()));
+            return ids;
+        }
         if self.text.is_some() {
             ids.push((13, String::new()));
             ids.push((1, String::new()));
@@ -80,12 +114,154 @@ impl LocalSnapshot {
     }
 }
 
+/// Windows file attributes this client synthesises from a Unix mode.
+const FILE_ATTRIBUTE_READONLY: u32 = 0x1;
+const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+/// Seconds between the Windows epoch (1601-01-01) and the Unix one.
+const FILETIME_EPOCH_OFFSET: u64 = 11_644_473_600;
+
+/// A Unix mtime as the FILETIME a Windows peer stamps the pasted file with.
+fn filetime(meta: &std::fs::Metadata) -> u64 {
+    let seconds = meta.mtime();
+    if seconds < -(FILETIME_EPOCH_OFFSET as i64) {
+        return 0;
+    }
+    let ticks = (seconds + FILETIME_EPOCH_OFFSET as i64) as u64;
+    ticks
+        .saturating_mul(10_000_000)
+        .saturating_add(meta.mtime_nsec().max(0) as u64 / 100)
+}
+
+fn attributes(meta: &std::fs::Metadata) -> u32 {
+    let mut bits = if meta.is_dir() {
+        FILE_ATTRIBUTE_DIRECTORY
+    } else {
+        FILE_ATTRIBUTE_NORMAL
+    };
+    // Owner write is the closest thing this filesystem has to the read-only bit.
+    if meta.mode() & 0o200 == 0 {
+        bits |= FILE_ATTRIBUTE_READONLY;
+    }
+    bits
+}
+
+/// Walk one copied path into the flat descriptor list the protocol carries.
+/// Names are relative to the copied item and use the separator Windows expects.
+fn collect_file(path: &Path, root: &Path, name: &str, items: &mut Vec<LocalFile>) -> Result<()> {
+    ensure!(
+        items.len() < MAX_FILES && safe_name(name),
+        "文件数量或名称不支持"
+    );
+    let meta = std::fs::symlink_metadata(path)?;
+    // A symlink is not copied: the peer would receive its target under a name
+    // that promises otherwise, and the target may sit outside the copy.
+    ensure!(!meta.is_symlink(), "不传输符号链接");
+    ensure!(meta.is_dir() || meta.is_file(), "只支持普通文件与目录");
+    let canonical = std::fs::canonicalize(path)?;
+    ensure!(canonical.starts_with(root), "文件超出复制范围");
+    items.push(LocalFile {
+        desc: ClipboardFileDescriptor {
+            file_name: name.replace('/', "\\"),
+            file_attributes: attributes(&meta),
+            last_write_time: filetime(&meta),
+            file_size: if meta.is_dir() { 0 } else { meta.len() },
+        },
+        path: (!meta.is_dir()).then(|| canonical.clone()),
+        root: root.to_path_buf(),
+    });
+    if meta.is_dir() {
+        let mut entries: Vec<_> = std::fs::read_dir(&canonical)?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|entry| entry.file_name())
+            .collect();
+        entries.sort();
+        for entry in entries {
+            collect_file(
+                &canonical.join(&entry),
+                root,
+                &format!("{name}\\{}", entry.to_string_lossy()),
+                items,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Flatten the paths the local clipboard holds. One unreadable entry fails the
+/// whole offer rather than handing the peer a list it cannot complete.
+fn collect_files(paths: &[PathBuf]) -> Result<LocalFiles> {
+    let mut items = Vec::new();
+    for path in paths {
+        let root = std::fs::canonicalize(path)?;
+        let name = root
+            .file_name()
+            .context("无法确定文件名")?
+            .to_string_lossy()
+            .into_owned();
+        collect_file(&root, &root, &name, &mut items)?;
+    }
+    ensure!(!items.is_empty(), "文件列表为空");
+    Ok(LocalFiles { items })
+}
+
+impl LocalFiles {
+    /// Serve one `FileContentsRequest`. `flags` is 1 for the size and 2 for a
+    /// range of the contents, as the official client sends them.
+    fn read(&self, ask: &ClipboardFileContentsRequest) -> Result<Vec<u8>> {
+        let file = self
+            .items
+            .get(ask.list_index as usize)
+            .context("无效的文件索引")?;
+        ensure!(ask.requested_len as usize <= FILE_BLOCK, "文件读取请求过大");
+        if ask.flags == 1 {
+            return Ok(file.desc.file_size.to_le_bytes().to_vec());
+        }
+        ensure!(
+            ask.flags == 2 && file.desc.file_attributes & FILE_ATTRIBUTE_DIRECTORY == 0,
+            "无效的文件读取类型"
+        );
+        let path = file.path.as_ref().context("该条目没有内容")?;
+        // O_NOFOLLOW closes the window where the final component is swapped for
+        // a link between the walk and this read.
+        let mut handle = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)?;
+        ensure!(
+            std::fs::canonicalize(path)?.starts_with(&file.root),
+            "文件超出原始复制范围"
+        );
+        let length =
+            (u64::from(ask.requested_len)).min(file.desc.file_size.saturating_sub(ask.pos_offset));
+        if length == 0 {
+            return Ok(Vec::new());
+        }
+        use std::io::{Read as _, Seek as _};
+        handle.seek(std::io::SeekFrom::Start(ask.pos_offset))?;
+        let mut data = vec![0u8; length as usize];
+        let mut filled = 0;
+        while filled < data.len() {
+            match handle.read(&mut data[filled..])? {
+                0 => break,
+                n => filled += n,
+            }
+        }
+        data.truncate(filled);
+        Ok(data)
+    }
+}
+
 struct State {
     receiver: Receiver<Command>,
     clipboard: Option<arboard::Clipboard>,
     sessions: HashMap<u64, Weak<Inner>>,
     published: HashMap<u64, Vec<Format>>,
     local: LocalSnapshot,
+    /// File lists handed out per session and task, kept until the clipboard
+    /// changes so a slow remote can keep reading the copy it started on.
+    tasks: HashMap<(u64, u32), Arc<LocalFiles>>,
     /// Set while this adapter writes, so the poll does not report its own write.
     writing: bool,
 }
@@ -150,6 +326,7 @@ fn run(receiver: Receiver<Command>) {
         sessions: HashMap::new(),
         published: HashMap::new(),
         local: LocalSnapshot::default(),
+        tasks: HashMap::new(),
         writing: false,
     };
     loop {
@@ -183,6 +360,12 @@ fn process(state: &mut State, command: Command) {
         Command::Activate(weak) => {
             if let Some(session) = weak.upgrade() {
                 state.sessions.insert(session.id, Arc::downgrade(&session));
+                tracing::debug!(
+                    id = session.id,
+                    sessions = state.sessions.len(),
+                    files = session.file_allowed(),
+                    "剪贴板会话已注册"
+                );
             }
         }
         Command::Remove(id) => {
@@ -301,8 +484,9 @@ fn write_text(state: &mut State, text: &str) -> Result<()> {
     result.context("写入系统剪贴板失败")?;
     state.local = LocalSnapshot {
         text: Some(text.to_owned()),
-        image: None,
+        ..Default::default()
     };
+    state.tasks.clear();
     Ok(())
 }
 
@@ -318,10 +502,30 @@ fn write_image(state: &mut State, dib: &[u8]) -> Result<()> {
     state.writing = false;
     result.context("写入系统剪贴板失败")?;
     state.local = LocalSnapshot {
-        text: None,
         image: Some(dib.to_vec()),
+        ..Default::default()
     };
+    state.tasks.clear();
     Ok(())
+}
+
+/// Strip the line ending a `text/uri-list` entry carries into the path.
+///
+/// RFC 2483 delimits that format with CRLF, which is what GNOME and every other
+/// file manager here writes, but the parser these paths come from splits on the
+/// line feed alone and leaves the carriage return on the end of the name. The
+/// path then resolves to nothing and the copy looks empty.
+fn trim_uri_path(path: PathBuf) -> PathBuf {
+    use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+    let bytes = path.as_os_str().as_bytes();
+    let trimmed = bytes
+        .iter()
+        .rposition(|byte| !matches!(byte, b'\r' | b'\n'))
+        .map_or(0, |last| last + 1);
+    if trimmed == bytes.len() {
+        return path;
+    }
+    PathBuf::from(std::ffi::OsString::from_vec(bytes[..trimmed].to_vec()))
 }
 
 /// Read the local clipboard and, when it changed, announce the new formats.
@@ -332,36 +536,78 @@ fn poll_local(state: &mut State) -> Result<()> {
     let Some(clipboard) = state.clipboard.as_mut() else {
         return Ok(());
     };
-    let text = clipboard.get_text().ok().filter(|text| !text.is_empty());
-    let snapshot = if let Some(text) = text {
+    // The whole outbound path starts here, so when files never reach the remote
+    // this says whether they were on the local clipboard at all.
+    if tracing::enabled!(target: "openuuyc::clipboard", tracing::Level::DEBUG) {
+        let probe = clipboard.get().file_list();
+        tracing::debug!(target: "openuuyc::clipboard",
+            sessions = state.sessions.len(),
+            files = ?probe.as_ref().map(Vec::len).map_err(ToString::to_string),
+            first = ?probe.as_ref().ok().and_then(|paths| paths.first().cloned()),
+            held = state.local.sources.len(),
+            "剪贴板轮询");
+    }
+    // A file manager puts the paths on the clipboard as `text/uri-list` and a
+    // plain-text copy of the same names, so files are looked for first.
+    let sources = clipboard
+        .get()
+        .file_list()
+        .unwrap_or_default()
+        .into_iter()
+        .map(trim_uri_path)
+        .filter(|path| path.is_absolute())
+        .collect::<Vec<_>>();
+    let snapshot = if !sources.is_empty() {
+        LocalSnapshot {
+            sources,
+            ..Default::default()
+        }
+    } else if let Some(text) = clipboard.get_text().ok().filter(|text| !text.is_empty()) {
         LocalSnapshot {
             text: Some(text),
-            image: None,
+            ..Default::default()
         }
     } else {
         match clipboard.get_image() {
             Ok(image) => LocalSnapshot {
-                text: None,
                 image: Some(rgba_to_dib(
                     image.width as u32,
                     image.height as u32,
                     &image.bytes,
                 )?),
+                ..Default::default()
             },
             Err(_) => LocalSnapshot::default(),
         }
     };
-    if snapshot.text == state.local.text && snapshot.image == state.local.image {
+    if snapshot.text == state.local.text
+        && snapshot.image == state.local.image
+        && snapshot.sources == state.local.sources
+    {
         return Ok(());
     }
+    if !state.local.sources.is_empty() || !snapshot.sources.is_empty() {
+        tracing::debug!(
+            files = snapshot.sources.len(),
+            text = snapshot.text.is_some(),
+            image = snapshot.image.is_some(),
+            "本地剪贴板已变化"
+        );
+    }
     state.local = snapshot;
+    // The previous copy is gone; a read still in flight against it now fails.
+    state.tasks.clear();
     if state.local.is_empty() {
         state.published.clear();
         return Ok(());
     }
     let ids = state.local.format_ids();
     for session in sessions(state) {
-        let links = formats::outgoing(&ids, session.platform.load(Ordering::Acquire), false);
+        let links = formats::outgoing(
+            &ids,
+            session.platform.load(Ordering::Acquire),
+            session.file_allowed(),
+        );
         if links.is_empty() {
             state.published.remove(&session.id);
             continue;
@@ -421,31 +667,114 @@ fn serve(
                 ),
             }
         }
-        // Serving files needs a promise this platform cannot make.
-        ClipboardRequestKind::FileDescListRequest(ask) => session.emit(
-            epoch,
-            response(
+        ClipboardRequestKind::FileDescListRequest(ask) => {
+            let result = (|| -> Result<Arc<LocalFiles>> {
+                ensure!(session.file_allowed(), "文件剪贴板已关闭");
+                ensure!(
+                    state.published.contains_key(&session.id),
+                    "原文件剪贴板已失效"
+                );
+                ensure!(!state.local.sources.is_empty(), "本地剪贴板没有文件");
+                ensure!(state.tasks.len() < 32, "文件任务过多");
+                Ok(Arc::new(collect_files(&state.local.sources)?))
+            })();
+            let Ok(files) = result else {
+                return session.emit(
+                    epoch,
+                    response(
+                        id,
+                        ClipboardResponseKind::FileDescListResponse(
+                            ClipboardFileDescriptorListResponse {
+                                task_id: ask.task_id,
+                                segment_count: 0,
+                                err: 2,
+                            },
+                        ),
+                    ),
+                );
+            };
+            state.tasks.insert((session.id, ask.task_id), files.clone());
+            // Stay below the SDK's 512 KiB message ceiling even with long names.
+            let mut segments = Vec::<Vec<ClipboardFileDescriptor>>::new();
+            let mut current = Vec::new();
+            let mut bytes = 0;
+            for item in &files.items {
+                let size = item.desc.encoded_len() + 8;
+                if current.len() == 1500 || bytes + size > 450_000 {
+                    segments.push(std::mem::take(&mut current));
+                    bytes = 0;
+                }
+                current.push(item.desc.clone());
+                bytes += size;
+            }
+            if !current.is_empty() {
+                segments.push(current);
+            }
+            let mut messages = std::collections::VecDeque::new();
+            messages.push_back(response(
                 id,
                 ClipboardResponseKind::FileDescListResponse(ClipboardFileDescriptorListResponse {
                     task_id: ask.task_id,
-                    segment_count: 0,
-                    err: 2,
+                    segment_count: segments.len() as u32,
+                    err: 1,
                 }),
-            ),
-        ),
-        ClipboardRequestKind::FileContentsRequest(ask) => session.emit(
-            epoch,
-            response(
-                id,
-                ClipboardResponseKind::FileContentsResponse(ClipboardFileContentsResponse {
-                    task_id: ask.task_id,
-                    data: Vec::new(),
-                    err: 2,
-                    pos_offset: 0,
-                    list_index: 0,
-                }),
-            ),
-        ),
+            ));
+            for (index, items) in segments.into_iter().enumerate() {
+                messages.push_back(request(
+                    session.next(),
+                    ClipboardRequestKind::DescSegment(ClipboardFileDescriptorSegment {
+                        task_id: ask.task_id,
+                        segment_id: index as u32 + 1,
+                        file_descs: items,
+                    }),
+                ));
+            }
+            session.enqueue(Outbound::Packets(epoch, messages))
+        }
+        ClipboardRequestKind::FileContentsRequest(ask) => {
+            let result = if session.file_allowed() {
+                state
+                    .tasks
+                    .get(&(session.id, ask.task_id))
+                    .context("文件任务已失效")
+                    .and_then(|files| files.read(&ask))
+            } else {
+                Err(anyhow!("文件剪贴板已关闭"))
+            };
+            let (err, data) = match result {
+                Ok(data) => (1, data),
+                Err(error) => {
+                    tracing::debug!(%error, index = ask.list_index, "读取本地文件失败");
+                    (2, Vec::new())
+                }
+            };
+            session.emit(
+                epoch,
+                response(
+                    id,
+                    ClipboardResponseKind::FileContentsResponse(ClipboardFileContentsResponse {
+                        task_id: ask.task_id,
+                        data,
+                        err,
+                        pos_offset: ask.pos_offset,
+                        list_index: ask.list_index,
+                    }),
+                ),
+            )
+        }
+        ClipboardRequestKind::CancelRequest(ask) => {
+            state.tasks.remove(&(session.id, ask.task_id));
+            session.emit(
+                epoch,
+                response(
+                    id,
+                    ClipboardResponseKind::CancelResponse(ClipboardFileCancelResponse {
+                        task_id: ask.task_id,
+                        err: 1,
+                    }),
+                ),
+            )
+        }
         _ => Ok(()),
     }
 }
