@@ -566,10 +566,14 @@ impl StreamControlHandle {
             volume: 100,
             muted: profile.muted,
         });
+        let clipboard = crate::clipboard::Clipboard::new();
+        // The connection setting decides where the per-session 文件复制 switch
+        // starts; the player can still turn it on or off afterwards.
+        clipboard.set_files(profile.clipboard_files);
         (
             Self {
                 microphone: crate::microphone::Microphone::new(),
-                clipboard: crate::clipboard::Clipboard::new(),
+                clipboard,
                 files: Arc::new(crate::file_transfer::Transport::default()),
                 mouse,
                 cursor,
