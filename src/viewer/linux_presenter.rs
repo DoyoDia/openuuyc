@@ -620,6 +620,11 @@ struct Player {
     focused: bool,
     /// Sub-pixel motion carried between raw events.
     motion_remainder: [f64; 2],
+    /// Throttles the pointer diagnostics, which stay off unless
+    /// `openuuyc::viewer::input` is enabled at debug.
+    diagnostics_at: [Option<Instant>; 2],
+    /// When the remote first said its pointer was hidden, for [`CURSOR_HIDE_GRACE`].
+    hidden_since: Option<Instant>,
 }
 
 impl Player {
@@ -654,6 +659,8 @@ impl Player {
             pointer_locked: false,
             focused: true,
             motion_remainder: [0.0, 0.0],
+            diagnostics_at: [None; 2],
+            hidden_since: None,
         })
     }
 
@@ -799,38 +806,83 @@ impl Player {
     fn draw_remote_cursor(&mut self, ui: &mut egui::Ui, window: &Arc<Window>) {
         if self.pointer_locked {
             // The remote draws its own pointer into the video in this mode.
+            self.cursor_note("locked");
             return;
         }
         let controlling = self.session.stream_control.mouse().mode() != MouseMode::View;
-        let hidden = self.session.stream_control.remote_cursor_hidden();
+        // An ordinary Windows desktop flaps this flag: it hides the pointer for
+        // a keystroke and shows it on the next mouse move, several times a
+        // second while someone types. Taking each report at face value makes
+        // the pointer blink between the remote shape and the local arrow, so a
+        // hide only counts once it has lasted.
+        let hidden = match (
+            self.session.stream_control.remote_cursor_hidden(),
+            self.hidden_since,
+        ) {
+            (false, _) => {
+                self.hidden_since = None;
+                false
+            }
+            (true, Some(since)) => since.elapsed() >= CURSOR_HIDE_GRACE,
+            (true, None) => {
+                self.hidden_since = Some(Instant::now());
+                false
+            }
+        };
         let pointer = ui.ctx().pointer_latest_pos();
         let Some((rect, position)) = self.video_rect.zip(pointer) else {
             window.set_cursor_visible(true);
+            self.cursor_note("no rect or pointer");
             return;
         };
         // Over a panel, menu or the caption the local pointer is the one that
         // matters, and the remote shape would be painted underneath them.
         if !controlling || !self.hit_video_at(ui.ctx(), position) {
             window.set_cursor_visible(true);
+            self.cursor_note("not over video");
             return;
         }
-        window.set_cursor_visible(false);
+        // Exactly one pointer belongs over the picture. The host draws its own
+        // into the frames while it is capturing the cursor, so a second one
+        // painted here would double it. While it is not, this client owns the
+        // job, and hiding the local pointer before there is a shape to put in
+        // its place just leaves the picture with nothing to aim with -- which
+        // is what a remote Windows desktop causes every time it hides its
+        // pointer for someone typing.
+        if self.session.stream_control.remote_cursor_captured() {
+            window.set_cursor_visible(false);
+            self.cursor_note("host draws it");
+            return;
+        }
         if hidden {
+            window.set_cursor_visible(true);
+            self.cursor = None;
+            self.cursor_note("remote hid it");
             return;
         }
-        let Some(cursor) = self.session.stream_control.remote_cursor() else {
-            return;
-        };
-        let identity = Arc::as_ptr(&cursor.image) as usize;
-        if self.cursor.as_ref().is_none_or(|(id, ..)| *id != identity) {
-            match decode_cursor(ui.ctx(), &cursor.image) {
-                Some(entry) => self.cursor = Some((identity, entry.0, entry.1, entry.2)),
-                None => return,
+        // A hide that has not lasted long enough leaves no shape behind: the
+        // report that carried it also cleared the one before it. The texture
+        // decoded earlier carries the pointer across that gap.
+        if let Some(cursor) = self.session.stream_control.remote_cursor() {
+            let identity = Arc::as_ptr(&cursor.image) as usize;
+            if self.cursor.as_ref().is_none_or(|(id, ..)| *id != identity) {
+                match decode_cursor(ui.ctx(), &cursor.image) {
+                    Some(entry) => self.cursor = Some((identity, entry.0, entry.1, entry.2)),
+                    None => {
+                        window.set_cursor_visible(true);
+                        self.cursor = None;
+                        self.cursor_note("undecodable");
+                        return;
+                    }
+                }
             }
         }
         let Some((_, texture, size, hotspot)) = &self.cursor else {
+            window.set_cursor_visible(true);
+            self.cursor_note("no texture");
             return;
         };
+        window.set_cursor_visible(false);
         // The cursor is authored in remote pixels; scale it with the video.
         let scale = self
             .session
@@ -858,6 +910,7 @@ impl Player {
                 egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                 egui::Color32::WHITE,
             );
+        self.cursor_note("painted");
     }
 
     /// The player commands, placed in the window caption between the title and
@@ -1001,8 +1054,11 @@ impl Player {
                     self.pointer_locked = true;
                 }
                 Err(error) => {
-                    tracing::warn!(%error, "无法锁定指针，相对模式可能不可用");
-                    self.control_error = Some("当前桌面不允许锁定指针".to_owned());
+                    tracing::warn!(%error, "无法锁定指针，改用绝对坐标");
+                    // Without the pointer the deltas would drift; the session
+                    // falls back to absolute positioning on its next poll.
+                    self.input().set_relative_available(false);
+                    self.control_error = Some("当前桌面不允许锁定指针，已改用绝对坐标".to_owned());
                 }
             }
         } else {
@@ -1111,6 +1167,13 @@ impl Player {
                     }
                     self.confirm_neutral();
                 }
+                tracing::debug!(target: "openuuyc::viewer::input",
+                    ?button, pressed = *state == ElementState::Pressed,
+                    consumed_by_ui, in_video = self.pointer_in_video,
+                    mode = ?self.input().mode(),
+                    relative = self.input().relative_mode(),
+                    neutral_wait = self.input().waiting_for_neutral(),
+                    "mouse button");
                 if consumed_by_ui || self.input().mode() == MouseMode::View {
                     return false;
                 }
@@ -1169,6 +1232,44 @@ impl Player {
                 self.performance_mode = self.performance_mode.next();
             }
         }
+    }
+
+    /// True at most once every half second, so a diagnostic on a per-frame path
+    /// does not flood the log. `slot` keeps the callers independent.
+    fn diagnose(&mut self, slot: usize) -> bool {
+        if !tracing::enabled!(target: "openuuyc::viewer::input", tracing::Level::DEBUG) {
+            return false;
+        }
+        let now = Instant::now();
+        if self.diagnostics_at[slot]
+            .is_some_and(|last| now.duration_since(last) < Duration::from_millis(500))
+        {
+            return false;
+        }
+        self.diagnostics_at[slot] = Some(now);
+        true
+    }
+
+    /// Why the remote pointer is or is not on screen. Every path out of
+    /// `draw_remote_cursor` names itself here: the two ways this goes wrong --
+    /// no pointer at all, and a pointer that does not aim where it looks -- are
+    /// indistinguishable from a screenshot.
+    fn cursor_note(&mut self, outcome: &str) {
+        if !self.diagnose(0) {
+            return;
+        }
+        tracing::debug!(target: "openuuyc::viewer::input",
+            outcome,
+            locked = self.pointer_locked,
+            relative = self.input().relative_mode(),
+            relative_available = self.input().relative_available(),
+            mode = ?self.input().mode(),
+            hidden = self.session.stream_control.remote_cursor_hidden(),
+            hidden_for_ms = self.hidden_since.map(|since| since.elapsed().as_millis()),
+            captured = self.session.stream_control.remote_cursor_captured(),
+            shape = self.session.stream_control.remote_cursor().is_some(),
+            in_video = self.pointer_in_video,
+            "remote cursor");
     }
 
     fn hit_video(&self, context: &egui::Context, position: PhysicalPosition<f64>) -> bool {
@@ -1340,6 +1441,11 @@ fn viewer_shortcut(
         crate::viewer_shortcuts::modifiers(modifiers),
     )
 }
+
+/// How long the remote has to keep saying its pointer is hidden before this
+/// client believes it. Long enough to swallow the flap a desktop produces while
+/// someone types, short enough that a real hide still feels immediate.
+const CURSOR_HIDE_GRACE: Duration = Duration::from_millis(600);
 
 /// Decode the remote cursor PNG into a texture, with its size and hotspot.
 fn decode_cursor(
