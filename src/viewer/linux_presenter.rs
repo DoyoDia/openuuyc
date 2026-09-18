@@ -833,15 +833,23 @@ impl Player {
             });
         let size = egui::vec2(size[0] as f32 * scale, size[1] as f32 * scale);
         let origin = position - egui::vec2(hotspot[0] as f32 * scale, hotspot[1] as f32 * scale);
-        // Its own foreground layer, so nothing drawn later can cover it.
-        egui::Area::new(egui::Id::new("remote-cursor"))
-            .order(egui::Order::Tooltip)
-            .fixed_pos(origin)
-            .interactable(false)
-            .show(ui.ctx(), |ui| {
-                egui::Image::from_texture(egui::load::SizedTexture::new(texture.id(), size))
-                    .paint_at(ui, egui::Rect::from_min_size(origin, size));
-            });
+        // Painted straight into a foreground layer rather than through an
+        // `Area`: an area restarts its fade-in whenever it skips a pass, and
+        // this one skips every pass the pointer spends on a panel or the
+        // caption, which left the shape at a fraction of its opacity. A bare
+        // layer also registers no `AreaState`, so it cannot shadow the video in
+        // `hit_video_at`.
+        ui.ctx()
+            .layer_painter(egui::LayerId::new(
+                egui::Order::Tooltip,
+                egui::Id::new("remote-cursor"),
+            ))
+            .image(
+                texture.id(),
+                egui::Rect::from_min_size(origin, size),
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
     }
 
     /// The player commands, placed in the window caption between the title and
