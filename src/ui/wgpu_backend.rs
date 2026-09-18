@@ -233,6 +233,7 @@ impl UiPresenter {
                 // or scale change. Reconfigure and draw on the next repaint.
                 self.surface.configure(&self.device, &self.config);
                 self.pending_output = Some(output);
+                self.flush_writes();
                 context.request_repaint();
                 return Ok(false);
             }
@@ -240,6 +241,7 @@ impl UiPresenter {
                 // Timeout or occluded: keep the frame and try again later.
                 tracing::debug!(?other, "窗口绘制表面暂时不可用");
                 self.pending_output = Some(output);
+                self.flush_writes();
                 context.request_repaint();
                 return Ok(false);
             }
@@ -316,7 +318,27 @@ impl UiPresenter {
         // if any is still pending.
         output.textures_delta.clear();
         self.queue.present(frame);
+        // Nothing else reclaims what a finished submission held. Each frame's
+        // `write_texture` takes a staging buffer from the device, and neither
+        // submitting nor presenting hands it back -- only maintaining the device
+        // does. Without this the buffers pile up at the video bitrate, a few
+        // hundred megabytes a second, until an upload fails with out of memory.
+        if let Err(error) = self.device.poll(wgpu::PollType::Poll) {
+            tracing::debug!(?error, "维护 GPU 设备失败");
+        }
         Ok(true)
+    }
+
+    /// Hand any queued `write_texture` data to the GPU without drawing.
+    ///
+    /// A write is only staged until the next submission, so a frame uploaded
+    /// for a pass that then bails would otherwise hold its staging copy inside
+    /// the device forever. An empty submission is enough to release it.
+    fn flush_writes(&self) {
+        self.queue.submit(std::iter::empty());
+        if let Err(error) = self.device.poll(wgpu::PollType::Poll) {
+            tracing::debug!(?error, "维护 GPU 设备失败");
+        }
     }
 
     pub(crate) fn defer_output(&mut self, output: RendererOutput) {
