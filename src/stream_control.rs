@@ -663,6 +663,12 @@ impl StreamControlHandle {
         self.cursor.hidden()
     }
 
+    /// Whether the host is drawing its own pointer into the captured frames.
+    /// While it is not, nothing but this client can put a pointer on screen.
+    pub(crate) fn remote_cursor_captured(&self) -> bool {
+        lock(&self.shared).baseline.cursor_capture
+    }
+
     pub fn snapshot(&self) -> StreamControlSnapshot {
         let mut state = lock(&self.shared);
         expire_cursor_request(&mut state);
@@ -1849,6 +1855,10 @@ impl StreamControlHandle {
         }
         let mode = state.mouse.mode();
         let (relative, wanted) = mouse_policy(state, mode);
+        // Relative motion is only correct while this client holds the pointer.
+        // A window that could not take it says so, and absolute positioning is
+        // then the only honest way to aim, whatever the policy would prefer.
+        let relative = relative && state.mouse.relative_available();
         if mode == MouseMode::Smart && state.mouse.relative_mode() != relative {
             state.mouse.set_relative_mode(relative);
         }
@@ -2591,7 +2601,15 @@ fn mouse_policy(state: &StreamControlState, mode: MouseMode) -> (bool, bool) {
         MouseMode::Smart => match state.peer_mouse_relative {
             Some(true) => (true, true),
             Some(false) => (false, false),
-            None => (state.remote_cursor.hidden(), false),
+            // The host says a game took the mouse with `special_game_mouse`,
+            // and that report is what pairs relative input with the host
+            // drawing its own pointer into the picture. Until it arrives,
+            // absolute positioning is the only coherent choice: inferring
+            // relative input from a hidden cursor fires on an ordinary desktop
+            // -- Windows hides the pointer for anyone typing, for as long as
+            // they type -- and leaves the client sending deltas while nothing
+            // draws a pointer to aim with.
+            None => (false, false),
         },
     }
 }
