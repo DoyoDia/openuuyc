@@ -1972,6 +1972,9 @@ impl ThreadedWindowsApp {
             } else {
                 state.mouse_preference
             };
+            if mode != crate::remote_input::MouseMode::View {
+                crate::ui::controls::clear_notice(&self.egui_context, "remote-input-error");
+            }
             if let Err(error) = self.stream_control.set_mouse_mode(mode) {
                 self.stream_control.mouse().fail(error.to_string());
             }

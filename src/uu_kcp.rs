@@ -33,6 +33,7 @@ const FEC_RETENTION: Duration = Duration::from_millis(1_000);
 const RECOVERY_INFO_INTERVAL: Duration = Duration::from_millis(500);
 const FEC_NETWORK_UPDATE_INTERVAL: Duration = Duration::from_millis(1_000);
 const BINARY_MESSAGE: u16 = 1;
+const CONTROL_SEND_WINDOW: u16 = 256;
 
 const CMD_PUSH: u8 = 81;
 const CMD_ACK: u8 = 82;
@@ -291,7 +292,7 @@ async fn run_worker(
     );
     kcp.set_mtu(KCP_STANDARD_MTU)
         .context("configure UU mixed-KCP MTU")?;
-    kcp.set_wndsize(256, 256);
+    kcp.set_wndsize(CONTROL_SEND_WINDOW, 256);
     // UU configures nodelay(1, 5, 2, 1). The local KCP fork preserves its
     // two-millisecond lower clamp instead of upstream KCP's ten milliseconds.
     kcp.set_nodelay(true, 5, 2, true);
@@ -327,7 +328,7 @@ async fn run_worker(
         version,
         conversation = KCP_CONVERSATION,
         wire_mtu = KCP_WIRE_MTU,
-        send_window = 256,
+        send_window = CONTROL_SEND_WINDOW,
         receive_window = 256,
         "UU mixed-KCP control transport started"
     );
@@ -335,23 +336,46 @@ async fn run_worker(
     let mut tick = tokio::time::interval(Duration::from_millis(5));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut receive_buffer = vec![0_u8; 65_536];
+    let mut pending = None;
     loop {
+        if let Some(WorkerCommand::Send {
+            stream_id,
+            payload,
+            guard,
+            release,
+            result,
+        }) = pending.take()
+        {
+            // Check cancellation before assigning reliable sequence numbers.
+            // wait_snd includes packets already on the wire awaiting ACK, not
+            // just unsent input. A full window applies backpressure; it is not
+            // itself a transport failure. The input sender keeps its existing
+            // deadline and coalesces queued motion while we receive ACKs.
+            if result.is_closed() || guard.as_ref().is_some_and(|valid: &SendGuard| !valid()) {
+                let _ = result.send(Err("control request cancelled before transmission".into()));
+            } else if guard.is_some()
+                && !release
+                && worker.kcp.wait_snd() >= usize::from(CONTROL_SEND_WINDOW)
+            {
+                pending = Some(WorkerCommand::Send {
+                    stream_id,
+                    payload,
+                    guard,
+                    release,
+                    result,
+                });
+            } else {
+                let outcome = match worker.send_message(stream_id, &payload) {
+                    Ok(bytes) => worker.flush_output(&endpoint).await.map(|()| bytes),
+                    Err(error) => Err(error),
+                };
+                let _ = result.send(outcome.map_err(|error| error.to_string()));
+            }
+        }
         tokio::select! {
-            command = commands.recv() => {
+            command = commands.recv(), if pending.is_none() => {
                 let Some(command) = command else { break; };
-                match command {
-                    WorkerCommand::Send { stream_id, payload, guard, release, result } => {
-                        // This is the final admission point before assigning KCP sequence numbers.
-                        if result.is_closed() || guard.as_ref().is_some_and(|valid|!valid()) {let _=result.send(Err("control request cancelled before transmission".into()));continue;}
-                        if guard.is_some() && !release && worker.kcp.wait_snd()>32 {let _=result.send(Err("control transport backlog exceeded".into()));continue;}
-                        let sent = worker.send_message(stream_id, &payload);
-                        let outcome = match sent {
-                            Ok(bytes) => worker.flush_output(&endpoint).await.map(|()| bytes),
-                            Err(error) => Err(error),
-                        };
-                        let _ = result.send(outcome.map_err(|error| error.to_string()));
-                    }
-                }
+                pending = Some(command);
             }
             received = endpoint.recv(&mut receive_buffer) => {
                 let size = received.context("receive UU mixed-KCP datagram")?;

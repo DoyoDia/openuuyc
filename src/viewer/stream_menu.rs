@@ -523,6 +523,13 @@ pub(super) fn show_stream_control_window(
         let _ = audio.refresh_output_devices();
     }
     let snapshot = handle.snapshot();
+    crate::ui::controls::observe_notice(
+        ctx,
+        "remote-input-error",
+        "控制已停止",
+        crate::ui::controls::DialogIcon::Error,
+        snapshot.mouse_error.as_deref(),
+    );
     state.display.select_screen(screen_id);
     crate::ui::controls::progress_notice(
         ctx,
@@ -993,6 +1000,7 @@ crate::ui::controls::observe_notice(ui.ctx(), "clipboard-error", "剪贴板同�
                             )
                             .clicked()
                             {
+                                crate::ui::controls::clear_notice(ctx, "remote-input-error");
                                 state.local_error = handle
                                     .set_mouse_mode(mode)
                                     .err()
@@ -1058,7 +1066,7 @@ crate::ui::controls::observe_notice(ui.ctx(), "clipboard-error", "剪贴板同�
                     }
                 }
                 if state.page != Page::Display {
-                    crate::ui::controls::observe_notice(ui.ctx(), "stream-settings-error", "设置未生效", crate::ui::controls::DialogIcon::Error, state.local_error.as_deref().or(snapshot.mouse_error.as_deref()).or(snapshot.cursor_error.as_deref()).or(snapshot.last_error.as_deref()).or(snapshot.network.error.as_deref()));
+                    crate::ui::controls::observe_notice(ui.ctx(), "stream-settings-error", "设置未生效", crate::ui::controls::DialogIcon::Error, state.local_error.as_deref().or(snapshot.cursor_error.as_deref()).or(snapshot.last_error.as_deref()).or(snapshot.network.error.as_deref()));
                     crate::ui::controls::observe_notice(ui.ctx(), "stream-settings-save", "设置未保存", crate::ui::controls::DialogIcon::Error, snapshot.persistence_error.as_deref());
                 }
             });
