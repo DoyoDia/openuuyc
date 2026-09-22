@@ -265,6 +265,8 @@ struct State {
     /// The remote copy currently published locally, mounted for as long as the
     /// clipboard points at it.
     mounted: Option<super::fuse::Mount>,
+    /// Holds the clipboard selection while those paths are the copy on it.
+    offer: Option<super::x11_offer::FileOffer>,
     /// Names each mount's directory, so a new copy never reuses a path the
     /// file manager may still have open.
     generation: u64,
@@ -334,6 +336,7 @@ fn run(receiver: Receiver<Command>) {
         local: LocalSnapshot::default(),
         tasks: HashMap::new(),
         mounted: None,
+        offer: None,
         generation: 0,
         writing: false,
     };
@@ -542,14 +545,35 @@ fn write_text(state: &mut State, text: &str) -> Result<()> {
     };
     state.tasks.clear();
     state.mounted = None;
+    state.offer = None;
     Ok(())
 }
 
 /// Publish paths as a file copy on the local clipboard.
+///
+/// A file copy has to be offered under several names at once, and only the
+/// owner of the selection can answer for more than one, so this takes the
+/// clipboard itself rather than going through the library used for text and
+/// images. On a desktop where that fails there is still `text/uri-list`, which
+/// is enough for anything that does not insist on the GTK file-manager name.
 fn write_files(state: &mut State, paths: &[PathBuf]) -> Result<()> {
-    let clipboard = state.clipboard.as_mut().context("系统剪贴板不可用")?;
     state.writing = true;
-    let result = clipboard.set().file_list(paths);
+    let offer = super::x11_offer::FileOffer::publish(paths.to_vec());
+    let result = match offer {
+        Ok(offer) => {
+            state.offer = Some(offer);
+            Ok(())
+        }
+        Err(error) => {
+            tracing::debug!(error = format!("{error:#}"), "接管剪贴板失败，改用单一格式");
+            state.offer = None;
+            let clipboard = state.clipboard.as_mut().context("系统剪贴板不可用")?;
+            clipboard
+                .set()
+                .file_list(paths)
+                .map_err(anyhow::Error::from)
+        }
+    };
     state.writing = false;
     result.context("写入系统剪贴板失败")?;
     state.local = LocalSnapshot {
@@ -577,6 +601,7 @@ fn write_image(state: &mut State, dib: &[u8]) -> Result<()> {
     };
     state.tasks.clear();
     state.mounted = None;
+    state.offer = None;
     Ok(())
 }
 

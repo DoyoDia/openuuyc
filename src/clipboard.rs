@@ -9,6 +9,9 @@ mod native;
 #[path = "clipboard/native_linux.rs"]
 mod native;
 mod protocol;
+#[cfg(not(windows))]
+#[path = "clipboard/x11_offer_linux.rs"]
+mod x11_offer;
 use anyhow::{Result, anyhow, bail, ensure};
 use prost::Message;
 use protocol::*;
