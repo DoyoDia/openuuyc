@@ -669,6 +669,7 @@ impl NativeViewerSession {
         let changed = self.screen_binding.swap(binding, Ordering::AcqRel) != binding;
         if changed {
             mutex_lock(&self.frame_queue).clear();
+            self.manager_wake.unpark();
         }
         changed
     }
@@ -832,6 +833,14 @@ fn decoder_manager(
             }
             continue 'decode;
         }
+        // Decoded GPU surfaces are leased from a finite pool. Hand off one
+        // ready frame before decoding again, including renderer startup.
+        // The render worker, hide/pause and shutdown paths unpark this worker.
+        // No extra playout clock, frame dropping or timed polling is involved.
+        if frame_wake.visible.load(Ordering::Acquire) && !mutex_lock(&frame_queue).is_empty() {
+            std::thread::park();
+            continue 'decode;
+        }
         if let Some(current) = pool.as_mut() {
             let output = current
                 .decoder()
@@ -851,6 +860,11 @@ fn decoder_manager(
         }
         if shutdown.load(Ordering::Acquire) {
             break;
+        }
+        // Poll may itself have delivered an older reordered output. Let the
+        // renderer consume it before admitting another compressed picture.
+        if frame_wake.visible.load(Ordering::Acquire) && !mutex_lock(&frame_queue).is_empty() {
+            continue 'decode;
         }
         performance.set_decoder_queue_frames(video_source.len());
         let frame = match video_source.try_recv() {

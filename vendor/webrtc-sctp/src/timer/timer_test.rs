@@ -94,7 +94,7 @@ mod test_rto_manager {
     #[tokio::test]
     async fn test_rto_manager_rto_calculation_small_rtt() -> Result<()> {
         let mut m = RtoManager::new();
-        let exp = [1800, 1500, 1275, 1106, 1000];
+        let exp = [1800, 1500, 1275, 1106, 979];
 
         for i in 0..5 {
             m.set_new_rtt(600);

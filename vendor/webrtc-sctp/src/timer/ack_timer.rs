@@ -1,10 +1,11 @@
-use std::sync::Weak;
+use portable_atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 
 use async_trait::async_trait;
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::Duration;
 
-pub(crate) const ACK_INTERVAL: Duration = Duration::from_millis(200);
+pub(crate) const ACK_INTERVAL: Duration = Duration::from_millis(50);
 
 /// ackTimerObserver is the interface to an ack timer observer.
 #[async_trait]
@@ -18,6 +19,7 @@ pub(crate) struct AckTimer<T: 'static + AckTimerObserver + Send> {
     pub(crate) timeout_observer: Weak<Mutex<T>>,
     pub(crate) interval: Duration,
     pub(crate) close_tx: Option<mpsc::Sender<()>>,
+    generation: Arc<AtomicU64>,
 }
 
 impl<T: 'static + AckTimerObserver + Send> AckTimer<T> {
@@ -27,6 +29,7 @@ impl<T: 'static + AckTimerObserver + Send> AckTimer<T> {
             timeout_observer,
             interval,
             close_tx: None,
+            generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -40,6 +43,8 @@ impl<T: 'static + AckTimerObserver + Send> AckTimer<T> {
         let (close_tx, mut close_rx) = mpsc::channel(1);
         let interval = self.interval;
         let timeout_observer = self.timeout_observer.clone();
+        let generation = self.generation.clone();
+        let epoch = generation.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
 
         tokio::spawn(async move {
             let timer = tokio::time::sleep(interval);
@@ -49,7 +54,9 @@ impl<T: 'static + AckTimerObserver + Send> AckTimer<T> {
                 _ = timer.as_mut() => {
                     if let Some(observer) = timeout_observer.upgrade(){
                         let mut observer = observer.lock().await;
-                        observer.on_ack_timeout().await;
+                        if generation.load(Ordering::SeqCst) == epoch {
+                            observer.on_ack_timeout().await;
+                        }
                     }
                  }
                 _ = close_rx.recv() => {},
@@ -63,6 +70,7 @@ impl<T: 'static + AckTimerObserver + Send> AckTimer<T> {
     /// stops the timer. this is similar to stop() but subsequent start() call
     /// will fail (the timer is no longer usable)
     pub(crate) fn stop(&mut self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
         self.close_tx.take();
     }
 

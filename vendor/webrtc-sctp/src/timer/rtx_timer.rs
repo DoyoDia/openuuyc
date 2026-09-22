@@ -1,3 +1,4 @@
+use portable_atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
 use async_trait::async_trait;
@@ -6,8 +7,9 @@ use tokio::time::Duration;
 
 use crate::association::RtxTimerId;
 
-pub(crate) const RTO_INITIAL: u64 = 3000; // msec
-pub(crate) const RTO_MIN: u64 = 1000; // msec
+pub(crate) const RTO_INITIAL: u64 = 500; // msec, UU V4.7.3 DATA estimator
+pub(crate) const RTO_MIN: u64 = 400; // msec
+pub(crate) const INIT_TIMEOUT: u64 = 1000; // INIT/COOKIE are independent of DATA RTO
 pub(crate) const RTO_MAX: u64 = 60000; // msec
 pub(crate) const RTO_ALPHA: u64 = 1;
 pub(crate) const RTO_BETA: u64 = 2;
@@ -110,6 +112,7 @@ pub(crate) struct RtxTimer<T: 'static + RtxTimerObserver + Send> {
     pub(crate) id: RtxTimerId,
     pub(crate) max_retrans: usize,
     pub(crate) close_tx: Arc<Mutex<Option<mpsc::Sender<()>>>>,
+    generation: Arc<AtomicU64>,
 }
 
 impl<T: 'static + RtxTimerObserver + Send> RtxTimer<T> {
@@ -126,6 +129,7 @@ impl<T: 'static + RtxTimerObserver + Send> RtxTimer<T> {
             id,
             max_retrans,
             close_tx: Arc::new(Mutex::new(None)),
+            generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -137,7 +141,7 @@ impl<T: 'static + RtxTimerObserver + Send> RtxTimer<T> {
         // value at RTO.Min or at RTO.Max.
 
         // this timer is already closed
-        let mut close_rx = {
+        let (mut close_rx, epoch) = {
             let mut close = self.close_tx.lock().await;
             if close.is_some() {
                 return false;
@@ -145,19 +149,30 @@ impl<T: 'static + RtxTimerObserver + Send> RtxTimer<T> {
 
             let (close_tx, close_rx) = mpsc::channel(1);
             *close = Some(close_tx);
-            close_rx
+            (
+                close_rx,
+                self.generation
+                    .fetch_add(1, Ordering::SeqCst)
+                    .wrapping_add(1),
+            )
         };
 
         let id = self.id;
         let max_retrans = self.max_retrans;
         let close_tx = Arc::clone(&self.close_tx);
         let timeout_observer = self.timeout_observer.clone();
+        let generation = self.generation.clone();
 
         tokio::spawn(async move {
             let mut n_rtos = 0;
 
             loop {
                 let interval = calculate_next_timeout(rto, n_rtos);
+                let interval = if id == RtxTimerId::T3RTX && n_rtos > 0 {
+                    interval.min(3000)
+                } else {
+                    interval
+                };
                 let timer = tokio::time::sleep(Duration::from_millis(interval));
                 tokio::pin!(timer);
 
@@ -168,6 +183,9 @@ impl<T: 'static + RtxTimerObserver + Send> RtxTimer<T> {
                         let failure = {
                             if let Some(observer) = timeout_observer.upgrade(){
                                 let mut observer = observer.lock().await;
+                                // ACK/close may have stopped this timer while
+                                // its already-fired task waited for the lock.
+                                if generation.load(Ordering::SeqCst) != epoch { break; }
                                 if max_retrans == 0 || n_rtos <= max_retrans {
                                     observer.on_retransmission_timeout(id, n_rtos).await;
                                     false
@@ -181,7 +199,9 @@ impl<T: 'static + RtxTimerObserver + Send> RtxTimer<T> {
                         };
                         if failure {
                             let mut close = close_tx.lock().await;
-                            *close = None;
+                            if generation.load(Ordering::SeqCst) == epoch {
+                                *close = None;
+                            }
                             break;
                         }
                     }
@@ -196,6 +216,7 @@ impl<T: 'static + RtxTimerObserver + Send> RtxTimer<T> {
     /// stop stops the timer.
     pub(crate) async fn stop(&self) {
         let mut close_tx = self.close_tx.lock().await;
+        self.generation.fetch_add(1, Ordering::SeqCst);
         close_tx.take();
     }
 

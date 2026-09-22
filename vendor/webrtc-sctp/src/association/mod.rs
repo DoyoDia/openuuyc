@@ -8,7 +8,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::Instant;
 
 use association_internal::*;
 use association_stats::*;
@@ -62,7 +62,7 @@ pub(crate) const RECEIVE_MTU: usize = 8192;
 // fragmentation surviving the path (#806).
 pub(crate) const INITIAL_MTU: u32 = 1191;
 /// initial MTU for outgoing packets (to DTLS)
-pub(crate) const INITIAL_RECV_BUF_SIZE: u32 = 1024 * 1024;
+pub(crate) const INITIAL_RECV_BUF_SIZE: u32 = 5 * 1024 * 1024;
 pub(crate) const COMMON_HEADER_SIZE: u32 = 12;
 pub(crate) const DATA_CHUNK_HEADER_SIZE: u32 = 16;
 pub(crate) const DEFAULT_MAX_MESSAGE_SIZE: u32 = 65536;
@@ -239,14 +239,15 @@ impl Association {
     pub async fn server(config: Config) -> Result<Self> {
         let (a, mut handshake_completed_ch_rx) = Association::new(config, false).await?;
 
-        if let Some(err_opt) = handshake_completed_ch_rx.recv().await {
-            if let Some(err) = err_opt {
-                Err(err)
-            } else {
-                Ok(a)
+        match handshake_completed_ch_rx.recv().await {
+            Some(None) => Ok(a),
+            outcome => {
+                let error = outcome
+                    .flatten()
+                    .unwrap_or(Error::ErrAssociationHandshakeClosed);
+                let _ = a.close().await;
+                Err(error)
             }
-        } else {
-            Err(Error::ErrAssociationHandshakeClosed)
         }
     }
 
@@ -254,14 +255,15 @@ impl Association {
     pub async fn client(config: Config) -> Result<Self> {
         let (a, mut handshake_completed_ch_rx) = Association::new(config, true).await?;
 
-        if let Some(err_opt) = handshake_completed_ch_rx.recv().await {
-            if let Some(err) = err_opt {
-                Err(err)
-            } else {
-                Ok(a)
+        match handshake_completed_ch_rx.recv().await {
+            Some(None) => Ok(a),
+            outcome => {
+                let error = outcome
+                    .flatten()
+                    .unwrap_or(Error::ErrAssociationHandshakeClosed);
+                let _ = a.close().await;
+                Err(error)
             }
-        } else {
-            Err(Error::ErrAssociationHandshakeClosed)
         }
     }
 
@@ -298,10 +300,12 @@ impl Association {
     pub async fn close(&self) -> Result<()> {
         log::debug!("[{}] closing association..", self.name);
 
+        {
+            let mut ai = self.association_internal.lock().await;
+            ai.close().await?;
+        }
         let _ = self.net_conn.close().await;
-
-        let mut ai = self.association_internal.lock().await;
-        ai.close().await
+        Ok(())
     }
 
     async fn new(config: Config, is_client: bool) -> Result<(Self, mpsc::Receiver<Option<Error>>)> {
@@ -393,9 +397,8 @@ impl Association {
                 ai.set_state(AssociationState::CookieWait);
                 ai.stored_init = Some(init);
                 ai.send_init()?;
-                let rto = ai.rto_mgr.get_rto();
                 if let Some(t1init) = &ai.t1init {
-                    t1init.start(rto).await;
+                    t1init.start(INIT_TIMEOUT).await;
                 }
             }
         }
@@ -499,7 +502,16 @@ impl Association {
             let name2 = Arc::clone(&name);
             let done2 = Arc::clone(&done);
             let mut buffer = None;
+            let sent_any = !packets.is_empty();
             for raw in packets {
+                // A terminal close retires queued packets. Do not cancel a
+                // transport write already in progress (it may be TCP-framed).
+                if matches!(
+                    close_loop_ch.try_recv(),
+                    Ok(_) | Err(broadcast::error::TryRecvError::Closed)
+                ) {
+                    break 'outer;
+                }
                 let mut buf = buffer
                     .take()
                     .unwrap_or_else(|| BytesMut::with_capacity(16 * 1024));
@@ -512,10 +524,17 @@ impl Association {
                     .await
                 {
                     Ok(Ok(mut buf)) => {
+                        if matches!(
+                            close_loop_ch.try_recv(),
+                            Ok(_) | Err(broadcast::error::TryRecvError::Closed)
+                        ) {
+                            break 'outer;
+                        }
                         let raw = buf.as_ref();
                         if let Err(err) = net_conn.send(raw.as_ref()).await {
                             log::warn!("[{name2}] failed to write packets on net_conn: {err}");
-                            done2.store(true, Ordering::Relaxed)
+                            done2.store(true, Ordering::Relaxed);
+                            break 'outer;
                         } else {
                             bytes_sent.fetch_add(raw.len(), Ordering::SeqCst);
                         }
@@ -545,8 +564,22 @@ impl Association {
                 break;
             }
 
-            //log::debug!("[{}] wait awake_write_loop_ch", name);
+            let deadline = {
+                let mut ai = association_internal.lock().await;
+                if sent_any {
+                    ai.last_packet_sent = Instant::now();
+                }
+                ai.heartbeat_deadline()
+            };
+            let heartbeat = async {
+                match deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+                    None => std::future::pending::<()>().await,
+                }
+            };
             tokio::select! {
+                _ = heartbeat => {}
+
                 _ = awake_write_loop_ch.recv() =>{}
                 _ = close_loop_ch.recv() => {
                     done.store(true, Ordering::Relaxed);

@@ -1976,6 +1976,11 @@ impl RTCPeerConnection {
         }
 
         // https://www.w3.org/TR/webrtc/#dom-rtcpeerconnection-close (step #5)
+        // Terminate the association before waiting for channel send/reset locks.
+        if let Err(err) = self.internal.sctp_transport.stop().await {
+            close_errs.push(Error::new(format!("sctp_transport: {err}")));
+        }
+
         {
             let mut data_channels = self.internal.sctp_transport.data_channels.lock().await;
             for d in &*data_channels {
@@ -1987,9 +1992,6 @@ impl RTCPeerConnection {
         }
 
         // https://www.w3.org/TR/webrtc/#dom-rtcpeerconnection-close (step #6)
-        if let Err(err) = self.internal.sctp_transport.stop().await {
-            close_errs.push(Error::new(format!("sctp_transport: {err}")));
-        }
 
         // https://www.w3.org/TR/webrtc/#dom-rtcpeerconnection-close (step #7)
         if let Err(err) = self.internal.dtls_transport.stop().await {

@@ -256,13 +256,17 @@ impl Transport {
         })
         .await
         .context("文件发送超时，未自动重发")??;
-        // Once packetization starts, complete its enqueue even if the business
-        // task is paused. Cancellation is checked before the next message.
-        if file {
-            channel.send(&bytes).await?;
-        } else {
-            channel.send_text_bytes(&bytes).await?;
-        }
+        // Capacity is reserved before SCTP assigns SSN; a timed-out admission
+        // is cancellable, while an admitted message is always complete.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            if file {
+                channel.send(&bytes).await
+            } else {
+                channel.send_text_bytes(&bytes).await
+            }
+        })
+        .await
+        .context("文件发送超时，未自动重发")??;
         Ok(())
     }
 }

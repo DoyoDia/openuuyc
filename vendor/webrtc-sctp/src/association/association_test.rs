@@ -1423,8 +1423,11 @@ async fn test_assoc_congestion_control_congestion_avoidance() -> Result<()> {
     let (s0, s1) = establish_session_pair(&br, &a0, &mut a1, SI).await?;
 
     {
-        let a = a0.association_internal.lock().await;
+        let mut a = a0.association_internal.lock().await;
         let b = a1.association_internal.lock().await;
+        // Keep the congestion threshold below the flow-control window so the
+        // test reaches CA without relying on growing a receiver-limited cwnd.
+        a.ssthresh = 16 * a.mtu;
         a.stats.reset();
         b.stats.reset();
     }
@@ -1489,12 +1492,7 @@ async fn test_assoc_congestion_control_congestion_avoidance() -> Result<()> {
             a.cwnd > a.ssthresh,
             "should be in congestion avoidance mode"
         );
-        assert!(
-            a.ssthresh >= MAX_RECEIVE_BUFFER_SIZE,
-            "{} should not be less than the initial size of 128KB {}",
-            a.ssthresh,
-            MAX_RECEIVE_BUFFER_SIZE
-        );
+        assert_eq!(a.ssthresh, 16 * a.mtu, "no loss should change ssthresh");
 
         assert_eq!(
             0,
@@ -2039,6 +2037,7 @@ async fn test_assoc_abort() -> Result<()> {
         create_new_association_pair(&br, Arc::new(ca), Arc::new(cb), AckMode::NoDelay, 0).await?;
 
     let abort = ChunkAbort {
+        reflected_tag: false,
         error_causes: vec![ErrorCauseProtocolViolation {
             code: PROTOCOL_VIOLATION,
             ..Default::default()

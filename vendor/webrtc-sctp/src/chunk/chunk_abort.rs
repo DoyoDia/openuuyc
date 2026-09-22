@@ -28,6 +28,7 @@ use crate::error_cause::*;
 ///+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 #[derive(Default, Debug, Clone)]
 pub(crate) struct ChunkAbort {
+    pub(crate) reflected_tag: bool,
     pub(crate) error_causes: Vec<ErrorCause>,
 }
 
@@ -48,7 +49,7 @@ impl Chunk for ChunkAbort {
     fn header(&self) -> ChunkHeader {
         ChunkHeader {
             typ: CT_ABORT,
-            flags: 0,
+            flags: u8::from(self.reflected_tag),
             value_length: self.value_length() as u16,
         }
     }
@@ -62,7 +63,7 @@ impl Chunk for ChunkAbort {
 
         let mut error_causes = vec![];
         let mut offset = CHUNK_HEADER_SIZE;
-        while offset + 4 <= raw.len() {
+        while offset + 4 <= CHUNK_HEADER_SIZE + header.value_length() {
             let e = ErrorCause::unmarshal(
                 &raw.slice(offset..CHUNK_HEADER_SIZE + header.value_length()),
             )?;
@@ -70,7 +71,10 @@ impl Chunk for ChunkAbort {
             error_causes.push(e);
         }
 
-        Ok(ChunkAbort { error_causes })
+        Ok(ChunkAbort {
+            error_causes,
+            reflected_tag: header.flags & 1 != 0,
+        })
     }
 
     fn marshal_to(&self, buf: &mut BytesMut) -> Result<usize> {

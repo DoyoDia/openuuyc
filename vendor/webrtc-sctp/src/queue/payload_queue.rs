@@ -15,6 +15,7 @@ pub(crate) struct PayloadQueue {
     pub(crate) sorted: VecDeque<u32>,
     pub(crate) dup_tsn: Vec<u32>,
     pub(crate) n_bytes: usize,
+    wire_inflight_bytes: usize,
 }
 
 impl PayloadQueue {
@@ -30,9 +31,13 @@ impl PayloadQueue {
         !(self.chunk_map.contains_key(&p.tsn) || sna32lte(p.tsn, cumulative_tsn))
     }
 
-    pub(crate) fn push_no_check(&mut self, p: ChunkPayloadData) {
+    pub(crate) fn push_no_check(&mut self, mut p: ChunkPayloadData) {
         let tsn = p.tsn;
         self.n_bytes += p.user_data.len();
+        p.in_flight = p.nsent != 0 && !p.acked && !p.retransmit;
+        if p.in_flight {
+            self.wire_inflight_bytes += p.wire_size();
+        }
         self.chunk_map.insert(tsn, p);
         self.length.fetch_add(1, Ordering::SeqCst);
 
@@ -81,6 +86,9 @@ impl PayloadQueue {
             if let Some(c) = self.chunk_map.remove(&tsn) {
                 self.length.fetch_sub(1, Ordering::SeqCst);
                 self.n_bytes -= c.user_data.len();
+                if c.in_flight {
+                    self.wire_inflight_bytes -= c.wire_size();
+                }
                 return Some(c);
             }
         }
@@ -108,17 +116,17 @@ impl PayloadQueue {
 
         let mut b = GapAckBlock::default();
         let mut gap_ack_blocks = vec![];
-        for (i, tsn) in self.sorted.iter().enumerate() {
-            let diff = if *tsn >= cumulative_tsn {
-                (*tsn - cumulative_tsn) as u16
-            } else {
-                0
-            };
+        for tsn in &self.sorted {
+            let distance = tsn.wrapping_sub(cumulative_tsn);
+            if distance == 0 || distance > u16::MAX as u32 {
+                continue;
+            }
+            let diff = distance as u16;
 
-            if i == 0 {
+            if b.start == 0 {
                 b.start = diff;
                 b.end = b.start;
-            } else if b.end + 1 == diff {
+            } else if u32::from(b.end) + 1 == u32::from(diff) {
                 b.end += 1;
             } else {
                 gap_ack_blocks.push(b);
@@ -128,7 +136,9 @@ impl PayloadQueue {
             }
         }
 
-        gap_ack_blocks.push(b);
+        if b.start != 0 {
+            gap_ack_blocks.push(b);
+        }
 
         gap_ack_blocks
     }
@@ -143,6 +153,10 @@ impl PayloadQueue {
 
     pub(crate) fn mark_as_acked(&mut self, tsn: u32) -> usize {
         let n_bytes_acked = if let Some(c) = self.chunk_map.get_mut(&tsn) {
+            if c.in_flight {
+                self.wire_inflight_bytes -= c.wire_size();
+                c.in_flight = false;
+            }
             c.acked = true;
             c.retransmit = false;
             let n = c.user_data.len();
@@ -165,8 +179,34 @@ impl PayloadQueue {
             if c.acked || c.abandoned() {
                 continue;
             }
+            if c.in_flight {
+                self.wire_inflight_bytes -= c.wire_size();
+                c.in_flight = false;
+            }
             c.retransmit = true;
         }
+    }
+
+    pub(crate) fn mark_lost(&mut self, tsn: u32) {
+        if let Some(c) = self.chunk_map.get_mut(&tsn) {
+            if c.in_flight {
+                self.wire_inflight_bytes -= c.wire_size();
+                c.in_flight = false;
+            }
+        }
+    }
+
+    pub(crate) fn mark_in_flight(&mut self, tsn: u32) {
+        if let Some(c) = self.chunk_map.get_mut(&tsn) {
+            if !c.in_flight && !c.acked {
+                self.wire_inflight_bytes += c.wire_size();
+                c.in_flight = true;
+            }
+        }
+    }
+
+    pub(crate) fn get_num_wire_bytes(&self) -> usize {
+        self.wire_inflight_bytes
     }
 
     pub(crate) fn get_num_bytes(&self) -> usize {

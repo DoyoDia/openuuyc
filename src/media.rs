@@ -221,6 +221,23 @@ pub fn detect_local_display() -> Result<LocalDisplayInfo> {
     })
 }
 
+/// Current active display dimensions offered by the UU controller. This is
+/// neither a list of supported physical modes nor a request to change one.
+pub(crate) fn local_display_dimensions() -> Vec<(u32, u32)> {
+    let mut modes = DisplayInfo::all()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|d| d.width != 0 && d.height != 0)
+        .map(|d| (d.width, d.height))
+        .collect::<Vec<_>>();
+    modes.sort_unstable();
+    modes.dedup();
+    if modes.is_empty() {
+        modes.push((1920, 1080));
+    }
+    modes
+}
+
 fn max_frame_rate_level(refresh_hz: u32) -> u32 {
     FPS_LEVELS_ASCENDING
         .into_iter()

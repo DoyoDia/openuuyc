@@ -878,13 +878,15 @@ async fn run(
     for (c, _) in running.values() {
         c.cancel();
     }
+    // Release this lease before joining workers. The final owner terminates
+    // SCTP and wakes admissions; other viewing/forwarding owners stay alive.
+    if let Some(tx) = end {
+        let _ = tx.send(());
+    }
     for (_, (_, t)) in running {
         let _ = t.await;
     }
     while queries.join_next().await.is_some() {}
-    if let Some(tx) = end {
-        let _ = tx.send(());
-    }
     if let Some(t) = alive {
         let _ = t.await;
     }

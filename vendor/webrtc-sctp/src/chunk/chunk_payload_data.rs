@@ -1,7 +1,7 @@
 use std::fmt;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::Instant;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use portable_atomic::AtomicBool;
@@ -110,7 +110,7 @@ pub struct ChunkPayloadData {
     pub(crate) miss_indicator: u32,
 
     /// Partial-reliability parameters used only by sender
-    pub(crate) since: SystemTime,
+    pub(crate) since: Instant,
     /// number of transmission made for this chunk
     pub(crate) nsent: u32,
 
@@ -122,6 +122,8 @@ pub struct ChunkPayloadData {
     /// Retransmission flag set when T1-RTX timeout occurred and this
     /// chunk is still in the inflight queue
     pub(crate) retransmit: bool,
+    pub(crate) pending_queue_credit: usize,
+    pub(crate) in_flight: bool,
 }
 
 impl Default for ChunkPayloadData {
@@ -138,11 +140,13 @@ impl Default for ChunkPayloadData {
             user_data: Bytes::new(),
             acked: false,
             miss_indicator: 0,
-            since: SystemTime::now(),
+            since: Instant::now(),
             nsent: 0,
             abandoned: Arc::new(AtomicBool::new(false)),
             all_inflight: Arc::new(AtomicBool::new(false)),
             retransmit: false,
+            pending_queue_credit: 0,
+            in_flight: false,
         }
     }
 }
@@ -217,11 +221,13 @@ impl Chunk for ChunkPayloadData {
             user_data,
             acked: false,
             miss_indicator: 0,
-            since: SystemTime::now(),
+            since: Instant::now(),
             nsent: 0,
             abandoned: Arc::new(AtomicBool::new(false)),
             all_inflight: Arc::new(AtomicBool::new(false)),
             retransmit: false,
+            pending_queue_credit: 0,
+            in_flight: false,
         })
     }
 
@@ -268,5 +274,12 @@ impl ChunkPayloadData {
         if self.ending_fragment {
             self.all_inflight.store(true, Ordering::SeqCst);
         }
+    }
+}
+
+impl ChunkPayloadData {
+    /// DATA common + fixed header and its required four-byte wire alignment.
+    pub(crate) fn wire_size(&self) -> usize {
+        (CHUNK_HEADER_SIZE + PAYLOAD_DATA_HEADER_SIZE + self.user_data.len() + 3) & !3
     }
 }

@@ -14,7 +14,9 @@ use super::*;
 ///|   Type = 14   |Reserved     |T|      Length = 4               |
 ///+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 #[derive(Default, Debug, Clone)]
-pub(crate) struct ChunkShutdownComplete;
+pub(crate) struct ChunkShutdownComplete {
+    pub(crate) reflected_tag: bool,
+}
 
 /// makes chunkShutdownComplete printable
 impl fmt::Display for ChunkShutdownComplete {
@@ -27,7 +29,7 @@ impl Chunk for ChunkShutdownComplete {
     fn header(&self) -> ChunkHeader {
         ChunkHeader {
             typ: CT_SHUTDOWN_COMPLETE,
-            flags: 0,
+            flags: u8::from(self.reflected_tag),
             value_length: self.value_length() as u16,
         }
     }
@@ -39,7 +41,9 @@ impl Chunk for ChunkShutdownComplete {
             return Err(Error::ErrChunkTypeNotShutdownComplete);
         }
 
-        Ok(ChunkShutdownComplete {})
+        Ok(ChunkShutdownComplete {
+            reflected_tag: header.flags & 1 != 0,
+        })
     }
 
     fn marshal_to(&self, writer: &mut BytesMut) -> Result<usize> {

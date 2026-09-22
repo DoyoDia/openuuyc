@@ -204,6 +204,7 @@ pub struct Kcp<Output> {
     snd_nxt: u32,
     /// Next packet to be received
     rcv_nxt: u32,
+    accepted_segments: u64,
 
     /// Congestion window threshold
     ssthresh: u16,
@@ -346,6 +347,7 @@ impl<Output> Kcp<Output> {
             snd_una: 0,
             snd_nxt: 0,
             rcv_nxt: 0,
+            accepted_segments: 0,
             ts_probe: 0,
             probe_wait: 0,
             snd_wnd: KCP_WND_SND,
@@ -651,6 +653,7 @@ impl<Output> Kcp<Output> {
 
         if !repeat {
             self.rcv_buf.insert(new_index, new_segment);
+            self.accepted_segments = self.accepted_segments.wrapping_add(1);
         }
 
         // move available data from rcv_buf -> rcv_queue
@@ -679,6 +682,16 @@ impl<Output> Kcp<Output> {
     #[inline]
     pub fn conv(&self) -> u32 {
         self.conv
+    }
+
+    /// Number of new PUSH segments actually admitted to the receive buffer.
+    pub fn accepted_segments(&self) -> u64 {
+        self.accepted_segments
+    }
+
+    /// First TSN not yet moved into the reliable receive queue.
+    pub fn receive_next(&self) -> u32 {
+        self.rcv_nxt
     }
 
     /// Call this when you received a packet from raw connection

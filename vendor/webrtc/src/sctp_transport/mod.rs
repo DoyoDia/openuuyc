@@ -49,6 +49,7 @@ pub type OnDataChannelOpenedHdlrFn = Box<
 >;
 
 struct AcceptDataChannelParams {
+    state: Arc<AtomicU8>,
     notify_rx: Arc<Notify>,
     sctp_association: Arc<Association>,
     data_channels: Arc<Mutex<Vec<Arc<RTCDataChannel>>>>,
@@ -66,7 +67,7 @@ pub struct RTCSctpTransport {
     pub(crate) dtls_transport: Arc<RTCDtlsTransport>,
 
     // State represents the current state of the SCTP transport.
-    state: AtomicU8, // RTCSctpTransportState
+    state: Arc<AtomicU8>, // RTCSctpTransportState
 
     // SCTPTransportState doesn't have an enum to distinguish between New/Connecting
     // so we need a dedicated field
@@ -103,7 +104,7 @@ impl RTCSctpTransport {
     ) -> Self {
         RTCSctpTransport {
             dtls_transport,
-            state: AtomicU8::new(RTCSctpTransportState::Connecting as u8),
+            state: Arc::new(AtomicU8::new(RTCSctpTransportState::Connecting as u8)),
             is_started: AtomicBool::new(false),
             max_channels: SCTP_MAX_CHANNELS,
             sctp_association: Mutex::new(None),
@@ -145,10 +146,15 @@ impl RTCSctpTransport {
         local_port: u16,
         remote_port: u16,
     ) -> Result<()> {
-        if self.is_started.load(Ordering::SeqCst) {
+        let stopped = self.notify_tx.notified();
+        tokio::pin!(stopped);
+        stopped.as_mut().enable();
+        if self.state() == RTCSctpTransportState::Closed {
+            return Err(Error::ErrSCTPTransportDTLS);
+        }
+        if self.is_started.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
-        self.is_started.store(true, Ordering::SeqCst);
 
         let dtls_transport = self.transport();
 
@@ -169,19 +175,18 @@ impl RTCSctpTransport {
                 .await;
             {
                 let mut current = self.data_mux.lock().await;
+                if self.state() == RTCSctpTransportState::Closed {
+                    drop(current);
+                    let mut data_mux = data_mux;
+                    data_mux.close().await;
+                    return Err(Error::ErrSCTPTransportDTLS);
+                }
                 *current = Some(data_mux);
             }
             self.data_mux_ready.notify_waiters();
-            let sctp_association = loop {
-                tokio::select! {
-                    _ = self.notify_tx.notified() => {
-                        // It seems like notify_tx is only notified on Stop so perhaps this check
-                        // is redundant.
-                        // TODO: Consider renaming notify_tx to shutdown_tx.
-                        if self.state.load(Ordering::SeqCst) == RTCSctpTransportState::Closed as u8 {
-                            return Err(Error::ErrSCTPTransportDTLS);
-                        }
-                    },
+            let sctp_association = tokio::select! {
+                    biased;
+                    _ = stopped.as_mut() => return Err(Error::ErrSCTPTransportDTLS),
                     association = sctp::association::Association::client(sctp::association::Config {
                         net_conn: Arc::clone(&sctp_conn) as Arc<dyn Conn + Send + Sync>,
                         max_receive_buffer_size: 0,
@@ -191,19 +196,31 @@ impl RTCSctpTransport {
                         local_port,
                         remote_port,
                     }) => {
-                        break Arc::new(association?);
+                        Arc::new(association?)
                     }
-                };
             };
 
             {
                 let mut sa = self.sctp_association.lock().await;
+                // Publish under the owner lock, preserving stop as terminal.
+                // Stop may have won while Association::client completed.
+                if self
+                    .state
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |state| {
+                        (state != RTCSctpTransportState::Closed as u8)
+                            .then_some(RTCSctpTransportState::Connected as u8)
+                    })
+                    .is_err()
+                {
+                    drop(sa);
+                    let _ = sctp_association.close().await;
+                    return Err(Error::ErrSCTPTransportDTLS);
+                }
                 *sa = Some(Arc::clone(&sctp_association));
             }
-            self.state
-                .store(RTCSctpTransportState::Connected as u8, Ordering::SeqCst);
 
             let param = AcceptDataChannelParams {
+                state: self.state.clone(),
                 notify_rx: self.notify_tx.clone(),
                 sctp_association,
                 data_channels: Arc::clone(&self.data_channels),
@@ -226,6 +243,11 @@ impl RTCSctpTransport {
 
     /// Stop stops the SCTPTransport
     pub async fn stop(&self) -> Result<()> {
+        // Make termination observable before awaiting any owner/IO lock.
+        self.state
+            .store(RTCSctpTransportState::Closed as u8, Ordering::SeqCst);
+        self.notify_tx.notify_waiters();
+        self.data_mux_ready.notify_waiters();
         {
             let mut sctp_association = self.sctp_association.lock().await;
             if let Some(sa) = sctp_association.take() {
@@ -233,11 +255,6 @@ impl RTCSctpTransport {
             }
         }
 
-        self.state
-            .store(RTCSctpTransportState::Closed as u8, Ordering::SeqCst);
-
-        self.notify_tx.notify_waiters();
-        self.data_mux_ready.notify_waiters();
         if let Some(mut mux) = self.data_mux.lock().await.take() {
             mux.close().await;
         }
@@ -289,6 +306,9 @@ impl RTCSctpTransport {
                     match result {
                         Ok(dc) => dc,
                         Err(err) => {
+                            if param.state.load(Ordering::SeqCst) == RTCSctpTransportState::Closed as u8 {
+                                break;
+                            }
                             if data::Error::ErrStreamClosed == err {
                                 log::error!("Failed to accept data channel: {err}");
                                 if let Some(handler) = &*param.on_error_handler.load() {

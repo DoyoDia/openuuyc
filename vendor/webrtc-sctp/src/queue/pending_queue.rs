@@ -1,8 +1,9 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::Ordering;
 
+use crate::error::{Error, Result};
 use portable_atomic::{AtomicBool, AtomicUsize};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, MutexGuard, Semaphore, SemaphorePermit};
 use util::sync::RwLock;
 
 use crate::chunk::chunk_payload_data::ChunkPayloadData;
@@ -12,15 +13,73 @@ use crate::chunk::chunk_payload_data::ChunkPayloadData;
 // Some tests push a lot of data before starting to process any data...
 #[cfg(test)]
 const QUEUE_BYTES_LIMIT: usize = 128 * 1024 * 1024;
-/// Maximum size of the pending queue, in bytes.
+/// UU V4.7.3 send-admission budget. Multiple complete FILE messages and TEXT
+/// can coexist so message-boundary stream scheduling can actually take effect.
 #[cfg(not(test))]
-const QUEUE_BYTES_LIMIT: usize = 128 * 1024;
-/// Total user data size, beyond which the packet will be split into chunks. The chunks will be
-/// added to the pending queue one by one.
-const QUEUE_APPEND_LARGE: usize = (QUEUE_BYTES_LIMIT * 2) / 3;
-
+const QUEUE_BYTES_LIMIT: usize = 2_000_000;
 /// Basic queue for either ordered or unordered chunks.
 pub(crate) type PendingBaseQueue = VecDeque<ChunkPayloadData>;
+
+/// UU's negotiated non-interleaved path selects a stream at message
+/// boundaries. It never interrupts the fragments of an admitted message.
+#[derive(Debug, Default)]
+struct OrderedQueue {
+    streams: BTreeMap<u16, PendingBaseQueue>,
+    ready: BTreeSet<(u64, u16)>,
+    current: Option<u16>,
+    virtual_time: u64,
+}
+
+impl OrderedQueue {
+    fn extend(&mut self, chunks: Vec<ChunkPayloadData>) {
+        for chunk in chunks {
+            let id = chunk.stream_identifier;
+            let queue = self.streams.entry(id).or_default();
+            if queue.is_empty() && self.current != Some(id) {
+                self.ready.insert((self.virtual_time + 1, id));
+            }
+            queue.push_back(chunk);
+        }
+    }
+
+    fn front(&mut self) -> Option<&ChunkPayloadData> {
+        // Pin the selection through the writer's cwnd/rwnd check and pop.
+        // Concurrent admission of a lower-ID stream must not change its head.
+        let id = match self.current {
+            Some(id) => id,
+            None => {
+                let (finish, id) = self.ready.pop_first()?;
+                self.virtual_time = self.virtual_time.max(finish);
+                self.current = Some(id);
+                id
+            }
+        };
+        self.streams.get(&id)?.front()
+    }
+
+    fn pop_front(&mut self) -> Option<ChunkPayloadData> {
+        let id = match self.current {
+            Some(id) => id,
+            None => {
+                let (finish, id) = self.ready.pop_first()?;
+                self.virtual_time = self.virtual_time.max(finish);
+                self.current = Some(id);
+                id
+            }
+        };
+        let queue = self.streams.get_mut(&id)?;
+        let chunk = queue.pop_front()?;
+        if chunk.ending_fragment {
+            self.current = None;
+            if queue.is_empty() {
+                self.streams.remove(&id);
+            } else {
+                self.ready.insert((self.virtual_time + 1, id));
+            }
+        }
+        Some(chunk)
+    }
+}
 
 /// A queue for both ordered and unordered chunks.
 #[derive(Debug)]
@@ -35,7 +94,7 @@ pub(crate) struct PendingQueue {
     semaphore: Semaphore,
 
     unordered_queue: RwLock<PendingBaseQueue>,
-    ordered_queue: RwLock<PendingBaseQueue>,
+    ordered_queue: RwLock<OrderedQueue>,
     queue_len: AtomicUsize,
     n_bytes: AtomicUsize,
     selected: AtomicBool,
@@ -62,92 +121,49 @@ impl PendingQueue {
         }
     }
 
-    /// Appends a chunk to the back of the pending queue.
-    pub(crate) async fn push(&self, c: ChunkPayloadData) {
-        let user_data_len = c.user_data.len();
-
-        {
-            let _sem_lock = self.semaphore_lock.lock().await;
-            let permits = self.semaphore.acquire_many(user_data_len as u32).await;
-            // unwrap ok because we never close the semaphore unless we have dropped self
-            permits.unwrap().forget();
-
-            if c.unordered {
-                let mut unordered_queue = self.unordered_queue.write();
-                unordered_queue.push_back(c);
-                self.n_bytes.fetch_add(user_data_len, Ordering::SeqCst);
-                self.queue_len.fetch_add(1, Ordering::SeqCst);
-            } else {
-                let mut ordered_queue = self.ordered_queue.write();
-                ordered_queue.push_back(c);
-                self.n_bytes.fetch_add(user_data_len, Ordering::SeqCst);
-                self.queue_len.fetch_add(1, Ordering::SeqCst);
-            }
-        }
+    /// Reserve before assigning a stream sequence number. A large message
+    /// exclusively occupies the budget until its last fragment leaves pending;
+    /// memory is bounded by max(queue budget, negotiated maximum message size).
+    pub(crate) async fn reserve(&self, bytes: usize) -> Result<PendingReservation<'_>> {
+        let guard = self.semaphore_lock.lock().await;
+        let permit = self
+            .semaphore
+            .acquire_many(bytes.min(QUEUE_BYTES_LIMIT) as u32)
+            .await
+            .map_err(|_| Error::ErrStreamClosed)?;
+        Ok(PendingReservation {
+            queue: self,
+            _guard: guard,
+            permit,
+        })
     }
 
-    /// Appends chunks to the back of the pending queue.
-    ///
-    /// # Panics
-    ///
-    /// If it's a mix of unordered and ordered chunks.
+    pub(crate) fn close(&self) {
+        self.semaphore.close();
+    }
+
+    pub(crate) async fn push(&self, chunk: ChunkPayloadData) -> Result<()> {
+        self.reserve(chunk.user_data.len())
+            .await?
+            .commit(vec![chunk]);
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) async fn append(&self, chunks: Vec<ChunkPayloadData>) {
-        self.append_and_wake(chunks, || {}).await;
+        self.append_and_wake(chunks, || {}).await.unwrap();
     }
 
+    #[cfg(test)]
     pub(crate) async fn append_and_wake(
         &self,
         chunks: Vec<ChunkPayloadData>,
         mut wake: impl FnMut(),
-    ) {
-        if chunks.is_empty() {
-            return;
-        }
-
-        let total_user_data_len = chunks.iter().fold(0, |acc, c| acc + c.user_data.len());
-
-        if total_user_data_len >= QUEUE_APPEND_LARGE {
-            self.append_large(chunks, &mut wake).await
-        } else {
-            let _sem_lock = self.semaphore_lock.lock().await;
-            let permits = self
-                .semaphore
-                .acquire_many(total_user_data_len as u32)
-                .await;
-            // unwrap ok because we never close the semaphore unless we have dropped self
-            permits.unwrap().forget();
-            self.append_unlimited(chunks, total_user_data_len);
-            wake();
-        }
-    }
-
-    // If this is a very large message we append chunks one by one to allow progress while we are appending
-    async fn append_large(&self, chunks: Vec<ChunkPayloadData>, wake: &mut impl FnMut()) {
-        // lock this for the whole duration
-        let _sem_lock = self.semaphore_lock.lock().await;
-
-        for chunk in chunks.into_iter() {
-            let user_data_len = chunk.user_data.len();
-            let permits = self.semaphore.acquire_many(user_data_len as u32).await;
-            // unwrap ok because we never close the semaphore unless we have dropped self
-            permits.unwrap().forget();
-
-            if chunk.unordered {
-                let mut unordered_queue = self.unordered_queue.write();
-                unordered_queue.push_back(chunk);
-                self.n_bytes.fetch_add(user_data_len, Ordering::SeqCst);
-                self.queue_len.fetch_add(1, Ordering::SeqCst);
-            } else {
-                let mut ordered_queue = self.ordered_queue.write();
-                ordered_queue.push_back(chunk);
-                self.n_bytes.fetch_add(user_data_len, Ordering::SeqCst);
-                self.queue_len.fetch_add(1, Ordering::SeqCst);
-            }
-            // A message can exceed the pending queue capacity. Let the writer
-            // drain published fragments before waiting for more permits.
-            wake();
-        }
+    ) -> Result<()> {
+        let bytes = chunks.iter().map(|c| c.user_data.len()).sum();
+        self.reserve(bytes).await?.commit(chunks);
+        wake();
+        Ok(())
     }
 
     /// Assumes that A) enough permits have been acquired and forget from the semaphore and that the semaphore_lock is held
@@ -186,7 +202,7 @@ impl PendingQueue {
                 let unordered_queue = self.unordered_queue.read();
                 return unordered_queue.front().cloned();
             } else {
-                let ordered_queue = self.ordered_queue.read();
+                let mut ordered_queue = self.ordered_queue.write();
                 return ordered_queue.front().cloned();
             }
         }
@@ -200,7 +216,7 @@ impl PendingQueue {
             return c;
         }
 
-        let ordered_queue = self.ordered_queue.read();
+        let mut ordered_queue = self.ordered_queue.write();
         ordered_queue.front().cloned()
     }
 
@@ -258,7 +274,7 @@ impl PendingQueue {
             let user_data_len = p.user_data.len();
             self.n_bytes.fetch_sub(user_data_len, Ordering::SeqCst);
             self.queue_len.fetch_sub(1, Ordering::SeqCst);
-            self.semaphore.add_permits(user_data_len);
+            self.semaphore.add_permits(p.pending_queue_credit);
         }
 
         popped
@@ -274,5 +290,27 @@ impl PendingQueue {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+}
+
+/// There is no await between assigning SSN and committing all its fragments.
+pub(crate) struct PendingReservation<'a> {
+    queue: &'a PendingQueue,
+    _guard: MutexGuard<'a, ()>,
+    permit: SemaphorePermit<'a>,
+}
+
+impl PendingReservation<'_> {
+    pub(crate) fn commit(self, mut chunks: Vec<ChunkPayloadData>) {
+        if chunks.is_empty() {
+            return;
+        }
+        let total = chunks.iter().map(|c| c.user_data.len()).sum();
+        for chunk in &mut chunks {
+            chunk.pending_queue_credit = 0;
+        }
+        chunks.last_mut().unwrap().pending_queue_credit = self.permit.num_permits();
+        self.permit.forget();
+        self.queue.append_unlimited(chunks, total);
     }
 }

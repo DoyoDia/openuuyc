@@ -74,6 +74,7 @@ pub struct Stream {
     pub(crate) read_notifier: Notify,
     pub(crate) read_shutdown: AtomicBool,
     pub(crate) write_shutdown: AtomicBool,
+    pub(crate) reset_failure: AtomicU32,
     pub(crate) unordered: AtomicBool,
     pub(crate) reliability_type: AtomicU8, //ReliabilityType,
     pub(crate) reliability_value: AtomicU32,
@@ -130,6 +131,7 @@ impl Stream {
             read_notifier: Notify::new(),
             read_shutdown: AtomicBool::new(false),
             write_shutdown: AtomicBool::new(false),
+            reset_failure: AtomicU32::new(0),
             unordered: AtomicBool::new(false),
             reliability_type: AtomicU8::new(0), //ReliabilityType::Reliable,
             reliability_value: AtomicU32::new(0),
@@ -181,6 +183,16 @@ impl Stream {
     /// Returns `(0, PayloadProtocolIdentifier::Unknown)` if the reading half of this stream is shutdown or it (the stream) was reset.
     pub async fn read_sctp(&self, p: &mut [u8]) -> Result<(usize, PayloadProtocolIdentifier)> {
         loop {
+            // Register before checking state or awaiting the reassembly lock.
+            // Close/reset uses notify_waiters, which does not retain a permit
+            // for a reader that starts waiting after that notification.
+            let ready = self.read_notifier.notified();
+            tokio::pin!(ready);
+            ready.as_mut().enable();
+            let result = self.reset_failure.load(Ordering::SeqCst);
+            if result != 0 {
+                return Err(Error::ErrStreamResetRejected(result));
+            }
             if self.read_shutdown.load(Ordering::SeqCst) {
                 return Ok((0, PayloadProtocolIdentifier::Unknown));
             }
@@ -194,7 +206,7 @@ impl Stream {
                 Ok(_) | Err(Error::ErrShortBuffer { .. }) => return result,
                 Err(_) => {
                     // wait for the next chunk to become available
-                    self.read_notifier.notified().await;
+                    ready.await;
                 }
             }
         }
@@ -269,8 +281,14 @@ impl Stream {
     ///
     /// Returns an error if the write half of this stream is shutdown or `p` is too large.
     pub async fn write_sctp(&self, p: &Bytes, ppi: PayloadProtocolIdentifier) -> Result<usize> {
+        if p.len() > self.max_message_size.load(Ordering::SeqCst) as usize {
+            return Err(Error::ErrOutboundPacketTooLarge);
+        }
+        let reservation = self.pending_queue.reserve(p.len()).await?;
+        // No suspension after packetize: cancellation cannot leave an SSN gap.
         let chunks = self.prepare_write(p, ppi)?;
-        self.send_payload_data(chunks).await?;
+        reservation.commit(chunks);
+        self.awake_write_loop();
 
         Ok(p.len())
     }
@@ -289,14 +307,9 @@ impl Stream {
             return Err(Error::ErrOutboundPacketTooLarge);
         }
 
-        let state: AssociationState = self.state.load(Ordering::SeqCst).into();
-        match state {
-            AssociationState::ShutdownSent
-            | AssociationState::ShutdownAckSent
-            | AssociationState::ShutdownPending
-            | AssociationState::ShutdownReceived => return Err(Error::ErrStreamClosed),
-            _ => {}
-        };
+        if self.get_state() != AssociationState::Established {
+            return Err(Error::ErrPayloadDataStateNotExist);
+        }
 
         Ok(self.packetize(p, ppi))
     }
@@ -481,21 +494,6 @@ impl Stream {
         let _ = self.awake_write_loop_ch.try_send(());
     }
 
-    async fn send_payload_data(&self, chunks: Vec<ChunkPayloadData>) -> Result<()> {
-        let state = self.get_state();
-        if state != AssociationState::Established {
-            return Err(Error::ErrPayloadDataStateNotExist);
-        }
-
-        // NOTE: append is used here instead of push in order to prevent chunks interlacing.
-        self.pending_queue
-            .append_and_wake(chunks, || self.awake_write_loop())
-            .await;
-
-        self.awake_write_loop();
-        Ok(())
-    }
-
     async fn send_reset_request(&self, stream_identifier: u16) -> Result<()> {
         let state = self.get_state();
         if state != AssociationState::Established {
@@ -512,7 +510,7 @@ impl Stream {
             ..Default::default()
         };
 
-        self.pending_queue.push(c).await;
+        self.pending_queue.push(c).await?;
 
         self.awake_write_loop();
         Ok(())

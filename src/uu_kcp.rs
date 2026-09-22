@@ -333,7 +333,7 @@ async fn run_worker(
         "UU mixed-KCP control transport started"
     );
 
-    let mut tick = tokio::time::interval(Duration::from_millis(5));
+    let mut tick = tokio::time::interval(Duration::from_millis(10));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut receive_buffer = vec![0_u8; 65_536];
     let mut pending = None;
@@ -417,12 +417,12 @@ impl Worker {
         let now_ms = self.now_ms();
         self.kcp.update(now_ms).context("update UU mixed-KCP")?;
         let now = Instant::now();
-        if now.duration_since(self.last_recovery_info) >= RECOVERY_INFO_INTERVAL {
+        if now.duration_since(self.last_recovery_info) > RECOVERY_INFO_INTERVAL {
             self.last_recovery_info = now;
             let recovery_info = self.recovery.encode_info(self.version, now_ms);
             self.queue_wire_packet(recovery_info);
         }
-        if now.duration_since(self.last_fec_network_update) >= FEC_NETWORK_UPDATE_INTERVAL {
+        if now.duration_since(self.last_fec_network_update) > FEC_NETWORK_UPDATE_INTERVAL {
             self.last_fec_network_update = now;
             if let Some(loss) = self.recovery.remote_loss_ratio
                 && let Some(decrease_fast_ack_after) =
@@ -625,9 +625,6 @@ impl Worker {
             "unsupported UU mixed-KCP command {wire_command}"
         );
         if matches!(wire_command, CMD_PUSH | CMD_RESEND_PUSH | CMD_FEC_DUPLICATE) {
-            let sequence = read_u32(wire, 16)?;
-            self.recovery
-                .record_received(sequence, wire_command, recovered_by_fec);
             if !recovered_by_fec {
                 self.last_remote_header = Some(RemoteHeader {
                     window: read_u16(wire, 10)?,
@@ -651,13 +648,21 @@ impl Worker {
             standard[8..12].copy_from_slice(&header.timestamp.to_le_bytes());
             standard[16..20].copy_from_slice(&header.una.to_le_bytes());
         }
+        let accepted = self.kcp.accepted_segments();
         self.kcp
             .input(&standard)
             .context("input UU mixed-KCP segment")?;
+        if self.kcp.accepted_segments() != accepted {
+            self.recovery
+                .record_received(read_u32(wire, 16)?, wire_command, recovered_by_fec);
+        }
         let now = self.now_ms();
         self.kcp.update(now).context("flush UU mixed-KCP ACK")?;
         self.kcp.flush().context("flush UU mixed-KCP input")?;
-        self.drain_messages(stream_control)
+        let result = self.drain_messages(stream_control);
+        self.fec_receiver.receive_next = self.kcp.receive_next();
+        self.fec_receiver.prune(Instant::now());
+        result
     }
 
     fn drain_messages(&mut self, stream_control: &StreamControlHandle) -> Result<()> {
@@ -992,6 +997,7 @@ fn fec_repair_count(original_count: usize, loss_ratio: f64) -> usize {
 
 #[derive(Default)]
 struct FecReceiver {
+    receive_next: u32,
     originals: HashMap<u32, RecentOriginal>,
     original_order: VecDeque<u32>,
     groups: HashMap<u32, FecGroup>,
@@ -1012,7 +1018,6 @@ struct FecGroup {
     repair_count: u8,
     shard_size: usize,
     shards: BTreeMap<u8, Vec<u8>>,
-    updated_at: Instant,
 }
 
 impl FecReceiver {
@@ -1042,7 +1047,6 @@ impl FecReceiver {
                 && let Some(index) = group.sequences.iter().position(|value| *value == sequence)
             {
                 insert_fec_original(group, index as u8, &packet);
-                group.updated_at = now;
             }
             recovered.extend(self.attempt(group_id)?);
         }
@@ -1097,6 +1101,14 @@ impl FecReceiver {
         if self.completed.contains(&group_id) {
             return Ok(Vec::new());
         }
+        if sequences
+            .iter()
+            .all(|sn| (sn.wrapping_sub(self.receive_next) as i32) < 0)
+        {
+            self.complete(group_id);
+            return Ok(Vec::new());
+        }
+        self.prune(now);
 
         let group = self.groups.entry(group_id).or_insert_with(|| {
             let mut group = FecGroup {
@@ -1106,7 +1118,6 @@ impl FecReceiver {
                 repair_count,
                 shard_size,
                 shards: BTreeMap::new(),
-                updated_at: now,
             };
             for (index, sequence) in sequences.iter().enumerate() {
                 if let Some(original) = self.originals.get(sequence) {
@@ -1124,7 +1135,6 @@ impl FecReceiver {
                 && group.shard_size == shard_size,
             "inconsistent UU KCP FEC group"
         );
-        group.updated_at = now;
         group
             .shards
             .entry(original_count + repair_index)
@@ -1223,19 +1233,21 @@ impl FecReceiver {
                 self.originals.remove(&expired);
             }
         }
+        // Repair-group usefulness follows reliable receive progress, not
+        // the independent one-second cache lifetime of original packets.
         let expired_groups = self
-            .group_order
+            .groups
             .iter()
-            .copied()
-            .take_while(|group_id| {
-                self.groups
-                    .get(group_id)
-                    .is_some_and(|group| now.duration_since(group.updated_at) > FEC_RETENTION)
+            .filter_map(|(id, group)| {
+                group
+                    .sequences
+                    .iter()
+                    .all(|sn| (sn.wrapping_sub(self.receive_next) as i32) < 0)
+                    .then_some(*id)
             })
             .collect::<Vec<_>>();
         for group_id in expired_groups {
-            self.groups.remove(&group_id);
-            self.group_order.pop_front();
+            self.complete(group_id);
         }
         while self.group_order.len() > MAX_RECENT_PACKETS {
             if let Some(expired) = self.group_order.pop_front() {
@@ -1258,8 +1270,6 @@ fn insert_fec_original(group: &mut FecGroup, index: u8, packet: &[u8]) {
 
 #[derive(Default)]
 struct RecoveryState {
-    received_sequences: HashSet<u32>,
-    received_order: VecDeque<u32>,
     received_total: u32,
     received_resend: u32,
     received_fec: u32,
@@ -1278,15 +1288,6 @@ struct RecoveryState {
 
 impl RecoveryState {
     fn record_received(&mut self, sequence: u32, command: u8, recovered_by_fec: bool) {
-        if !self.received_sequences.insert(sequence) {
-            return;
-        }
-        self.received_order.push_back(sequence);
-        while self.received_order.len() > MAX_RECENT_PACKETS {
-            if let Some(expired) = self.received_order.pop_front() {
-                self.received_sequences.remove(&expired);
-            }
-        }
         self.received_total = self.received_total.wrapping_add(1);
         if recovered_by_fec {
             self.received_fec = self.received_fec.wrapping_add(1);
@@ -1366,7 +1367,7 @@ impl RecoveryState {
             if (0.0..=1.0).contains(&sample) {
                 self.remote_loss_ratio = Some(
                     self.remote_loss_ratio
-                        .map_or(sample, |previous| (previous * 3.0 + sample) * 0.25),
+                        .map_or(sample * 0.25, |previous| (previous * 3.0 + sample) * 0.25),
                 );
             }
         }

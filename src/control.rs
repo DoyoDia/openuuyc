@@ -215,6 +215,15 @@ fn encode_connect_options(
         push_varint_field(&mut decoder, 5, u64::from(chroma));
         push_bytes_field(&mut options, 4, &decoder);
     }
+    if purpose == ControlPurpose::Viewing {
+        for (width, height) in crate::media::local_display_dimensions() {
+            let mut mode = Vec::new();
+            push_varint_field(&mut mode, 1, u64::from(width));
+            push_varint_field(&mut mode, 2, u64::from(height));
+            push_varint_field(&mut mode, 3, 60); // VirtualDisplayMode.VSync
+            push_bytes_field(&mut options, 6, &mode);
+        }
+    }
     push_varint_field(&mut options, 8, 3); // desktop controller ABI value
     // ConnectOptions.device_id identifies the controller. The controlled host
     // uses it as the key for per-controller display-layout state. Sending the

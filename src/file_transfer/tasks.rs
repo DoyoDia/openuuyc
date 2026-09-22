@@ -45,13 +45,21 @@ impl Rpc {
     }
     pub async fn req(&self, v: Req, file: bool) -> Result<()> {
         ensure!(!self.stop.is_cancelled(), "{}", self.failure());
-        // SCTP assigns a sequence number before asynchronously enqueueing all
-        // fragments. Dropping that future would leave a permanent ordered gap.
-        self.wire.request(self.id, v, file).await
+        // SCTP reserves capacity before packetization and commits a whole
+        // message without suspension. Cancelling a pending send leaves no SSN gap.
+        tokio::select! {
+            biased;
+            _ = self.stop.cancelled() => anyhow::bail!(self.failure()),
+            result = self.wire.request(self.id, v, file) => result,
+        }
     }
     pub async fn res(&self, v: Res) -> Result<()> {
         ensure!(!self.stop.is_cancelled(), "{}", self.failure());
-        self.wire.response(self.id, v).await
+        tokio::select! {
+            biased;
+            _ = self.stop.cancelled() => anyhow::bail!(self.failure()),
+            result = self.wire.response(self.id, v) => result,
+        }
     }
     fn failure(&self) -> String {
         lock(&self.fault)

@@ -80,7 +80,7 @@ fn test_config_mtu() -> Result<()> {
         remote_port: 5000,
     });
     assert_eq!(a.mtu, INITIAL_MTU);
-    assert_eq!(a.max_payload_size, INITIAL_MTU - (COMMON_HEADER_SIZE + DATA_CHUNK_HEADER_SIZE));
+    assert_eq!(a.max_payload_size, 1160); // 1191-byte MTU includes header and padding
 
     let a = create_association_internal(Config {
         net_conn: Arc::new(DumbConn {}),

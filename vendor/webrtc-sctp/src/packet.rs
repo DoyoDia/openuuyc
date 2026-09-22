@@ -9,6 +9,7 @@ use crate::chunk::chunk_error::ChunkError;
 use crate::chunk::chunk_forward_tsn::ChunkForwardTsn;
 use crate::chunk::chunk_header::*;
 use crate::chunk::chunk_heartbeat::ChunkHeartbeat;
+use crate::chunk::chunk_heartbeat_ack::ChunkHeartbeatAck;
 use crate::chunk::chunk_init::ChunkInit;
 use crate::chunk::chunk_payload_data::ChunkPayloadData;
 use crate::chunk::chunk_reconfig::ChunkReconfig;
@@ -128,6 +129,7 @@ impl Packet {
                 CT_COOKIE_ECHO => Box::new(ChunkCookieEcho::unmarshal(&raw.slice(offset..))?),
                 CT_COOKIE_ACK => Box::new(ChunkCookieAck::unmarshal(&raw.slice(offset..))?),
                 CT_HEARTBEAT => Box::new(ChunkHeartbeat::unmarshal(&raw.slice(offset..))?),
+                CT_HEARTBEAT_ACK => Box::new(ChunkHeartbeatAck::unmarshal(&raw.slice(offset..))?),
                 CT_PAYLOAD_DATA => Box::new(ChunkPayloadData::unmarshal(&raw.slice(offset..))?),
                 CT_SACK => Box::new(ChunkSelectiveAck::unmarshal(&raw.slice(offset..))?),
                 CT_RECONFIG => Box::new(ChunkReconfig::unmarshal(&raw.slice(offset..))?),
@@ -219,13 +221,13 @@ impl Packet {
         // Check values on the packet that are specific to a particular chunk type
         for c in &self.chunks {
             if let Some(ci) = c.as_any().downcast_ref::<ChunkInit>() {
+                if self.chunks.len() != 1 {
+                    return Err(Error::ErrInitChunkBundled);
+                }
                 if !ci.is_ack {
                     // An INIT or INIT ACK chunk MUST NOT be bundled with any other chunk.
                     // They MUST be the only chunks present in the SCTP packets that carry
                     // them.
-                    if self.chunks.len() != 1 {
-                        return Err(Error::ErrInitChunkBundled);
-                    }
 
                     // A packet containing an INIT chunk MUST have a zero Verification
                     // Tag.

@@ -7,6 +7,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug, Error, PartialEq, Eq, Clone)]
 #[non_exhaustive]
 pub enum Error {
+    #[error("stream reset rejected with result {0}")]
+    ErrStreamResetRejected(u32),
     #[error("raw is too small for a SCTP chunk")]
     ErrChunkHeaderTooSmall,
     #[error("not enough data left in SCTP packet to satisfy requested length")]

@@ -47,6 +47,7 @@ use crate::error_cause::*;
 #[test]
 fn test_abort_chunk_one_error_cause() -> Result<()> {
     let abort1 = ChunkAbort {
+        reflected_tag: false,
         error_causes: vec![ErrorCause {
             code: PROTOCOL_VIOLATION,
             ..Default::default()
@@ -69,6 +70,7 @@ fn test_abort_chunk_one_error_cause() -> Result<()> {
 #[test]
 fn test_abort_chunk_many_error_causes() -> Result<()> {
     let abort1 = ChunkAbort {
+        reflected_tag: false,
         error_causes: vec![
             ErrorCause {
                 code: INVALID_MANDATORY_PARAMETER,

@@ -45,6 +45,8 @@ pub struct AssociationInternal {
     inflight_queue: PayloadQueue,
     pending_queue: Arc<PendingQueue>,
     control_queue: ControlQueue,
+    prepared_outbound: VecDeque<Packet>,
+    prepared_shutdown: bool,
     pub(crate) mtu: u32,
     max_payload_size: u32, // max DATA chunk payload size
     cumulative_tsn_ack_point: u32,
@@ -69,6 +71,10 @@ pub struct AssociationInternal {
     pub(crate) treconfig: Option<RtxTimer<AssociationInternal>>,
     pub(crate) ack_timer: Option<AckTimer<AssociationInternal>>,
 
+    heartbeat_epoch: Instant,
+    pub(crate) last_packet_sent: Instant,
+    heartbeat: Option<(Bytes, Instant, Instant, bool)>,
+
     // Chunks stored for retransmission
     pub(crate) stored_init: Option<ChunkInit>,
     stored_cookie_echo: Option<ChunkCookieEcho>,
@@ -76,7 +82,7 @@ pub struct AssociationInternal {
     streams: HashMap<u16, Arc<Stream>>,
 
     close_loop_ch_tx: Option<broadcast::Sender<()>>,
-    accept_ch_tx: mpsc::Sender<Arc<Stream>>,
+    accept_ch_tx: Option<mpsc::Sender<Arc<Stream>>>,
     handshake_completed_ch_tx: mpsc::Sender<Option<Error>>,
 
     // per inbound packet context
@@ -120,13 +126,8 @@ impl AssociationInternal {
         } else {
             config.mtu
         };
-        // RFC 4690 Sec 7.2.1
-        //  o  The initial cwnd before DATA transmission or after a sufficiently
-        //     long idle period MUST be set to min(4*MTU, max (2*MTU, 4380
-        //     bytes)).
-        //     TODO: Consider whether this should use `clamp`
-        #[allow(clippy::manual_clamp)]
-        let cwnd = std::cmp::min(4 * mtu, std::cmp::max(2 * mtu, 4380));
+        // UU's actual socket options start at ten safe-MTU packets.
+        let cwnd = 10 * mtu;
 
         let ret = AssociationInternal {
             name: config.name,
@@ -136,7 +137,12 @@ impl AssociationInternal {
             will_send_shutdown: Arc::new(AtomicBool::default()),
             awake_write_loop_ch,
             peer_verification_tag: 0,
-            my_verification_tag: random::<u32>(),
+            my_verification_tag: loop {
+                let tag = random::<u32>();
+                if tag != 0 {
+                    break tag;
+                }
+            },
 
             my_next_tsn: tsn,
             peer_last_tsn: 0,
@@ -161,8 +167,10 @@ impl AssociationInternal {
             inflight_queue_length,
             pending_queue: Arc::new(PendingQueue::new()),
             control_queue: ControlQueue::new(),
+            prepared_outbound: VecDeque::new(),
+            prepared_shutdown: false,
             mtu,
-            max_payload_size: mtu - (COMMON_HEADER_SIZE + DATA_CHUNK_HEADER_SIZE),
+            max_payload_size: ((mtu - COMMON_HEADER_SIZE) & !3) - DATA_CHUNK_HEADER_SIZE,
             cumulative_tsn_ack_point: tsn - 1,
             advanced_peer_tsn_ack_point: tsn - 1,
             use_forward_tsn: false,
@@ -183,11 +191,14 @@ impl AssociationInternal {
             treconfig: None,
             ack_timer: None,
 
+            heartbeat_epoch: Instant::now(),
+            last_packet_sent: Instant::now(),
+            heartbeat: None,
             stored_init: None,
             stored_cookie_echo: None,
             streams: HashMap::new(),
             close_loop_ch_tx: Some(close_loop_ch_tx),
-            accept_ch_tx,
+            accept_ch_tx: Some(accept_ch_tx),
             handshake_completed_ch_tx,
 
             delayed_ack_triggered: false,
@@ -250,8 +261,20 @@ impl AssociationInternal {
     }
 
     pub(crate) async fn close(&mut self) -> Result<()> {
-        if self.get_state() != AssociationState::Closed {
+        self.pending_queue.close();
+        self.prepared_outbound.clear();
+        self.prepared_shutdown = true;
+        self.heartbeat = None;
+        // Wake accept_stream even when the transport's stop notification was
+        // delivered while its accept task was processing a previous channel.
+        self.accept_ch_tx.take();
+        if self.close_loop_ch_tx.is_some() {
             self.set_state(AssociationState::Closed);
+            // Transport EOF/ABORT can arrive before INIT/COOKIE completes.
+            // Do not leave client/server awaiting a sender held by this TCB.
+            let _ = self
+                .handshake_completed_ch_tx
+                .try_send(Some(Error::ErrAssociationHandshakeClosed));
 
             log::debug!("[{}] closing association..", self.name);
 
@@ -361,6 +384,14 @@ impl AssociationInternal {
             return Ok(());
         }
 
+        if !self.accepts_packet(&p) {
+            log::debug!(
+                "[{}] discarded SCTP packet for another association",
+                self.name
+            );
+            return Ok(());
+        }
+
         self.handle_chunk_start();
 
         for c in &p.chunks {
@@ -376,7 +407,64 @@ impl AssociationInternal {
         }
 
         self.handle_chunk_end();
+        if self.close_loop_ch_tx.is_some() && !self.prepared_shutdown {
+            // UU handles SACK then produces fast retransmissions/new DATA
+            // before dispatching the next received packet (72D43A). Reserve
+            // that wire flight now; the separate writer only serializes it.
+            // Otherwise a batched reader drains all ACKs before the writer
+            // can refill flight, falsely making slow start application-limited.
+            let (packets, keep_running) = self.produce_outbound().await;
+            if !packets.is_empty() || !keep_running {
+                self.prepared_outbound.extend(packets);
+                self.prepared_shutdown = !keep_running;
+                self.awake_write_loop();
+            }
+        }
         Ok(())
+    }
+
+    fn accepts_packet(&self, p: &Packet) -> bool {
+        if p.source_port != self.destination_port || p.destination_port != self.source_port {
+            return false;
+        }
+        let Some(first) = p.chunks.first() else {
+            return false;
+        };
+        if let Some(init) = first.as_any().downcast_ref::<ChunkInit>() {
+            return p.chunks.len() == 1
+                && p.verification_tag
+                    == if init.is_ack {
+                        self.my_verification_tag
+                    } else {
+                        0
+                    };
+        }
+        if p.verification_tag == 0 {
+            return false;
+        }
+        if p.chunks.len() == 1 {
+            let reflected = first
+                .as_any()
+                .downcast_ref::<ChunkAbort>()
+                .map(|c| c.reflected_tag)
+                .or_else(|| {
+                    first
+                        .as_any()
+                        .downcast_ref::<ChunkShutdownComplete>()
+                        .map(|c| c.reflected_tag)
+                });
+            if let Some(reflected) = reflected {
+                return p.verification_tag
+                    == if reflected {
+                        self.peer_verification_tag
+                    } else {
+                        self.my_verification_tag
+                    };
+            }
+        }
+        // This implementation keeps its cookie and local tag in the same
+        // association; COOKIE-ECHO still validates the opaque cookie below.
+        p.verification_tag == self.my_verification_tag
     }
 
     fn gather_data_packets_to_retransmit(&mut self, mut raw_packets: Vec<Packet>) -> Vec<Packet> {
@@ -421,12 +509,12 @@ impl AssociationInternal {
 
             if !sis_to_reset.is_empty() {
                 let rsn = self.generate_next_rsn();
-                let tsn = self.my_next_tsn - 1;
+                let tsn = self.my_next_tsn.wrapping_sub(1);
                 log::debug!(
                     "[{}] sending RECONFIG: rsn={} tsn={} streams={:?}",
                     self.name,
                     rsn,
-                    self.my_next_tsn - 1,
+                    self.my_next_tsn.wrapping_sub(1),
                     sis_to_reset
                 );
 
@@ -467,10 +555,13 @@ impl AssociationInternal {
 
             let mut i = 0;
             loop {
-                let tsn = self.cumulative_tsn_ack_point + i + 1;
+                let tsn = self
+                    .cumulative_tsn_ack_point
+                    .wrapping_add(i)
+                    .wrapping_add(1);
                 if let Some(c) = self.inflight_queue.get_mut(tsn) {
                     if c.acked || c.abandoned() || c.nsent > 1 || c.miss_indicator < 3 {
-                        i += 1;
+                        i = i.wrapping_add(1);
                         continue;
                     }
 
@@ -484,7 +575,7 @@ impl AssociationInternal {
                     //      of cwnd and SHOULD NOT delay retransmission for this single
                     //		packet.
 
-                    let data_chunk_size = DATA_CHUNK_HEADER_SIZE + c.user_data.len() as u32;
+                    let data_chunk_size = c.wire_size() as u32;
                     if self.mtu < fast_retrans_size + data_chunk_size {
                         break;
                     }
@@ -496,6 +587,7 @@ impl AssociationInternal {
                     break; // end of pending data
                 }
 
+                self.inflight_queue.mark_in_flight(tsn);
                 if let Some(c) = self.inflight_queue.get(tsn) {
                     self.check_partial_reliability_status(c);
                     to_fast_retrans.push(Box::new(c.clone()));
@@ -507,7 +599,7 @@ impl AssociationInternal {
                         self.fast_recover_exit_point
                     );
                 }
-                i += 1;
+                i = i.wrapping_add(1);
             }
 
             if !to_fast_retrans.is_empty() {
@@ -583,7 +675,7 @@ impl AssociationInternal {
         } else if self.will_send_shutdown_complete {
             self.will_send_shutdown_complete = false;
 
-            let shutdown_complete = ChunkShutdownComplete {};
+            let shutdown_complete = ChunkShutdownComplete::default();
             ok = false;
             let p = self.create_packet(vec![Box::new(shutdown_complete)]);
 
@@ -596,6 +688,17 @@ impl AssociationInternal {
     /// gather_outbound gathers outgoing packets. The returned bool value set to
     /// false means the association should be closed down after the final send.
     pub(crate) async fn gather_outbound(&mut self) -> (Vec<Packet>, bool) {
+        let mut packets = self.prepared_outbound.drain(..).collect::<Vec<_>>();
+        if self.prepared_shutdown {
+            return (packets, false);
+        }
+        let (generated, keep_running) = self.produce_outbound().await;
+        packets.extend(generated);
+        (packets, keep_running)
+    }
+
+    async fn produce_outbound(&mut self) -> (Vec<Packet>, bool) {
+        self.poll_heartbeat();
         let mut raw_packets = Vec::with_capacity(16);
 
         if !self.control_queue.is_empty() {
@@ -608,10 +711,10 @@ impl AssociationInternal {
         match state {
             AssociationState::Established => {
                 raw_packets = self.gather_data_packets_to_retransmit(raw_packets);
+                raw_packets = self.gather_outbound_fast_retransmission_packets(raw_packets);
                 raw_packets = self
                     .gather_outbound_data_and_reconfig_packets(raw_packets)
                     .await;
-                raw_packets = self.gather_outbound_fast_retransmission_packets(raw_packets);
                 raw_packets = self.gather_outbound_sack_packets(raw_packets).await;
                 raw_packets = self.gather_outbound_forward_tsn_packets(raw_packets);
                 (raw_packets, true)
@@ -847,15 +950,91 @@ impl AssociationInternal {
             self.send_cookie_echo()?;
 
             if let Some(t1cookie) = &self.t1cookie {
-                t1cookie.start(self.rto_mgr.get_rto()).await;
+                t1cookie.start(INIT_TIMEOUT).await;
             }
 
             self.set_state(AssociationState::CookieEchoed);
 
             Ok(vec![])
         } else {
+            let _ = self
+                .handshake_completed_ch_tx
+                .try_send(Some(Error::ErrInitAckNoCookie));
+            self.close().await?;
             Err(Error::ErrInitAckNoCookie)
         }
+    }
+
+    pub(crate) fn heartbeat_deadline(&self) -> Option<Instant> {
+        if self.get_state() != AssociationState::Established {
+            return None;
+        }
+        if let Some((_, _, deadline, false)) = &self.heartbeat {
+            return Some(*deadline);
+        }
+        Some(
+            self.last_packet_sent
+                + std::time::Duration::from_millis(30000 + self.rto_mgr.get_rto()),
+        )
+    }
+
+    fn poll_heartbeat(&mut self) {
+        let now = Instant::now();
+        if self
+            .heartbeat_deadline()
+            .is_none_or(|deadline| now < deadline)
+        {
+            return;
+        }
+        if let Some((_, _, _, timed_out)) = &mut self.heartbeat {
+            if !*timed_out {
+                *timed_out = true;
+                // The actual UU socket disables the association error limit.
+                // ICE owns terminal connectivity failure; no extra reconnect.
+                log::debug!("[{}] SCTP heartbeat timed out", self.name);
+                return;
+            }
+        }
+        let timestamp = self.heartbeat_epoch.elapsed().as_millis().max(1) as u64;
+        let token = Bytes::copy_from_slice(&timestamp.to_be_bytes());
+        self.heartbeat = Some((
+            token.clone(),
+            now,
+            now + std::time::Duration::from_millis(self.rto_mgr.get_rto()),
+            false,
+        ));
+        self.control_queue
+            .push_back(self.create_packet(vec![Box::new(ChunkHeartbeat {
+                params: vec![Box::new(ParamHeartbeatInfo {
+                    heartbeat_information: token,
+                })],
+            })]));
+    }
+
+    fn handle_heartbeat_ack(&mut self, chunk: &ChunkHeartbeatAck) {
+        let Some(info) = chunk
+            .params
+            .first()
+            .and_then(|p| p.as_any().downcast_ref::<ParamHeartbeatInfo>())
+        else {
+            return;
+        };
+        let Some((token, sent, _, _)) = &self.heartbeat else {
+            return;
+        };
+        if info.heartbeat_information != *token {
+            return;
+        }
+        let rtt = sent.elapsed().as_millis() as u64;
+        self.rto_mgr.set_new_rtt(rtt);
+        self.heartbeat = None;
+        self.awake_write_loop();
+        log::debug!(
+            "[{}] SCTP heartbeat RTT={}ms RTO={}ms",
+            self.name,
+            rtt,
+            self.rto_mgr.get_rto()
+        );
     }
 
     async fn handle_heartbeat(&self, c: &ChunkHeartbeat) -> Result<Vec<Packet>> {
@@ -1020,8 +1199,12 @@ impl AssociationInternal {
         // Meaning, if peer_last_tsn+1 points to a chunk that is received,
         // advance peer_last_tsn until peer_last_tsn+1 points to unreceived chunk.
         log::debug!("[{}] peer_last_tsn = {}", self.name, self.peer_last_tsn);
-        while self.payload_queue.pop(self.peer_last_tsn + 1).is_some() {
-            self.peer_last_tsn += 1;
+        while self
+            .payload_queue
+            .pop(self.peer_last_tsn.wrapping_add(1))
+            .is_some()
+        {
+            self.peer_last_tsn = self.peer_last_tsn.wrapping_add(1);
             log::debug!("[{}] peer_last_tsn = {}", self.name, self.peer_last_tsn);
 
             let rst_reqs: Vec<ParamOutgoingResetRequest> =
@@ -1098,7 +1281,11 @@ impl AssociationInternal {
         ));
 
         if accept {
-            if self.accept_ch_tx.try_send(Arc::clone(&s)).is_ok() {
+            if self
+                .accept_ch_tx
+                .as_ref()
+                .is_some_and(|tx| tx.try_send(Arc::clone(&s)).is_ok())
+            {
                 log::debug!(
                     "[{}] accepted a new stream (streamIdentifier: {})",
                     self.name,
@@ -1125,23 +1312,63 @@ impl AssociationInternal {
     async fn process_selective_ack(
         &mut self,
         d: &ChunkSelectiveAck,
-    ) -> Result<(HashMap<u16, i64>, u32)> {
+    ) -> Result<(HashMap<u16, i64>, u32, usize)> {
+        // Validate the entire acknowledgment before changing queues, timers,
+        // RTT or stream accounting. Invalid peer input must leave a usable TCB.
+        let count = d
+            .cumulative_tsn_ack
+            .wrapping_sub(self.cumulative_tsn_ack_point) as usize;
+        if count > self.inflight_queue.len() {
+            return Err(Error::ErrInflightQueueTsnPop);
+        }
+        for (offset, tsn) in self.inflight_queue.sorted.iter().take(count).enumerate() {
+            let expected = self
+                .cumulative_tsn_ack_point
+                .wrapping_add(offset as u32 + 1);
+            if *tsn != expected || self.inflight_queue.get(expected).is_none() {
+                return Err(Error::ErrInflightQueueTsnPop);
+            }
+        }
+        let last_sent = self.my_next_tsn.wrapping_sub(1);
+        if sna32gt(d.cumulative_tsn_ack, last_sent) {
+            return Err(Error::ErrTsnRequestNotExist);
+        }
+        for gap in &d.gap_ack_blocks {
+            if gap.start == 0
+                || gap.start > gap.end
+                || sna32gt(d.cumulative_tsn_ack.wrapping_add(gap.end as u32), last_sent)
+            {
+                return Err(Error::ErrTsnRequestNotExist);
+            }
+            for offset in gap.start..=gap.end {
+                if self
+                    .inflight_queue
+                    .get(d.cumulative_tsn_ack.wrapping_add(offset as u32))
+                    .is_none()
+                {
+                    return Err(Error::ErrTsnRequestNotExist);
+                }
+            }
+        }
+
         let mut bytes_acked_per_stream = HashMap::new();
+        let mut wire_bytes_acked = 0;
 
         // New ack point, so pop all ACKed packets from inflight_queue
         // We add 1 because the "currentAckPoint" has already been popped from the inflight queue
         // For the first SACK we take care of this by setting the ackpoint to cumAck - 1
-        let mut i = self.cumulative_tsn_ack_point + 1;
+        let mut i = self.cumulative_tsn_ack_point.wrapping_add(1);
         //log::debug!("[{}] i={} d={}", self.name, i, d.cumulative_tsn_ack);
         while sna32lte(i, d.cumulative_tsn_ack) {
             if let Some(c) = self.inflight_queue.pop(i) {
                 if !c.acked {
+                    wire_bytes_acked += c.wire_size();
                     // RFC 4096 sec 6.3.2.  Retransmission Timer Rules
                     //   R3)  Whenever a SACK is received that acknowledges the DATA chunk
                     //        with the earliest outstanding TSN for that address, restart the
                     //        T3-rtx timer for that address with its current RTO (if there is
                     //        still outstanding data on that address).
-                    if i == self.cumulative_tsn_ack_point + 1 {
+                    if i == self.cumulative_tsn_ack_point.wrapping_add(1) {
                         // T3 timer needs to be reset. Stop it for now.
                         if let Some(t3rtx) = &self.t3rtx {
                             t3rtx.stop().await;
@@ -1168,10 +1395,7 @@ impl AssociationInternal {
                     //        chunk or for a later instance)
                     if c.nsent == 1 && sna32gte(c.tsn, self.min_tsn2measure_rtt) {
                         self.min_tsn2measure_rtt = self.my_next_tsn;
-                        let rtt = match SystemTime::now().duration_since(c.since) {
-                            Ok(rtt) => rtt,
-                            Err(_) => return Err(Error::ErrInvalidSystemTime),
-                        };
+                        let rtt = c.since.elapsed();
                         let srtt = self.rto_mgr.set_new_rtt(rtt.as_millis() as u64);
                         log::trace!(
                             "[{}] SACK: measured-rtt={} srtt={} new-rto={}",
@@ -1191,7 +1415,7 @@ impl AssociationInternal {
                 return Err(Error::ErrInflightQueueTsnPop);
             }
 
-            i += 1;
+            i = i.wrapping_add(1);
         }
 
         let mut htna = d.cumulative_tsn_ack;
@@ -1199,7 +1423,7 @@ impl AssociationInternal {
         // Mark selectively acknowledged chunks as "acked"
         for g in &d.gap_ack_blocks {
             for i in g.start..=g.end {
-                let tsn = d.cumulative_tsn_ack + i as u32;
+                let tsn = d.cumulative_tsn_ack.wrapping_add(i as u32);
 
                 let (is_existed, is_acked) = if let Some(c) = self.inflight_queue.get(tsn) {
                     (true, c.acked)
@@ -1207,6 +1431,7 @@ impl AssociationInternal {
                     (false, false)
                 };
                 let n_bytes_acked = if is_existed && !is_acked {
+                    wire_bytes_acked += self.inflight_queue.get(tsn).unwrap().wire_size();
                     self.inflight_queue.mark_as_acked(tsn) as i64
                 } else {
                     0
@@ -1225,10 +1450,7 @@ impl AssociationInternal {
 
                         if c.nsent == 1 {
                             self.min_tsn2measure_rtt = self.my_next_tsn;
-                            let rtt = match SystemTime::now().duration_since(c.since) {
-                                Ok(rtt) => rtt,
-                                Err(_) => return Err(Error::ErrInvalidSystemTime),
-                            };
+                            let rtt = c.since.elapsed();
                             let srtt = self.rto_mgr.set_new_rtt(rtt.as_millis() as u64);
                             log::trace!(
                                 "[{}] SACK: measured-rtt={} srtt={} new-rto={}",
@@ -1249,10 +1471,14 @@ impl AssociationInternal {
             }
         }
 
-        Ok((bytes_acked_per_stream, htna))
+        Ok((bytes_acked_per_stream, htna, wire_bytes_acked))
     }
 
-    async fn on_cumulative_tsn_ack_point_advanced(&mut self, total_bytes_acked: i64) {
+    async fn on_cumulative_tsn_ack_point_advanced(
+        &mut self,
+        wire_bytes_acked: usize,
+        flight_before: usize,
+    ) {
         // RFC 4096, sec 6.3.2.  Retransmission Timer Rules
         //   R2)  Whenever all outstanding data sent to an address have been
         //        acknowledged, turn off the T3-rtx timer of that address.
@@ -1272,64 +1498,22 @@ impl AssociationInternal {
             }
         }
 
-        // Update congestion control parameters
+        // UU 851462 uses pre-SACK flight + one MTU to decide whether the
+        // window was utilized. Pending app data is not a substitute for flight.
+        let utilized = flight_before.saturating_add(self.mtu as usize) >= self.cwnd as usize;
         if self.cwnd <= self.ssthresh {
-            // RFC 4096, sec 7.2.1.  Slow-Start
-            //   o  When cwnd is less than or equal to ssthresh, an SCTP endpoint MUST
-            //		use the slow-start algorithm to increase cwnd only if the current
-            //      congestion window is being fully utilized, an incoming SACK
-            //      advances the Cumulative TSN Ack Point, and the data sender is not
-            //      in Fast Recovery.  Only when these three conditions are met can
-            //      the cwnd be increased; otherwise, the cwnd MUST not be increased.
-            //		If these conditions are met, then cwnd MUST be increased by, at
-            //      most, the lesser of 1) the total size of the previously
-            //      outstanding DATA chunk(s) acknowledged, and 2) the destination's
-            //      path MTU.
-            if !self.in_fast_recovery && !self.pending_queue.is_empty() {
-                self.cwnd += std::cmp::min(total_bytes_acked as u32, self.cwnd); // TCP way
-                                                                                 // self.cwnd += min32(uint32(total_bytes_acked), self.mtu) // SCTP way (slow)
-                log::trace!(
-                    "[{}] updated cwnd={} ssthresh={} acked={} (SS)",
-                    self.name,
-                    self.cwnd,
-                    self.ssthresh,
-                    total_bytes_acked
-                );
-            } else {
-                log::trace!(
-                    "[{}] cwnd did not grow: cwnd={} ssthresh={} acked={} FR={} pending={}",
-                    self.name,
-                    self.cwnd,
-                    self.ssthresh,
-                    total_bytes_acked,
-                    self.in_fast_recovery,
-                    self.pending_queue.len()
-                );
+            if utilized && !self.in_fast_recovery {
+                self.cwnd = self
+                    .cwnd
+                    .saturating_add(wire_bytes_acked.min(self.mtu as usize) as u32);
             }
         } else {
-            // RFC 4096, sec 7.2.2.  Congestion Avoidance
-            //   o  Whenever cwnd is greater than ssthresh, upon each SACK arrival
-            //      that advances the Cumulative TSN Ack Point, increase
-            //      partial_bytes_acked by the total number of bytes of all new chunks
-            //      acknowledged in that SACK including chunks acknowledged by the new
-            //      Cumulative TSN Ack and by Gap Ack Blocks.
-            self.partial_bytes_acked += total_bytes_acked as u32;
-
-            //   o  When partial_bytes_acked is equal to or greater than cwnd and
-            //      before the arrival of the SACK the sender had cwnd or more bytes
-            //      of data outstanding (i.e., before arrival of the SACK, flight size
-            //      was greater than or equal to cwnd), increase cwnd by MTU, and
-            //      reset partial_bytes_acked to (partial_bytes_acked - cwnd).
-            if self.partial_bytes_acked >= self.cwnd && !self.pending_queue.is_empty() {
+            self.partial_bytes_acked = self
+                .partial_bytes_acked
+                .saturating_add(wire_bytes_acked as u32);
+            if utilized && self.partial_bytes_acked >= self.cwnd {
                 self.partial_bytes_acked -= self.cwnd;
-                self.cwnd += self.mtu;
-                log::trace!(
-                    "[{}] updated cwnd={} ssthresh={} acked={} (CA)",
-                    self.name,
-                    self.cwnd,
-                    self.ssthresh,
-                    total_bytes_acked
-                );
+                self.cwnd = self.cwnd.saturating_add(self.mtu);
             }
         }
     }
@@ -1355,10 +1539,12 @@ impl AssociationInternal {
                 htna
             } else {
                 // b) increment for all TSNs reported missing
-                cum_tsn_ack_point + (self.inflight_queue.len() as u32) + 1
+                cum_tsn_ack_point
+                    .wrapping_add(self.inflight_queue.len() as u32)
+                    .wrapping_add(1)
             };
 
-            let mut tsn = cum_tsn_ack_point + 1;
+            let mut tsn = cum_tsn_ack_point.wrapping_add(1);
             while sna32lt(tsn, max_tsn) {
                 if let Some(c) = self.inflight_queue.get_mut(tsn) {
                     if !c.acked && !c.abandoned() && c.miss_indicator < 3 {
@@ -1368,7 +1554,7 @@ impl AssociationInternal {
                             //     destination address(es) to which the missing DATA chunks were
                             //     last sent, according to the formula described in Section 7.2.3.
                             self.in_fast_recovery = true;
-                            self.fast_recover_exit_point = htna;
+                            self.fast_recover_exit_point = self.my_next_tsn.wrapping_sub(1);
                             self.ssthresh = std::cmp::max(self.cwnd / 2, 4 * self.mtu);
                             self.cwnd = self.ssthresh;
                             self.partial_bytes_acked = 0;
@@ -1387,7 +1573,14 @@ impl AssociationInternal {
                     return Err(Error::ErrTsnRequestNotExist);
                 }
 
-                tsn += 1;
+                if self
+                    .inflight_queue
+                    .get(tsn)
+                    .is_some_and(|c| c.miss_indicator >= 3 && c.nsent == 1)
+                {
+                    self.inflight_queue.mark_lost(tsn);
+                }
+                tsn = tsn.wrapping_add(1);
             }
         }
 
@@ -1435,13 +1628,30 @@ impl AssociationInternal {
             return Ok(vec![]);
         }
 
-        // Process selective ack
-        let (bytes_acked_per_stream, htna) = self.process_selective_ack(d).await?;
-
-        let mut total_bytes_acked = 0;
-        for n_bytes_acked in bytes_acked_per_stream.values() {
-            total_bytes_acked += *n_bytes_acked;
+        // Normalize valid, overlapping gap ranges before accounting. Keep
+        // single-TSN ranges and reject references to data never sent below.
+        let mut normalized = d.clone();
+        normalized
+            .gap_ack_blocks
+            .retain(|g| g.start > 0 && g.start <= g.end);
+        normalized.gap_ack_blocks.sort_by_key(|g| (g.start, g.end));
+        let mut gaps: Vec<crate::chunk::chunk_selective_ack::GapAckBlock> = Vec::new();
+        for gap in normalized.gap_ack_blocks.drain(..) {
+            if let Some(last) = gaps.last_mut() {
+                if u32::from(gap.start) <= u32::from(last.end) + 1 {
+                    last.end = last.end.max(gap.end);
+                    continue;
+                }
+            }
+            gaps.push(gap);
         }
+        normalized.gap_ack_blocks = gaps;
+        let d = &normalized;
+
+        // Process selective ack
+        let flight_before = self.inflight_queue.get_num_wire_bytes();
+        let (bytes_acked_per_stream, htna, wire_bytes_acked) =
+            self.process_selective_ack(d).await?;
 
         let mut cum_tsn_ack_point_advanced = false;
         if sna32lt(self.cumulative_tsn_ack_point, d.cumulative_tsn_ack) {
@@ -1454,7 +1664,7 @@ impl AssociationInternal {
 
             self.cumulative_tsn_ack_point = d.cumulative_tsn_ack;
             cum_tsn_ack_point_advanced = true;
-            self.on_cumulative_tsn_ack_point_advanced(total_bytes_acked)
+            self.on_cumulative_tsn_ack_point_advanced(wire_bytes_acked, flight_before)
                 .await;
         }
 
@@ -1472,7 +1682,7 @@ impl AssociationInternal {
         //       TSN Ack and the Gap Ack Blocks.
 
         // bytes acked were already subtracted by markAsAcked() method
-        let bytes_outstanding = self.inflight_queue.get_num_bytes() as u32;
+        let bytes_outstanding = self.inflight_queue.get_num_wire_bytes() as u32;
         if bytes_outstanding >= d.advertised_receiver_window_credit {
             self.rwnd = 0;
         } else {
@@ -1491,13 +1701,13 @@ impl AssociationInternal {
             }
 
             // RFC 3758 Sec 3.5 C2
-            let mut i = self.advanced_peer_tsn_ack_point + 1;
+            let mut i = self.advanced_peer_tsn_ack_point.wrapping_add(1);
             while let Some(c) = self.inflight_queue.get(i) {
                 if !c.abandoned() {
                     break;
                 }
                 self.advanced_peer_tsn_ack_point = i;
-                i += 1;
+                i = i.wrapping_add(1);
             }
 
             // RFC 3758 Sec 3.5 C3
@@ -1609,7 +1819,7 @@ impl AssociationInternal {
     fn create_forward_tsn(&self) -> ChunkForwardTsn {
         // RFC 3758 Sec 3.5 C4
         let mut stream_map: HashMap<u16, u16> = HashMap::new(); // to report only once per SI
-        let mut i = self.cumulative_tsn_ack_point + 1;
+        let mut i = self.cumulative_tsn_ack_point.wrapping_add(1);
         while sna32lte(i, self.advanced_peer_tsn_ack_point) {
             if let Some(c) = self.inflight_queue.get(i) {
                 if let Some(ssn) = stream_map.get(&c.stream_identifier) {
@@ -1624,7 +1834,7 @@ impl AssociationInternal {
                 break;
             }
 
-            i += 1;
+            i = i.wrapping_add(1);
         }
 
         let mut fwd_tsn = ChunkForwardTsn {
@@ -1733,8 +1943,8 @@ impl AssociationInternal {
 
         // Advance peer_last_tsn
         while sna32lt(self.peer_last_tsn, c.new_cumulative_tsn) {
-            self.payload_queue.pop(self.peer_last_tsn + 1); // may not exist
-            self.peer_last_tsn += 1;
+            self.payload_queue.pop(self.peer_last_tsn.wrapping_add(1)); // may not exist
+            self.peer_last_tsn = self.peer_last_tsn.wrapping_add(1);
         }
 
         // Report new peer_last_tsn value and abandoned largest SSN value to
@@ -1759,28 +1969,6 @@ impl AssociationInternal {
         self.handle_peer_last_tsn_and_acknowledgement(false)
     }
 
-    async fn send_reset_request(&mut self, stream_identifier: u16) -> Result<()> {
-        let state = self.get_state();
-        if state != AssociationState::Established {
-            return Err(Error::ErrResetPacketInStateNotExist);
-        }
-
-        // Create DATA chunk which only contains valid stream identifier with
-        // nil userData and use it as a EOS from the stream.
-        let c = ChunkPayloadData {
-            stream_identifier,
-            beginning_fragment: true,
-            ending_fragment: true,
-            user_data: Bytes::new(),
-            ..Default::default()
-        };
-
-        self.pending_queue.push(c).await;
-        self.awake_write_loop();
-
-        Ok(())
-    }
-
     #[allow(clippy::borrowed_box)]
     async fn handle_reconfig_param(
         &mut self,
@@ -1793,7 +1981,44 @@ impl AssociationInternal {
             self.reset_streams_if_any(p, true, reply)?;
             Ok(())
         } else if let Some(p) = raw.as_any().downcast_ref::<ParamReconfigResponse>() {
-            self.reconfigs.remove(&p.reconfig_response_sequence_number);
+            let sequence = p.reconfig_response_sequence_number;
+            let Some(request) = self.reconfigs.get(&sequence) else {
+                return Ok(());
+            };
+            match p.result {
+                ReconfigResult::InProgress => {
+                    // Keep this exact request. A late response must not complete
+                    // another reset; retry after the current RTO.
+                    if let Some(timer) = &self.treconfig {
+                        timer.stop().await;
+                        timer.start(self.rto_mgr.get_rto()).await;
+                    }
+                    return Ok(());
+                }
+                ReconfigResult::Unknown => return Ok(()),
+                ReconfigResult::SuccessNop | ReconfigResult::SuccessPerformed => {}
+                result => {
+                    for param in [&request.param_a, &request.param_b].into_iter().flatten() {
+                        if let Some(reset) =
+                            param.as_any().downcast_ref::<ParamOutgoingResetRequest>()
+                        {
+                            for id in &reset.stream_identifiers {
+                                if let Some(stream) = self.streams.get(id) {
+                                    stream.reset_failure.store(result as u32, Ordering::SeqCst);
+                                    stream.read_notifier.notify_waiters();
+                                }
+                            }
+                        }
+                    }
+                    log::warn!(
+                        "[{}] stream reset {} rejected: {}",
+                        self.name,
+                        sequence,
+                        result
+                    );
+                }
+            }
+            self.reconfigs.remove(&sequence);
             if self.reconfigs.is_empty() {
                 if let Some(treconfig) = &self.treconfig {
                     treconfig.stop().await;
@@ -1846,7 +2071,7 @@ impl AssociationInternal {
         // reconfig_response_sequence_number.
         if !sis_to_reset.is_empty() {
             let rsn = self.generate_next_rsn();
-            let tsn = self.my_next_tsn - 1;
+            let tsn = self.my_next_tsn.wrapping_sub(1);
 
             let c = ChunkReconfig {
                 param_a: Some(Box::new(ParamOutgoingResetRequest {
@@ -1894,7 +2119,7 @@ impl AssociationInternal {
             // Assign TSN
             c.tsn = self.generate_next_tsn();
 
-            c.since = SystemTime::now(); // use to calculate RTT and also for maxPacketLifeTime
+            c.since = Instant::now(); // use to calculate RTT and also for maxPacketLifeTime
             c.nsent = 1; // being sent for the first time
 
             self.check_partial_reliability_status(&c);
@@ -1957,15 +2182,16 @@ impl AssociationInternal {
                 continue;
             }
 
-            if self.inflight_queue.get_num_bytes() + data_len > self.cwnd as usize {
+            let wire_len = c.wire_size();
+            if self.inflight_queue.get_num_wire_bytes() + wire_len > self.cwnd as usize {
                 break; // would exceed cwnd
             }
 
-            if data_len > self.rwnd as usize {
+            if wire_len > self.rwnd as usize {
                 break; // no more rwnd
             }
 
-            self.rwnd -= data_len as u32;
+            self.rwnd -= wire_len as u32;
 
             if let Some(chunk) = self
                 .move_pending_data_chunk_to_inflight_queue(beginning_fragment, unordered)
@@ -2007,13 +2233,14 @@ impl AssociationInternal {
             //   single packet.  Furthermore, DATA chunks being retransmitted MAY be
             //   bundled with new DATA chunks, as long as the resulting packet size
             //   does not exceed the path MTU.
-            if bytes_in_packet + c.user_data.len() as u32 > self.mtu {
+            let wire_len = c.wire_size() as u32;
+            if !chunks_to_send.is_empty() && bytes_in_packet + wire_len > self.mtu {
                 packets.push(self.create_packet(chunks_to_send));
                 chunks_to_send = vec![];
                 bytes_in_packet = COMMON_HEADER_SIZE;
             }
 
-            bytes_in_packet += DATA_CHUNK_HEADER_SIZE + c.user_data.len() as u32;
+            bytes_in_packet += wire_len;
             chunks_to_send.push(Box::new(c));
         }
 
@@ -2056,7 +2283,8 @@ impl AssociationInternal {
                     );
                 }
             } else if reliability_type == ReliabilityType::Timed {
-                if let Ok(elapsed) = SystemTime::now().duration_since(c.since) {
+                {
+                    let elapsed = c.since.elapsed();
                     if elapsed.as_millis() as u32 >= reliability_value {
                         c.set_abandoned(true);
                         log::trace!(
@@ -2083,30 +2311,34 @@ impl AssociationInternal {
         let mut done = false;
         let mut i = 0;
         while !done {
-            let tsn = self.cumulative_tsn_ack_point + i + 1;
+            let tsn = self
+                .cumulative_tsn_ack_point
+                .wrapping_add(i)
+                .wrapping_add(1);
             if let Some(c) = self.inflight_queue.get_mut(tsn) {
                 if !c.retransmit {
-                    i += 1;
+                    i = i.wrapping_add(1);
                     continue;
                 }
 
-                if i == 0 && self.rwnd < c.user_data.len() as u32 {
+                if i == 0 && self.rwnd < c.wire_size() as u32 {
                     // Send it as a zero window probe
                     done = true;
-                } else if bytes_to_send + c.user_data.len() > awnd as usize {
+                } else if bytes_to_send + c.wire_size() > awnd as usize {
                     break;
                 }
 
                 // reset the retransmit flag not to retransmit again before the next
                 // t3-rtx timer fires
                 c.retransmit = false;
-                bytes_to_send += c.user_data.len();
+                bytes_to_send += c.wire_size();
 
                 c.nsent += 1;
             } else {
                 break; // end of pending data
             }
 
+            self.inflight_queue.mark_in_flight(tsn);
             if let Some(c) = self.inflight_queue.get(tsn) {
                 self.check_partial_reliability_status(c);
 
@@ -2120,7 +2352,7 @@ impl AssociationInternal {
 
                 chunks.push(c.clone());
             }
-            i += 1;
+            i = i.wrapping_add(1);
         }
 
         self.bundle_data_chunks_into_packets(chunks)
@@ -2129,14 +2361,14 @@ impl AssociationInternal {
     /// generate_next_tsn returns the my_next_tsn and increases it. The caller should hold the lock.
     fn generate_next_tsn(&mut self) -> u32 {
         let tsn = self.my_next_tsn;
-        self.my_next_tsn += 1;
+        self.my_next_tsn = self.my_next_tsn.wrapping_add(1);
         tsn
     }
 
     /// generate_next_rsn returns the my_next_rsn and increases it. The caller should hold the lock.
     fn generate_next_rsn(&mut self) -> u32 {
         let rsn = self.my_next_rsn;
-        self.my_next_rsn += 1;
+        self.my_next_rsn = self.my_next_rsn.wrapping_add(1);
         rsn
     }
 
@@ -2169,6 +2401,8 @@ impl AssociationInternal {
             // Will send delayed ack in the next ack timeout
             self.ack_state = AckState::Delay;
             if let Some(ack_timer) = &mut self.ack_timer {
+                ack_timer.interval =
+                    std::time::Duration::from_millis((self.rto_mgr.get_rto() / 2).min(50));
                 ack_timer.start();
             }
         }
@@ -2192,6 +2426,9 @@ impl AssociationInternal {
             return Err(Error::ErrChunk);
         } else if let Some(c) = chunk_any.downcast_ref::<ChunkError>() {
             log::error!("[{}] error chunk, with following errors: {}", self.name, c);
+            vec![]
+        } else if let Some(c) = chunk_any.downcast_ref::<ChunkHeartbeatAck>() {
+            self.handle_heartbeat_ack(c);
             vec![]
         } else if let Some(c) = chunk_any.downcast_ref::<ChunkHeartbeat>() {
             self.handle_heartbeat(c).await?
@@ -2297,6 +2534,12 @@ impl AssociationInternal {
 #[async_trait]
 impl AckTimerObserver for AssociationInternal {
     async fn on_ack_timeout(&mut self) {
+        // The fired task is finished. Clear its running handle so the next
+        // isolated DATA packet can arm a fresh delayed ACK without needing a
+        // second packet to force an immediate ACK.
+        if let Some(timer) = &mut self.ack_timer {
+            timer.stop();
+        }
         log::trace!(
             "[{}] ack timed out (ack_state: {})",
             self.name,
@@ -2369,6 +2612,7 @@ impl RtxTimerObserver for AssociationInternal {
 
                 self.ssthresh = std::cmp::max(self.cwnd / 2, 4 * self.mtu);
                 self.cwnd = self.mtu;
+                self.partial_bytes_acked = 0;
                 log::trace!(
                     "[{}] updated cwnd={} ssthresh={} inflight={} (RTO)",
                     self.name,
@@ -2383,13 +2627,13 @@ impl RtxTimerObserver for AssociationInternal {
                 //  the procedures outlined in C2 - C5.
                 if self.use_forward_tsn {
                     // RFC 3758 Sec 3.5 C2
-                    let mut i = self.advanced_peer_tsn_ack_point + 1;
+                    let mut i = self.advanced_peer_tsn_ack_point.wrapping_add(1);
                     while let Some(c) = self.inflight_queue.get(i) {
                         if !c.abandoned() {
                             break;
                         }
                         self.advanced_peer_tsn_ack_point = i;
-                        i += 1;
+                        i = i.wrapping_add(1);
                     }
 
                     // RFC 3758 Sec 3.5 C3
