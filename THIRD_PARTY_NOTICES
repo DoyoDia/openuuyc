@@ -64,7 +64,12 @@ modifications are reflected in the source. The included Abseil reference
 version is 20230125.3, with absl/LICENSE (Apache-2.0) retained. Included
 Opus public headers retain third_party/opus/src/COPYING.
 
-vendor/speexdsp retains the copyright notices and BSD license in COPYING.
+src/audio/dsp.rs is a Rust adaptation of the floating-point, quality-5
+resampler in SpeexDSP 1.2.1 (Jean-Marc Valin, 2007). Filter coefficients,
+algorithm provenance and BSD terms are preserved in src/audio/COPYING.SpeexDSP.
+The implementation owns a stereo history and fractional phase, with no native
+Speex library or FFI. Original C source is kept only for offline comparison.
+Source: https://downloads.xiph.org/releases/speex/speexdsp-1.2.1.tar.gz
 The Cargo licenses of opusic-c 1.6.1 and opusic-sys 0.7.5 are BSD-3-Clause.
 Notices for the underlying Opus implementation and its authors must also
 be retained as required by the source used. These version numbers identify

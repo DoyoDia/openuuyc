@@ -112,6 +112,8 @@ impl DeviceCenterApp {
                 "Third-Party Notices and Licenses",
                 concat!(
                     include_str!("../../../THIRD_PARTY_NOTICES"),
+                    "\n\nAppendix: SpeexDSP BSD license (Rust resampler adaptation)\n\n",
+                    include_str!("../../audio/COPYING.SpeexDSP"),
                     "\n\nAppendix: GNU LGPL 2.1 (covered components are licensed LGPL-2.1-or-later)\n\n",
                     include_str!("../../decoder/COPYING.FFmpeg")
                 ),

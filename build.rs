@@ -10,16 +10,6 @@ fn main() {
         .manifest_required()
         .expect("compile Windows application icon");
     build_neteq();
-    println!("cargo:rerun-if-changed=vendor/speexdsp");
-    cc::Build::new()
-        .opt_level(3)
-        .file("vendor/speexdsp/libspeexdsp/resample.c")
-        .include("vendor/speexdsp/include")
-        .define("FLOATING_POINT", "1")
-        .define("EXPORT", "")
-        .flag_if_supported("-fwrapv")
-        .warnings(false)
-        .compile("openuuyc_speexdsp");
 }
 
 fn build_neteq() {
