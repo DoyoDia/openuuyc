@@ -391,12 +391,20 @@ impl Mount {
                 fuser::MountOption::NoSuid,
                 fuser::MountOption::NoDev,
                 fuser::MountOption::NoAtime,
-                // Without this a crash leaves the mount behind, and the next
-                // run cannot reuse the directory.
-                fuser::MountOption::AutoUnmount,
+                // Not `AutoUnmount`: it needs `AllowOther` or `AllowRoot`, and
+                // either would hand the remote's files to every local user. A
+                // mount left behind by a crash is cleared on the next run
+                // instead.
             ],
-        )
-        .with_context(|| format!("挂载 {} 失败", root.display()))?;
+        );
+        let session = match session {
+            Ok(session) => session,
+            Err(error) => {
+                let _ = std::fs::remove_dir(&root);
+                return Err(anyhow::Error::new(error))
+                    .with_context(|| format!("挂载 {} 失败", root.display()));
+            }
+        };
         Ok(Self {
             session,
             root,
@@ -435,5 +443,33 @@ pub(super) fn mount_parent() -> Result<PathBuf> {
         .context("XDG_RUNTIME_DIR 未设置，无法挂载剪贴板文件")?;
     let parent = base.join("openuuyc").join("clipboard");
     std::fs::create_dir_all(&parent).with_context(|| format!("创建 {} 失败", parent.display()))?;
+    static CLEANED: std::sync::Once = std::sync::Once::new();
+    CLEANED.call_once(|| retire_stale(&parent));
     Ok(parent)
+}
+
+/// Clear out generations from an earlier run of this process. Nothing unmounts
+/// them when it dies, so they are still mounted, and the directory each stands
+/// on cannot be removed until it is not.
+fn retire_stale(parent: &Path) {
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // Not `is_dir`: asking the kernel about a mount whose server died
+        // fails with `ENOTCONN`, so the entries most in need of clearing are
+        // exactly the ones that would answer no. Unmounting something that was
+        // never mounted is harmless.
+        //
+        // Lazily, because a file manager may still hold the old mount open;
+        // the kernel detaches it once the last user lets go.
+        let _ = std::process::Command::new("fusermount3")
+            .args(["-u", "-q", "-z"])
+            .arg(&path)
+            .status();
+        if std::fs::remove_dir(&path).is_err() {
+            tracing::debug!(path = %path.display(), "残留的剪贴板挂载点暂时无法移除");
+        }
+    }
 }

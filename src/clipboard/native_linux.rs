@@ -384,6 +384,9 @@ fn process(state: &mut State, command: Command) {
             if let Some(session) = weak.upgrade().filter(|session| session.valid(epoch))
                 && let Err(error) = accept_offer(state, &session, epoch, formats)
             {
+                // The notice shows the outermost line; the cause is only in
+                // the chain, and it is the part worth reading.
+                tracing::debug!(error = format!("{error:#}"), "接受远端剪贴板失败");
                 session.fail(error.to_string());
             }
         }
