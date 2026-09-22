@@ -262,6 +262,12 @@ struct State {
     /// File lists handed out per session and task, kept until the clipboard
     /// changes so a slow remote can keep reading the copy it started on.
     tasks: HashMap<(u64, u32), Arc<LocalFiles>>,
+    /// The remote copy currently published locally, mounted for as long as the
+    /// clipboard points at it.
+    mounted: Option<super::fuse::Mount>,
+    /// Names each mount's directory, so a new copy never reuses a path the
+    /// file manager may still have open.
+    generation: u64,
     /// Set while this adapter writes, so the poll does not report its own write.
     writing: bool,
 }
@@ -327,6 +333,8 @@ fn run(receiver: Receiver<Command>) {
         published: HashMap::new(),
         local: LocalSnapshot::default(),
         tasks: HashMap::new(),
+        mounted: None,
+        generation: 0,
         writing: false,
     };
     loop {
@@ -426,11 +434,16 @@ fn accept_offer(
         return Ok(());
     }
     let platform = session.platform.load(Ordering::Acquire);
-    // Files need delayed rendering, so they are never accepted here.
+    let files = session.file_allowed();
     let links: Vec<Format> = offered
         .into_iter()
-        .filter_map(|format| formats::incoming(format, platform, false))
+        .filter_map(|format| formats::incoming(format, platform, files))
         .collect();
+    // Files win when offered: a peer that copied files usually also offers
+    // their names as text, and pasting the names is not what was asked for.
+    if files && links.iter().any(|link| link.local == descriptor_format()) {
+        return accept_files(state, session, epoch);
+    }
     let Some(format) = [13u32, 1, 8, 17]
         .into_iter()
         .find_map(|id| links.iter().find(|format| format.local == id))
@@ -455,6 +468,44 @@ fn accept_offer(
         8 | 17 => write_image(state, &data)?,
         _ => return Ok(()),
     }
+    *lock(&session.error) = None;
+    Ok(())
+}
+
+fn descriptor_format() -> u32 {
+    formats::register("FileGroupDescriptorW")
+}
+
+/// Mount the remote's copy and point the local clipboard at it.
+///
+/// Only the list is fetched here. The contents follow one read at a time,
+/// through the filesystem, if and when something actually opens them.
+fn accept_files(state: &mut State, session: &Arc<Inner>, epoch: u64) -> Result<()> {
+    // The task id the official Windows client uses for an inbound offer.
+    const TASK: u32 = 0;
+    let descriptors = session.descriptors(epoch, TASK)?;
+    ensure!(!descriptors.is_empty(), "远端剪贴板文件列表为空");
+    let tree = super::fuse::Tree::build(&descriptors)?;
+    let parent = super::fuse::mount_parent()?;
+    let reader = {
+        let session = Arc::downgrade(session);
+        Arc::new(move |index: u32, offset: u64, length: usize| {
+            let session = session.upgrade().context("剪贴板会话已结束")?;
+            session.read_file(epoch, TASK, index, offset, length.min(FILE_BLOCK), 2)
+        })
+    };
+    state.generation += 1;
+    let mount = super::fuse::Mount::new(&parent, state.generation, tree, reader)?;
+    let paths = mount.paths();
+    tracing::debug!(
+        files = descriptors.len(),
+        root = %mount.root().display(),
+        "已挂载远端剪贴板文件"
+    );
+    write_files(state, &paths)?;
+    // Held until the next copy replaces it: the clipboard still points here,
+    // and the paste may be minutes away.
+    state.mounted = Some(mount);
     *lock(&session.error) = None;
     Ok(())
 }
@@ -487,6 +538,22 @@ fn write_text(state: &mut State, text: &str) -> Result<()> {
         ..Default::default()
     };
     state.tasks.clear();
+    state.mounted = None;
+    Ok(())
+}
+
+/// Publish paths as a file copy on the local clipboard.
+fn write_files(state: &mut State, paths: &[PathBuf]) -> Result<()> {
+    let clipboard = state.clipboard.as_mut().context("系统剪贴板不可用")?;
+    state.writing = true;
+    let result = clipboard.set().file_list(paths);
+    state.writing = false;
+    result.context("写入系统剪贴板失败")?;
+    state.local = LocalSnapshot {
+        sources: paths.to_vec(),
+        ..Default::default()
+    };
+    state.tasks.clear();
     Ok(())
 }
 
@@ -506,6 +573,7 @@ fn write_image(state: &mut State, dib: &[u8]) -> Result<()> {
         ..Default::default()
     };
     state.tasks.clear();
+    state.mounted = None;
     Ok(())
 }
 
@@ -556,6 +624,15 @@ fn poll_local(state: &mut State) -> Result<()> {
         .into_iter()
         .map(trim_uri_path)
         .filter(|path| path.is_absolute())
+        // A copy the remote sent is published as paths into this process's own
+        // filesystem. Offering those back would ask the remote for the files it
+        // just gave us, over and over.
+        .filter(|path| {
+            !state
+                .mounted
+                .as_ref()
+                .is_some_and(|m| path.starts_with(m.root()))
+        })
         .collect::<Vec<_>>();
     let snapshot = if !sources.is_empty() {
         LocalSnapshot {

@@ -1,5 +1,8 @@
 //! Device-scoped clipboard RPC with a process-wide platform adapter.
 mod formats;
+#[cfg(not(windows))]
+#[path = "clipboard/fuse_linux.rs"]
+mod fuse;
 #[cfg(windows)]
 mod native;
 #[cfg(not(windows))]
