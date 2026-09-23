@@ -1,5 +1,6 @@
 //! One receive-only audio output per UU connection, shared by all its windows.
-mod dsp;
+pub(crate) mod dsp;
+pub(crate) mod encoder;
 mod neteq;
 
 use std::collections::VecDeque;

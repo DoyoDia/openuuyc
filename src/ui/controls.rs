@@ -1059,15 +1059,21 @@ pub fn menu_row(
             .line_segment([origin + vec2(-0.5, 2.5), origin + vec2(4.5, -3.0)], stroke);
     }
     let label_left = rect.left() + if selected.is_some() { 28.0 } else { 10.0 };
-    let detail_width = ui
-        .painter()
-        .layout_no_wrap(
-            detail.to_owned(),
-            egui::FontId::proportional(theme::SMALL),
-            MUTED,
-        )
-        .size()
-        .x;
+    let detail_color = if enabled || selected == Some(true) {
+        MUTED
+    } else {
+        theme::DISABLED
+    };
+    let mut detail_job = egui::text::LayoutJob::simple_singleline(
+        detail.to_owned(),
+        egui::FontId::proportional(theme::SMALL),
+        detail_color,
+    );
+    detail_job.wrap.max_width = rect.width() * 0.5;
+    detail_job.wrap.max_rows = 1;
+    detail_job.wrap.break_anywhere = true;
+    let detail_galley = ui.painter().layout_job(detail_job);
+    let detail_width = detail_galley.size().x;
     let label_width =
         (rect.right() - label_left - detail_width - if more { 36.0 } else { 20.0 }).max(0.0);
     let mut job = egui::text::LayoutJob::simple_singleline(
@@ -1084,11 +1090,13 @@ pub fn menu_row(
         galley,
         color,
     );
-    ui.painter().text(
-        rect.right_center() - vec2(if more { 26.0 } else { 10.0 }, 0.0),
-        egui::Align2::RIGHT_CENTER,
-        detail,
-        egui::FontId::proportional(theme::SMALL),
+    ui.painter().galley(
+        rect.right_center()
+            - vec2(
+                (if more { 26.0 } else { 10.0 }) + detail_width,
+                detail_galley.size().y / 2.0,
+            ),
+        detail_galley,
         if enabled || selected == Some(true) {
             MUTED
         } else {

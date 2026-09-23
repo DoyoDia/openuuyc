@@ -25,6 +25,7 @@ pub use crate::remote_input::MouseMode;
 pub(crate) mod annotation;
 mod display_settings;
 mod display_topology;
+mod microphone;
 pub use display_settings::{
     DisplayChangeRequest, DisplayChangeStatus, DisplayResolution, RemoteDisplayInfo,
     RemoteDisplayMode,
@@ -302,6 +303,7 @@ pub struct StreamControlSnapshot {
 
 #[derive(Clone)]
 pub struct StreamControlHandle {
+    microphone: crate::microphone::Microphone,
     clipboard: crate::clipboard::Clipboard,
     files: Arc<crate::file_transfer::Transport>,
     mouse: crate::remote_input::RemoteInput,
@@ -548,6 +550,7 @@ impl StreamControlHandle {
         });
         (
             Self {
+                microphone: crate::microphone::Microphone::new(),
                 clipboard: crate::clipboard::Clipboard::new(),
                 files: Arc::new(crate::file_transfer::Transport::default()),
                 mouse,
@@ -583,6 +586,7 @@ impl StreamControlHandle {
         let mut state = lock(&self.shared);
         state.mouse_transport_connected = connected;
         if !connected {
+            self.microphone.disconnect();
             self.clipboard.suspend();
             state.annotation.disconnect();
             state.peer_mouse_relative = None;
@@ -1332,6 +1336,7 @@ impl StreamControlHandle {
             _ => return,
         }
         if !open {
+            self.microphone.disconnect();
             self.clipboard.suspend();
             state.peer_clipboard = 0;
             state.annotation.disconnect();
@@ -1408,6 +1413,9 @@ impl StreamControlHandle {
     }
 
     pub(crate) fn mark_send_failed(&self, sequence: i64, error: &str) {
+        if self.microphone.send_failed(sequence, error) {
+            return;
+        }
         let mut state = lock(&self.shared);
         if self.topology_send_failed(&mut state, sequence, error) {
             return;
@@ -1450,6 +1458,7 @@ impl StreamControlHandle {
         }
         state.viewing_enabled = enabled;
         if !enabled {
+            self.disable_microphone_locked(&mut state);
             self.clipboard.suspend();
         }
         if enabled {
@@ -1512,6 +1521,9 @@ impl StreamControlHandle {
         let mut handshake_changed = false;
         let mut state = lock(&self.shared);
         match message.payload {
+            Some(PbPayload::SimpleAction(action)) if matches!(action.action, 23..=27) => {
+                self.microphone.event(action.action);
+            }
             Some(PbPayload::SimpleAction(action)) if source == PbMessageSource::Control => {
                 // F91D10 dispatches CONTROL SimpleAction to the ECHO handler;
                 // TEXT and signal_app_data only reach the business observers.
@@ -1619,6 +1631,12 @@ impl StreamControlHandle {
                         response.payload.as_ref(),
                     ) {
                         match response.payload {
+                            Some(PbRpcResponsePayload::VirtualAudioDriverPolicyRsp(bytes)) => {
+                                let response =
+                                    microphone::PolicyResponse::decode(bytes.as_slice())?;
+                                self.microphone
+                                    .response(header.request_id, response.error_code);
+                            }
                             Some(PbRpcResponsePayload::DrawResp(draw)) => {
                                 state.annotation.response(header.request_id, draw)
                             }
@@ -1744,6 +1762,12 @@ impl StreamControlHandle {
     }
 
     fn refresh_mouse_policy(&self, state: &mut StreamControlState) {
+        if !state.viewing_enabled
+            || state.mouse.mode() == MouseMode::View
+            || self.microphone.needs_cleanup()
+        {
+            self.disable_microphone_locked(state);
+        }
         self.clipboard.policy(
             state.viewing_enabled
                 && state.pb_connected
@@ -2828,6 +2852,8 @@ struct PbResponseHeader {
 
 #[derive(Clone, PartialEq, prost::Message)]
 struct PbRpcRequest {
+    #[prost(message, optional, tag = "21")]
+    virtual_audio_driver_policy: Option<microphone::PolicyRequest>,
     #[prost(message, optional, tag = "27")]
     draw: Option<annotation::PbDrawRequest>,
     #[prost(message, optional, tag = "1")]

@@ -679,7 +679,7 @@ fn player_title_bar(ui: &mut egui::Ui, mut bar: PlayerTitleBar<'_>) -> PlayerChr
             crate::ui::theme::WINDOW_TITLE_CONTENT_HEIGHT,
         ),
     );
-    const VIEW_ACTIONS_WIDTH: f32 = 180.0;
+    const VIEW_ACTIONS_WIDTH: f32 = crate::ui::theme::VIEWER_ACTIONS_WIDTH;
     let title = bar.title.trim_start_matches(crate::VIEWER_TITLE_PREFIX);
     let title_width = if bar.screens.device_switch.is_some() {
         crate::ui::controls::viewer_device_button_width(ui, title)
@@ -893,6 +893,34 @@ fn player_title_bar(ui: &mut egui::Ui, mut bar: PlayerTitleBar<'_>) -> PlayerChr
         .on_disabled_hover_text("请先还原窗口")
         .clicked();
     let control = bar.stream_control.snapshot();
+    let mic = bar.stream_control.microphone().snapshot();
+    let mic_hint = if mic.pending {
+        "麦克风：等待远端确认"
+    } else if mic.error.is_some() {
+        "麦克风错误（在高级设置中查看）"
+    } else if mic.capturing {
+        "正在将麦克风发送到远端，点击关闭"
+    } else if mic.enabled {
+        "麦克风已开启，等待远端应用使用，点击关闭"
+    } else {
+        "将所选麦克风发送到远端（设备可在高级设置中切换）"
+    };
+    if actions
+        .add_enabled_ui(
+            mic.enabled
+                || (bar.stream_control.microphone_available()
+                    && control.ready
+                    && control.mouse_mode != crate::remote_input::MouseMode::View),
+            |ui| title_icon_button(ui, TitleIcon::Microphone, mic.enabled, mic_hint),
+        )
+        .inner
+        .on_disabled_hover_text("请先连接支持麦克风的 Windows 设备并开启键鼠控制")
+        .clicked()
+    {
+        if let Err(error) = bar.stream_control.set_microphone_enabled(!mic.enabled) {
+            bar.stream_control_ui.local_error = Some(error.to_string());
+        }
+    }
     let enabled =
         control.mouse_mode != crate::remote_input::MouseMode::View || control.mouse_pending;
     action.toggle_mouse = actions

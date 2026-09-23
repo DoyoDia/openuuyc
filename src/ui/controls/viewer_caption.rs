@@ -7,6 +7,7 @@ pub(crate) enum ViewerCaptionIcon {
     Annotation,
     OneToOne,
     Mouse,
+    Microphone,
     Quality,
     Minimize,
     Maximize,
@@ -58,6 +59,36 @@ fn paint_caption_icon(
     let center = rect.center();
     let stroke = egui::Stroke::new(theme::ICON_STROKE, color);
     match icon {
+        ViewerCaptionIcon::Microphone => {
+            painter.rect_stroke(
+                egui::Rect::from_center_size(center + egui::vec2(0.0, -3.0), egui::vec2(6.0, 10.0)),
+                3.0,
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+            painter.line(
+                vec![
+                    center + egui::vec2(-6.0, -2.0),
+                    center + egui::vec2(-6.0, 1.0),
+                    center + egui::vec2(-3.0, 4.0),
+                    center + egui::vec2(3.0, 4.0),
+                    center + egui::vec2(6.0, 1.0),
+                    center + egui::vec2(6.0, -2.0),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [center + egui::vec2(0.0, 4.0), center + egui::vec2(0.0, 8.0)],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    center + egui::vec2(-4.0, 8.0),
+                    center + egui::vec2(4.0, 8.0),
+                ],
+                stroke,
+            );
+        }
         ViewerCaptionIcon::Annotation => super::annotation::paint_annotation_icon(
             painter,
             egui::Rect::from_center_size(center, egui::vec2(16., 16.)),

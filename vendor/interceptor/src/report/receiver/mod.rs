@@ -97,12 +97,17 @@ impl RTCPWriter for ReceiverReportRtcpWriter {
         while index < packets.len() {
             let Some(ssrc) = feedback_ssrc(packets[index].as_ref()) else {
                 // Transport-wide feedback belongs to Call, not to a video
-                // receive module. Never manufacture RR/XR for it.
+                // receive module. Never manufacture RR/XR for it. Preserve
+                // compound groups supplied by senders (SR + SDES); splitting
+                // these into individual writes destroys their RTCP contract.
+                let end = (index + 1..packets.len())
+                    .find(|&next| feedback_ssrc(packets[next].as_ref()).is_some())
+                    .unwrap_or(packets.len());
                 total += self
                     .parent
-                    .write(&packets[index..index + 1], attributes)
+                    .write(&packets[index..end], attributes)
                     .await?;
-                index += 1;
+                index = end;
                 continue;
             };
             let end = (index + 1..packets.len())

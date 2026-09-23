@@ -77,7 +77,7 @@ modules! {
     ("recovery", "丢包恢复", false, ["openuuyc::official_receiver", "openuuyc::nack_audit", "openuuyc::replay_recovery", "openuuyc::rsfec", "openuuyc::ulpfec", "openuuyc::flexfec", "openuuyc::xor_fec"]),
     ("decoder", "视频解码", false, ["openuuyc::decoder", "openuuyc::decoder_pool", "openuuyc::decoder_result", "openuuyc::codec_parameters", "openuuyc_h264"]),
     ("viewer", "播放窗口", false, ["openuuyc::viewer", "openuuyc::controller::windows", "openuuyc::video_color", "openuuyc::video_format"]),
-    ("audio", "音频播放", false, ["openuuyc::audio"]),
+    ("audio", "音频", false, ["openuuyc::audio", "openuuyc::microphone"]),
     ("control", "串流设置", false, ["openuuyc::stream_control", "openuuyc::viewing_settings"]),
     ("keyboard", "键盘输入", false, ["openuuyc::viewer::windows_keyboard"]),
     ("mouse", "鼠标与光标", false, ["openuuyc::viewer::windows_mouse", "openuuyc::viewer::windows_cursor", "openuuyc::remote_cursor"]),

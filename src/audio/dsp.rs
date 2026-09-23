@@ -1,4 +1,5 @@
-//! Fixed-rate stereo resampling for the audio renderer (48 kHz, quality 5).
+//! Fixed-rate stereo resampling (quality 5). Playback uses 48 kHz input;
+//! microphone capture converts the device's native rate to 48 kHz.
 //!
 //! Rust adaptation of SpeexDSP 1.2.1 resample.c by Jean-Marc Valin (2007).
 //! Filter design and coefficients retain the Speex BSD license; see
@@ -11,7 +12,7 @@ const INPUT_RATE: usize = 48_000;
 const INPUT_CHUNK: usize = 160;
 const BASE_TAPS: usize = 80;
 
-pub(super) struct Resampler {
+pub(crate) struct Resampler {
     taps: usize,
     denominator: usize,
     integer_step: usize,
@@ -29,13 +30,18 @@ enum Filter {
 
 impl Resampler {
     pub fn new(output_rate: u32) -> Result<Self> {
+        Self::with_rates(INPUT_RATE as u32, output_rate)
+    }
+
+    pub(crate) fn with_rates(input_rate: u32, output_rate: u32) -> Result<Self> {
         ensure!(
-            (8_000..=384_000).contains(&output_rate),
-            "不支持输出采样率：{output_rate}"
+            (8_000..=384_000).contains(&output_rate) && (8_000..=384_000).contains(&input_rate),
+            "不支持采样率转换：{input_rate} → {output_rate}"
         );
+        let input_rate = input_rate as usize;
         let output_rate = output_rate as usize;
-        let divisor = gcd(INPUT_RATE, output_rate);
-        let numerator = INPUT_RATE / divisor;
+        let divisor = gcd(input_rate, output_rate);
+        let numerator = input_rate / divisor;
         let denominator = output_rate / divisor;
         let mut taps = BASE_TAPS;
         let mut oversample = 16;

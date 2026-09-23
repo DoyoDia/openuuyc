@@ -29,6 +29,7 @@ mod flexfec;
 pub mod logging;
 pub mod login;
 pub mod media;
+mod microphone;
 mod network_control;
 mod nrd_http;
 pub mod official_receiver;

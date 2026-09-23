@@ -29,6 +29,7 @@ enum Page {
     Custom,
     Advanced,
     Audio,
+    Microphone,
     Mouse,
     Display,
 }
@@ -40,6 +41,7 @@ impl Page {
             Self::Custom => "自定义码率",
             Self::Advanced => "高级设置",
             Self::Audio => "音频输出",
+            Self::Microphone => "麦克风设备",
             Self::Mouse => "鼠标模式",
             Self::Display => "显示设置",
         }
@@ -594,7 +596,7 @@ pub(super) fn show_stream_control_window(
             ui.horizontal(|ui| {
                 if state.page != Page::Quality {
                     back =
-                        icon_button(ui, Icon::Back, if state.page == Page::Mouse { "返回高级设置" } else { "返回画质菜单；未应用的修改会取消" }).clicked();
+                        icon_button(ui, Icon::Back, if matches!(state.page, Page::Mouse | Page::Microphone) { "返回高级设置" } else { "返回画质菜单；未应用的修改会取消" }).clicked();
                 }
                 let title = if state.page == Page::Display {
                     "显示设置".to_owned()
@@ -938,6 +940,25 @@ crate::ui::controls::observe_notice(ui.ctx(), "audio-output-disconnected", "音�
                                 switch_row(ui, "拦截本机快捷键", &mut view.intercept_shortcuts)
                                     .on_hover_text("仅当前播放窗口。开启后，控制时优先将按键交给远端；关闭后允许本机快捷键响应。播放器自身快捷键始终保留。");
                                 let clipboard = handle.clipboard();
+                                let mic=handle.microphone().snapshot();
+                                let input=handle.microphone().selected_input();
+                                let devices=handle.microphone().input_devices();
+                                let name=input.as_ref().map(|id|devices.devices.iter().find(|d|&d.id==id).map(|d|d.name.as_str()).unwrap_or(if devices.error.is_some() {"所选麦克风"}else{"所选设备已断开"})).unwrap_or("跟随系统默认");
+                                if menu_row(ui,"麦克风设备",name,None,true,true)
+                                    .on_hover_text(name).clicked() {
+                                    state.page=Page::Microphone;
+                                    state.local_error=handle.microphone().refresh_input_devices().err().map(|e|e.to_string());
+                                }
+                                if mic.enabled {
+                                    let label=if mic.pending {"等待远端确认"}else if mic.capturing {"麦克风正在发送"}else if mic.remote_active {"正在打开本机麦克风"}else{"等待远端应用使用麦克风"};
+                                    ui.label(RichText::new(label).color(MUTED));
+                                    if mic.capturing {
+                                        ui.add(egui::ProgressBar::new(mic.level.clamp(0.0,1.0)).text(&mic.device));
+                                        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                                    }
+                                    if mic.error.is_some() && menu_row(ui,"重试麦克风","",None,true,false).clicked() {handle.microphone().retry();}
+                                }
+                                crate::ui::controls::observe_notice(ui.ctx(),"microphone-error","麦克风",crate::ui::controls::DialogIcon::Error,mic.error.as_deref());
                                 let clip = clipboard.snapshot();
                                 let mut enabled = clip.enabled;
                                 if switch_row(ui, "剪贴板同步", &mut enabled).changed() {
@@ -969,6 +990,35 @@ crate::ui::controls::observe_notice(ui.ctx(), "clipboard-error", "剪贴板同�
                                     view.send_ctrl_alt_del = true;
                                 }
                             });
+                    }
+                    Page::Microphone => {
+                        let microphone=handle.microphone();
+                        let selected=microphone.selected_input();
+                        let inputs=microphone.input_devices();
+                        ctx.request_repaint_after(std::time::Duration::from_millis(250));
+                        if menu_row(ui,"跟随系统默认","",Some(selected.is_none()),true,false).clicked() {
+                            microphone.set_input_device(None);
+                        }
+                        section_separator(ui);
+                        egui::ScrollArea::vertical().id_salt("microphone-input-devices")
+                            .max_height((ctx.content_rect().height()-250.0).clamp(100.0,360.0))
+                            .show(ui,|ui| {
+                                if inputs.updated.is_none() {ui.label(RichText::new("正在读取麦克风设备…").color(MUTED));}
+                                for input in &inputs.devices {
+                                    if menu_row(ui,&input.name,"",Some(selected.as_ref()==Some(&input.id)),true,false)
+                                        .on_hover_text(&input.name).clicked() {
+                                        microphone.set_input_device(Some(input.id.clone()));
+                                    }
+                                }
+                                if inputs.updated.is_some() && inputs.devices.is_empty() && inputs.error.is_none() {
+                                    ui.label(RichText::new("未找到麦克风设备").color(MUTED));
+                                }
+                                if inputs.error.is_none() && selected.as_ref().is_some_and(|id| inputs.updated.is_some() && !inputs.devices.iter().any(|d|&d.id==id)) {
+                                    ui.label(RichText::new("所选麦克风已断开，请重新连接或选择其他设备").color(MUTED));
+                                }
+                            });
+                        crate::ui::controls::observe_notice(ui.ctx(),"microphone-device-query","麦克风设备",crate::ui::controls::DialogIcon::Error,inputs.error.as_deref());
+                        ui.label(RichText::new("使用标题栏麦克风按钮开启或关闭发送").color(MUTED));
                     }
                     Page::Mouse => {
                         for (mode, label, description) in [
@@ -1122,7 +1172,7 @@ crate::ui::controls::observe_notice(ui.ctx(), "clipboard-error", "剪贴板同�
         }
     }
     if back {
-        state.page = if state.page == Page::Mouse {
+        state.page = if matches!(state.page, Page::Mouse | Page::Microphone) {
             Page::Advanced
         } else {
             Page::Quality

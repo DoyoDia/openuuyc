@@ -30,6 +30,7 @@ pub const SMALL: f32 = 12.0;
 pub const TINY: f32 = 11.0;
 pub const ICON_STROKE: f32 = 1.35;
 pub const VIEWER_CAPTION_BUTTON: f32 = 30.0;
+pub const VIEWER_ACTIONS_WIDTH: f32 = 214.0;
 pub const SESSION_STATUS_WIDTH: f32 = 280.0;
 pub const MICRO: f32 = 10.0;
 pub const SECTION: f32 = 16.0;

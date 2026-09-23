@@ -15,7 +15,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, broadcast, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use webrtc::api::APIBuilder;
-use webrtc::api::interceptor_registry::configure_twcc_receiver_with_builder;
+use webrtc::api::interceptor_registry::{
+    configure_twcc_receiver_with_builder, configure_twcc_sender_only,
+};
 use webrtc::api::media_engine::{MIME_TYPE_H264, MIME_TYPE_HEVC, MIME_TYPE_OPUS, MediaEngine};
 use webrtc::api::setting_engine::SettingEngine;
 use webrtc::data_channel::RTCDataChannel;
@@ -27,7 +29,6 @@ use webrtc::ice_transport::ice_connection_state::RTCIceConnectionState;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::interceptor::registry::Registry;
 use webrtc::interceptor::report::receiver::ReceiverReport;
-use webrtc::interceptor::report::sender::SenderReport as SenderReportInterceptor;
 use webrtc::interceptor::twcc::receiver::Receiver as TransportFeedbackReceiver;
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::peer_connection::configuration::RTCConfiguration;
@@ -399,9 +400,9 @@ impl DataChannels {
                     // Clipboard owns only its RPC fields, independently of video requests.
                 } else if label == "STREAMER_DATA_CHANNEL" {
                     // Peer media_inbounds describe the peer's receive direction.
-                    // This read-only client has no UU video sender. Do not use
+                    // This client has no UU video sender. Do not use
                     // those reports as measurements of our local video pipeline.
-                    tracing::trace!(bytes = message.data.len(), "peer receiver statistics not used by read-only viewer");
+                    tracing::trace!(bytes = message.data.len(), "peer receiver statistics not used for incoming video");
                 } else if matches!(
                     label.as_str(),
                     "CONTROL_DATA_CHANNEL" | "TEXT_DATA_CHANNEL"
@@ -2041,9 +2042,9 @@ fn remove_relay_candidates_from_sdp(sdp: &str) -> String {
 
 // Local send-controller bootstrap, not an incoming video bitrate limit.
 // UU's DataRate parser treats the factory trial's bare start:8100 as kbps.
-// This read-only client has no outgoing RTP media/probes or encoder/pacer
-// pushback: available => configured bootstrap, unavailable => zero. A future
-// media sender must supply its real evolving estimate instead of this projection.
+// Incoming-video feedback retains this transport bootstrap. The microphone's
+// fixed 100 kbps encoding allocation is not a measured path-capacity estimate.
+// There is no outgoing video/probe pacer supplying an evolving GCC estimate.
 const UU_LOCAL_SEND_START_BPS: u64 = 8_100_000;
 
 fn uu_transport_feedback_interval(send_bitrate_bps: u64) -> Duration {
@@ -2111,7 +2112,6 @@ impl NativePeer {
             ReceiverReport::builder()
                 .with_jittered_media_intervals(Duration::from_secs(1), Duration::from_secs(5)),
         ));
-        registry.add(Box::new(SenderReportInterceptor::builder()));
         let (feedback_interval_tx, feedback_interval_rx) =
             watch::channel(Duration::from_millis(100));
         let registry = configure_twcc_receiver_with_builder(
@@ -2120,6 +2120,8 @@ impl NativePeer {
             TransportFeedbackReceiver::builder().with_interval_updates(feedback_interval_rx),
         )
         .context("register WebRTC transport feedback interceptors")?;
+        let registry = configure_twcc_sender_only(registry, &mut media_engine)
+            .context("register audio sender transport sequence extension")?;
         let mut setting_engine = SettingEngine::default();
         setting_engine.set_sctp_max_message_size_can_send(
             webrtc::api::setting_engine::SctpMaxMessageSize::Bounded(524_288),
@@ -2169,7 +2171,7 @@ impl NativePeer {
         // even when no microphone samples are produced. A bare sendrecv
         // transceiver omits the MSID/SSRC block and the controlled client does
         // not treat that offer as the desktop-controller profile.
-        let audio_track: Arc<dyn TrackLocal + Send + Sync> = Arc::new(TrackLocalStaticRTP::new(
+        let audio_track = Arc::new(TrackLocalStaticRTP::new(
             RTCRtpCodecCapability {
                 mime_type: MIME_TYPE_OPUS.to_owned(),
                 clock_rate: 48_000,
@@ -2180,9 +2182,9 @@ impl NativePeer {
             "audio_0".to_owned(),
             "audio_0".to_owned(),
         ));
-        connection
+        let audio_transceiver = connection
             .add_transceiver_from_track(
-                audio_track,
+                audio_track.clone() as Arc<dyn TrackLocal + Send + Sync>,
                 Some(transceiver(RTCRtpTransceiverDirection::Sendrecv)),
             )
             .await
@@ -2214,6 +2216,23 @@ impl NativePeer {
             uu_kcp.clone(),
             Arc::downgrade(&connection),
         );
+        let microphone = data_channels.stream_control.microphone().clone();
+        data_channels.workers.spawn(async move {
+            microphone.send(audio_track).await;
+        });
+        let microphone = data_channels.stream_control.microphone().clone();
+        let audio_sender = audio_transceiver.sender().await;
+        let reports = data_channels.stream_control.microphone().clone();
+        let reports_sender = audio_sender.clone();
+        let reports_connection = Arc::downgrade(&connection);
+        data_channels.workers.spawn(async move {
+            reports
+                .send_reports(reports_connection, reports_sender)
+                .await;
+        });
+        data_channels.workers.spawn(async move {
+            microphone.feedback(audio_sender).await;
+        });
         data_channels.workers.spawn(sample_network_performance(
             Arc::clone(&connection),
             performance.clone(),
@@ -2253,7 +2272,7 @@ impl NativePeer {
                     tracing::debug!(
                         send_bitrate_bps = bitrate,
                         interval_ms = interval.as_millis(),
-                        "updated UU read-only transport feedback budget"
+                        "updated UU transport feedback budget"
                     );
                 }
             }
@@ -2521,6 +2540,44 @@ impl NativePeer {
             sdp = remove_relay_candidates_from_sdp(&sdp);
         }
         let answer = RTCSessionDescription::answer(sdp).context("parse remote SDP answer")?;
+        let mut microphone_encoding = None;
+        for media in answer.unmarshal()?.media_descriptions {
+            if media.media_name.media != "audio"
+                || media.media_name.port.value == 0
+                || media
+                    .attributes
+                    .iter()
+                    .any(|a| matches!(a.key.as_str(), "sendonly" | "inactive"))
+            {
+                continue;
+            }
+            let opus_pt = media
+                .attributes
+                .iter()
+                .filter(|a| a.key == "rtpmap")
+                .filter_map(|a| a.value.as_deref()?.split_once(' '))
+                .find(|(_, codec)| codec.eq_ignore_ascii_case("opus/48000/2"))
+                .map(|(pt, _)| pt);
+            if let Some(pt) = opus_pt {
+                let fmtp = media
+                    .attributes
+                    .iter()
+                    .filter(|a| a.key == "fmtp")
+                    .filter_map(|a| a.value.as_deref()?.split_once(' '))
+                    .find(|(id, _)| *id == pt)
+                    .map(|(_, value)| value)
+                    .unwrap_or("");
+                let ptime = media
+                    .attributes
+                    .iter()
+                    .find(|a| a.key == "ptime")
+                    .and_then(|a| a.value.as_ref()?.parse::<u32>().ok());
+                match crate::microphone::Encoding::negotiated(fmtp, ptime) {
+                    Ok(config) => microphone_encoding = Some(config),
+                    Err(error) => tracing::warn!(%error,"microphone negotiation unsupported"),
+                }
+            }
+        }
         // Receiver::tracks is populated only after async transport startup.
         // Register the negotiated MSIDs, not just tracks that already sent RTP.
         let mut indexes = Vec::new();
@@ -2554,6 +2611,10 @@ impl NativePeer {
             .set_remote_description(answer)
             .await
             .context("install remote SDP answer")?;
+        self.data_channels
+            .stream_control
+            .microphone()
+            .configure(microphone_encoding);
         self.data_channels
             .stream_control
             .set_available_video_tracks(indexes);
@@ -2929,6 +2990,7 @@ impl NativePeer {
     }
 
     pub async fn close(&self) -> Result<()> {
+        self.data_channels.stream_control.microphone().close().await;
         self.data_channels.stream_control.file_transfer().close();
         self.data_channels.stream_control.clipboard().suspend();
         self.data_channels.port_mapping.close();
@@ -2945,6 +3007,7 @@ impl NativePeer {
 
 impl Drop for NativePeer {
     fn drop(&mut self) {
+        self.data_channels.stream_control.microphone().stop();
         self.data_channels.stream_control.clipboard().suspend();
         self.data_channels.stream_control.mouse().set_ready(false);
         // Normal paths await close(). This also retires application tasks on
