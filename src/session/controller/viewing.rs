@@ -24,15 +24,6 @@ pub async fn run_saved_viewer_window(
     run_viewer_window(alias, options, target_id, None, None).await
 }
 
-pub async fn run_assist_viewer_window(
-    alias: String,
-    request: crate::account::assist::AssistRequest,
-    options: ConnectionMediaOptions,
-) -> Result<()> {
-    request.validate()?;
-    run_viewer_window(alias, options, None, Some(request), None).await
-}
-
 pub(super) async fn run_viewer_window(
     alias: String,
     options: ConnectionMediaOptions,

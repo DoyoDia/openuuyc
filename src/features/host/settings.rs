@@ -1,6 +1,7 @@
 //! Persistent access policy, isolated by account and this registered device.
+use crate::account::auth::SecretEntry as Entry;
 use anyhow::{Result, bail, ensure};
-use keyring::{Entry, Error};
+use keyring::Error;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -16,6 +17,12 @@ struct Record {
 }
 
 impl Store {
+    pub(super) fn enroll(&self) -> Result<()> {
+        self.0.enroll()
+    }
+    pub(super) fn restore_portable(&self) -> Result<()> {
+        self.0.restore_portable()
+    }
     pub fn new(account: &str, device: &str) -> Result<Self> {
         ensure!(!account.is_empty(), "无法确定被控设置所属账号");
         crate::account::api::validate_device_id(device)?;

@@ -15,8 +15,6 @@ use openuuyc::application::app;
 use openuuyc::diagnostics::logging;
 use openuuyc::media;
 use openuuyc::session::controller;
-use openuuyc::transport::rtc;
-use openuuyc::transport::signal;
 
 #[derive(Parser)]
 #[command(
@@ -37,10 +35,47 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// 打开卸载窗口，选择是否保留驱动和本机数据
+    Uninstall {
+        #[arg(long, hide = true)]
+        parent: Option<u32>,
+    },
     #[command(hide = true)]
-    DisplayDriverInstall,
+    Service,
     #[command(hide = true)]
-    DisplayDriverUninstall,
+    HostResident {
+        #[arg(long)]
+        parent: u32,
+    },
+    #[command(hide = true)]
+    InputAgent {
+        #[arg(long)]
+        pipe: String,
+        #[arg(long)]
+        parent: u32,
+    },
+    #[command(hide = true)]
+    CaptureAgent {
+        #[arg(long)]
+        pipe: String,
+        #[arg(long)]
+        parent: u32,
+    },
+    #[command(hide = true)]
+    Component {
+        #[arg(value_enum)]
+        component: openuuyc::application::ComponentKind,
+        #[arg(value_enum)]
+        operation: openuuyc::application::ComponentOperation,
+        #[arg(long)]
+        allow_sas: bool,
+        #[arg(long)]
+        owner: Option<String>,
+        #[arg(long)]
+        remove_display_driver: bool,
+        #[arg(long)]
+        remove_data: bool,
+    },
     #[command(hide = true)]
     DisplayRecovery { token: String },
     #[command(hide = true)]
@@ -50,6 +85,8 @@ enum Commands {
     PluginHost { manifest: PathBuf },
     /// 打开完整图形设备中心
     Gui {
+        #[arg(long)]
+        background: bool,
         /// 初始码流帧率：auto、144、90、60 或 30
         #[arg(long, default_value = "auto")]
         fps: media::FrameRateChoice,
@@ -63,30 +100,18 @@ enum Commands {
         #[arg(long, default_value = "auto")]
         transport: media::TransportChoice,
     },
-    /// 显示原生传输实现状态
-    NativeStatus,
-    /// 在本地创建 WebRTC offer 并检查媒体能力
-    RtcSelftest,
-    /// 查看平台凭据存储与本地登录态
-    AuthStatus,
     /// 恢复保存的登录态，或进行二维码登录
     Login,
-    /// 仅删除本地登录会话，保留虚拟设备身份
-    LogoutLocal,
-    /// 显示当前已知的 REST 合约
-    Contracts,
     /// 以适合脚本处理的文本格式列出设备
     Devices,
-    /// 连接指定设备并保持会话，按 Ctrl+C 正常退出
+    /// 打开指定设备的观看窗口，关闭窗口或按 Ctrl+C 退出
     Connect {
         /// 设备的完整名称（必须唯一且完全匹配）
-        device: String,
+        #[arg(required_unless_present = "device_id", conflicts_with = "device_id")]
+        device: Option<String>,
         /// 按已核实的设备 ID 选择目标，避免重复或变化的别名选错设备
         #[arg(long)]
         device_id: Option<String>,
-        /// Read assistance credentials from stdin, never from argv.
-        #[arg(long, hide = true, conflicts_with = "device_id")]
-        assist_stdin: bool,
         /// 静音启动，只影响本地播放
         #[arg(long)]
         mute: bool,
@@ -103,15 +128,6 @@ enum Commands {
         #[arg(long, default_value = "auto")]
         transport: media::TransportChoice,
     },
-    /// 检查解密 RTP 捕获的流、包数量与原始字节可重放性
-    RtpCaptureInfo { path: PathBuf },
-    /// 通过官方同构接收流水线离线回放解密 RTP 捕获
-    RtpReplay {
-        path: PathBuf,
-        /// 丢弃所有在捕获中有 RTX 副本的原包，用于验证恢复链的字节一致性
-        #[arg(long)]
-        drop_repairable_originals: bool,
-    },
 }
 
 fn main() -> Result<()> {
@@ -124,8 +140,11 @@ fn main() -> Result<()> {
                 Commands::PluginHost { .. }
                     | Commands::PluginVideoHost
                     | Commands::DisplayRecovery { .. }
-                    | Commands::DisplayDriverInstall
-                    | Commands::DisplayDriverUninstall
+                    | Commands::Component { .. }
+                    | Commands::Service
+                    | Commands::HostResident { .. }
+                    | Commands::InputAgent { .. }
+                    | Commands::CaptureAgent { .. }
             )
         )
     }) {
@@ -133,12 +152,16 @@ fn main() -> Result<()> {
     }
     let cli = parsed.unwrap_or_else(|error| error.exit());
     let command = cli.command.unwrap_or(Commands::Gui {
+        background: false,
         fps: media::FrameRateChoice::Auto,
         codec: media::CodecPreference::Auto,
         hardware_decode: true,
         transport: media::TransportChoice::Auto,
     });
 
+    if matches!(command, Commands::Gui { .. }) && openuuyc::application::route_installed_gui()? {
+        return Ok(());
+    }
     let _instance = if matches!(command, Commands::Gui { .. }) {
         match app::instance::acquire()? {
             Some(instance) => Some(instance),
@@ -147,40 +170,63 @@ fn main() -> Result<()> {
     } else {
         None
     };
-    let _logging = logging::init(cli.log_level.as_deref(), cli.log_file.as_deref())?;
+    let _logging = if matches!(command, Commands::Uninstall { .. }) {
+        None
+    } else {
+        Some(logging::init(
+            cli.log_level.as_deref(),
+            cli.log_file.as_deref(),
+        )?)
+    };
     tracing::info!(target: "openuuyc", version = env!("CARGO_PKG_VERSION"), "application started");
 
-    if matches!(
-        command,
-        Commands::DisplayDriverInstall | Commands::DisplayDriverUninstall
-    ) {
-        let reboot = if matches!(command, Commands::DisplayDriverInstall) {
-            openuuyc::application::install_display_driver()
-        } else {
-            openuuyc::application::uninstall_display_driver()
-        };
-        if let Err(error) = &reboot {
-            tracing::error!(%error, "display driver operation failed");
-        }
-        let reboot = reboot?;
+    if let Commands::Component {
+        component,
+        operation,
+        allow_sas,
+        owner,
+        remove_display_driver,
+        remove_data,
+    } = command
+    {
+        let reboot = openuuyc::application::component_operation(
+            component,
+            operation,
+            allow_sas,
+            owner.as_deref(),
+            remove_display_driver,
+            remove_data,
+        )?;
         drop(_logging);
+        if remove_data && !reboot {
+            openuuyc::application::purge_machine_data()?;
+        }
         if reboot {
             std::process::exit(3010);
         }
         return Ok(());
     }
     let result = match command {
-        Commands::DisplayDriverInstall | Commands::DisplayDriverUninstall => unreachable!(),
+        Commands::Uninstall { parent } => openuuyc::application::uninstall_application(parent),
+        Commands::Component { .. } => unreachable!(),
+        Commands::Service => openuuyc::application::host_service(),
+        Commands::HostResident { parent } => openuuyc::application::host_resident(parent),
+        Commands::InputAgent { pipe, parent } => openuuyc::application::input_agent(&pipe, parent),
+        Commands::CaptureAgent { pipe, parent } => {
+            openuuyc::application::capture_agent(&pipe, parent)
+        }
         Commands::DisplayRecovery { token } => openuuyc::application::display_recovery(&token),
         Commands::PluginVideoHost => openuuyc::plugins::video::host(),
 
         Commands::PluginHost { manifest } => openuuyc::plugins::host(&manifest),
         Commands::Gui {
+            background,
             fps,
             codec,
             hardware_decode,
             transport,
         } => app::run(app::GuiOptions {
+            background,
             media: media::ConnectionMediaOptions {
                 muted: false,
                 frame_rate: fps,
@@ -189,54 +235,14 @@ fn main() -> Result<()> {
                 transport,
             },
         }),
-        Commands::NativeStatus => {
-            let sample = signal::encode_event("soac", &[], Some(1))?;
-            let _ = signal::decode(&sample)?;
-            let _ = signal::encode_pong("");
-            println!("transport: native HTTPS + Socket.IO + WebRTC/DTLS-SRTP");
-            println!(
-                "media: decrypted RTP -> complete Annex-B frames -> native platform decode -> Rust GUI"
-            );
-            println!("decode backends: Windows Rust DXVA11 / Rust H.264 software");
-            println!("signal events: {}", signal::KNOWN_EVENTS.join(", "));
-            println!(
-                "signal headers: {}, {}, {}",
-                signal::AUTH_HEADER,
-                signal::RECONNECT_HEADER,
-                signal::CONTROLLING_HEADER
-            );
-            println!("official DLL dependency: none");
-            Ok(())
-        }
-        Commands::RtcSelftest => tokio::runtime::Runtime::new()?.block_on(async {
-            let peer = rtc::NativePeer::new(Vec::new(), media::TransportChoice::Auto).await?;
-            let _tracks = peer
-                .install_rtp_forwarder(rtc::RtpForwardConfig::default())
-                .await?;
-            let sdp = peer.create_offer().await?;
-            println!("H.265: {}", sdp.contains("H265/90000"));
-            println!("H.264: {}", sdp.contains("H264/90000"));
-            println!("Opus: {}", sdp.contains("opus/48000/2"));
-            println!("SCTP: {}", sdp.contains("webrtc-datachannel"));
-            peer.close().await
-        }),
-        Commands::AuthStatus => login::auth_status(),
         Commands::Login => {
             tokio::runtime::Runtime::new()?.block_on(login::interactive_login())?;
-            Ok(())
-        }
-        Commands::LogoutLocal => login::clear_local_session(),
-        Commands::Contracts => {
-            for (name, contract) in api::CONTRACTS {
-                println!("{name:<22} {:?} {}", contract.method, api::url(contract));
-            }
             Ok(())
         }
         Commands::Devices => tokio::runtime::Runtime::new()?.block_on(print_devices()),
         Commands::Connect {
             device,
             device_id,
-            assist_stdin,
             mute,
             fps,
             codec,
@@ -252,33 +258,14 @@ fn main() -> Result<()> {
                 transport,
             },
             device_id,
-            assist_stdin,
         )),
-        Commands::RtpCaptureInfo { path } => {
-            print!(
-                "{}",
-                openuuyc::diagnostics::rtp_capture::inspect_capture(path)?
-            );
-            Ok(())
-        }
-        Commands::RtpReplay {
-            path,
-            drop_repairable_originals,
-        } => {
-            print!(
-                "{}",
-                openuuyc::transport::official_receiver::replay_capture(
-                    path,
-                    openuuyc::transport::official_receiver::ReplayOptions {
-                        drop_repairable_originals,
-                    },
-                )?
-            );
-            Ok(())
-        }
     };
     if let Err(error) = &result {
         tracing::error!(target: "openuuyc", error = %format_args!("{error:#}"), "application stopped with an error");
+    }
+    drop(_instance);
+    if result.is_ok() && openuuyc::application::take_installed_handoff() {
+        openuuyc::application::launch_installed(std::env::args_os().skip(1))?;
     }
     result
 }
@@ -293,16 +280,16 @@ fn attach_parent_console() {
 }
 
 async fn connect_device(
-    device: String,
+    device: Option<String>,
     options: media::ConnectionMediaOptions,
     device_id: Option<String>,
-    assist_stdin: bool,
 ) -> Result<()> {
-    if assist_stdin {
-        let request = openuuyc::account::assist::read_launch_request()?;
-        return controller::run_assist_viewer_window(device, request, options).await;
-    }
-    controller::run_saved_viewer_window(device, options, device_id).await
+    controller::run_saved_viewer_window(
+        device.unwrap_or_else(|| device_id.clone().expect("clap requires a target")),
+        options,
+        device_id,
+    )
+    .await
 }
 
 async fn print_devices() -> Result<()> {
@@ -326,8 +313,9 @@ async fn print_devices() -> Result<()> {
 fn print_device(index: Option<usize>, device: &api::DeviceInfo) {
     let prefix = index.map_or_else(|| "  ".to_owned(), |value| format!("  [{value}] "));
     println!(
-        "{prefix}{} — {}，{}，可控 {}，会话参与者 {}",
+        "{prefix}{} [{}] — {}，{}，可控 {}，会话参与者 {}",
         device.alias,
+        device.device_id,
         device.status_label(),
         device.platform_label(),
         if device.controlled_support && device.controllable {

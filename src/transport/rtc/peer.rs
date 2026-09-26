@@ -14,7 +14,6 @@ use super::tracks::{
 };
 use super::workers::std_mutex_lock;
 use crate::diagnostics::performance::PerformanceMonitor;
-use crate::diagnostics::rtp_capture::RtpCaptureBuilder;
 use crate::features::stream_control::StreamControlHandle;
 use crate::media::{ConnectionMediaProfile, TransportChoice, VideoCodec};
 use crate::transport::rsfec::RsFecConfig;
@@ -73,7 +72,6 @@ pub struct NativePeer {
     pub(super) nack_rtt_micros: Arc<AtomicU64>,
     pub(super) rtcp_timing: RtcpTiming,
     pub(super) p2p_only: AtomicBool,
-    pub(super) rtp_capture: Option<RtpCaptureBuilder>,
     pub(super) ice_servers: Vec<IceServer>,
     pub(super) data_channels: DataChannels,
     pub(super) video_tracks: VideoTrackRegistry,
@@ -121,10 +119,6 @@ impl NativePeer {
         register_uu_codecs(&mut media_engine)?;
         register_uu_header_extensions(&mut media_engine)?;
         let mut registry = Registry::new();
-        let rtp_capture = RtpCaptureBuilder::from_environment()?;
-        if let Some(capture) = &rtp_capture {
-            registry.add(Box::new(capture.clone()));
-        }
         let rtcp_timing = RtcpTiming::new();
         // Register before RR: the report worker must write through the XR
         // adapter, not capture the unwrapped transport writer.
@@ -311,7 +305,6 @@ impl NativePeer {
             performance,
             nack_rtt_micros,
             rtcp_timing,
-            rtp_capture,
             p2p_only: AtomicBool::new(transport == TransportChoice::P2p),
             ice_servers: configured_ice_servers,
             data_channels,
@@ -699,7 +692,6 @@ impl NativePeer {
         let performance = self.performance.clone();
         let nack_rtt_micros = Arc::clone(&self.nack_rtt_micros);
         let rtcp_timing = self.rtcp_timing.clone();
-        let rtp_capture = self.rtp_capture.clone();
 
         self.core.connection
             .on_track(Box::new(move |track, receiver, _| {
@@ -717,7 +709,6 @@ impl NativePeer {
                 let mut performance = performance.clone();
                 let nack_rtt_micros = Arc::new(AtomicU64::new(nack_rtt_micros.load(Ordering::Relaxed)));
                 let rtcp_timing = rtcp_timing.clone();
-                let rtp_capture = rtp_capture.clone();
                 let _ = owner.spawn_in(stop.clone(), async move {
                     let Some(connection) = connection.upgrade() else {
                         return;
@@ -804,9 +795,6 @@ impl NativePeer {
                                 .eq_ignore_ascii_case("video/rs-fec-cm256")
                         })
                         .map(|codec| RsFecConfig::from_fmtp(&codec.capability.sdp_fmtp_line));
-                    if let Some(capture) = &rtp_capture {
-                        capture.record_codecs(track.ssrc(), &parameters, extmap_allow_mixed);
-                    }
                     let video_payload_codecs = parameters
                         .codecs
                         .iter()

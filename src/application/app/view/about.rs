@@ -113,10 +113,10 @@ impl DeviceCenterApp {
                     include_str!("../../../media/audio/COPYING.SpeexDSP"),
                     "\n\nAppendix: GNU LGPL 2.1 (covered components are licensed LGPL-2.1-or-later)\n\n",
                     include_str!("../../../media/decoder/COPYING.FFmpeg"),
-                    "\n\nAppendix: SudoVDA attribution and Microsoft Public License\n\n",
-                    include_str!("../../../../assets/drivers/sudovda/SudoVDA-README.md"),
+                    "\n\nAppendix: OpenUUYC Display attribution and Microsoft Public License\n\n",
+                    include_str!("../../../../drivers/display/UPSTREAM.md"),
                     "\n\n",
-                    include_str!("../../../../assets/drivers/sudovda/Microsoft-LICENSE.txt")
+                    include_str!("../../../../drivers/display/LICENSE")
                 ),
             ),
         };

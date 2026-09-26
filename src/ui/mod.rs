@@ -4,6 +4,7 @@ use anyhow::Result;
 pub(crate) mod chrome;
 use crate::platform::graphics as d3d11;
 
+mod tray;
 pub(crate) mod window_manager;
 mod windows;
 

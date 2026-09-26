@@ -53,6 +53,7 @@ pub(super) enum GuiCommand {
     },
     CancelLogin(u64),
     Logout,
+    PrepareExit,
     Shutdown,
     Mutate {
         generation: u64,
@@ -91,6 +92,7 @@ pub(super) enum MutationOutcome {
 }
 
 pub(super) enum GuiEvent {
+    ExitReady(std::result::Result<(), String>),
     Host(u64, crate::features::host::Handle),
     Viewer(
         u64,

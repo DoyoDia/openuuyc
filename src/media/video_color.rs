@@ -12,7 +12,7 @@ pub(crate) struct VideoColorSpace {
     pub hdr_metadata: Option<HdrMetadata>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct HdrMetadata {
     pub max_luminance: u16,
     pub min_luminance: u16,

@@ -226,7 +226,10 @@ pub(super) fn message(pointer: *const std::ffi::c_void) -> bool {
             r.drain_keys();
             return false;
         }
-        if !(8..=254).contains(&msg.wParam.0) || msg.wParam.0 == 231 {
+        if crate::platform::windows::input::system::own_message()
+            || !(8..=254).contains(&msg.wParam.0)
+            || msg.wParam.0 == 231
+        {
             return false;
         }
         let flags = msg.lParam.0 as u32;
@@ -817,6 +820,9 @@ unsafe extern "system" fn keyboard_proc(code: i32, message: WPARAM, data: LPARAM
         let down = matches!(message.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
         if down || matches!(message.0 as u32, WM_KEYUP | WM_SYSKEYUP) {
             let event = unsafe { &*(data.0 as *const KBDLLHOOKSTRUCT) };
+            if event.dwExtraInfo == crate::platform::windows::input::system::INPUT_MARKER {
+                return unsafe { CallNextHookEx(None, code, message, data) };
+            }
             let vk = u32::from(normalize_key(
                 event.vkCode,
                 event.scanCode,

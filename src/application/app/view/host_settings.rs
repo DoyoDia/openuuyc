@@ -14,6 +14,11 @@ impl DeviceCenterApp {
         }
     }
     pub(super) fn host_settings(&mut self, ui: &mut egui::Ui) {
+        ui.add_enabled_ui(!self.center_ui.components.busy(), |ui| {
+            self.host_settings_controls(ui)
+        });
+    }
+    fn host_settings_controls(&mut self, ui: &mut egui::Ui) {
         section(ui, "被控设置");
         let host = self.host.clone();
         let mut allowed = host.as_ref().is_some_and(|h| h.allowed());
@@ -94,9 +99,7 @@ impl DeviceCenterApp {
             }
         }
         let status = host.as_ref().map(|host| host.status()).unwrap_or_default();
-        self.center_ui
-            .display_driver
-            .show(ui, status.session_active);
+
         let message = if status.message.is_empty() {
             "已禁止被控"
         } else {
@@ -131,6 +134,12 @@ impl DeviceCenterApp {
             ("host-settings-error", status.settings_error),
             ("host-session-error", status.error),
         ] {
+            // Service maintenance intentionally stops the resident endpoint;
+            // its temporary polling failure is not a settings failure.
+            if self.center_ui.components.busy() {
+                crate::ui::controls::clear_notice(ui.ctx(), (source, self.login_generation));
+                continue;
+            }
             crate::ui::controls::observe_notice(
                 ui.ctx(),
                 (source, self.login_generation),

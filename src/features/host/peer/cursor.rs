@@ -1,13 +1,10 @@
-//! Shape notifications share the session's reports; video cursor composition
-//! remains controlled by each stream's CaptureSetting.
+//! The capture owner samples the actual desktop; this task only publishes changes.
 use super::{ReportRoutes, screens::Reports};
-use crate::{
-    features::{
-        host::lock,
-        remote_cursor::{self, CursorImage},
-    },
-    platform::windows::cursor_shape,
+use crate::features::{
+    host::lock,
+    remote_cursor::{self, CursorImage},
 };
+use base64::Engine;
 use std::{
     sync::{Arc, atomic::Ordering},
     time::Duration,
@@ -20,19 +17,19 @@ pub(super) async fn run(
     mut route: watch::Receiver<ReportRoutes>,
     cancel: CancellationToken,
     lease: crate::features::host::Lease,
+    kcp: crate::transport::uu_kcp::UuKcpControl,
 ) {
     let mut timer = tokio::time::interval(Duration::from_millis(33));
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut sent = None;
     let mut revision = None;
-    let mut cached = None::<(usize, Option<u32>, CursorImage)>;
+    let mut sent = None;
     loop {
-        tokio::select! {_=cancel.cancelled()=>return,_=timer.tick()=>{},r=route.changed()=>{if r.is_err(){return;}}}
+        tokio::select! {_=cancel.cancelled()=>return,_=timer.tick()=>{},r=route.changed()=>{if r.is_err(){return}}}
         if !lease.requested() {
             return;
         }
         let routes = route.borrow_and_update().clone();
-        let Some(channel) = routes.text.as_ref().and_then(std::sync::Weak::upgrade) else {
+        let Some(channel) = routes.control.as_ref().and_then(std::sync::Weak::upgrade) else {
             continue;
         };
         if revision != Some(routes.revision) {
@@ -40,8 +37,13 @@ pub(super) async fn run(
             sent = None;
         }
         let media = reports.media();
-        let pointer = cursor_shape::pointer().ok();
-        let screen = pointer.and_then(|p| {
+        let current = reports.current.load(Ordering::Acquire);
+        let pointer = media
+            .iter()
+            .filter(|(_, m)| m.capturing && m.visible)
+            .max_by_key(|(_, m)| m.screen.id == current)
+            .and_then(|(index, _)| lock(&reports.pointers[*index]).clone());
+        let screen = pointer.as_ref().and_then(|p| {
             lock(&reports.catalog)
                 .iter()
                 .find(|info| {
@@ -56,83 +58,62 @@ pub(super) async fn run(
                 })
                 .map(|info| info.screen.clone())
         });
-        let visible = pointer.is_some_and(|p| p.showing) && screen.is_some();
+        let visible = pointer
+            .as_ref()
+            .is_some_and(|p| p.showing && p.image.is_some())
+            && screen.is_some();
+        let image = if visible {
+            pointer.as_ref().and_then(|p| p.image.clone())
+        } else {
+            None
+        };
         let key = (
-            visible,
-            if visible { pointer.unwrap().handle } else { 0 },
+            image.clone(),
             screen.as_ref().map_or(-1, |s| s.id),
             screen
                 .as_ref()
                 .map(|s| (s.dpi_scale, s.width, s.height, s.left, s.top)),
         );
-        if sent == Some(key) {
+        if sent.as_ref() == Some(&key) {
             continue;
         }
-        let dpi = screen.as_ref().and_then(|s| s.dpi_scale);
-        if visible
-            && cached
-                .as_ref()
-                .is_none_or(|(handle, scale, _)| *handle != key.1 || *scale != dpi)
-        {
-            let handle = key.1;
-            let image = tokio::task::spawn_blocking(move || -> anyhow::Result<CursorImage> {
-                use image::ImageEncoder;
-                let shape = cursor_shape::shape(handle)?;
-                let mut png = Vec::new();
-                image::codecs::png::PngEncoder::new(&mut png).write_image(
-                    &shape.rgba,
-                    shape.width,
-                    shape.height,
-                    image::ExtendedColorType::Rgba8,
-                )?;
-                anyhow::ensure!(png.len() <= 4 * 1024 * 1024, "光标图片过大");
-                Ok(CursorImage {
+        let image = match image {
+            Some(image) => match base64::engine::general_purpose::STANDARD.decode(&image.png) {
+                Ok(png) => Some(CursorImage {
                     png,
-                    width: shape.width,
-                    height: shape.height,
-                    hotspot: shape.hotspot,
-                    system_type: shape.kind,
-                })
-            })
-            .await;
-            match image {
-                Ok(Ok(image)) => cached = Some((handle, dpi, image)),
-                _ => {
-                    cached = None;
+                    width: image.width,
+                    height: image.height,
+                    hotspot: image.hotspot,
+                    system_type: image.kind,
+                }),
+                Err(error) => {
+                    tracing::warn!(%error,"invalid sampled cursor image");
                     continue;
                 }
-            }
-        }
-        if !lease.requested() {
-            return;
-        }
-        let position = match (pointer, screen.as_ref()) {
+            },
+            None => None,
+        };
+        let position = match (pointer.as_ref(), screen.as_ref()) {
             (Some(p), Some(s)) => [
                 (f64::from(p.x) - f64::from(s.left)) / f64::from(s.width),
                 (f64::from(p.y) - f64::from(s.top)) / f64::from(s.height),
             ],
             _ => [0.0, 0.0],
         };
-        let payload = remote_cursor::encode_shape(
-            if visible {
-                cached.as_ref().map(|(_, _, image)| image)
-            } else {
-                None
-            },
-            key.2,
-            position,
-        );
-        let bytes = crate::features::stream_control::publisher::cursor_report(
-            payload,
-            reports.sequence.fetch_add(1, Ordering::Relaxed),
-        );
-        // Cancellation here closes this whole connection, never one reliable
-        // message in a still-active SCTP association.
-        let bytes = bytes::Bytes::from(bytes);
+        let payload = remote_cursor::encode_shape(image.as_ref(), key.1, position);
+        let bytes = crate::features::stream_control::publisher::cursor_report(payload);
+        if bytes.len() > 512 * 1024 {
+            tracing::warn!(bytes = bytes.len(), "cursor exceeds signal message limit");
+            continue;
+        }
         let result =
-            tokio::select! {_=cancel.cancelled()=>return,r=channel.send_text_bytes(&bytes)=>r};
-        if result.is_ok() {
-            sent = Some(key);
+            tokio::select! {_=cancel.cancelled()=>return,r=kcp.send_control(&channel,bytes)=>r};
+        match result {
+            Ok(_) => {
+                tracing::debug!(screen=key.1,visible,size=?image.as_ref().map(|i|(i.width,i.height)),"host cursor CONTROL state published");
+                sent = Some(key);
+            }
+            Err(error) => tracing::debug!(%error,"host cursor CONTROL publication failed"),
         }
     }
 }

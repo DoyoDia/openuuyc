@@ -4,18 +4,62 @@ pub mod app;
 pub mod viewer;
 pub(crate) mod viewer_shortcuts;
 pub(crate) mod wallpaper;
+static INSTALLED_HANDOFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub(crate) fn schedule_installed_handoff() {
+    INSTALLED_HANDOFF.store(true, std::sync::atomic::Ordering::Release);
+}
+pub fn take_installed_handoff() -> bool {
+    INSTALLED_HANDOFF.swap(false, std::sync::atomic::Ordering::AcqRel)
+}
+pub fn launch_installed(
+    arguments: impl IntoIterator<Item = std::ffi::OsString>,
+) -> anyhow::Result<()> {
+    crate::platform::windows::components::application::start_installed(arguments)
+}
+pub fn route_installed_gui() -> anyhow::Result<bool> {
+    app::maintenance::route_gui().inspect_err(app::maintenance::report_error)
+}
+pub fn uninstall_application(parent: Option<u32>) -> anyhow::Result<()> {
+    app::maintenance::uninstall(parent).inspect_err(app::maintenance::report_error)
+}
+
+pub fn host_service() -> anyhow::Result<()> {
+    crate::platform::windows::host_service::service::run()
+}
+pub fn host_resident(parent: u32) -> anyhow::Result<()> {
+    crate::platform::windows::host_service::resident::run(parent)
+}
+pub fn input_agent(pipe: &str, parent: u32) -> anyhow::Result<()> {
+    crate::features::host::input::broker::agent(pipe, parent)
+}
+pub fn capture_agent(pipe: &str, parent: u32) -> anyhow::Result<()> {
+    crate::platform::windows::capture_service::agent(pipe, parent)
+}
+pub use crate::platform::windows::components::{
+    Kind as ComponentKind, Operation as ComponentOperation,
+};
+pub fn component_operation(
+    kind: ComponentKind,
+    operation: ComponentOperation,
+    allow_sas: bool,
+    owner: Option<&str>,
+    remove_display: bool,
+    remove_data: bool,
+) -> anyhow::Result<bool> {
+    crate::platform::windows::components::execute(
+        kind,
+        operation,
+        allow_sas,
+        owner,
+        remove_display,
+        remove_data,
+    )
+}
+pub fn purge_machine_data() -> anyhow::Result<()> {
+    crate::platform::windows::components::application::purge_machine_data()
+}
 
 /// Internal crash-recovery role of the same executable.
 pub fn display_recovery(token: &str) -> anyhow::Result<()> {
     crate::features::host::displays::recovery::watch(token)
-}
-
-/// Elevated role reached only by an explicit driver installation action.
-pub fn install_display_driver() -> anyhow::Result<bool> {
-    crate::platform::display::install::install()
-}
-
-/// Elevated role reached only by an explicit driver removal action.
-pub fn uninstall_display_driver() -> anyhow::Result<bool> {
-    crate::platform::display::install::uninstall()
 }

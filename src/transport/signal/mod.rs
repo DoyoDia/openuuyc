@@ -24,20 +24,6 @@ use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 pub use wire::{EnginePacket, SocketPacket, decode, encode_event, encode_pong};
 use wire::{encode_binary_event, gzip_sdp};
 
-pub const KNOWN_EVENTS: [&str; 11] = [
-    "room_info",
-    "control",
-    "soac",
-    "forward_setting",
-    "refresh_reconnect_key",
-    "update_geo_ip",
-    "leave",
-    "released",
-    "left",
-    "bmsg_push",
-    "publisher_disconnect",
-];
-
 pub const AUTH_HEADER: &str = "X-NRD-AUTH";
 pub const RECONNECT_HEADER: &str = "X-NRD-RECONN-KEY";
 pub const CONTROLLING_HEADER: &str = "X-NRD-CONTROLLING";

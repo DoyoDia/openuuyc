@@ -14,12 +14,18 @@ pub(super) async fn bind_channel(
     cancel: CancellationToken,
     kcp: crate::transport::uu_kcp::UuKcpControl,
     report_target: ReportTarget,
+    input: crate::features::host::input::Receiver,
 ) {
     let control = channel.label() == "CONTROL_DATA_CHANNEL";
     let text = channel.label() == "TEXT_DATA_CHANNEL";
     if !control && !text {
         return;
     }
+    let input_generation = if control {
+        Some(input.bind(channel.id()))
+    } else {
+        None
+    };
     let (handshake_source, handshake_config, handshake_caps) = {
         let state = screens.lock().await;
         (
@@ -42,10 +48,13 @@ pub(super) async fn bind_channel(
     let close_kcp = kcp.clone();
     let close_channel = Arc::downgrade(&channel);
     let closing_target = report_target.clone();
+    let closing_input = input.clone();
     channel.on_close(Box::new(move || {
         if control {
             if let Some(channel) = close_channel.upgrade() {
-                close_kcp.set_control_stream(channel.id(), false);
+                if closing_input.close(channel.id(), input_generation.unwrap()) {
+                    close_kcp.set_control_stream(channel.id(), false);
+                }
             }
         }
         closing_target.send_if_modified(|routes| {
@@ -68,12 +77,16 @@ pub(super) async fn bind_channel(
         Box::pin(async {})
     }));
     let opening_target = report_target.clone();
+    let opening_input = input.clone();
     channel.on_open(Box::new(move || {
         Box::pin(async move {
             let Some(channel) = weak.upgrade() else {
                 return;
             };
             if opening.is_cancelled() {
+                return;
+            }
+            if control && opening_input.generation(channel.id()) != input_generation {
                 return;
             }
             opening_target.send_modify(|routes| {
@@ -85,6 +98,13 @@ pub(super) async fn bind_channel(
                 routes.revision = routes.revision.wrapping_add(1);
             });
             if text {
+                return;
+            }
+            if !opening_input
+                .ready(channel.id(), input_generation.unwrap())
+                .await
+                || opening.is_cancelled()
+            {
                 return;
             }
             tracing::info!(channel = channel.label(), "host business channel opened");
@@ -105,9 +125,45 @@ pub(super) async fn bind_channel(
         let cancel = cancel.clone();
         let kcp = kcp.clone();
         let report_target = report_target.clone();
+        let input = input.clone();
         Box::pin(async move {
             if cancel.is_cancelled() {
                 return;
+            }
+            let Some(channel) = weak.upgrade() else {
+                return;
+            };
+            if text
+                && !report_target
+                    .borrow()
+                    .text
+                    .as_ref()
+                    .is_some_and(|current| current.ptr_eq(&weak))
+            {
+                return;
+            }
+            if control {
+                if input.generation(channel.id()) != input_generation {
+                    return;
+                }
+                match input.receive(channel.id(), &message.data) {
+                    Ok(true) => return,
+                    Ok(false) => {}
+                    Err(error) => {
+                        tracing::warn!(%error,"rejected malformed host input envelope");
+                        return;
+                    }
+                }
+            }
+            if text {
+                match input.receive_action(&message.data) {
+                    Ok(true) => return,
+                    Ok(false) => {}
+                    Err(error) => {
+                        tracing::warn!(%error,"rejected malformed host input action");
+                        return;
+                    }
+                }
             }
             tracing::debug!(
                 control,
@@ -135,6 +191,9 @@ pub(super) async fn bind_channel(
                 Ok(responses) => {
                     report_target.send_if_modified(|routes| routes.received(&responses));
                     if let Some(channel) = weak.upgrade() {
+                        if control && !input.ready(channel.id(), input_generation.unwrap()).await {
+                            return;
+                        }
                         for response in responses.messages {
                             if cancel.is_cancelled() {
                                 break;
@@ -172,6 +231,9 @@ pub(super) async fn publish_state(
     cancel: CancellationToken,
     kcp: crate::transport::uu_kcp::UuKcpControl,
     initial: crate::features::host::capture::Screen,
+    mut mouse_policy: tokio::sync::watch::Receiver<
+        crate::features::host::input::config::MousePolicy,
+    >,
 ) {
     use crate::features::stream_control::publisher;
     use std::sync::atomic::Ordering;
@@ -182,6 +244,7 @@ pub(super) async fn publish_state(
     let mut last_quality = None;
     let mut last_probe = None::<u32>;
     let mut last_locked = None;
+    let mut last_mouse_policy = None;
     let mut revision = None;
     let mut secure_revision = None;
     let sequence = &reports.sequence;
@@ -192,6 +255,7 @@ pub(super) async fn publish_state(
             _=cancel.cancelled()=>break,
             result=changed.changed()=>{if result.is_err(){break;} false},
             result=target.changed()=>{if result.is_err(){break;} false},
+            result=mouse_policy.changed()=>{if result.is_err(){break;} false},
             _=timer.tick()=>true,
         };
         if refresh && let Ok(mut state) = screens.try_lock() {
@@ -208,6 +272,7 @@ pub(super) async fn publish_state(
             last_quality = None;
             last_probe = None;
             last_locked = None;
+            last_mouse_policy = None;
         }
         if secure_revision != Some(routes.secure_revision) {
             secure_revision = Some(routes.secure_revision);
@@ -273,6 +338,16 @@ pub(super) async fn publish_state(
             .filter(|(_, state)| state.capturing)
             .map(|(index, state)| (state.screen.id, *index))
             .collect();
+        let policy = mouse_policy.borrow_and_update().clone();
+        if last_mouse_policy.as_ref() != Some(&policy) {
+            if let Some(message) = policy.message() {
+                if send(true, message).await {
+                    last_mouse_policy = Some(policy);
+                }
+            } else {
+                last_mouse_policy = Some(policy);
+            }
+        }
         let screen = publisher::screen_states(&catalog, &mapping, current);
         if last_screen.as_ref() != Some(&screen)
             && send(routes.control_screens, screen.clone()).await

@@ -69,6 +69,8 @@ struct DesktopWindow {
     input: egui_winit::State,
     viewport: egui::ViewportInfo,
     close_requested: bool,
+    tray: Option<super::tray::Tray>,
+    exiting: bool,
     show_after_present: bool,
     window_move: super::chrome::WindowMoveState,
     window_resize: super::chrome::WindowResizeState,
@@ -171,6 +173,7 @@ impl Runner {
             .take()
             .context("desktop factory already consumed")?;
         let app = AppSession(factory(&context, Some(graphics)));
+        let uses_tray = self.root && app.0.uses_tray();
         let refresh = window
             .current_monitor()
             .and_then(|monitor| monitor.refresh_rate_millihertz())
@@ -183,6 +186,12 @@ impl Runner {
             input,
             viewport,
             close_requested: false,
+            tray: if uses_tray {
+                Some(super::tray::Tray::new()?)
+            } else {
+                None
+            },
+            exiting: false,
             show_after_present: self.config.viewport.visible.unwrap_or(true),
             window_move: Default::default(),
             window_resize: Default::default(),
@@ -265,6 +274,7 @@ impl DesktopWindow {
                             &self.window.title(),
                             Some(&mut self.window_move),
                         ) {
+                            self.exiting = false;
                             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                         }
                     },
@@ -320,6 +330,13 @@ impl DesktopWindow {
         }
         // Both native CloseRequested/Alt+F4 and the custom caption command
         // reach this point before any resources or business windows are closed.
+        if self.close_requested && self.tray.is_some() && !self.exiting && !self.app.0.exit_ready()
+        {
+            self.close_requested = false;
+            self.show_after_present = false;
+            self.window.set_visible(false);
+            self.app.0.on_focus_changed(false);
+        }
         if self.close_requested && !self.app.0.on_close_requested() {
             self.close_requested = false;
             self.context.request_repaint();
@@ -327,7 +344,10 @@ impl DesktopWindow {
         if let Some(size) = self.window_resize.requested_render_size.take() {
             self.presenter.resize(size)?;
         }
-        if !self.close_requested && self.window.is_minimized() != Some(true) {
+        if !self.close_requested
+            && (self.show_after_present || self.window.is_visible() != Some(false))
+            && self.window.is_minimized() != Some(true)
+        {
             let presented = self.presenter.render(&self.context, drawing, false)?;
             if presented && self.show_after_present {
                 self.show_after_present = false;
@@ -366,6 +386,7 @@ impl ApplicationHandler<Event> for Runner {
                 Ok(())
             }
             WindowEvent::CloseRequested => {
+                state.exiting = false;
                 state.close_requested = true;
                 state.render()
             }
@@ -415,7 +436,7 @@ impl ApplicationHandler<Event> for Runner {
             if let Some(when) = state.next_repaint {
                 if when <= Instant::now() {
                     state.next_repaint = None;
-                    if state.show_after_present {
+                    if state.show_after_present || state.window.is_visible() == Some(false) {
                         // Hidden HWNDs need not receive WM_PAINT. Retry a busy
                         // first Present directly, at the regular repaint deadline.
                         if let Err(error) = state.render() {
@@ -539,6 +560,24 @@ impl ApplicationHandler<Event> for Windows {
                 {
                     viewer.runner.user_event(event_loop, Event::Repaint(event));
                 }
+            }
+            Event::Request(Request::ShowMain) => {
+                if let Some(state) = &mut self.main.state {
+                    state.window.set_visible(true);
+                    state.window.set_minimized(false);
+                    state.window.focus_window();
+                    state.context.request_repaint();
+                }
+            }
+            Event::Request(Request::Exit) => {
+                if let Some(state) = &mut self.main.state {
+                    state.exiting = true;
+                    state.close_requested = true;
+                    if let Err(error) = state.render() {
+                        self.main.fail(event_loop, error);
+                    }
+                }
+                self.main.finish_close(event_loop);
             }
             Event::Request(Request::Focus(key)) => self.focus(&key),
             Event::Request(Request::Open {

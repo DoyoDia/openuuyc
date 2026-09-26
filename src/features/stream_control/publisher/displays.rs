@@ -158,6 +158,24 @@ pub(crate) async fn receive_session(
                 request_id: h.request_id,
             });
             match request.payload {
+                Some(PbRpcRequestPayload::MouseSwitch(bytes)) => {
+                    #[derive(Clone, PartialEq, prost::Message)]
+                    struct Switch {
+                        #[prost(bool, tag = "1")]
+                        enable: bool,
+                    }
+                    let _ = Switch::decode(bytes.as_slice())?;
+                    // S4D01A0 -> IInputActions+56 -> S49C4A0 -> S5E5810:
+                    // current Windows returns supported and performs no install,
+                    // removal or persistent preference mutation for this request.
+                    return Ok(response(
+                        &message,
+                        header,
+                        PbRpcResponsePayload::MouseSwitchResponse(
+                            PbDisplayResult { error_code: 0 }.encode_to_vec(),
+                        ),
+                    ));
+                }
                 Some(PbRpcRequestPayload::CreateVirtualDisplay(create)) => {
                     let result = async {
                         anyhow::ensure!(
@@ -271,8 +289,25 @@ pub(crate) async fn receive_session(
                         }),
                     ));
                 }
-                Some(PbRpcRequestPayload::CaptureSetting(setting)) => {
+                Some(PbRpcRequestPayload::CaptureSetting(mut setting)) => {
+                    tracing::info!(?setting, "host capture setting received");
                     session.refresh()?;
+                    // S456070 -> S456550: a single desktop track accepts -1
+                    // for its current source. Android uses this for ordinary
+                    // media settings. Do not guess a target in a multi-track session.
+                    if setting.screen_id == -1 {
+                        let mut sources = session.slots.iter().filter_map(|slot| {
+                            slot.screen
+                                .as_ref()
+                                .or(slot.suspended.as_ref())
+                                .map(|s| s.id)
+                        });
+                        if let Some(id) = sources.next()
+                            && sources.next().is_none()
+                        {
+                            setting.screen_id = id;
+                        }
+                    }
                     let ids: Vec<_> = if setting.screen_id == EXISTING_SESSION_TRACKS {
                         session
                             .slots
@@ -296,11 +331,14 @@ pub(crate) async fn receive_session(
                         .await
                         {
                             Ok(mut result) => errors.append(&mut result),
-                            Err(error) => errors.push(PbError {
-                                error_code: -2,
-                                error_message: format!("{error:#}"),
-                                ..Default::default()
-                            }),
+                            Err(error) => {
+                                tracing::warn!(screen_id=id, %error, "host capture setting rejected");
+                                errors.push(PbError {
+                                    error_code: -2,
+                                    error_message: format!("{error:#}"),
+                                    ..Default::default()
+                                });
+                            }
                         }
                     }
                     if errors.is_empty() {

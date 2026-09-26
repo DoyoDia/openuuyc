@@ -50,7 +50,21 @@ pub struct AuthenticatedClient {
 #[derive(Default)]
 struct RestoreState {
     ready: bool,
-    failure: Option<ApiFailure>,
+    failure: Option<RestoreFailure>,
+}
+
+#[derive(Clone)]
+enum RestoreFailure {
+    Api(ApiFailure),
+    Local(String),
+}
+impl RestoreFailure {
+    fn error(&self) -> anyhow::Error {
+        match self {
+            Self::Api(error) => error.clone().into(),
+            Self::Local(message) => anyhow::anyhow!("本机初始化失败：{message}"),
+        }
+    }
 }
 
 pub struct LogoutOutcome {
@@ -72,14 +86,17 @@ impl AuthenticatedClient {
         let session_store = KeyringSessionStore::new()?;
         let session = session_store.load()?.ok_or(NoSavedSession)?;
         let identity = device.identity().client_identity()?;
-        let host = crate::features::host::Handle::load(session.user_id(), &identity.device_id);
+        let mut host = crate::features::host::Handle::load(session.user_id(), &identity.device_id);
+        host.bind_account(session.generation());
         let mut api = NrdApi::new(identity)?;
         api.set_user_id(Some(session.user_id()))?;
         api.set_bearer_token(Some(session.token()))?;
         let ended = CancellationToken::new();
 
         device.watch_account(ended.clone())?;
-        let restore_trigger = if owned_device.is_some() {
+        let restore_trigger = if owned_device.is_some()
+            || crate::platform::windows::host_service::resident::is_owner()
+        {
             RestoreTrigger::DeviceStartup
         } else {
             RestoreTrigger::ExplicitLogin
@@ -103,6 +120,10 @@ impl AuthenticatedClient {
             wallpaper: Mutex::new(wallpaper::Sync::default()),
             features: crate::account::feature_ability::FeatureCatalog::default(),
         })
+    }
+
+    pub(crate) fn account_generation(&self) -> String {
+        self.session.generation()
     }
 
     pub fn device_id(&self) -> String {
@@ -168,7 +189,7 @@ impl AuthenticatedClient {
             return Ok(());
         }
         if let Some(failure) = &validated.failure {
-            return Err(failure.clone().into());
+            return Err(failure.error());
         }
         let device = &self.device;
         let identity = tokio::select! {
@@ -179,14 +200,13 @@ impl AuthenticatedClient {
         let identity = match identity {
             Ok(identity) => identity,
             Err(error) => {
-                let failure = error
-                    .downcast::<ApiFailure>()
-                    .unwrap_or_else(|error| ApiFailure {
-                        code: -1,
-                        message: format!("{error:#}"),
-                    });
-                validated.failure = Some(failure.clone());
-                return Err(failure.into());
+                let failure = match error.downcast::<ApiFailure>() {
+                    Ok(error) => RestoreFailure::Api(error),
+                    Err(error) => RestoreFailure::Local(format!("{error:#}")),
+                };
+                let error = failure.error();
+                validated.failure = Some(failure);
+                return Err(error);
             }
         };
         let mut api = self
@@ -214,7 +234,7 @@ impl AuthenticatedClient {
                     self.retire();
                     self.clear_saved_generation()?;
                 }
-                validated.failure = Some(failure.clone());
+                validated.failure = Some(RestoreFailure::Api(failure.clone()));
                 return Err(failure.into());
             }
         }
@@ -245,6 +265,14 @@ impl AuthenticatedClient {
     }
 
     pub async fn logout(&self) -> LogoutOutcome {
+        if crate::platform::windows::host_service::resident::managed() {
+            let _ = crate::platform::windows::host_service::resident::request(
+                crate::platform::windows::host_service::resident::Request::Retire {
+                    account: self.account_generation(),
+                },
+            )
+            .await;
+        }
         let api = self
             .api
             .lock()
@@ -339,6 +367,20 @@ impl AuthenticatedClient {
                     200 + (n - 200) / 50 * 50
                 }
             }))
+    }
+    pub(crate) async fn host_input_configuration(
+        &self,
+    ) -> Result<crate::features::host::input::config::Configuration> {
+        let configs = self
+            .request(|api| async move {
+                api.query_configures(&[
+                    ("app_white_list".into(), String::new()),
+                    ("win_keylock_optimize".into(), String::new()),
+                ])
+                .await
+            })
+            .await?;
+        crate::features::host::input::config::Configuration::from_response(configs)
     }
 
     pub async fn list_devices(&self) -> Result<DeviceList> {

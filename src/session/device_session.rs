@@ -199,12 +199,20 @@ impl Initializer {
                         let _ = reply.send(std::time::Duration::from_secs(seconds));
                     }
                     Some(Command::Controllable(value, reply)) => {
+                        if crate::platform::windows::host_service::resident::managed() {
+                            let result = crate::platform::windows::host_service::resident::request(crate::platform::windows::host_service::resident::Request::Controllable(value)).await.map(|_| ());
+                            let _ = self.reload(); let _ = reply.send(result); continue;
+                        }
                         let result = self.reload().and_then(|()| {
                             let mut next = self.identity.clone(); next.set_controllable(value); self.commit(next)
                         });
                         let _ = reply.send(result);
                     }
                     Some(Command::Name(expected_id, value, reply)) => {
+                        if crate::platform::windows::host_service::resident::managed() {
+                            let result = crate::platform::windows::host_service::resident::request(crate::platform::windows::host_service::resident::Request::Name { device: expected_id, value }).await.map(|_| ());
+                            let _ = self.reload(); let _ = reply.send(result); continue;
+                        }
                         let result = self.reload().and_then(|()| {
                             if self.identity.client_identity()?.device_id != expected_id { bail!("虚拟设备身份已改变，未覆盖新身份"); }
                             let mut next = self.identity.clone(); next.set_device_name(value); self.commit(next)
@@ -212,6 +220,15 @@ impl Initializer {
                         let _ = reply.send(result);
                     }
                     Some(Command::Ensure { force, result }) => {
+                        if crate::platform::windows::host_service::resident::managed() {
+                            use crate::platform::windows::host_service::resident::{self, Request, Reply};
+                            let value = match resident::request(Request::Initialize { force }).await {
+                                Ok(Reply::Identity(value)) => { self.identity = *value.clone(); self.published.send_replace(*value.clone()); Ok(*value) }
+                                Ok(_) => Err(anyhow::anyhow!("后台设备响应无效")),
+                                Err(e) => Err(e),
+                            };
+                            Self::finish(Some(result), value); continue;
+                        }
                         if let Err(error) = self.reload() { Self::finish(Some(result), Err(error)); continue; }
                         let today = chrono::Local::now().date_naive();
                         if !force && self.initialized && self.date == Some(today) {

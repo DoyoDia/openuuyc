@@ -6,7 +6,6 @@ use webrtc::rtp::packet::Packet as RtpPacket;
 
 pub(super) fn depacketize_h265(
     packet: &RtpPacket,
-    received_micros: u64,
     received_at: Instant,
 ) -> Option<ParsedVideoPacket> {
     let payload = packet.payload.as_ref();
@@ -77,7 +76,6 @@ pub(super) fn depacketize_h265(
         packet_keyframe,
         nalus,
         output,
-        received_micros,
         received_at,
     )
 }
@@ -90,7 +88,6 @@ pub(super) fn parsed_packet(
     packet_keyframe: bool,
     mut nalus: Vec<NaluInfo>,
     payload: Vec<u8>,
-    received_micros: u64,
     received_at: Instant,
 ) -> Option<ParsedVideoPacket> {
     let sps_kind = if codec == VideoCodecKind::H264 { 7 } else { 33 };
@@ -135,7 +132,6 @@ pub(super) fn parsed_packet(
         playout_delay: None,
         nack_count: 0,
         payload,
-        received_micros,
         received_at,
     })
 }
@@ -160,20 +156,8 @@ pub(super) fn parse_video_timing(payload: &[u8]) -> Option<VideoSendTiming> {
     })
 }
 
-pub(super) fn fec_mutable_preserve_bytes(uri: &str) -> Option<usize> {
-    match uri {
-        "urn:ietf:params:rtp-hdrext:toffset"
-        | "http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time"
-        | "http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01"
-        | "http://www.webrtc.org/experiments/rtp-hdrext/video-frame-sending-delay" => Some(0),
-        "http://www.webrtc.org/experiments/rtp-hdrext/video-timing" => Some(7),
-        _ => None,
-    }
-}
-
 pub(super) fn depacketize_h264(
     packet: &RtpPacket,
-    received_micros: u64,
     received_at: Instant,
 ) -> Option<ParsedVideoPacket> {
     let payload = packet.payload.as_ref();
@@ -254,7 +238,6 @@ pub(super) fn depacketize_h264(
         packet_keyframe,
         nalus,
         output,
-        received_micros,
         received_at,
     )
 }

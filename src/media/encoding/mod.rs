@@ -2,7 +2,7 @@
 use crate::media::video_color::{HdrMetadata, VideoColorSpace};
 use crate::protocol::capability::CodecCapability;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub(crate) enum Codec {
     H264,
     H265,
@@ -35,7 +35,7 @@ impl Codec {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Format {
     pub codec: Codec,
     pub chroma: u8,
@@ -84,7 +84,7 @@ impl Format {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub(crate) enum Backend {
     Nvidia,
     Amd,
@@ -131,7 +131,7 @@ impl Backend {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Capability {
     pub adapter: u64,
     pub backend: Backend,

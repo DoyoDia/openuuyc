@@ -72,8 +72,7 @@ impl Negotiated {
                 }
                 for decoder in decoders {
                     if decoder.codec != peer.video_codec
-                        || decoder.chroma != i32::from(peer.chroma_sampling)
-                        || decoder.fps <= 0
+                        || decoder.chroma_sampling() != peer.chroma_sampling
                         || decoder.width < 2
                         || decoder.height < 2
                     {
@@ -107,16 +106,22 @@ impl Negotiated {
                                 .min(decoder.height as u32)
                                 .min(row.max_height as u32),
                         ),
-                        fps: (decoder.fps as u32).min(if capability.backend == Backend::Software {
-                            crate::media::encoding::software::MAX_FPS
-                        } else {
-                            144
-                        }),
+                        fps: decoder.maximum_fps().min(
+                            if capability.backend == Backend::Software {
+                                crate::media::encoding::software::MAX_FPS
+                            } else {
+                                144
+                            },
+                        ),
                     });
                 }
             }
         }
-        anyhow::ensure!(!choices.is_empty(), "没有共同的画面编码/解码能力");
+        if choices.is_empty() {
+            tracing::warn!(local=?local_wire.video_codec_capability,remote=?remote.video_codec_capability,
+                decoders=?decoders,intersection=?dual.frame_quality_capability,"host media capability intersection empty");
+            anyhow::bail!("没有共同的画面编码/解码能力");
+        }
         Ok(Self {
             choices,
             dual,

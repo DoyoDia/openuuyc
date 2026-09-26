@@ -26,6 +26,7 @@ mod device_sync;
 mod diagnostics;
 
 pub mod instance;
+pub(crate) mod maintenance;
 mod phone;
 mod power;
 mod updates;
@@ -34,6 +35,7 @@ mod view;
 const WORKER_TICK: Duration = Duration::from_millis(250);
 
 pub struct GuiOptions {
+    pub background: bool,
     pub media: ConnectionMediaOptions,
 }
 
@@ -53,6 +55,7 @@ pub fn run(options: GuiOptions) -> Result<()> {
         .context("invalid initial GUI media options")?;
 
     let viewport = egui::ViewportBuilder::default()
+        .with_visible(!options.background)
         .with_title(format!("{} · 控制中心", crate::APP_NAME))
         .with_icon(crate::ui::branding::icon())
         .with_inner_size([1180.0, 760.0])
@@ -157,8 +160,9 @@ struct DeviceCenterApp {
     active_session: Option<ViewingSession>,
     opening_viewer: bool,
     closing_session: bool,
-    close_confirmation: bool,
-    close_confirmed: bool,
+    exit_requested: bool,
+    exit_pending: bool,
+    exit_ready: bool,
     logout_confirmation: bool,
     takeover_confirmation: Option<(u64, DeviceInfo)>,
     logout_pending: bool,
@@ -214,8 +218,9 @@ impl DeviceCenterApp {
             refresh_pending: true,
             active_session: None,
             closing_session: false,
-            close_confirmation: false,
-            close_confirmed: false,
+            exit_requested: false,
+            exit_pending: false,
+            exit_ready: false,
             logout_confirmation: false,
             takeover_confirmation: None,
             logout_pending: false,
@@ -239,6 +244,20 @@ impl DeviceCenterApp {
         self.diagnostics.poll();
         while let Ok(event) = self.worker.events.try_recv() {
             match event {
+                GuiEvent::ExitReady(result) => {
+                    self.exit_pending = false;
+                    match result {
+                        Ok(()) => {
+                            self.exit_ready = true;
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                        Err(error) => {
+                            self.exit_requested = false;
+                            self.status = StatusMessage::error(format!("后台尚未退出：{error}"));
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                        }
+                    }
+                }
                 GuiEvent::Viewer(generation, alias, device_id, result) => {
                     self.opening_viewer = false;
                     if generation != self.login_generation || self.logout_pending {
@@ -660,7 +679,11 @@ impl DeviceCenterApp {
     }
 
     fn begin_login(&mut self) {
-        if self.logout_pending || self.active_session.is_some() || self.mutation_pending {
+        if self.center_ui.components.busy()
+            || self.logout_pending
+            || self.active_session.is_some()
+            || self.mutation_pending
+        {
             return;
         }
         self.clear_catalog();
@@ -731,7 +754,10 @@ impl DeviceCenterApp {
     }
 
     fn logout(&mut self) {
-        if self.mutation_pending || (self.assist.busy && !self.assist.querying) {
+        if self.center_ui.components.busy()
+            || self.mutation_pending
+            || (self.assist.busy && !self.assist.querying)
+        {
             self.status = StatusMessage::warning("请等待设备操作完成再退出账号");
             return;
         }
@@ -1057,6 +1083,20 @@ impl DeviceCenterApp {
             self.status = StatusMessage::error("设备后台服务已停止");
         }
     }
+    fn prepare_exit(&mut self) {
+        if !self.exit_requested
+            || self.exit_pending
+            || self.exit_ready
+            || self.center_ui.components.busy()
+        {
+            return;
+        }
+        self.exit_pending = self.worker.commands.send(GuiCommand::PrepareExit).is_ok();
+        if !self.exit_pending {
+            self.exit_requested = false;
+            self.status = StatusMessage::error("后台线程已停止，无法确认被控是否退出");
+        }
+    }
     fn stop_viewer(&mut self) {
         if let Some(session) = &self.active_session {
             session.handle.request_close();
@@ -1066,24 +1106,13 @@ impl DeviceCenterApp {
 }
 
 impl crate::ui::App for DeviceCenterApp {
+    fn exit_ready(&self) -> bool {
+        self.exit_ready
+    }
     fn on_close_requested(&mut self) -> bool {
-        if self.close_confirmed {
-            return true;
-        }
-        let has_viewer = self.opening_viewer
-            || self
-                .active_session
-                .as_ref()
-                .is_some_and(|session| session.handle.result().is_none());
-        if has_viewer
-            || crate::features::port_mapping::service::active_service_count() > 0
-            || crate::features::file_transfer::service::active_count() > 0
-        {
-            self.close_confirmation = true;
-            false
-        } else {
-            true
-        }
+        self.exit_requested = true;
+        self.prepare_exit();
+        self.exit_ready
     }
 
     fn on_focus_changed(&mut self, focused: bool) {
@@ -1107,8 +1136,9 @@ impl crate::ui::App for DeviceCenterApp {
         self.tick_power();
         self.draw_center(ui);
         self.draw_dialogs(&ctx);
-        self.display_driver_dialogs(&ctx);
-        if !self.close_confirmation && !self.login_restoring && !self.login_running {
+        self.component_dialogs(&ctx);
+        self.prepare_exit();
+        if !self.exit_requested && !self.login_restoring && !self.login_running {
             self.update_dialog(&ctx);
         }
         ui.ctx().request_repaint_after(WORKER_TICK);

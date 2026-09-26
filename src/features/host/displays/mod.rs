@@ -3,6 +3,9 @@
 mod initial;
 pub(crate) mod recovery;
 mod store;
+pub(crate) fn transfer_preferences(to_service: bool) -> anyhow::Result<()> {
+    store::transfer_preferences(to_service)
+}
 use super::{Lease, capture, lock};
 use crate::platform::display::{
     self,

@@ -10,6 +10,10 @@ pub const MAX_TOTAL_MIB: u64 = 256;
 pub const RETENTION_DAYS: u64 = 14;
 
 pub(super) fn directories() -> Result<(PathBuf, PathBuf)> {
+    if crate::platform::windows::host_service::vault::applies()? {
+        let base = crate::platform::windows::host_service::vault::root()?;
+        return Ok((base.clone(), base.join("logs")));
+    }
     {
         let base = std::env::var_os("LOCALAPPDATA")
             .map(PathBuf::from)

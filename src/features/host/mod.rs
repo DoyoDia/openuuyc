@@ -9,6 +9,7 @@ mod encoding_settings;
 mod fec;
 pub(crate) mod format;
 mod hevc;
+pub(crate) mod input;
 mod keyframe;
 pub(crate) mod network;
 pub(crate) mod parameters;
@@ -26,8 +27,15 @@ pub(crate) fn lock<T>(value: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-pub(crate) use access::{AccessRequest, ActiveEncoding, Handle, Lease, SessionLease};
+pub(crate) use access::{AccessRequest, ActiveEncoding, Handle, Lease, SessionLease, Status};
 pub(crate) use encoding_settings::{EncoderCodec, EncoderMode, EncodingSettings};
+
+pub(crate) fn enroll_settings(account: &str, device: &str) -> anyhow::Result<()> {
+    settings::Store::new(account, device)?.enroll()
+}
+pub(crate) fn restore_portable_settings(account: &str, device: &str) -> anyhow::Result<()> {
+    settings::Store::new(account, device)?.restore_portable()
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct VideoConfig {

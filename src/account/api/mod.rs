@@ -181,21 +181,6 @@ pub const ROOM_JOIN_BY_DEVICE: Contract = Contract {
     json_content_type: true,
 };
 
-pub const CONTRACTS: [(&str, Contract); 12] = [
-    ("login_qr_generate", LOGIN_QR_GENERATE),
-    ("login_qr_status", LOGIN_QR_STATUS),
-    ("login_by_qr", LOGIN_BY_QR),
-    ("login_sms_code", LOGIN_SMS_CODE),
-    ("login_by_mobile", LOGIN_BY_MOBILE),
-    ("user_info", USER_INFO),
-    ("user_logout", USER_LOGOUT),
-    ("device_windows_init", DEVICE_WINDOWS_INIT),
-    ("device_list", DEVICE_LIST),
-    ("device_controllable", DEVICE_CONTROLLABLE),
-    ("room_create", ROOM_CREATE),
-    ("room_join_by_device", ROOM_JOIN_BY_DEVICE),
-];
-
 pub fn url(contract: Contract) -> String {
     format!("{BASE_URL}{}", contract.path)
 }

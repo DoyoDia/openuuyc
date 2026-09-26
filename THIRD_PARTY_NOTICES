@@ -31,8 +31,8 @@ service access require separate assessment.
 Windows NVENC hardware encoder ABI bindings:
 vendor/nvenc-sys/ retains the NVENC-only Windows bindings, GUIDs, version
 constants and original layout tests from nvidia-video-codec-sdk 0.4.0 (MIT).
-Local adaptations and source are described in that directory's README.md;
-wrapper and NVIDIA header notices are retained alongside it. No NVDEC or
+Bindings and local adaptations are included in that directory;
+wrapper and NVIDIA header notices are retained alongside them. No NVDEC or
 CUDA implementation is included in this component.
 Source: https://github.com/ViliamVadocz/nvidia-video-codec-sdk
 
@@ -144,7 +144,7 @@ presumed original to this project.
 
 Protocol interoperability parameter provenance:
 vendor/amf-sys contains Rust bindings and retained AMD AMF 1.5.2 public
-headers under their original MIT notices. See vendor/amf-sys/README.md.
+headers under their original MIT notices in vendor/amf-sys/include/.
 vendor/vpl-sys contains public Intel oneVPL bindings and the static driver
 dispatcher, pinned to 674d015bcb294bc39fa276e99a652ea045423e82, under MIT.
 Its original LICENSE is retained in vendor/vpl-sys/dispatcher/LICENSE.
@@ -154,8 +154,7 @@ distributed by these additions; the actual encoder is the installed driver.
 The bitrate budget table in src/features/host/parameters.rs and the repair-count tables
 src/features/host/fec-high-rtt.bin and fec-low-rtt.bin contain interoperability parameters
 obtained from the currently analyzed UU V4.7.3 SDK distributed
-with 4.41.2.2602 (VA 180FA0D70, 18107EEE0 and 181085BE0). See the settings and sender analysis for
-dimensions and selection rules. These parameters are not claimed as
+with 4.41.2.2602 (VA 180FA0D70, 18107EEE0 and 181085BE0). Dimensions and selection rules are defined at their call sites. These parameters are not claimed as
 original project material or covered by the goog_cc/NVENC binding licenses.
 
 
@@ -175,14 +174,14 @@ retained in licenses/openh264-algorithms.txt. This attribution does not add the
 OpenH264 C/C++ library or bindings to the application.
 
 
-Optional SudoVDA display driver
+Optional OpenUUYC Display driver
 
-The unchanged SudoVDA 1.10.9.289 package is extracted from Apollo v0.4.6
-(https://github.com/ClassicOldSong/Apollo/releases/tag/v0.4.6). Driver source:
-https://github.com/SudoMaker/SudoVDA. Its author offers their changes under
-MIT / CC0 / Public Domain; see assets/drivers/sudovda/SudoVDA-README.md.
+Built from the project's derivative in drivers/display, based on
+https://github.com/SudoMaker/SudoVDA at a4b09fa2aa731a964d0cb5d139cb1e6240e4da12.
+The upstream author offers their changes under
+MIT / CC0 / Public Domain; see drivers/display/UPSTREAM.md.
 Microsoft Windows driver sample contributions retain their MS-PL license,
-Copyright (c) 2015 Microsoft; see assets/drivers/sudovda/Microsoft-LICENSE.txt.
+Copyright (c) 2015 Microsoft; see drivers/display/LICENSE.
 The package is embedded for explicit optional installation only; it is not
 an official UU driver, and installing it requires separate administrator
-consent and trust of its self-signed publisher certificate.
+consent and trust of the shared OpenUUYC Drivers publisher certificate.

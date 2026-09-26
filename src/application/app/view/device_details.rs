@@ -398,7 +398,7 @@ impl DeviceCenterApp {
         if self.center_ui.edit.is_none()
             && self.center_ui.power.is_none()
             && !self.logout_confirmation
-            && !self.close_confirmation
+            && !self.exit_requested
             && self.takeover_confirmation.is_none()
             && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
         {

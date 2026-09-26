@@ -5,6 +5,7 @@ use crate::protocol::capability::DeviceCapability;
 use anyhow::{Context, Result, ensure};
 use std::sync::Arc;
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Capabilities {
     pub screen: capture::Screen,
     pub codecs: Vec<format::Capability>,
@@ -34,6 +35,9 @@ impl Cache {
         let capabilities = Arc::new(probe(screen, adapters, active).await?);
         *cached = Some(capabilities.clone());
         Ok(capabilities)
+    }
+    pub async fn replace(&self, value: Option<Capabilities>) {
+        *self.0.lock().await = value.map(Arc::new);
     }
     pub async fn invalidate(&self) {
         self.0.lock().await.take();
