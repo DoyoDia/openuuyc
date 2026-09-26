@@ -55,7 +55,7 @@ pub(crate) fn session_locked() -> Option<bool> {
 }
 
 fn outputs() -> Result<Vec<(IDXGIAdapter1, IDXGIOutput1, Screen)>> {
-    let displays = display_info::DisplayInfo::all().unwrap_or_default();
+    let displays = super::display::active_displays().unwrap_or_default();
     unsafe {
         let factory: IDXGIFactory1 = CreateDXGIFactory1()?;
         let mut result = Vec::new();

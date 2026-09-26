@@ -64,7 +64,10 @@ default-features = false
 features = ["ring", "std", "tls12"]
 
 [dependencies.tokio-rustls]
+# The TURN TLS connection explicitly constructs the ring provider.
 version = "0.26"
+default-features = false
+features = ["ring", "tls12", "logging"]
 
 [dependencies.serde]
 version = "1"

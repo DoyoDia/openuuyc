@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 //! Bounded, transactional parameter registry for the verified AVC base stream.
 //! Reuses syntax parsers, without the upstream decoder's MVC/SVC state machine.
+use crate::syntax::{nal::parse_nal_unit, pps::Pps, slice_header::SliceHeader, sps::Sps};
 use crate::{Error, Result, bits::Bits};
-use oxideav_h264::{nal::parse_nal_unit, pps::Pps, slice_header::SliceHeader, sps::Sps};
 use std::{borrow::Cow, sync::Arc};
 #[derive(Clone)]
-pub(crate) struct Headers {
+pub struct Headers {
     sps: [Option<Arc<Sps>>; 32],
     pps: [Option<Arc<Pps>>; 256],
 }
-pub(crate) struct Slice<'a> {
+pub struct Slice<'a> {
     pub header: SliceHeader,
     pub sps: Sps,
     pub pps: Pps,

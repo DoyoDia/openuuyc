@@ -1,12 +1,11 @@
 //! Rust DXVA11 and H.264 software decoding.
 //! No MFT, native video bridge or implicit backend fallback.
 #![cfg(windows)]
-use crate::media::decode_api::{
-    DecodeError, DecoderNotification, VideoDecoder, VideoDecoderConfig, VideoOutputPreference,
-};
-use mediaway_common::{Bytes, CodecKind, GpuDeviceHandle, Packet};
+use crate::media::VideoCodec;
+use crate::media::decode_api::{DecodeError, DecoderMode, DecoderNotification, VideoDecoderConfig};
+use bytes::Bytes;
 use std::collections::VecDeque;
-use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
+use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11Texture2D};
 mod diagnostics;
 mod rust_dxva;
 pub struct WindowsGpuVideoFrame {
@@ -94,8 +93,8 @@ fn software_error(error: openuuyc_h264::Error) -> DecodeError {
 }
 impl WindowsVideoDecoder {
     pub(crate) fn check_format(
-        device: GpuDeviceHandle,
-        codec: CodecKind,
+        device: ID3D11Device,
+        codec: VideoCodec,
         width: u32,
         height: u32,
         depth: u8,
@@ -104,9 +103,9 @@ impl WindowsVideoDecoder {
         rust_dxva::Session::check_format(device, codec, width, height, depth, chroma)
     }
     pub fn open(config: &VideoDecoderConfig) -> Result<Self, DecodeError> {
-        let backend = match config.output {
-            VideoOutputPreference::CpuFramesOk => {
-                if config.codec != CodecKind::H264 {
+        let backend = match config.mode {
+            DecoderMode::Software => {
+                if config.codec != VideoCodec::H264 {
                     return Err(DecodeError::Unsupported);
                 }
                 if config.width == 0
@@ -120,9 +119,7 @@ impl WindowsVideoDecoder {
                 decoder.seed(&config.extra_data).map_err(software_error)?;
                 Backend::Software(Box::new(decoder))
             }
-            VideoOutputPreference::ZeroCopyGpu => {
-                Backend::Hardware(Box::new(rust_dxva::Session::open(config)?))
-            }
+            DecoderMode::Hardware => Backend::Hardware(Box::new(rust_dxva::Session::open(config)?)),
         };
         Ok(Self {
             backend,
@@ -131,8 +128,8 @@ impl WindowsVideoDecoder {
         })
     }
     pub fn probe_format(
-        device: GpuDeviceHandle,
-        codec: CodecKind,
+        device: ID3D11Device,
+        codec: VideoCodec,
         width: u32,
         height: u32,
         depth: u8,
@@ -170,23 +167,19 @@ impl WindowsVideoDecoder {
         }
     }
 }
-impl VideoDecoder for WindowsVideoDecoder {
-    fn set_notification(&mut self, notification: DecoderNotification) {
+impl WindowsVideoDecoder {
+    pub fn set_notification(&mut self, notification: DecoderNotification) {
         self.notification = notification;
     }
-    fn push_packet(&mut self, packet: &Packet) -> Result<(), DecodeError> {
+    pub fn push_packet(&mut self, payload: &[u8], token: i64) -> Result<(), DecodeError> {
         match &mut self.backend {
-            Backend::Hardware(session) => session.push(packet, &self.notification),
+            Backend::Hardware(session) => session.push(payload, token, &self.notification),
             Backend::Software(session) => {
-                if packet.payload.len() > i32::MAX as usize || packet.duration > i64::MAX as u64 {
+                if payload.len() > i32::MAX as usize {
                     return Err(DecodeError::InvalidInput);
                 }
                 let outputs = session
-                    .submit_with_cancel(
-                        &packet.payload,
-                        packet.pts as u64,
-                        self.notification.cancellation(),
-                    )
+                    .submit_with_cancel(payload, token as u64, self.notification.cancellation())
                     .map_err(software_error)?;
                 for output in outputs {
                     let picture = output.picture;

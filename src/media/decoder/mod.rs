@@ -1,8 +1,7 @@
-use crate::media::decode_api::{
-    DecodeError, VideoDecoder, VideoDecoderConfig, VideoOutputPreference,
-};
+use crate::media::decode_api::{DecodeError, DecoderMode, VideoDecoderConfig};
 use anyhow::{Context, Result, anyhow, bail};
-use mediaway_common::{Bytes, CodecKind, Packet, PixelFormat, Rational};
+use bytes::Bytes;
+use windows::Win32::Graphics::Direct3D11::ID3D11Device;
 use yuv::{YuvBiPlanarImage, YuvConversionMode, YuvRange, YuvStandardMatrix, yuv_nv12_to_rgba};
 
 use crate::media::video_color::{ColorMatrix, RenderColor};
@@ -82,10 +81,10 @@ impl DecodedSurface {
 }
 
 pub(crate) struct NativeVideoDecoder {
-    backend: DecoderBackend,
+    decoder: Box<WindowsVideoDecoder>,
+    frame_reader: FrameReader,
     candidate: DecoderCandidate,
     label: String,
-    frame_duration: u64,
 
     software_slot: Option<std::rc::Rc<software_slot::SoftwareSlot>>,
 }
@@ -198,16 +197,15 @@ impl NativeVideoDecoder {
         if width == 0 || height == 0 || frame_rate == 0 {
             return Err(DecodeError::InvalidInput.into());
         }
-        let frame_duration = (90_000 / u64::from(frame_rate)).max(1);
         let format = crate::media::video_format::parse_annex_b_format(codec, &extra_data);
         let depth = format.map_or(8, |f| f.bit_depth_luma);
         let chroma = format.map_or(1, |f| f.chroma_format_idc);
         match candidate {
             DecoderCandidate::WindowsD3d11 => {
                 let supports = |writer: &windows_surface::D3D11SurfaceWriter| {
-                    PlatformDecoder::probe_format(
+                    WindowsVideoDecoder::probe_format(
                         writer.device_handle(),
-                        codec_kind(codec),
+                        codec,
                         width,
                         height,
                         depth,
@@ -221,37 +219,27 @@ impl NativeVideoDecoder {
                         .find(supports)
                         .ok_or(DecodeError::Unsupported)?,
                 };
-                Self::open_windows_hardware(
-                    codec_kind(codec),
-                    width,
-                    height,
-                    frame_duration,
-                    writer,
-                    extra_data,
-                )
+                Self::open_windows_hardware(codec, width, height, writer, extra_data)
             }
 
             DecoderCandidate::SoftwareH264 => {
                 let software_slot =
                     Some(software_slot.map_or_else(software_slot::SoftwareSlot::acquire, Ok)?);
                 let config = decoder_config(
-                    codec_kind(codec),
+                    codec,
                     width,
                     height,
-                    VideoOutputPreference::CpuFramesOk,
+                    DecoderMode::Software,
                     None,
                     extra_data,
                 );
-                let decoder = open_platform_decoder(&config)?;
+                let decoder = WindowsVideoDecoder::open(&config)?;
                 let label = { "Rust H.264 软件解码" };
                 Ok(Self {
-                    backend: DecoderBackend::Platform {
-                        decoder: Box::new(decoder),
-                        frame_reader: FrameReader::Cpu,
-                    },
+                    decoder: Box::new(decoder),
+                    frame_reader: FrameReader::Cpu,
                     candidate,
                     label: label.to_owned(),
-                    frame_duration,
 
                     software_slot,
                 })
@@ -272,20 +260,16 @@ impl NativeVideoDecoder {
     }
 
     pub(crate) fn surface_writer(&self) -> Option<windows_surface::D3D11SurfaceWriter> {
-        match &self.backend {
-            DecoderBackend::Platform {
-                frame_reader: FrameReader::Windows(writer),
-                ..
-            } => Some(writer.clone()),
-            _ => None,
+        match &self.frame_reader {
+            FrameReader::Windows(writer) => Some(writer.clone()),
+            FrameReader::Cpu => None,
         }
     }
 
     fn open_windows_hardware(
-        codec: CodecKind,
+        codec: VideoCodec,
         width: u32,
         height: u32,
-        frame_duration: u64,
         reader: windows_surface::D3D11SurfaceWriter,
         extra_data: Bytes,
     ) -> Result<Self> {
@@ -293,19 +277,16 @@ impl NativeVideoDecoder {
             codec,
             width,
             height,
-            VideoOutputPreference::ZeroCopyGpu,
+            DecoderMode::Hardware,
             Some(reader.device_handle()),
             extra_data,
         );
-        let backend = open_platform_decoder(&config)?;
+        let backend = WindowsVideoDecoder::open(&config)?;
         Ok(Self {
-            backend: DecoderBackend::Platform {
-                decoder: Box::new(backend),
-                frame_reader: FrameReader::Windows(reader),
-            },
+            decoder: Box::new(backend),
+            frame_reader: FrameReader::Windows(reader),
             candidate: DecoderCandidate::WindowsD3d11,
             label: format!("{} D3D11 硬解", platform_label()),
-            frame_duration,
             software_slot: None,
         })
     }
@@ -318,57 +299,33 @@ impl NativeVideoDecoder {
         &mut self,
         notification: crate::media::decode_api::DecoderNotification,
     ) {
-        match &mut self.backend {
-            DecoderBackend::Platform { decoder, .. } => decoder.set_notification(notification),
-        }
+        self.decoder.set_notification(notification);
     }
 
-    pub(crate) fn reset_for_keyframe(&mut self, _hard_reset: bool) -> Result<()> {
-        match &mut self.backend {
-            DecoderBackend::Platform { decoder, .. } => decoder
-                .reset_for_keyframe()
-                .with_context(|| format!("reset {} decoder for keyframe cutover", self.label)),
-        }
+    pub(crate) fn reset_for_keyframe(&mut self) -> Result<()> {
+        self.decoder
+            .reset_for_keyframe()
+            .with_context(|| format!("reset {} decoder for keyframe cutover", self.label))
     }
 
     pub(crate) fn push(&mut self, frame: EncodedVideoFrame, decode_token: i64) -> DecodedBatch {
-        match &mut self.backend {
-            DecoderBackend::Platform {
-                decoder,
-                frame_reader,
-            } => {
-                let packet = Packet {
-                    stream_id: 0,
-                    pts: decode_token,
-                    dts: decode_token,
-                    duration: self.frame_duration,
-                    is_keyframe: frame.keyframe,
-                    is_discard: false,
-                    payload: frame.data,
-                };
-                let input_error = decoder
-                    .push_packet(&packet)
-                    .context("submit Annex-B frame to native decoder")
-                    .err();
-                let mut batch = poll_platform_decoder(decoder, frame_reader);
-                batch.input_error = input_error;
-                batch
-            }
-        }
+        let input_error = self
+            .decoder
+            .push_packet(&frame.data, decode_token)
+            .context("submit Annex-B frame to native decoder")
+            .err();
+        let mut batch = poll_platform_decoder(&mut self.decoder, &mut self.frame_reader);
+        batch.input_error = input_error;
+        batch
     }
 
     pub(crate) fn poll(&mut self) -> DecodedBatch {
-        match &mut self.backend {
-            DecoderBackend::Platform {
-                decoder,
-                frame_reader,
-            } => poll_platform_decoder(decoder, frame_reader),
-        }
+        poll_platform_decoder(&mut self.decoder, &mut self.frame_reader)
     }
 }
 
 fn poll_platform_decoder(
-    decoder: &mut PlatformDecoder,
+    decoder: &mut WindowsVideoDecoder,
     frame_reader: &mut FrameReader,
 ) -> DecodedBatch {
     let mut batch = DecodedBatch::default();
@@ -450,9 +407,9 @@ pub(crate) fn detect_native_decoder_support(
                     for depth in [8, 10] {
                         for &(width, height) in QUALITY_DIMENSIONS[1..].iter().rev() {
                             if writers.iter().any(|writer| {
-                                PlatformDecoder::probe_format(
+                                WindowsVideoDecoder::probe_format(
                                     writer.device_handle(),
-                                    codec_kind(codec),
+                                    codec,
                                     width as u32,
                                     height as u32,
                                     depth,
@@ -504,29 +461,20 @@ pub(crate) fn detect_native_decoder_support(
 }
 
 fn decoder_config(
-    codec: CodecKind,
+    codec: VideoCodec,
     width: u32,
     height: u32,
-    output: VideoOutputPreference,
-    gpu_device: Option<mediaway_common::GpuDeviceHandle>,
+    mode: DecoderMode,
+    gpu_device: Option<ID3D11Device>,
     extra_data: Bytes,
 ) -> VideoDecoderConfig {
     VideoDecoderConfig {
         codec,
         width,
         height,
-        time_base: Rational::new(1, 90_000),
-        pixel_format: PixelFormat::Nv12,
-        output,
+        mode,
         gpu_device,
         extra_data,
-    }
-}
-
-fn codec_kind(codec: VideoCodec) -> CodecKind {
-    match codec {
-        VideoCodec::H264 => CodecKind::H264,
-        VideoCodec::H265 => CodecKind::Hevc,
     }
 }
 
@@ -638,18 +586,7 @@ fn nv12_to_rgba_pixels(
     Ok(pixels)
 }
 
-enum DecoderBackend {
-    Platform {
-        decoder: Box<PlatformDecoder>,
-        frame_reader: FrameReader,
-    },
-}
-
-type PlatformDecoder = crate::platform::decoder::WindowsVideoDecoder;
-
-fn open_platform_decoder(config: &VideoDecoderConfig) -> Result<PlatformDecoder> {
-    PlatformDecoder::open(config).map_err(Into::into)
-}
+use crate::platform::decoder::WindowsVideoDecoder;
 
 fn platform_label() -> &'static str {
     "DXVA11"

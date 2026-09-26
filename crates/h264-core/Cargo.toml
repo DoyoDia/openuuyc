@@ -7,9 +7,7 @@ license = "LGPL-2.1-or-later"
 description = "OpenUUYC platform-independent H.264 software core"
 
 [dependencies]
-# Parameter-set parsing and selected forward/inverse transform primitives.
-# Decoder pixels and the realtime encoder pipeline are owned by this crate.
-oxideav-h264 = "=0.1.8"
+thiserror = "2.0.21"
 
 [lib]
 path = "src/lib.rs"

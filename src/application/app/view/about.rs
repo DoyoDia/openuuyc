@@ -116,7 +116,9 @@ impl DeviceCenterApp {
                     "\n\nAppendix: OpenUUYC Display attribution and Microsoft Public License\n\n",
                     include_str!("../../../../drivers/display/UPSTREAM.md"),
                     "\n\n",
-                    include_str!("../../../../drivers/display/LICENSE")
+                    include_str!("../../../../drivers/display/LICENSE"),
+                    "\n\nAppendix: OxideAV MIT license (retained AVC/HEVC syntax primitives)\n\n",
+                    include_str!("../../../../crates/h264-core/COPYING.OxideAV")
                 ),
             ),
         };

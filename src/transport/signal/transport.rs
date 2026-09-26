@@ -22,12 +22,12 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::http::Request;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, client_async};
+use tokio_tungstenite::{WebSocketStream, client_async};
 
 const IO_STAGE_TIMEOUT: Duration = Duration::from_secs(5);
 const NAMESPACE_TIMEOUT: Duration = Duration::from_secs(10);
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
-type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+type Socket = WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;
 type Reader = SplitStream<Socket>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -268,7 +268,7 @@ impl Worker {
     }
 
     async fn run(&mut self) -> Result<()> {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        crate::transport::init_tls();
         let endpoint_roster = self
             .endpoints
             .iter()
@@ -657,11 +657,8 @@ async fn connect_socket(request: Request<()>, tls: Arc<rustls::ClientConfig>) ->
     let tls = timeout(IO_STAGE_TIMEOUT, connector.connect(name, tcp))
         .await
         .context("signaling TLS handshake timed out")??;
-    let (socket, _) = timeout(
-        IO_STAGE_TIMEOUT,
-        client_async(request, MaybeTlsStream::Rustls(tls)),
-    )
-    .await
-    .context("signaling WebSocket opening handshake timed out")??;
+    let (socket, _) = timeout(IO_STAGE_TIMEOUT, client_async(request, tls))
+        .await
+        .context("signaling WebSocket opening handshake timed out")??;
     Ok(socket)
 }

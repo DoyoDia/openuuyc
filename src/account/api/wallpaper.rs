@@ -78,7 +78,7 @@ pub(crate) async fn upload_wallpaper(
     let mut authorization = HeaderValue::from_str(&grant.token)
         .map_err(|_| anyhow::anyhow!("invalid wallpaper upload token"))?;
     authorization.set_sensitive(true);
-    let client = reqwest::Client::builder()
+    let client = crate::transport::http_client()
         .https_only(true)
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(30).min(Duration::from_secs(grant.ttl)))

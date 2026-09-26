@@ -6,4 +6,4 @@ mod error;
 mod video;
 
 pub use error::DecodeError;
-pub use video::{DecoderNotification, VideoDecoder, VideoDecoderConfig, VideoOutputPreference};
+pub use video::{DecoderMode, DecoderNotification, VideoDecoderConfig};

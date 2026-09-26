@@ -90,7 +90,7 @@ modules! {
     ("kcp", "KCP", true, ["kcp"]),
     ("ice", "ICE 直连与中转", true, ["webrtc_ice", "stun", "turn", "webrtc_mdns"]),
     ("sctp", "SCTP / DTLS / SRTP", true, ["webrtc_sctp", "dtls", "webrtc_srtp"]),
-    ("http", "HTTP / TLS / WebSocket", true, ["reqwest", "hyper", "hyper_util", "rustls", "tokio_tungstenite", "tungstenite", "tower", "quinn"]),
+    ("http", "HTTP / TLS / WebSocket", true, ["reqwest", "hyper", "hyper_util", "rustls", "tokio_tungstenite", "tungstenite", "tower"]),
     ("credentials", "系统凭据库", true, ["keyring_core"]),
     ("runtime", "异步运行时", true, ["tokio", "mio"]),
     ("graphics", "图像与字体", true, ["epaint", "glifo", "vello_common", "zune_core", "zune_jpeg", "fax"]),

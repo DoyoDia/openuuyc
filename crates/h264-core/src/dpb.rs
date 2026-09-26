@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 // FFmpeg h264_refs.c reference-list and marking design, expressed with owning
 // Rust pictures. Copyright (c) 2003 Michael Niedermayer; Rust port OpenUUYC.
+use crate::syntax::{
+    slice_header::{MmcoOp, RefPicListModificationOp as Reorder, SliceHeader},
+    sps::Sps,
+};
 use crate::{
     Error, Result,
     picture::{Chroma, Crop, Picture},
     reconstruct::Reference,
-};
-use oxideav_h264::{
-    slice_header::{MmcoOp, RefPicListModificationOp as Reorder, SliceHeader},
-    sps::Sps,
 };
 use std::sync::Arc;
 

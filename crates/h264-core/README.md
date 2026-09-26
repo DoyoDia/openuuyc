@@ -10,6 +10,10 @@ Rust H.264 decoding and low-delay desktop encoding used by OpenUUYC.
 cargo test --manifest-path crates/h264-core/Cargo.toml --lib
 ```
 
+AVC syntax and parameter tracking are shared by software and DXVA decoding.
+Selected OxideAV-derived primitives retain [their MIT notice](COPYING.OxideAV);
+there is no oxideav runtime dependency.
+
 The crate does not link FFmpeg or OpenH264. FFmpeg-derived code retains
 LGPL-2.1-or-later and original author notices; see [COPYING.LGPLv2.1](COPYING.LGPLv2.1).
 OpenH264-derived encoder algorithms retain the

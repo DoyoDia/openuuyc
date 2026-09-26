@@ -487,7 +487,7 @@ pub(super) fn decoder_manager(
             // records remain until output retires the prefix, or Decode fails.
             let reset = pool.decoder().map_or_else(
                 || Err(crate::media::decode_api::DecodeError::NoBackend.into()),
-                |decoder| decoder.reset_for_keyframe(cutover.hard_reset),
+                |decoder| decoder.reset_for_keyframe(),
             );
             if let Err(error) = reset {
                 tracing::warn!(%error, hard_reset = cutover.hard_reset, "decoder cutover reset failed");

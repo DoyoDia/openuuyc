@@ -2,6 +2,12 @@
 // Streaming syntax-to-macroblock path. Header grammar is supplied by the pinned
 // pure-Rust syntax library; entropy, dequant, pixels and filtering are local.
 use crate::headers::{Headers, Slice as ParsedSlice};
+use crate::syntax::{
+    nal::AnnexBSplitter,
+    pps::Pps,
+    slice_header::{SliceHeader, SliceType},
+    sps::Sps,
+};
 use crate::{
     Error, Result,
     dsp::transform::{self, Dequant},
@@ -9,12 +15,6 @@ use crate::{
     picture::{Chroma, Crop, Picture},
     reconstruct::{Kind, Macroblock, Prediction, Reconstruction, References, Slice},
     scan,
-};
-use oxideav_h264::{
-    nal::AnnexBSplitter,
-    pps::Pps,
-    slice_header::{SliceHeader, SliceType},
-    sps::Sps,
 };
 use std::sync::{
     Arc,
@@ -365,11 +365,11 @@ impl Decoder {
                     .is_none_or(|(old_sps, old_pps, _)| old_sps != &sps || old_pps != &pps)
                 {
                     let four = std::array::from_fn(|i| {
-                        oxideav_h264::transform::select_scaling_list_4x4(i, &sps, &pps)
+                        crate::syntax::transform::select_scaling_list_4x4(i, &sps, &pps)
                             .map(|v| v as u8)
                     });
                     let eight = std::array::from_fn(|i| {
-                        oxideav_h264::transform::select_scaling_list_8x8(i, &sps, &pps)
+                        crate::syntax::transform::select_scaling_list_8x8(i, &sps, &pps)
                             .map(|v| v as u8)
                     });
                     self.dequant = Some((

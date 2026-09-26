@@ -282,7 +282,7 @@ async fn download(address: &str) -> Result<Vec<u8>> {
     if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
         bail!("unsupported wallpaper URL");
     }
-    let client = reqwest::Client::builder()
+    let client = crate::transport::http_client()
         .https_only(true)
         .redirect(reqwest::redirect::Policy::limited(3))
         .timeout(Duration::from_secs(12))

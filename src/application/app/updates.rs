@@ -135,7 +135,7 @@ struct Release {
 }
 
 async fn latest() -> Result<State> {
-    let client = reqwest::Client::builder()
+    let client = crate::transport::http_client()
         .https_only(true)
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(5))

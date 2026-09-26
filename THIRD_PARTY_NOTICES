@@ -61,12 +61,17 @@ MIT OR Apache-2.0.
 Original notice: Copyright (c) 2026 NyxWays.
 License texts: src/media/decoder/LICENSE-MIT and src/media/decoder/LICENSE-APACHE.
 The original crate was removed, but licenses and attributions for existing
-derivative code remain applicable. mediaway-common 0.1.8 is still a
-dependency, licensed under MIT OR Apache-2.0.
+derivative code remain applicable. mediaway-common has also been removed;
+active media types and decoder ownership now belong to OpenUUYC.
 
-Parameter-parsing dependencies oxideav-h264 0.1.8 and oxideav-h265 0.0.10:
-MIT. Their licenses do not replace the LGPL applicable to FFmpeg-derived
-decoding implementations.
+Selected AVC/HEVC syntax, reference metadata and transform primitives are
+adapted from oxideav-h264 0.1.8 and oxideav-h265 0.0.10 (MIT),
+Copyright (c) 2026 Karpelès Lab Inc. The retained portions are in
+crates/h264-core/src/syntax and crates/h265-syntax/src. These packages are
+no longer runtime Cargo dependencies; unused codec/extension implementations
+were not imported. Original MIT texts are retained as COPYING.OxideAV in
+both crates. Their license does not replace the LGPL applicable to
+FFmpeg-derived decoding implementations.
 
 3. Audio
 
@@ -162,8 +167,8 @@ Rust H.264 desktop encoder
 
 The realtime encoder in crates/h264-core shares the existing LGPL-2.1-or-later
 FFmpeg-derived interpolation, prediction, deblocking and CAVLC tables with the
-decoder. Selected forward/inverse transform primitives use the already declared
-oxideav-h264 0.1.8 dependency. Frame decisions, motion search, rate control and
+decoder. Selected forward/inverse transform primitives retain the MIT attribution
+from oxideav-h264 0.1.8 in the local syntax module. Frame decisions, motion search, rate control and
 bitstream writing are implemented in the project. OpenH264 is not linked.
 
 The specialized Rust encoder's GOM rate-control formulas, screen-change thresholds,

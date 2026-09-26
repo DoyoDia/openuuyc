@@ -314,7 +314,7 @@ fn forward(a: &[u8], sa: usize, b: &[u8], sb: usize) -> [i32; 16] {
     let residual = std::array::from_fn(|i| {
         i32::from(a[i / 4 * sa + i % 4]) - i32::from(b[i / 4 * sb + i % 4])
     });
-    oxideav_h264::encoder::transform::forward_core_4x4(&residual)
+    crate::syntax::forward::forward_core_4x4(&residual)
 }
 #[inline]
 pub(super) fn satd4(a: &[u8], sa: usize, b: &[u8], sb: usize) -> u32 {
