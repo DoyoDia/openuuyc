@@ -2,9 +2,6 @@
 
 pub(crate) mod clipboard;
 pub(crate) mod file_transfer;
-// The host role: capture, GPU encoding and virtual displays have no Linux
-// backend, so the role is not built there.
-#[cfg(windows)]
 pub(crate) mod host;
 pub(crate) mod network_control;
 pub(crate) mod port_mapping;

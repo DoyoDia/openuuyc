@@ -1,9 +1,15 @@
-//! The local displays, as far as the client needs them: the geometry and
-//! refresh rate a stream is sized for. The host role's display drivers and
-//! topology have no Linux counterpart.
+//! Local displays: the geometry a viewed stream is sized for, and for the
+//! host role the RandR topology, its recovery guard and the (absent) virtual
+//! display driver.
 use crate::media::LocalDisplayInfo;
 use anyhow::{Context, Result, bail};
 use display_info::DisplayInfo;
+
+pub(crate) mod recovery;
+pub(crate) mod topology;
+pub(crate) mod virtual_driver;
+
+pub(crate) use crate::media::capture::source_id;
 
 pub fn detect_local_display() -> Result<LocalDisplayInfo> {
     let displays = DisplayInfo::all().context("failed to enumerate local displays")?;

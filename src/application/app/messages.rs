@@ -91,7 +91,6 @@ pub(super) enum MutationOutcome {
 }
 
 pub(super) enum GuiEvent {
-    #[cfg(windows)]
     Host(u64, crate::features::host::Handle),
     Viewer(
         u64,

@@ -27,6 +27,7 @@ dunce = "1.0"
 egui = { version = "0.36.1", default-features = false, features = ["bytemuck", "default_fonts"] }
 flate2 = "1.1"
 futures-util = "0.3.34"
+goog_cc = { path = "vendor/goog_cc" }
 hmac = "0.12.1"
 hyper = { version = "1.10.1", default-features = false }
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "bmp", "tiff"] }
@@ -73,10 +74,9 @@ embed-resource = "3.0.11"
 [target.'cfg(windows)'.dependencies]
 windows-core = "0.62.2"
 openuuyc-nvenc-sys = { path = "vendor/nvenc-sys" }
-# The host role: Intel VPL and AMD AMF encoders beside NVENC, and its congestion control.
+# The host role's Intel VPL and AMD AMF encoders beside NVENC.
 openuuyc-amf-sys = { path = "vendor/amf-sys" }
 openuuyc-vpl-sys = { path = "vendor/vpl-sys" }
-goog_cc = { path = "vendor/goog_cc" }
 egui-directx11 = { path = "vendor/egui-directx11" }
 windows = { version = "0.62.2", default-features = false, features = [
     "Win32_Devices_Display",
@@ -119,7 +119,7 @@ winit = { version = "0.30.13", default-features = false, features = ["rwh_06", "
 arboard = { version = "3.6.1", default-features = false, features = ["image-data", "wayland-data-control"] }
 libc = "0.2"
 fuser = { version = "0.15", default-features = false }
-x11rb = "0.13"
+x11rb = { version = "0.13", features = ["randr", "shm", "xfixes"] }
 pollster = "0.4"
 
 [patch.crates-io]

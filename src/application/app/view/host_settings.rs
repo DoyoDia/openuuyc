@@ -94,6 +94,9 @@ impl DeviceCenterApp {
             }
         }
         let status = host.as_ref().map(|host| host.status()).unwrap_or_default();
+        // SudoVDA backs extended and super screens on Windows; X11 has no
+        // virtual display driver to offer.
+        #[cfg(windows)]
         self.center_ui
             .display_driver
             .show(ui, status.session_active);

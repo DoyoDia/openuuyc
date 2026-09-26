@@ -46,9 +46,6 @@ pub(crate) mod annotation;
 mod display_settings;
 mod display_topology;
 mod microphone;
-// The host role: capture, GPU encoding and virtual displays have no Linux
-// backend, so the role is not built there.
-#[cfg(windows)]
 pub(crate) mod publisher;
 
 const VIDEO_QUALITY_FAST: i32 = 1;

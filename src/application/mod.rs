@@ -6,7 +6,6 @@ pub(crate) mod viewer_shortcuts;
 pub(crate) mod wallpaper;
 
 /// Internal crash-recovery role of the same executable.
-#[cfg(windows)]
 pub fn display_recovery(token: &str) -> anyhow::Result<()> {
     crate::features::host::displays::recovery::watch(token)
 }

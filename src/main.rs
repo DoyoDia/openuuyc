@@ -187,14 +187,10 @@ fn main() -> Result<()> {
     let result = match command {
         #[cfg(windows)]
         Commands::DisplayDriverInstall | Commands::DisplayDriverUninstall => unreachable!(),
-        #[cfg(windows)]
         Commands::DisplayRecovery { token } => openuuyc::application::display_recovery(&token),
-        // The host role's display driver and its recovery watcher; nothing on
-        // this platform starts them.
+        // SudoVDA is a Windows driver; Linux has no virtual display to install.
         #[cfg(not(windows))]
-        Commands::DisplayDriverInstall
-        | Commands::DisplayDriverUninstall
-        | Commands::DisplayRecovery { .. } => {
+        Commands::DisplayDriverInstall | Commands::DisplayDriverUninstall => {
             Err(anyhow::anyhow!("虚拟显示驱动只用于 Windows 本机被控"))
         }
         Commands::PluginVideoHost => openuuyc::plugins::video::host(),

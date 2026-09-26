@@ -45,7 +45,7 @@ pub(super) fn capture_loop(
     let mut initial_auto = true;
     let mut admission = crate::features::host::parameters::WindowAdmission::default();
     let mut generation = 0;
-    let mut encoding_device = None::<(u64, windows::Win32::Graphics::Direct3D11::ID3D11Device)>;
+    let mut encoding_device = None::<(u64, capture::Device)>;
     let mut transfer = None::<crate::features::host::transfer::Transfer>;
     let mut frame_metadata = std::collections::BTreeMap::new();
     let mut last_diagnostics = None;
@@ -465,9 +465,7 @@ pub(super) fn capture_loop(
                 frame_metadata.pop_first();
             }
             let encoded = active_encoder.encode(
-                delivery
-                    .as_ref()
-                    .map_or(&frame.texture, |d| &d.frame.texture),
+                delivery.as_ref().map_or(&frame.image, |d| &d.frame.image),
                 timestamp,
                 force,
             )?;
@@ -493,7 +491,7 @@ pub(super) fn capture_loop(
                 encoded
             }
             Err(error) => {
-                if unsafe { source_device.GetDeviceRemovedReason() }.is_err() {
+                if capture::device_lost(source_device) {
                     tracing::warn!(%error,"capture graphics device was removed; recreating selected source");
                     encoder = None;
                     current = None;
@@ -519,7 +517,7 @@ pub(super) fn capture_loop(
                 next = Instant::now() + Duration::from_secs_f64(1.0 / f64::from(wanted.fps));
                 if encode_errors >= 10
                     || error.downcast_ref::<encoder::SwitchCandidate>().is_some()
-                    || unsafe { device.GetDeviceRemovedReason() }.is_err()
+                    || capture::device_lost(&device)
                 {
                     // T C2C610: disable the failed candidate. Do not endlessly
                     // reopen that same encoder after its consecutive failures.

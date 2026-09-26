@@ -95,15 +95,10 @@ async fn run_presence(
         } else {
             PresenceState::Connecting
         }));
-        // 39C5B0: a device that has never been controlled sends -1, which is
-        // always the case where the host role is not built.
-        #[cfg(windows)]
-        let last_controlled = client.host.last_controlled_interval();
-        #[cfg(not(windows))]
-        let last_controlled = -1;
+        // 39C5B0: a device that has never been controlled sends -1.
         let request = tokio::select! {
             _ = task_cancel.cancelled() => return Ok(()),
-            result = client.create_host_room(last_controlled) => result,
+            result = client.create_host_room(client.host.last_controlled_interval()) => result,
         };
         let room = match request {
             Ok(room) => {

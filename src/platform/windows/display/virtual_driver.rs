@@ -268,3 +268,11 @@ impl Driver {
         Ok(())
     }
 }
+
+/// Whether a failed removal means the display was already gone
+/// (ERROR_NOT_FOUND from the driver).
+pub(crate) fn already_removed(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<windows::core::Error>()
+        .is_some_and(|e| e.code() == windows::core::HRESULT::from_win32(1168))
+}

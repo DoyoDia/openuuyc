@@ -170,10 +170,7 @@ pub(super) async fn gui_worker_loop(
                         && logout_task.is_none()
                         && let Some(client) = client.as_ref().filter(|c| c.is_active())
                     {
-                        #[cfg(windows)]
                         client.host.persist_settings().await;
-                        #[cfg(not(windows))]
-                        let _ = client;
                     }
                 }
                 GuiCommand::View {
@@ -802,21 +799,13 @@ pub(super) async fn gui_worker_loop(
             }
             if media_ready != Some(catalog_generation) {
                 if startup_media.is_none() {
-                    #[cfg(windows)]
                     let host = active_client.host.clone();
                     let cancel = tokio_util::sync::CancellationToken::new();
                     let task_cancel = cancel.clone();
                     startup_media = Some(StartupMedia {
                         generation: catalog_generation,
                         cancel,
-                        #[cfg(windows)]
                         task: tokio::spawn(async move { host.prepare_startup(task_cancel).await }),
-                        // Only the host role has local encoders to probe.
-                        #[cfg(not(windows))]
-                        task: tokio::spawn(async move {
-                            drop(task_cancel);
-                            Ok(())
-                        }),
                     });
                     startup_last = Some((catalog_generation, StartupStage::Media));
                     let _ = events.send(GuiEvent::Startup(catalog_generation, StartupStage::Media));
@@ -882,7 +871,6 @@ pub(super) async fn gui_worker_loop(
                 )));
             }
             if host_signal.is_none() && !presence_stopped {
-                #[cfg(windows)]
                 let _ = events.send(GuiEvent::Host(
                     catalog_generation,
                     active_client.host.clone(),

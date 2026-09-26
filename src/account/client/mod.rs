@@ -32,7 +32,6 @@ pub(crate) enum RestorationStage {
 }
 
 pub struct AuthenticatedClient {
-    #[cfg(windows)]
     pub(crate) host: crate::features::host::Handle,
     api: Mutex<Option<NrdApi>>,
     session: LoginSession,
@@ -73,7 +72,6 @@ impl AuthenticatedClient {
         let session_store = KeyringSessionStore::new()?;
         let session = session_store.load()?.ok_or(NoSavedSession)?;
         let identity = device.identity().client_identity()?;
-        #[cfg(windows)]
         let host = crate::features::host::Handle::load(session.user_id(), &identity.device_id);
         let mut api = NrdApi::new(identity)?;
         api.set_user_id(Some(session.user_id()))?;
@@ -88,7 +86,6 @@ impl AuthenticatedClient {
         };
         let account_name = Mutex::new(session.nickname().to_owned());
         Ok(Self {
-            #[cfg(windows)]
             host,
             api: Mutex::new(Some(api)),
             session,
@@ -146,7 +143,6 @@ impl AuthenticatedClient {
     /// Retire this generation before asynchronous room teardown. Late responses
     /// cannot restore its headers or deliver authenticated results.
     pub fn retire(&self) {
-        #[cfg(windows)]
         self.host.retire();
         let mut api = self.api.lock().unwrap_or_else(|error| error.into_inner());
         self.ended.cancel();
@@ -609,7 +605,6 @@ impl AuthenticatedClient {
 
 impl Drop for AuthenticatedClient {
     fn drop(&mut self) {
-        #[cfg(windows)]
         self.host.retire();
         self.ended.cancel();
     }

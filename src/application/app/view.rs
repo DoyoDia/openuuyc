@@ -11,10 +11,9 @@ mod device_details;
 mod device_visuals;
 mod devices;
 mod diagnostics_panel;
-// The host role's settings and its optional virtual display driver.
+// The host role's optional virtual display driver, which is Windows-only.
 #[cfg(windows)]
 mod display_driver;
-#[cfg(windows)]
 mod host_settings;
 mod logs;
 mod port_mapping;
@@ -883,11 +882,7 @@ impl DeviceCenterApp {
             }
         }
 
-        #[cfg(windows)]
-        let controlled = self.host.as_ref().is_some_and(|h| h.status().connected);
-        #[cfg(not(windows))]
-        let controlled = false;
-        let (presence, color) = if controlled {
+        let (presence, color) = if self.host.as_ref().is_some_and(|h| h.status().connected) {
             ("正在被控", GREEN)
         } else {
             presence_text(&self.presence)
@@ -1129,7 +1124,6 @@ impl DeviceCenterApp {
         ui.add_space(18.0);
         self.alert(ui);
         crate::ui::controls::page_scroll("center-settings-scroll").show(ui, |ui| {
-            #[cfg(windows)]
             self.host_settings(ui);
             section(ui, "画面与连接");
             form_row(ui, "串流帧率", "以远端实际刷新率为准", |ui| {

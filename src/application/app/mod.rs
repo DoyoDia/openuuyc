@@ -150,7 +150,6 @@ struct DeviceCenterApp {
     local_display: LocalDisplayInfo,
     media: ConnectionMediaOptions,
     presence: PresenceState,
-    #[cfg(windows)]
     host: Option<crate::features::host::Handle>,
     status: StatusMessage,
     refreshed_at: Option<Instant>,
@@ -206,7 +205,6 @@ impl DeviceCenterApp {
             local_display,
             media,
             presence: PresenceState::Connecting,
-            #[cfg(windows)]
             host: None,
             status: display_warning.map_or_else(
                 || StatusMessage::info("正在读取设备并建立本机在线状态"),
@@ -269,7 +267,6 @@ impl DeviceCenterApp {
                     }
                 }
                 GuiEvent::Presence(presence) => self.presence = presence,
-                #[cfg(windows)]
                 GuiEvent::Host(generation, host) => {
                     if generation == self.login_generation {
                         self.host = Some(host);
@@ -785,10 +782,7 @@ impl DeviceCenterApp {
     }
 
     fn clear_catalog(&mut self) {
-        #[cfg(windows)]
-        {
-            self.host = None;
-        }
+        self.host = None;
         self.center_ui.clear_wallpapers();
         self.assist = AssistUi::default();
         self.extra_details.clear();

@@ -6,7 +6,7 @@ use crate::{
         host::lock,
         remote_cursor::{self, CursorImage},
     },
-    platform::windows::cursor_shape,
+    platform::cursor_shape,
 };
 use std::{
     sync::{Arc, atomic::Ordering},
