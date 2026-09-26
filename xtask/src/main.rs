@@ -88,9 +88,9 @@ fn main() -> Result<()> {
     check_startup(&bundle, &root, &version)?;
     ensure!(
         command("upx")
-            // NRV preserves startup on current Windows builds where the LZMA
-            // image can pass UPX integrity checking but fail loader initialization.
-            .args(["--best", "--overlay=copy", "-o"])
+            // D3D12.dll queries the EXE's D3D12SDKVersion export in DllMain,
+            // before UPX runs. Keep exports readable during loader initialization.
+            .args(["--best", "--compress-exports=0", "--overlay=copy", "-o"])
             .arg(&candidate)
             .arg(&bundle)
             .status()
@@ -103,18 +103,11 @@ fn main() -> Result<()> {
         "UPX integrity check failed"
     );
     if let Err(error) = check_startup(&candidate, &root, &version) {
-        // Some PE layouts fail loader initialization only at a particular NRV
-        // level (UPX #811). Try one bounded alternative, validating real startup.
-        eprintln!("Best compression cannot start ({error}); checking fast NRV.");
-        let fast = stage.path().join("OpenUUYC-fast.exe");
-        let packed = command("upx").args(["-1", "--overlay=copy", "-o"]).arg(&fast).arg(&bundle).status()?.success();
-        if packed && command("upx").arg("-t").arg(&fast).status()?.success() && check_startup(&fast, &root, &version).is_ok() {
-            fs::copy(&fast, &candidate)?;
-        } else {
-            eprintln!("Compression startup checks failed; using the verified uncompressed image.");
-            fs::copy(&bundle, &candidate)?;
-            check_startup(&candidate, &root, &version)?;
-        }
+        eprintln!(
+            "Compressed image cannot start ({error}); using the verified uncompressed image."
+        );
+        fs::copy(&bundle, &candidate)?;
+        check_startup(&candidate, &root, &version)?;
     }
     ensure!(
         file_hash(&source)? == original_hash,
@@ -273,7 +266,9 @@ fn check_startup(executable: &Path, root: &Path, version: &str) -> Result<()> {
         .stderr(Stdio::piped())
         .spawn();
     #[cfg(windows)]
-    unsafe { SetErrorMode(previous_error_mode); }
+    unsafe {
+        SetErrorMode(previous_error_mode);
+    }
     let mut child = spawned.context("start release check")?;
     let mut stdout = child.stdout.take().context("missing check output pipe")?;
     let mut stderr = child.stderr.take().context("missing check error pipe")?;
