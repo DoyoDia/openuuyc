@@ -54,6 +54,12 @@ const RECONNECT_KEY_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 const RECONNECT_KEY_MAX_AGE: Duration = Duration::from_secs(300);
 const RECONNECT_KEY_ACK_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_SDP_BYTES: u64 = 1024 * 1024;
+// The host role: capture, GPU encoding and virtual displays have no Linux
+// backend, so the role is not built there.
+#[cfg(windows)]
+pub(crate) mod host;
+#[cfg(not(windows))]
+#[path = "host_unavailable.rs"]
 pub(crate) mod host;
 mod tls;
 mod transport;
@@ -661,6 +667,7 @@ impl SignalSession {
         self.keep_alive_inner(shutdown, peer, control, None).await
     }
 
+    #[cfg(windows)]
     pub(crate) async fn keep_alive_host(
         self,
         shutdown: oneshot::Receiver<()>,
@@ -668,6 +675,17 @@ impl SignalSession {
     ) -> Result<()> {
         self.keep_alive_inner(shutdown, None, None, Some(host::Session::new(client)))
             .await
+    }
+
+    #[cfg(not(windows))]
+    pub(crate) async fn keep_alive_host(
+        self,
+        shutdown: oneshot::Receiver<()>,
+        _client: std::sync::Arc<crate::account::client::AuthenticatedClient>,
+    ) -> Result<()> {
+        // The device room still carries presence; without the host role there
+        // is no controlled-connection session to attach to it.
+        self.keep_alive_inner(shutdown, None, None, None).await
     }
 
     async fn keep_alive_inner(

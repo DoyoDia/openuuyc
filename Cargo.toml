@@ -27,9 +27,6 @@ dunce = "1.0"
 egui = { version = "0.36.1", default-features = false, features = ["bytemuck", "default_fonts"] }
 flate2 = "1.1"
 futures-util = "0.3.34"
-goog_cc = { path = "vendor/goog_cc" }
-openuuyc-amf-sys = { path = "vendor/amf-sys" }
-openuuyc-vpl-sys = { path = "vendor/vpl-sys" }
 hmac = "0.12.1"
 hyper = { version = "1.10.1", default-features = false }
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "bmp", "tiff"] }
@@ -61,6 +58,13 @@ webrtc = { path = "vendor/webrtc" }
 webrtc-srtp = "0.17.2"
 yuv = "0.8.17"
 object = { version = "0.37.3", default-features = false, features = ["read_core", "std", "pe"] }
+openuuyc-plugin-api = { path = "plugins/sdk" }
+libloading = "0.8.9"
+openuuyc-h264 = { path = "crates/h264-core" }
+oxideav-h264 = { version = "=0.1.8" }
+oxideav-h265 = { version = "=0.0.10" }
+egui-winit = { version = "0.36.1", default-features = false, features = ["clipboard", "links"] }
+winit = { version = "0.30.13", default-features = false, features = ["rwh_06"] }
 
 [build-dependencies]
 cc = "1.2"
@@ -68,15 +72,12 @@ embed-resource = "3.0.11"
 
 [target.'cfg(windows)'.dependencies]
 windows-core = "0.62.2"
-openuuyc-plugin-api = { path = "plugins/sdk" }
-libloading = "0.8.9"
 openuuyc-nvenc-sys = { path = "vendor/nvenc-sys" }
-openuuyc-h264 = { path = "crates/h264-core" }
-oxideav-h264 = { version = "=0.1.8" }
-oxideav-h265 = { version = "=0.0.10" }
+# The host role: Intel VPL and AMD AMF encoders beside NVENC, and its congestion control.
+openuuyc-amf-sys = { path = "vendor/amf-sys" }
+openuuyc-vpl-sys = { path = "vendor/vpl-sys" }
+goog_cc = { path = "vendor/goog_cc" }
 egui-directx11 = { path = "vendor/egui-directx11" }
-egui-winit = { version = "0.36.1", default-features = false, features = ["clipboard", "links"] }
-winit = { version = "0.30.13", default-features = false, features = ["rwh_06"] }
 windows = { version = "0.62.2", default-features = false, features = [
     "Win32_Devices_Display",
     "Win32_Devices_DeviceAndDriverInstallation",
@@ -108,6 +109,18 @@ windows = { version = "0.62.2", default-features = false, features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+cros-libva = { path = "vendor/cros-libva" }
+egui-wgpu = { version = "0.36.1", default-features = false }
+wgpu = { version = "30.0", default-features = false, features = ["vulkan", "gles", "wgsl"] }
+egui-winit = { version = "0.36.1", default-features = false, features = ["clipboard", "links", "x11", "wayland"] }
+winit = { version = "0.30.13", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen"] }
+arboard = { version = "3.6.1", default-features = false, features = ["image-data", "wayland-data-control"] }
+libc = "0.2"
+fuser = { version = "0.15", default-features = false }
+x11rb = "0.13"
+pollster = "0.4"
 
 [patch.crates-io]
 dtls = { path = "vendor/dtls" }

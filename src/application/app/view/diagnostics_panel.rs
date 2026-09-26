@@ -1,4 +1,5 @@
 use super::*;
+#[cfg(windows)]
 use crate::features::host::format::{Backend, Codec};
 use crate::ui::controls::{diagnostics_empty, diagnostics_row, diagnostics_table};
 
@@ -6,13 +7,18 @@ use crate::ui::controls::{diagnostics_empty, diagnostics_row, diagnostics_table}
 enum Tab {
     #[default]
     Device,
+    // Local encoders exist for the host role, and the decode check exercises
+    // DXVA11 adapters; neither is built on Linux.
+    #[cfg(windows)]
     Encoding,
+    #[cfg(windows)]
     Decoding,
     Sessions,
 }
 #[derive(Default)]
 pub(super) struct ViewState {
     tab: Tab,
+    #[cfg(windows)]
     encoder: Option<(u64, Backend)>,
     decoder: usize,
 }
@@ -32,7 +38,9 @@ impl DeviceCenterApp {
             ui.horizontal(|ui| {
                 for (tab, label) in [
                     (Tab::Device, "设备概览"),
+                    #[cfg(windows)]
                     (Tab::Encoding, "编码能力"),
+                    #[cfg(windows)]
                     (Tab::Decoding, "解码检查"),
                     (Tab::Sessions, "当前会话"),
                 ] {
@@ -53,7 +61,9 @@ impl DeviceCenterApp {
                     ui.set_min_height(theme::DIAGNOSTICS_BODY_MIN_HEIGHT);
                     match tab {
                         Tab::Device => self.diagnostic_device(ui),
+                        #[cfg(windows)]
                         Tab::Encoding => self.diagnostic_encoding(ui),
+                        #[cfg(windows)]
                         Tab::Decoding => self.diagnostic_decoding(ui),
                         Tab::Sessions => self.diagnostic_sessions(ui),
                     }
@@ -79,6 +89,7 @@ impl DeviceCenterApp {
         }
     }
 
+    #[cfg(windows)]
     fn diagnostic_encoding(&mut self, ui: &mut egui::Ui) {
         let Some(caps) = self.host.as_ref().and_then(|host| host.capabilities()) else {
             diagnostics_empty(ui, "暂无有效编码能力，连接时会重新检查");
@@ -183,6 +194,7 @@ impl DeviceCenterApp {
         );
     }
 
+    #[cfg(windows)]
     fn diagnostic_decoding(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             let busy = self.diagnostics.busy();
@@ -294,13 +306,22 @@ impl DeviceCenterApp {
     }
 
     fn diagnostic_sessions(&self, ui: &mut egui::Ui) {
-        let host = self.host.as_ref().map(|host| host.status());
+        #[cfg(windows)]
+        let host = self
+            .host
+            .as_ref()
+            .map(|host| host.status())
+            .filter(|host| host.session_active);
+        // Only the host role serves sessions of its own.
+        #[cfg(not(windows))]
+        let host = None::<()>;
         let viewing = self.active_session.as_ref().and_then(|s| s.handle.info());
-        if !host.as_ref().is_some_and(|host| host.session_active) && viewing.is_none() {
+        if host.is_none() && viewing.is_none() {
             diagnostics_empty(ui, "暂无活动会话 · 连接后显示实际编解码信息");
             return;
         }
-        if let Some(host) = host.filter(|host| host.session_active) {
+        #[cfg(windows)]
+        if let Some(host) = host {
             ui.strong("本机被控");
             diagnostics_row(ui, "连接状态", &host.message);
             for (index, stream) in host.streams {
@@ -367,6 +388,7 @@ impl DeviceCenterApp {
     }
 }
 
+#[cfg(windows)]
 fn codec_label(codec: Codec) -> &'static str {
     match codec {
         Codec::H264 => "H.264",

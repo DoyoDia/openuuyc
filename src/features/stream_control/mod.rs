@@ -46,6 +46,9 @@ pub(crate) mod annotation;
 mod display_settings;
 mod display_topology;
 mod microphone;
+// The host role: capture, GPU encoding and virtual displays have no Linux
+// backend, so the role is not built there.
+#[cfg(windows)]
 pub(crate) mod publisher;
 
 const VIDEO_QUALITY_FAST: i32 = 1;
@@ -415,12 +418,22 @@ struct PendingCapturePreferences {
 struct StreamControlState {
     peer_clipboard: i32,
     clipboard_files_allowed: bool,
+    /// Last reported value of the clipboard gate, so the diagnostic only fires
+    /// when it changes.
+    clipboard_ready_reported: bool,
     remote_upgrade: Option<crate::features::remote_upgrade::RemoteUpgrade>,
     annotation: annotation::Annotation,
     custom_bitrate_limit: u32,
     features: Option<crate::account::feature_ability::FeaturePolicy>,
     remote_notice: Option<(Instant, &'static str)>,
     preferred_mouse_mode: MouseMode,
+    /// Take control automatically once the control channel is usable.
+    auto_mouse_control: bool,
+    /// Set when the viewer explicitly gives control back, so an automatic
+    /// hand-over does not fight that choice on the next reconnect.
+    auto_mouse_declined: bool,
+    /// Keeps the "still waiting" diagnostic to one line per session.
+    auto_mouse_reported: bool,
     remote_cursor: crate::features::remote_cursor::RemoteCursorState,
     peer_mouse_relative: Option<bool>,
     cursor_sync_needed: bool,
@@ -487,14 +500,22 @@ impl StreamControlHandle {
             .clamp(1, profile.stream_fps.max(1));
         let mouse = crate::features::remote_input::RemoteInput::default();
         let cursor = crate::features::remote_cursor::RemoteCursorState::default();
+        tracing::debug!(
+            auto_mouse_control = profile.auto_mouse_control,
+            "stream control created"
+        );
         let state = StreamControlState {
             peer_clipboard: 0,
             clipboard_files_allowed: true,
+            clipboard_ready_reported: false,
             remote_upgrade: None,
             annotation: Default::default(),
             custom_bitrate_limit: MAX_CUSTOM_BITRATE_MBPS,
             features: None,
             preferred_mouse_mode: MouseMode::Smart,
+            auto_mouse_control: profile.auto_mouse_control,
+            auto_mouse_declined: false,
+            auto_mouse_reported: false,
             remote_notice: None,
             remote_cursor: cursor.clone(),
             peer_mouse_relative: None,
@@ -584,10 +605,14 @@ impl StreamControlHandle {
             volume: 100,
             muted: profile.muted,
         });
+        let clipboard = crate::features::clipboard::Clipboard::new();
+        // The connection setting decides where the per-session 文件复制 switch
+        // starts; the player can still turn it on or off afterwards.
+        clipboard.set_files(profile.clipboard_files);
         (
             Self {
                 microphone: crate::media::microphone::Microphone::new(),
-                clipboard: crate::features::clipboard::Clipboard::new(),
+                clipboard,
                 files: Arc::new(crate::features::file_transfer::Transport::default()),
                 mouse,
                 cursor,

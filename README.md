@@ -2,7 +2,7 @@
 
 ![OpenUUYC](assets/banner.png)
 
-OpenUUYC 是用 Rust 编写的 UU 远程第三方 Windows 客户端。使用已有的 UU 账号登录，连接和控制远端设备。
+OpenUUYC 是用 Rust 编写的 UU 远程第三方客户端，支持 Windows 和 Linux。使用已有的 UU 账号登录，连接和控制远端设备。
 
 ## 下载与使用
 
@@ -23,13 +23,26 @@ OpenUUYC 是用 Rust 编写的 UU 远程第三方 Windows 客户端。使用已�
 - **批注**：画笔、形状、擦除、撤销重做，以及激光笔和鼠标指示；笔迹在远端可见。
 - **插件**：用节点图组合画面处理效果，提供[滤镜示例与插件 SDK](plugins/README.md)。
 
-上述功能主要面向主控端。目前仅支持 Windows x64。
+上述功能主要面向主控端。目前支持 Windows x64 与 Linux x64，Linux 版需要自行构建，差异见下文。
 
 预发布版本新增本机被控：在连接设置中开启“允许被控”，支持同账号连接后的画面采集与编码、物理多屏、分辨率/DPI、虚拟屏和超级屏及退出恢复。SudoVDA 为可选驱动，首次登录后可选择安装，也可在设置中安装或卸载；安装会明确询问信任证书并请求管理员授权。
 
 本机被控键鼠、桌面音频、剪贴板、文件等能力仍在开发，主控端已有对应功能不代表本机已能接收这些操作。1.0.0 正式版留待约定范围内的完整被控能力完成并验证后发布。
 
+### Linux 版差异
+
+Linux 版是主控端，可以登录、管理设备、观看和控制远端桌面，界面走 wgpu（Vulkan，缺失时回退 OpenGL），X11 与 Wayland 均可运行。与 Windows 版相比：
+
+- **解码**：H.264 通过 VA-API 硬件解码（Constrained Baseline、Main、High，8 位 4:2:0），其余 H.264 格式使用 Rust 软件解码；H.265 暂不支持。硬件解码需要对应的 VA-API 驱动。
+- **剪贴板**：文字、图片与文件双向同步。粘贴远端复制的文件时，文件通过挂载在 `$XDG_RUNTIME_DIR` 下的只读 FUSE 文件系统按需读取，需要安装 `fuse3`。
+- **未接入**：本机被控、批注与白板、插件节点图、多显示器独立窗口、HDR、全局快捷键（快捷键仅在播放窗口获得焦点时生效），以及诊断页中的编码能力与解码检查。
+- **凭据**：登录态保存在系统密钥环（Secret Service），需要运行 gnome-keyring、KWallet 等服务；没有明文回退。
+
+Wayland 下窗口的拖动与缩放由合成器接管，因此不支持窗口吸附等 Windows 专有行为。
+
 ## 构建
+
+### Windows
 
 需要 Rust stable（MSVC）、Visual Studio C++ 构建工具、Windows SDK、CMake 和 UPX，确保 `upx` 在 PATH 中。软件 H.264 编解码使用项目 Rust 核心。
 
@@ -42,6 +55,23 @@ cargo dist
 程序位于 `target/dist/upx/`，打包时自动进行 UPX 压缩、完整性和启动检查。命令行用法可通过程序的 `--help` 查看。
 
 代码目录、模块职责、资源所有权及后续平台接入说明见 [架构说明](ARCHITECTURE.md)。
+
+### Linux
+
+需要 Rust stable（edition 2024）与 C/C++ 工具链。Ubuntu 22.04 及以上：
+
+```bash
+sudo apt install build-essential cmake clang pkg-config libva-dev \
+    libasound2-dev libdbus-1-dev libxkbcommon-dev libxkbcommon-x11-dev \
+    libwayland-dev libx11-dev libxcb1-dev libxrandr-dev libxi-dev libxcursor-dev \
+    libgl1-mesa-dev libvulkan-dev libudev-dev libssl-dev fonts-noto-cjk fuse3
+git clone https://github.com/djkcyl/openuuyc.git
+cd openuuyc
+cargo build --release
+./target/release/OpenUUYC gui
+```
+
+`cargo dist` 只用于 Windows 打包，Linux 直接用 `cargo build`。
 
 ## 反馈与许可
 

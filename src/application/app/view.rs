@@ -11,7 +11,10 @@ mod device_details;
 mod device_visuals;
 mod devices;
 mod diagnostics_panel;
+// The host role's settings and its optional virtual display driver.
+#[cfg(windows)]
 mod display_driver;
+#[cfg(windows)]
 mod host_settings;
 mod logs;
 mod port_mapping;
@@ -57,6 +60,7 @@ impl Page {
 
 #[derive(Default)]
 pub(super) struct CenterUi {
+    #[cfg(windows)]
     display_driver: display_driver::DriverUi,
     page: Page,
     device_lists: [devices::ListUi; 2],
@@ -879,7 +883,11 @@ impl DeviceCenterApp {
             }
         }
 
-        let (presence, color) = if self.host.as_ref().is_some_and(|h| h.status().connected) {
+        #[cfg(windows)]
+        let controlled = self.host.as_ref().is_some_and(|h| h.status().connected);
+        #[cfg(not(windows))]
+        let controlled = false;
+        let (presence, color) = if controlled {
             ("正在被控", GREEN)
         } else {
             presence_text(&self.presence)
@@ -1121,6 +1129,7 @@ impl DeviceCenterApp {
         ui.add_space(18.0);
         self.alert(ui);
         crate::ui::controls::page_scroll("center-settings-scroll").show(ui, |ui| {
+            #[cfg(windows)]
             self.host_settings(ui);
             section(ui, "画面与连接");
             form_row(ui, "串流帧率", "以远端实际刷新率为准", |ui| {
@@ -1169,6 +1178,22 @@ impl DeviceCenterApp {
                         ui.selectable_value(&mut self.media.hardware_decode, false, "软件解码");
                     });
             });
+            form_row(
+                ui,
+                "键鼠控制",
+                "连接后自动接管远端键鼠，可在播放窗口随时切换",
+                |ui| {
+                    crate::ui::controls::switch(ui, &mut self.media.auto_mouse_control);
+                },
+            );
+            form_row(
+                ui,
+                "文件复制",
+                "连接后允许剪贴板复制文件，可在播放窗口随时切换",
+                |ui| {
+                    crate::ui::controls::switch(ui, &mut self.media.clipboard_files);
+                },
+            );
             form_row(
                 ui,
                 "连接线路",
