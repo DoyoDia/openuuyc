@@ -48,6 +48,7 @@ struct Api {
     ctx_push: unsafe extern "C" fn(*mut c_void) -> CuResult,
     ctx_pop: unsafe extern "C" fn(*mut *mut c_void) -> CuResult,
     ctx_synchronize: unsafe extern "C" fn() -> CuResult,
+    ctx_set_limit: unsafe extern "C" fn(c_uint, usize) -> CuResult,
     mem_alloc_pitch:
         unsafe extern "C" fn(*mut DevicePtr, *mut usize, usize, usize, c_uint) -> CuResult,
     mem_free: unsafe extern "C" fn(DevicePtr) -> CuResult,
@@ -86,6 +87,7 @@ fn load() -> Result<Api> {
             ctx_push: symbol!("cuCtxPushCurrent_v2"),
             ctx_pop: symbol!("cuCtxPopCurrent_v2"),
             ctx_synchronize: symbol!("cuCtxSynchronize"),
+            ctx_set_limit: symbol!("cuCtxSetLimit"),
             mem_alloc_pitch: symbol!("cuMemAllocPitch_v2"),
             mem_free: symbol!("cuMemFree_v2"),
             memcpy_2d: symbol!("cuMemcpy2D_v2"),
@@ -178,12 +180,39 @@ impl Context {
             unsafe { (api.primary_ctx_retain)(&mut raw, device) },
             "cuDevicePrimaryCtxRetain",
         )?;
-        Ok(Self {
+        let context = Self {
             api,
             device,
             raw,
             pci_bus,
-        })
+        };
+        context.trim()?;
+        Ok(context)
+    }
+
+    /// Give back the context's default reservations. This process launches
+    /// no kernels of its own, and the ones inside NvFBC and NVENC need no
+    /// device heap or printf buffer; the per-thread stack, reserved for every
+    /// resident thread of the GPU, dominates a fresh context (about 90 MiB on
+    /// an 84-SM GPU), and the driver grows it again for any launch that needs
+    /// more. A fresh context drops from about 260 MiB to about 140 MiB.
+    fn trim(&self) -> Result<()> {
+        const STACK_SIZE: c_uint = 0;
+        const PRINTF_FIFO_SIZE: c_uint = 1;
+        const MALLOC_HEAP_SIZE: c_uint = 2;
+        let _current = self.enter()?;
+        for (limit, name) in [
+            (STACK_SIZE, "stack"),
+            (PRINTF_FIFO_SIZE, "printf"),
+            (MALLOC_HEAP_SIZE, "heap"),
+        ] {
+            check(
+                self.api,
+                unsafe { (self.api.ctx_set_limit)(limit, 0) },
+                &format!("cuCtxSetLimit({name})"),
+            )?;
+        }
+        Ok(())
     }
 
     pub fn raw(&self) -> *mut c_void {

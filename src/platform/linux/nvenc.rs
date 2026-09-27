@@ -165,3 +165,38 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod memory_tests {
+    /// Stage by stage, so an outside `nvidia-smi` can attribute video memory.
+    #[test]
+    #[ignore]
+    fn video_memory_by_stage() {
+        let pause = |stage: &str| {
+            println!("STAGE {stage}");
+            std::thread::sleep(std::time::Duration::from_secs(4));
+        };
+        pause("start");
+        let context = super::super::cuda::display_context().unwrap();
+        pause("cuda-context");
+        let (w, h) = (2560, 1440);
+        let buffer = super::super::cuda::Buffer::new(&context, w, h).unwrap();
+        pause("cuda-buffer");
+        let rate = crate::media::encoding::Rate {
+            target: 20_000_000,
+            peak: 20_000_000,
+            fps: 60,
+            quality: 4,
+        };
+        let encoder =
+            super::Encoder::new(&context, (w, h), crate::media::encoding::Format::AVC, rate)
+                .unwrap();
+        pause("nvenc-h264-1440p");
+        let screens = super::super::capture::screens().unwrap();
+        let desktop = super::super::capture::Desktop::open_selected(&screens[0]).unwrap();
+        println!("backend {}", desktop.backend_name());
+        pause("nvfbc");
+        drop((desktop, encoder, buffer));
+        pause("dropped");
+    }
+}
