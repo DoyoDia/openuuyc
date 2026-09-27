@@ -135,7 +135,9 @@ libc = "0.2"
 fuser = { version = "0.15", default-features = false }
 x11rb = { version = "0.13", features = ["randr", "shm", "xfixes", "xtest"] }
 # Notification-area icon (StatusNotifierItem), the counterpart of the Windows tray.
-ksni = { version = "0.3.6", default-features = false, features = ["blocking", "async-io"] }
+ksni = { version = "0.3.6", features = ["blocking"] }
+# Host capture through the XDG ScreenCast portal (Wayland, and X11 on request).
+ashpd = { version = "0.13.13", default-features = false, features = ["tokio", "screencast"] }
 pollster = "0.4"
 
 [patch.crates-io]
