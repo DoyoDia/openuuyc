@@ -29,7 +29,7 @@ cargo dist
 
 验证脚本检查公钥、安装器指纹、DLL/SYS/CAT 签名、目录文件成员和源码 INF 一致性，不安装驱动、不修改证书信任。音频 INF 以 UTF-16LE 打包。此处的 Authenticode 检查不表示已通过 Microsoft 内核签名或 WHQL；当前包未加时间戳，证书续期时需要重新签名并更新内嵌包。
 
-Release 附件使用 `target/dist/` 中未加壳的单个 EXE，驱动和许可证已内嵌；`cargo dist --upx` 仍可用于自行构建压缩包。源码仓库保留驱动源码、构建脚本和已签名包。输入驱动使用 Windows 的 VHF/UMDF 组件；虚拟音频使用 KMDF/ACX，不同 Windows 版本和安全策略仍需分别验证。
+Release 附件使用 `target/dist/` 中经 UPX 压缩并通过完整性、实际启动检查的单个 EXE，驱动和许可证已内嵌；未加壳的开发构建使用 `cargo dist --no-upx`。源码仓库保留驱动源码、构建脚本和已签名包。输入驱动使用 Windows 的 VHF/UMDF 组件；虚拟音频使用 KMDF/ACX，不同 Windows 版本和安全策略仍需分别验证。
 
 显示驱动基于 SudoVDA，原始来源及声明见 [UPSTREAM.md](display/UPSTREAM.md)，Microsoft 示例代码许可见 [LICENSE](display/LICENSE)。
 

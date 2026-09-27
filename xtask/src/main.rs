@@ -10,10 +10,18 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[derive(Default)]
 struct Options {
     build_directory: Option<PathBuf>,
     upx: bool,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            build_directory: None,
+            upx: true,
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -21,7 +29,7 @@ fn main() -> Result<()> {
     let mut args = std::env::args_os().skip(1);
     while let Some(arg) = args.next() {
         match arg.to_str() {
-            Some("--upx") => options.upx = true,
+            Some("--no-upx") => options.upx = false,
             Some("--build-directory") => {
                 options.build_directory = Some(
                     args.next()
@@ -31,9 +39,9 @@ fn main() -> Result<()> {
             }
             Some("--help" | "-h") => {
                 println!(
-                    "cargo dist [--build-directory PATH] [--upx]\n\
-                    Builds and checks the Windows release in target/dist.\n\
-                    --upx optionally compresses it into target/dist/upx; requires UPX on PATH."
+                    "cargo dist [--build-directory PATH] [--no-upx]\n\
+                    Builds, UPX-compresses and checks the Windows release in target/dist.\n\
+                    Requires UPX on PATH. --no-upx writes an uncompressed development build to target/dist/uncompressed."
                 );
                 return Ok(());
             }
@@ -104,12 +112,6 @@ fn main() -> Result<()> {
             command("upx").arg("-t").arg(&candidate).status()?.success(),
             "UPX integrity check failed"
         );
-        if let Err(error) = check_startup(&candidate, &root, &version) {
-            eprintln!(
-                "Compressed image cannot start ({error}); using the verified uncompressed image."
-            );
-            fs::copy(&source, &candidate)?;
-        }
     } else {
         fs::copy(&source, &candidate)?;
     }
@@ -120,9 +122,9 @@ fn main() -> Result<()> {
     );
 
     let destination = if options.upx {
-        target.join("dist").join("upx")
-    } else {
         target.join("dist")
+    } else {
+        target.join("dist").join("uncompressed")
     };
     fs::create_dir_all(&destination)?;
     let published = destination.join(file_name);

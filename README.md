@@ -63,7 +63,7 @@ OpenUUYC 是用 Rust 编写的 UU 远程第三方 Windows 客户端。使用已�
 
 ## 构建
 
-需要 Rust stable（MSVC）、Visual Studio C++ 构建工具、Windows SDK 和 CMake。软件 H.264 编解码使用项目 Rust 核心。
+需要 Rust stable（MSVC）、Visual Studio C++ 构建工具、Windows SDK、CMake 和 UPX。软件 H.264 编解码使用项目 Rust 核心。
 
 ```powershell
 git clone https://github.com/djkcyl/openuuyc.git
@@ -71,7 +71,7 @@ cd openuuyc
 cargo dist
 ```
 
-程序位于 `target/dist/`，打包时自动检查启动，不依赖 UPX。如需额外压缩，可安装 UPX 后运行 `cargo dist --upx`，产物位于 `target/dist/upx/`，并额外执行压缩完整性检查。命令行用法可通过程序的 `--help` 查看。
+程序位于 `target/dist/`，默认使用 UPX 压缩，并检查压缩完整性和实际启动；任一步失败都会中止打包，不以未压缩文件替代发布。需要未加壳的开发构建时运行 `cargo dist --no-upx`，产物位于 `target/dist/uncompressed/`。命令行用法可通过程序的 `--help` 查看。
 
 命令行支持 `gui`（默认）、`login`、`devices`、`connect` 和 `uninstall`。`devices` 会列出设备 ID；连接时使用完整设备名或 `connect --device-id <ID>`，二者选一。`gui --background` 启动到托盘；观看的帧率、编码、硬件解码和链路选项见对应命令的 `--help`。`--log-level`、`--log-file` 可用于指定诊断日志。
 
