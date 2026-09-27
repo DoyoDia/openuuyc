@@ -10,7 +10,6 @@ use anyhow::{Context, Result, anyhow, bail};
 use decode_pipeline::{DecodeActivity, DecoderConfig, decoder_manager};
 pub(super) use hud::{PerformancePanelMode, show_performance_overlay};
 use std::collections::VecDeque;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc as std_mpsc};
 use std::thread::JoinHandle;
@@ -595,44 +594,6 @@ impl Drop for NativeViewerSession {
 const COMPACT_HUD_WIDTH: f32 = 120.0;
 const COMPACT_METER_WIDTH: f32 = 37.0;
 const COMPACT_COLUMN_GAP: f32 = 8.0;
-
-pub(crate) fn install_system_cjk_font(ctx: &egui::Context) {
-    let candidates = system_cjk_font_candidates();
-    let Some((path, bytes)) = candidates
-        .into_iter()
-        .find_map(|path| std::fs::read(&path).ok().map(|bytes| (path, bytes)))
-    else {
-        tracing::warn!("no system CJK font found; non-Latin labels may be unavailable");
-        return;
-    };
-    let mut fonts = egui::FontDefinitions::default();
-    let name = "system-cjk".to_owned();
-    fonts
-        .font_data
-        .insert(name.clone(), Arc::new(egui::FontData::from_owned(bytes)));
-    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-        fonts.families.entry(family).or_default().push(name.clone());
-    }
-    ctx.set_fonts(fonts);
-    ctx.request_repaint();
-    tracing::debug!(path = %path.display(), "installed system CJK font for native viewer");
-}
-
-fn system_cjk_font_candidates() -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-
-    {
-        let fonts = std::env::var_os("WINDIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
-            .join("Fonts");
-        for name in ["msyh.ttc", "msyhbd.ttc", "simhei.ttf", "simsun.ttc"] {
-            paths.push(fonts.join(name));
-        }
-    }
-
-    paths
-}
 
 fn mutex_lock<T>(lock: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     lock.lock()

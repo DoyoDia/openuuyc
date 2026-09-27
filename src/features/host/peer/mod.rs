@@ -44,6 +44,9 @@ pub(crate) struct Peer {
     ice_servers: Vec<RTCIceServer>,
     relay_only: AtomicBool,
     input: super::input::Session,
+    audio: super::audio::Audio,
+    microphone: super::microphone::Session,
+    microphone_tracks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 }
 
 #[derive(Default)]
@@ -140,6 +143,10 @@ impl Peer {
                     clock_rate: 48_000,
                     channels: 2,
                     sdp_fmtp_line: "minptime=10;stereo=1;useinbandfec=1".into(),
+                    rtcp_feedback: vec![RTCPFeedback {
+                        typ: "transport-cc".into(),
+                        parameter: String::new(),
+                    }],
                     ..Default::default()
                 },
                 payload_type: 111,
@@ -226,7 +233,6 @@ impl Peer {
                 RTPCodecType::Video,
             )?;
         }
-        // Keep the ordinary UU audio_0 SDP identity; no capture or mic policy is enabled.
         media.register_codec(
             RTCRtpCodecParameters {
                 capability: RTCRtpCodecCapability {
@@ -240,6 +246,18 @@ impl Peer {
             },
             RTPCodecType::Video,
         )?;
+        for uri in [
+            "urn:ietf:params:rtp-hdrext:ssrc-audio-level",
+            "http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time",
+            "http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01",
+            "urn:ietf:params:rtp-hdrext:sdes:mid",
+        ] {
+            media.register_header_extension(
+                RTCRtpHeaderExtensionCapability { uri: uri.into() },
+                RTPCodecType::Audio,
+                None,
+            )?;
+        }
         for uri in [
             "http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time",
             "urn:ietf:params:rtp-hdrext:toffset",
@@ -300,7 +318,7 @@ impl Peer {
             Box::pin(async {})
         }));
         let connected = Arc::new(AtomicBool::new(false));
-        let audio = Arc::new(TrackLocalStaticRTP::new(
+        let audio_track = Arc::new(TrackLocalStaticRTP::new(
             RTCRtpCodecCapability {
                 mime_type: "audio/opus".into(),
                 clock_rate: 48_000,
@@ -311,9 +329,15 @@ impl Peer {
             "audio_0".into(),
             "audio_0".into(),
         ));
-        connection
-            .add_track(audio as Arc<dyn TrackLocal + Send + Sync>)
+        let audio_sender = connection
+            .add_track(audio_track.clone() as Arc<dyn TrackLocal + Send + Sync>)
             .await?;
+        let audio = super::audio::Audio::new(
+            handle.clone(),
+            cancel.clone(),
+            connected.clone(),
+            transport.clone(),
+        );
         let screen_pool = screens::Screens::new(
             connection.clone(),
             handle.clone(),
@@ -348,6 +372,43 @@ impl Peer {
                     .collect(),
             },
         )?;
+        let microphone =
+            super::microphone::Session::new(handle.clone(), cancel.clone(), connected.clone())?;
+        let microphone_tracks = Arc::new(Mutex::new(Vec::new()));
+        let track_tasks = microphone_tracks.clone();
+        let track_microphone = microphone.receiver();
+        let track_cancel = cancel.clone();
+        connection.on_track(Box::new(move |track, receiver, _| {
+            let microphone = track_microphone.clone();
+            let stop = track_cancel.clone();
+            let tasks = track_tasks.clone();
+            Box::pin(async move {
+                if track.kind() != RTPCodecType::Audio || stop.is_cancelled() { return; }
+                let codec = track.codec().capability;
+                if !codec.mime_type.eq_ignore_ascii_case("audio/opus") || codec.clock_rate != 48000 || !(1..=2).contains(&codec.channels) {
+                    tracing::warn!(codec=%codec.mime_type,"unsupported remote microphone codec");
+                    return;
+                }
+                let generation = microphone.select_source();
+                let receive_stop = stop.clone();
+                let task = tokio::spawn(async move {
+                    loop {
+                        let incoming = tokio::select! { _=receive_stop.cancelled()=>break, p=track.read_rtp()=>p };
+                        let Ok((packet, _)) = incoming else { break; };
+                        microphone.receive(generation, packet.payload, packet.header.sequence_number, packet.header.timestamp);
+                    }
+                });
+                let reports = tokio::spawn(async move {
+                    loop {
+                        let result = tokio::select! { _=stop.cancelled()=>break, r=receiver.read_rtcp()=>r };
+                        if result.is_err() { break; }
+                    }
+                });
+                let mut tasks = lock(&tasks);
+                for old in tasks.drain(..) { let old: tokio::task::JoinHandle<()> = old; old.abort(); }
+                tasks.extend([task, reports]);
+            })
+        }));
         let stream_transports: Vec<_> = screen_pool
             .slots
             .iter()
@@ -360,6 +421,8 @@ impl Peer {
         let state_dtls = Arc::downgrade(&connection.sctp().transport());
         let stopped = cancel.clone();
         let state_input = input.receiver();
+        let state_audio = audio.clone();
+        let state_microphone = microphone.receiver();
         connection.on_peer_connection_state_change(Box::new(move |state| {
             tracing::info!(?state, "host peer connection state changed");
             state_transport.network(state == RTCPeerConnectionState::Connected);
@@ -367,6 +430,8 @@ impl Peer {
                 ready.swap(state == RTCPeerConnectionState::Connected, Ordering::AcqRel);
             if was_ready && state != RTCPeerConnectionState::Connected {
                 state_input.transport_lost();
+                state_audio.transport_lost();
+                state_microphone.transport_lost();
             }
             state_handle.update(
                 true,
@@ -452,6 +517,8 @@ impl Peer {
             kcp.clone(),
             screen.clone(),
             input.receiver().mouse_policy(),
+            audio.clone(),
+            microphone.receiver().status(),
         ));
         let (control_tx, mut control_rx) = mpsc::unbounded_channel::<(u16, u64, Vec<u8>)>();
         let control_screen = screen.clone();
@@ -508,14 +575,25 @@ impl Peer {
         let channel_cancel = cancel.clone();
         let channel_kcp = kcp.clone();
         let channel_input = input.receiver();
+        let channel_microphone = microphone.receiver();
         connection.on_data_channel(Box::new(move |channel| {
             let screens = channel_screens.clone();
             let stop = channel_cancel.clone();
             let kcp = channel_kcp.clone();
             let report_target = report_target.clone();
             let input = channel_input.clone();
+            let microphone = channel_microphone.clone();
             Box::pin(async move {
-                bind_channel(channel, screens, stop, kcp, report_target, input).await;
+                bind_channel(
+                    channel,
+                    screens,
+                    stop,
+                    kcp,
+                    report_target,
+                    input,
+                    microphone,
+                )
+                .await;
             })
         }));
         let mut stream_tasks = Vec::new();
@@ -570,6 +648,29 @@ impl Peer {
                 }
             }
         });
+        let capture_audio = audio.clone();
+        stream_tasks.push(tokio::spawn(async move {
+            if let Err(error) = tokio::task::spawn_blocking(move || capture_audio.run()).await {
+                tracing::error!(%error,"desktop audio worker failed");
+            }
+        }));
+        let send_audio = audio.clone();
+        let send_cancel = cancel.clone();
+        stream_tasks.push(tokio::spawn(async move {
+            tokio::select! { _=send_cancel.cancelled()=>{}, _=send_audio.transmitter().send(&send_audio,audio_track)=>{} }
+        }));
+        let report_audio = audio.clone();
+        let report_sender = audio_sender.clone();
+        let report_peer = Arc::downgrade(&connection);
+        let report_cancel = cancel.clone();
+        stream_tasks.push(tokio::spawn(async move {
+            tokio::select! { _=report_cancel.cancelled()=>{}, _=report_audio.transmitter().send_reports(&report_audio,report_peer,report_sender)=>{} }
+        }));
+        let feedback_audio = audio.clone();
+        let feedback_cancel = cancel.clone();
+        stream_tasks.push(tokio::spawn(async move {
+            tokio::select! { _=feedback_cancel.cancelled()=>{}, _=feedback_audio.transmitter().feedback(audio_sender)=>{} }
+        }));
         let peer_transport = transport.clone();
         construction.disarm();
         Ok(Self {
@@ -596,6 +697,9 @@ impl Peer {
             ice_servers,
             relay_only: AtomicBool::new(relay),
             input,
+            audio,
+            microphone,
+            microphone_tracks,
         })
     }
 
@@ -680,6 +784,7 @@ impl Peer {
             .collect();
         anyhow::ensure!(!fragments.is_empty(), "主控SDP缺少ICE代次");
         let description = RTCSessionDescription::offer(sdp)?;
+        let audio_config = crate::media::audio::encoder::remote_config(&description)?;
         if restart {
             if let Err(error) = self.restart_network(network_type).await {
                 // Native B055D0 logs SetConfig failure and retains the live peer.
@@ -725,6 +830,7 @@ impl Peer {
         anyhow::ensure!(!self.ended() && self.handle.requested(), "画面会话已取消");
         self.core
             .activate_control(mixed_kcp, self.control_receiver.clone())?;
+        self.audio.configure(audio_config);
         Ok(sdp)
     }
     pub(crate) async fn add_candidate(&self, mut candidate: RTCIceCandidateInit) -> Result<()> {
@@ -780,7 +886,12 @@ impl Peer {
     pub(crate) async fn close(mut self) {
         self.cancel.cancel();
         self.input.close();
+        self.microphone.close();
         let _ = self.core.close().await;
+        let tracks = std::mem::take(&mut *lock(&self.microphone_tracks));
+        for track in tracks {
+            let _ = track.await;
+        }
         for task in self.tasks.drain(..) {
             let _ = task.await;
         }
@@ -803,6 +914,10 @@ impl Drop for Peer {
     fn drop(&mut self) {
         self.cancel.cancel();
         self.input.close();
+        self.microphone.close();
+        for track in lock(&self.microphone_tracks).drain(..) {
+            track.abort();
+        }
         for task in &self.tasks {
             task.abort();
         }

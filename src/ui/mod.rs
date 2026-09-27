@@ -11,6 +11,7 @@ mod windows;
 mod app;
 pub(crate) mod branding;
 pub(crate) mod controls;
+pub(crate) mod fonts;
 pub(crate) mod theme;
 use app::AppFactory;
 

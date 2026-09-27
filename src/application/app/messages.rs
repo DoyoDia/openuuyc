@@ -9,6 +9,9 @@ use crate::session::presence::PresenceState;
 use std::time::Instant;
 
 pub(super) enum GuiCommand {
+    RefreshHostAudioDevices {
+        generation: u64,
+    },
     SaveHostSettings {
         generation: u64,
     },

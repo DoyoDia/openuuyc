@@ -117,8 +117,12 @@ impl DeviceCenterApp {
                     include_str!("../../../../drivers/display/UPSTREAM.md"),
                     "\n\n",
                     include_str!("../../../../drivers/display/LICENSE"),
+                    "\n\nAppendix: OpenUUYC Audio attribution\n\n",
+                    include_str!("../../../../drivers/audio/UPSTREAM.md"),
                     "\n\nAppendix: OxideAV MIT license (retained AVC/HEVC syntax primitives)\n\n",
-                    include_str!("../../../../crates/h264-core/COPYING.OxideAV")
+                    include_str!("../../../../crates/h264-core/COPYING.OxideAV"),
+                    "\n\n--- Bundled fonts ---\n\n",
+                    include_str!("../../../../assets/fonts/LICENSE")
                 ),
             ),
         };

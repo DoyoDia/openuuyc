@@ -119,7 +119,12 @@ fn cleanup_helpers() {
     }
 }
 fn run(uninstall: bool) -> Result<bool> {
-    let _instance = super::instance::reserve_maintenance()?;
+    let _installer = super::instance::reserve_installer()?;
+    let _instance = if uninstall {
+        Some(super::instance::reserve_maintenance()?)
+    } else {
+        None
+    };
     if uninstall && deployment::active_directory()?.exists() {
         deployment::verify_directory(&deployment::active_directory()?)?;
     }
@@ -140,12 +145,10 @@ fn run(uninstall: bool) -> Result<bool> {
             centered: true,
         },
         Box::new(move |ctx, _| {
-            crate::application::viewer::install_system_cjk_font(ctx);
             super::view::configure_visuals(ctx);
             Box::new(Maintenance {
                 uninstall,
-                remove_display: false,
-                remove_data: false,
+                removal: Default::default(),
                 pending: None,
                 error: None,
                 finished: false,
@@ -158,8 +161,7 @@ fn run(uninstall: bool) -> Result<bool> {
 }
 struct Maintenance {
     uninstall: bool,
-    remove_display: bool,
-    remove_data: bool,
+    removal: components::RemovalOptions,
     pending: Option<Receiver<Result<bool, String>>>,
     error: Option<String>,
     finished: bool,
@@ -234,19 +236,20 @@ impl crate::ui::App for Maintenance {
                     ui.add_space(12.);
                 }
                 ui.label(if self.finished {
-                    if self.remove_data { "卸载完成，本机数据已清除。" } else { "卸载完成，账号和用户设置已保留。" }
+                    if self.removal.remove_data { "卸载完成，本机数据已清除。" } else { "卸载完成，账号和用户设置已保留。" }
                 } else if self.uninstall {
                     "将移除程序、后台服务、输入驱动、快捷方式及自启动。"
                 } else {
-                    "此文件与已安装版本不同。更新后将从系统安装目录重新打开 OpenUUYC。"
+                    "更新将结束当前连接并关闭运行中的 OpenUUYC，完成后自动打开新版本。"
                 });
                 ui.add_space(12.);
                 if !self.finished {
                     ui.add_enabled_ui(self.pending.is_none(), |ui| {
                         if self.uninstall {
-                            ui.checkbox(&mut self.remove_display, "同时卸载 OpenUUYC 虚拟显示驱动");
-                            ui.checkbox(&mut self.remove_data, "同时删除本机 OpenUUYC 数据");
-                            if self.remove_data {
+                            ui.checkbox(&mut self.removal.remove_display_driver, "同时卸载 OpenUUYC 虚拟显示驱动");
+                            ui.checkbox(&mut self.removal.remove_audio_driver, "同时卸载 OpenUUYC 虚拟声卡" );
+                            ui.checkbox(&mut self.removal.remove_data, "同时删除本机 OpenUUYC 数据");
+                            if self.removal.remove_data {
                                 ui.label(egui::RichText::new("删除登录信息、设置、插件、缓存和日志，下次使用需重新登录。").color(theme::AMBER));
                             }
                         } else if ui.link("打开已安装版本").clicked() {
@@ -318,27 +321,66 @@ impl Maintenance {
         self.pending = Some(rx);
         self.error = None;
         let uninstall = self.uninstall;
-        let remove_display = self.remove_display;
-        let remove_data = self.remove_data;
+        let removal = self.removal;
         std::thread::spawn(move || {
-            let result = components::request(
-                if uninstall {
-                    Kind::Application
-                } else {
-                    Kind::Suite
-                },
-                if uninstall {
-                    Operation::Uninstall
-                } else {
-                    Operation::Install
-                },
-                false,
-                remove_display,
-                remove_data,
-            )
+            let result = if !uninstall {
+                update_running()
+            } else {
+                components::request(Kind::Application, Operation::Uninstall, false, removal)
+            }
             .map_err(|e| format!("{e:#}"));
             let _ = tx.send(result);
             ctx.request_repaint();
         });
     }
+}
+
+fn update_running() -> Result<bool> {
+    let gate = super::instance::reserve_update()?;
+    let running = super::instance::running_installed()?;
+    let mut had_window = running.is_some();
+    let background = host_service::resident::managed() && host_service::install::running()?;
+    let resume = background && !host_service::resident::paused()?;
+    let result = (|| -> Result<bool> {
+        if let Some(running) = running {
+            running.close()?;
+        }
+        // Headless and pre-handoff builds can leave their resident online after
+        // the UI exits. Pause it and wait for its agents before deployment.
+        if background {
+            host_service::resident::call(host_service::resident::Request::Pause)?;
+        }
+        let started = std::time::Instant::now();
+        let _reservation = loop {
+            match super::instance::reserve_after_exit()? {
+                Some(guard) => break guard,
+                None if started.elapsed() < Duration::from_secs(5) => {
+                    if let Some(running) = super::instance::running_installed()? {
+                        had_window = true;
+                        running.close()?;
+                    }
+                    std::thread::sleep(Duration::from_millis(50))
+                }
+                None => anyhow::bail!("运行版本仍在退出，尚未开始替换文件"),
+            }
+        };
+        components::request(Kind::Suite, Operation::Install, false, Default::default())
+    })();
+    drop(gate);
+    if let Err(error) = result {
+        let restored = if had_window {
+            deployment::start_installed(std::iter::empty::<std::ffi::OsString>())
+        } else if resume {
+            host_service::resident::call(host_service::resident::Request::Resume).map(|_| ())
+        } else {
+            Ok(())
+        };
+        return match restored {
+            Ok(()) => Err(error),
+            Err(recovery) => Err(anyhow::anyhow!(
+                "{error:#}；恢复原运行状态失败：{recovery:#}"
+            )),
+        };
+    }
+    result
 }

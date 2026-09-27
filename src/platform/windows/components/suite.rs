@@ -48,7 +48,7 @@ pub(crate) fn execute(
     operation: Operation,
     owner: Option<&str>,
     allow_sas: bool,
-    remove_display: bool,
+    removal: super::RemovalOptions,
 ) -> Result<bool> {
     match operation {
         Operation::Install => {
@@ -70,6 +70,10 @@ pub(crate) fn execute(
             if !display.ready {
                 reboot |= super::super::display::install::install()?;
             }
+            let audio = super::super::virtual_audio::install::status()?;
+            if audio.installed && !audio.ready {
+                reboot |= super::super::virtual_audio::install::execute(Operation::Install)?;
+            }
             host_service::install::start_installed()?;
             if let Err(error) = super::application::cleanup_legacy() {
                 tracing::warn!(%error, "previous installation remains in use; retained for later cleanup");
@@ -79,15 +83,12 @@ pub(crate) fn execute(
         Operation::Uninstall => {
             let record = receipt()?.context("没有本程序的服务安装记录")?;
             host_service::install::preflight()?;
-            if remove_display {
-                super::super::display::install::preflight(Operation::Uninstall)?;
-            }
+            removal.preflight()?;
             // Close admission and agents before removing their driver resources.
             host_service::install::stop_for_maintenance()?;
-            let mut reboot = false;
-            if remove_display {
-                reboot |= super::super::display::install::uninstall()?;
-            }
+            super::super::virtual_audio::Defaults::recover_defaults()
+                .context("卸载前恢复默认音频设备失败")?;
+            let mut reboot = removal.remove_optional_drivers()?;
             reboot |= super::super::input::install::uninstall()?;
             reboot |= host_service::install::uninstall()?;
             // Only this fixed, explicitly owned vault is removed. Keep unrelated
@@ -123,7 +124,11 @@ pub(crate) fn execute(
         }
     }
 }
-pub(crate) fn request(operation: Operation, allow_sas: bool, remove_display: bool) -> Result<bool> {
+pub(crate) fn request(
+    operation: Operation,
+    allow_sas: bool,
+    removal: super::RemovalOptions,
+) -> Result<bool> {
     if operation == Operation::Uninstall {
         crate::account::auth::restore_portable()?;
     }
@@ -146,11 +151,7 @@ pub(crate) fn request(operation: Operation, allow_sas: bool, remove_display: boo
             ""
         }
     );
-    let args = if remove_display && operation == Operation::Uninstall {
-        format!("{args} --remove-display-driver")
-    } else {
-        args
-    };
+    let args = format!("{args}{}", removal.arguments());
     let reboot = super::elevate(&args, Kind::Suite)?;
     if operation == Operation::Install {
         crate::account::auth::enroll_resident()?;

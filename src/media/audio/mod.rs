@@ -1,7 +1,8 @@
 //! One receive-only audio output per UU connection, shared by all its windows.
 pub(crate) mod dsp;
 pub(crate) mod encoder;
-mod neteq;
+pub(crate) mod neteq;
+pub(crate) mod sender;
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};

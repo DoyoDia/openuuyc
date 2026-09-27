@@ -291,7 +291,6 @@ impl DeviceSync {
     pub async fn poll(
         &mut self,
         client: &Arc<AuthenticatedClient>,
-        foreground: bool,
         events: &Sender<GuiEvent>,
         generation: u64,
     ) -> Option<anyhow::Error> {
@@ -304,9 +303,10 @@ impl DeviceSync {
                 client.feature_catalog(),
             )
             .await;
-        if foreground {
-            self.start_reads(client, events);
-        }
+        // Pending reads belong to account synchronization, not window focus.
+        // Startup, push reconciliation and hardware classification must finish
+        // while the control center is covered, minimized or in the tray.
+        self.start_reads(client, events);
         failure
     }
 

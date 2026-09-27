@@ -36,24 +36,16 @@ pub fn capture_agent(pipe: &str, parent: u32) -> anyhow::Result<()> {
     crate::platform::windows::capture_service::agent(pipe, parent)
 }
 pub use crate::platform::windows::components::{
-    Kind as ComponentKind, Operation as ComponentOperation,
+    Kind as ComponentKind, Operation as ComponentOperation, RemovalOptions,
 };
 pub fn component_operation(
     kind: ComponentKind,
     operation: ComponentOperation,
     allow_sas: bool,
     owner: Option<&str>,
-    remove_display: bool,
-    remove_data: bool,
+    removal: RemovalOptions,
 ) -> anyhow::Result<bool> {
-    crate::platform::windows::components::execute(
-        kind,
-        operation,
-        allow_sas,
-        owner,
-        remove_display,
-        remove_data,
-    )
+    crate::platform::windows::components::execute(kind, operation, allow_sas, owner, removal)
 }
 pub fn purge_machine_data() -> anyhow::Result<()> {
     crate::platform::windows::components::application::purge_machine_data()

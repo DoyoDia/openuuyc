@@ -74,6 +74,7 @@ pub(super) fn machine() -> Result<()> {
     reject_reparse(directory)?;
     reject_reparse(&root)?;
     ensure_recovered(&root)?;
+    crate::platform::windows::virtual_audio::Defaults::ensure_recovered()?;
     remove_tree(directory)
 }
 pub(super) fn user() -> Result<()> {
@@ -88,7 +89,7 @@ pub(super) fn user() -> Result<()> {
         .map_err(|_| anyhow::anyhow!("系统凭据库不可用"))?;
     let entries = keyring_core::Entry::search(&std::collections::HashMap::from([(
         "pattern",
-        r"\.com\.openuuyc\.(session|wallpaper|(assist|viewing|audio|host)\.[0-9a-f]{64})$",
+        r"\.com\.openuuyc\.(session|wallpaper|(assist|viewing|audio|microphone|host)\.[0-9a-f]{64})$",
     )]))?;
     for entry in entries {
         entry.delete_credential()?;

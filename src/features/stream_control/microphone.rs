@@ -4,7 +4,7 @@ use super::*;
 #[derive(Clone, PartialEq, prost::Message)]
 pub(super) struct PolicyRequest {
     #[prost(int32, tag = "1")]
-    policy: i32,
+    pub(super) policy: i32,
 }
 #[derive(Clone, PartialEq, prost::Message)]
 pub(super) struct PolicyResponse {

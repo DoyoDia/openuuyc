@@ -5,8 +5,7 @@ use super::screen_windows::ScreenWindows;
 use crate::application::viewer::windows_ui::{UiPresenter, UiTimingAudit};
 use crate::application::viewer::{
     ConnectionProgress, ConnectionProgressApp, NativeViewerSession, ViewerDisplayHandle,
-    ViewerPreferences, ViewerWindowEvent, configure_viewer_visuals, install_system_cjk_font,
-    mutex_lock,
+    ViewerPreferences, ViewerWindowEvent, configure_viewer_visuals, mutex_lock,
 };
 use crate::ui::chrome::{
     configure_dwm_window, title_bar_height, title_bar_panel, window_title_bar,
@@ -539,7 +538,7 @@ impl WindowsConnectionApp {
                 }));
             }
         });
-        install_system_cjk_font(&egui_context);
+        crate::ui::fonts::install(&egui_context);
         configure_viewer_visuals(&egui_context);
         let egui_winit = egui_winit::State::new(
             egui_context.clone(),

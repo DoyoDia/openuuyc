@@ -1,7 +1,9 @@
 //! Shared control appearance for the center, viewer menus and node editor.
 use super::theme::{self, HOVER, LINE, MUTED, SURFACE, TEXT};
 use egui::{Color32, RichText, Stroke, vec2};
+mod audio_quality;
 mod diagnostics;
+pub(crate) use audio_quality::{audio_quality, audio_quality_segments};
 mod dialogs;
 pub(crate) use diagnostics::{
     diagnostics_action, diagnostics_empty, diagnostics_label, diagnostics_row, diagnostics_table,

@@ -104,6 +104,7 @@ impl Runner {
             return Ok(());
         }
         let context = egui::Context::default();
+        super::fonts::install(&context);
         context.set_embed_viewports(true);
         // WindowConfig sizes describe page content; the shared caption occupies
         // client space now, so preserve the page's requested and minimum size.
@@ -126,11 +127,6 @@ impl Runner {
         )?;
         super::chrome::configure_dwm_window(&window);
         super::branding::set_taskbar_icon(&window);
-        if self.root {
-            crate::application::app::instance::register_window(super::d3d11::window_hwnd(
-                &window,
-            )?)?;
-        }
         if self.config.centered
             && let Some(monitor) = window.current_monitor()
         {
@@ -174,6 +170,11 @@ impl Runner {
             .context("desktop factory already consumed")?;
         let app = AppSession(factory(&context, Some(graphics)));
         let uses_tray = self.root && app.0.uses_tray();
+        if uses_tray {
+            crate::application::app::instance::register_window(super::d3d11::window_hwnd(
+                &window,
+            )?)?;
+        }
         let refresh = window
             .current_monitor()
             .and_then(|monitor| monitor.refresh_rate_millihertz())
@@ -436,15 +437,14 @@ impl ApplicationHandler<Event> for Runner {
             if let Some(when) = state.next_repaint {
                 if when <= Instant::now() {
                     state.next_repaint = None;
-                    if state.show_after_present || state.window.is_visible() == Some(false) {
-                        // Hidden HWNDs need not receive WM_PAINT. Retry a busy
-                        // first Present directly, at the regular repaint deadline.
-                        if let Err(error) = state.render() {
-                            self.fail(event_loop, error);
-                            return;
-                        }
-                    } else {
-                        state.window.request_redraw();
+                    // WM_PAINT is not a reliable completion signal for covered
+                    // or minimized windows. Run the due UI pass here so worker
+                    // events and the next deadline do not depend on mouse input.
+                    // render() already defers presentation for hidden/minimized
+                    // windows; native RedrawRequested still handles exposure.
+                    if let Err(error) = state.render() {
+                        self.fail(event_loop, error);
+                        return;
                     }
                     event_loop.set_control_flow(
                         state

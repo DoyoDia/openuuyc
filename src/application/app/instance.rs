@@ -40,6 +40,10 @@ fn acquire_named(name: PCWSTR) -> Result<Option<Instance>> {
 }
 
 pub fn acquire() -> Result<Option<Instance>> {
+    // The confirmed updater owns startup until replacement or recovery finishes.
+    if acquire_named(w!("Local\\OpenUUYC.Updating.v1"))?.is_none() {
+        return Ok(None);
+    }
     let result = acquire_named(w!("Local\\OpenUUYC.ControlCenter.v1"));
     let message = match &result {
         Ok(Some(_)) => return result,
@@ -90,6 +94,18 @@ unsafe extern "system" fn window_message(
     _id: usize,
     _data: usize,
 ) -> LRESULT {
+    if message == exit_message() {
+        if crate::platform::windows::components::maintaining() {
+            return LRESULT(2);
+        }
+        return LRESULT(
+            if crate::ui::window_manager::send(crate::ui::window_manager::Request::Exit).is_ok() {
+                1
+            } else {
+                2
+            },
+        );
+    }
     if message == show_message() {
         // Updating visibility through the UI owner keeps winit's WindowFlags in
         // sync. Showing the HWND directly leaves VISIBLE false after tray hide.
@@ -103,6 +119,9 @@ unsafe extern "system" fn window_message(
         }
     }
     unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
+}
+pub(crate) fn reserve_after_exit() -> Result<Option<Instance>> {
+    acquire_named(w!("Local\\OpenUUYC.ControlCenter.v1"))
 }
 pub(crate) fn reserve_maintenance() -> Result<Instance> {
     acquire_named(w!("Local\\OpenUUYC.ControlCenter.v1"))?
@@ -134,4 +153,141 @@ fn activate_existing() -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn exit_message() -> u32 {
+    static MESSAGE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *MESSAGE.get_or_init(|| unsafe {
+        RegisterWindowMessageW(w!("OpenUUYC.ControlCenter.ExitForUpdate.v1"))
+    })
+}
+pub(crate) fn reserve_installer() -> Result<Instance> {
+    acquire_named(w!("Local\\OpenUUYC.Installer.v1"))?.context("已有安装或卸载窗口，请先完成该操作")
+}
+pub(crate) fn reserve_update() -> Result<Instance> {
+    acquire_named(w!("Local\\OpenUUYC.Updating.v1"))?.context("已有程序更新正在进行")
+}
+pub(crate) struct Running {
+    window: HWND,
+    process: crate::platform::windows::host_service::pipe::Handle,
+}
+pub(crate) fn running_installed() -> Result<Option<Running>> {
+    use crate::platform::windows::{
+        components::application as deployment,
+        host_service::{pipe::Handle, process, vault},
+    };
+    use windows::Win32::System::Threading::*;
+    unsafe extern "system" fn collect(hwnd: HWND, data: LPARAM) -> BOOL {
+        if !unsafe { GetPropW(hwnd, w!("OpenUUYC.ControlCenter.Window.v1")) }.is_invalid() {
+            unsafe {
+                (*(data.0 as *mut Vec<HWND>)).push(hwnd);
+            }
+        }
+        true.into()
+    }
+    let mut windows = Vec::<HWND>::new();
+    unsafe {
+        EnumWindows(Some(collect), LPARAM(&mut windows as *mut _ as isize))?;
+    }
+    let image = std::fs::canonicalize(deployment::image()?)?;
+    let own = std::process::id();
+    let sid = vault::sid(own)?;
+    let session = process::session(own)?;
+    let mut found = None;
+    for window in windows {
+        let mut pid = 0;
+        unsafe {
+            GetWindowThreadProcessId(window, Some(&mut pid));
+        }
+        if pid == 0 || pid == own {
+            continue;
+        }
+        let Ok(handle) = (unsafe {
+            OpenProcess(
+                PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+                false,
+                pid,
+            )
+        }) else {
+            continue;
+        };
+        let pinned = Handle(handle);
+        let Ok(path) = process::image(pid).and_then(|p| Ok(std::fs::canonicalize(p)?)) else {
+            continue;
+        };
+        if !path
+            .as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&image.as_os_str().to_string_lossy())
+        {
+            continue;
+        }
+        anyhow::ensure!(
+            process::session(pid)? == session && vault::sid(pid)? == sid,
+            "运行版本不属于当前Windows用户会话"
+        );
+        anyhow::ensure!(found.is_none(), "检测到多个控制中心，暂不能进行更新");
+        // Pin the process handle and verify the HWND still belongs to it.
+        let mut current = 0;
+        unsafe {
+            GetWindowThreadProcessId(window, Some(&mut current));
+        }
+        anyhow::ensure!(current == pid, "运行程序已变化，请重试更新");
+        found = Some(Running {
+            window,
+            process: pinned,
+        });
+    }
+    Ok(found)
+}
+impl Running {
+    pub fn close(self) -> Result<()> {
+        use windows::Win32::{
+            Foundation::WAIT_OBJECT_0, System::Threading::*, UI::WindowsAndMessaging::*,
+        };
+        if unsafe { WaitForSingleObject(self.process.0, 0) } == WAIT_OBJECT_0 {
+            return Ok(());
+        }
+        if !unsafe { IsWindow(Some(self.window)) }.as_bool() {
+            anyhow::ensure!(
+                unsafe { WaitForSingleObject(self.process.0, 45_000) } == WAIT_OBJECT_0,
+                "等待运行版本完成退出超时，更新未开始"
+            );
+            return Ok(());
+        }
+        let mut reply = 0usize;
+        let message = exit_message();
+        anyhow::ensure!(message != 0, "注册更新退出消息失败");
+        anyhow::ensure!(
+            unsafe {
+                SendMessageTimeoutW(
+                    self.window,
+                    message,
+                    WPARAM(0),
+                    LPARAM(0),
+                    SMTO_ABORTIFHUNG | SMTO_BLOCK,
+                    2000,
+                    Some(&mut reply),
+                )
+            }
+            .0 != 0,
+            "运行版本未响应退出请求，更新未开始"
+        );
+        anyhow::ensure!(reply != 2, "运行版本正在处理组件操作，暂不能更新");
+        if reply == 0 {
+            // Existing builds predate ExitForUpdate. Their current winit owner
+            // accepts this registered destroy request and runs the application's
+            // on_exit/shutdown cleanup. Never synthesize WM_DESTROY or kill a PID.
+            let destroy = unsafe { RegisterWindowMessageW(w!("Winit::DestroyMsg")) };
+            anyhow::ensure!(destroy != 0, "注册窗口退出消息失败");
+            unsafe {
+                PostMessageW(Some(self.window), destroy, WPARAM(0), LPARAM(0))?;
+            }
+        }
+        anyhow::ensure!(
+            unsafe { WaitForSingleObject(self.process.0, 45_000) } == WAIT_OBJECT_0,
+            "等待运行版本完成退出超时，更新未开始"
+        );
+        Ok(())
+    }
 }

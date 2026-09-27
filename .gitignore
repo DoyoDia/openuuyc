@@ -15,6 +15,7 @@ captures/
 !/crates/h264-core/README.md
 !/drivers/README.md
 !/drivers/display/UPSTREAM.md
+!/drivers/audio/UPSTREAM.md
 !**/LICENSE*.md
 !**/COPYING*.md
 !**/NOTICE*.md
@@ -86,3 +87,5 @@ secrets.json
 !/assets/drivers/input/OpenUUYCInput.cat
 !/assets/drivers/display/OpenUUYCDisplay.dll
 !/assets/drivers/display/OpenUUYCDisplay.cat
+!/assets/drivers/audio/OpenUUYCAudio.sys
+!/assets/drivers/audio/OpenUUYCAudio.cat

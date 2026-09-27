@@ -5,7 +5,7 @@ use anyhow::{Result, ensure};
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
-pub(super) struct Statistics {
+pub(crate) struct Statistics {
     pub output_samples: u64,
     pub concealed_samples: u64,
     pub inserted_samples: u64,
@@ -33,7 +33,7 @@ unsafe extern "C" {
     ) -> i32;
 }
 
-pub(super) struct Receiver(NonNull<c_void>);
+pub(crate) struct Receiver(NonNull<c_void>);
 // One owner on the audio callback thread; no pointers or sample slices escape.
 unsafe impl Send for Receiver {}
 

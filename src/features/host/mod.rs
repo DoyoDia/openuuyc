@@ -1,6 +1,7 @@
 //! Local controlled-device services; access policy and media sessions have separate owners.
 mod access;
 mod allocation;
+pub(crate) mod audio;
 mod burst;
 mod congestion;
 pub(crate) mod desktop;
@@ -11,6 +12,7 @@ pub(crate) mod format;
 mod hevc;
 pub(crate) mod input;
 mod keyframe;
+pub(crate) mod microphone;
 pub(crate) mod network;
 pub(crate) mod parameters;
 pub(crate) mod peer;

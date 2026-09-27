@@ -29,7 +29,6 @@ pub(crate) fn open(
         },
         factory: Box::new(move |ctx, _| {
             theme::configure(ctx);
-            crate::application::viewer::install_system_cjk_font(ctx);
             let _enter = runtime.enter();
             let handle = super::service::start(client.clone(), device.clone(), options);
             let previous = handle.snapshot();

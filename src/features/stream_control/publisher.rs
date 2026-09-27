@@ -8,6 +8,58 @@ use anyhow::Context as _;
 mod displays;
 pub(crate) use displays::{receive_session, screen_states};
 
+pub(crate) struct MicrophonePolicy {
+    pub enabled: bool,
+    sequence: i64,
+    timestamp: i64,
+    request: i64,
+}
+pub(crate) fn microphone_policy(bytes: &[u8]) -> Result<Option<MicrophonePolicy>> {
+    let message = PbControlMessage::decode(bytes)?;
+    let Some(PbPayload::RpcRequest(bytes)) = message.payload else {
+        return Ok(None);
+    };
+    let request = PbRpcRequest::decode(bytes.as_slice())?;
+    let Some(PbRpcRequestPayload::VirtualAudioDriverPolicy(policy)) = request.payload else {
+        return Ok(None);
+    };
+    let header = request.request_header.context("麦克风请求缺少标识")?;
+    Ok(Some(MicrophonePolicy {
+        enabled: policy.policy & 1 != 0,
+        sequence: message.seq,
+        timestamp: message.timestamp,
+        request: header.request_id,
+    }))
+}
+impl MicrophonePolicy {
+    pub fn response(&self, error_code: i32) -> Vec<u8> {
+        PbControlMessage {
+            seq: self.sequence,
+            timestamp: self.timestamp,
+            payload: Some(PbPayload::RpcResponse(PbRpcResponse {
+                response_header: Some(PbResponseHeader {
+                    request_id: self.request,
+                }),
+                payload: Some(PbRpcResponsePayload::VirtualAudioDriverPolicyRsp(
+                    super::microphone::PolicyResponse { error_code }.encode_to_vec(),
+                )),
+            })),
+        }
+        .encode_to_vec()
+    }
+}
+pub(crate) fn audio_device_event(action: i32) -> Vec<u8> {
+    PbControlMessage {
+        payload: Some(PbPayload::SimpleAction(PbSimpleAction {
+            action,
+            args: String::new(),
+            params: None,
+        })),
+        ..Default::default()
+    }
+    .encode_to_vec()
+}
+
 #[derive(Clone, PartialEq, prost::Message)]
 pub(crate) struct ConnectOptions {
     #[prost(int32, tag = "1")]
@@ -169,7 +221,7 @@ pub(crate) fn capture_change(screen: &Screen, capturing: bool) -> Vec<u8> {
     }
     .encode_to_vec()
 }
-pub(crate) fn permissions(visible: bool) -> Vec<u8> {
+pub(crate) fn permissions(visible: bool, audio: bool) -> Vec<u8> {
     #[derive(Clone, PartialEq, prost::Message)]
     struct Permission {
         #[prost(bool, tag = "2")]
@@ -190,7 +242,7 @@ pub(crate) fn permissions(visible: bool) -> Vec<u8> {
                 permission: Some(Permission {
                     video: true,
                     visible,
-                    audio: false,
+                    audio,
                 }),
             }
             .encode_to_vec(),

@@ -13,6 +13,7 @@ use std::{
 #[derive(Default)]
 struct Options {
     build_directory: Option<PathBuf>,
+    upx: bool,
 }
 
 fn main() -> Result<()> {
@@ -20,6 +21,7 @@ fn main() -> Result<()> {
     let mut args = std::env::args_os().skip(1);
     while let Some(arg) = args.next() {
         match arg.to_str() {
+            Some("--upx") => options.upx = true,
             Some("--build-directory") => {
                 options.build_directory = Some(
                     args.next()
@@ -29,9 +31,9 @@ fn main() -> Result<()> {
             }
             Some("--help" | "-h") => {
                 println!(
-                    "cargo dist [--build-directory PATH]\n\
-                    Builds the Windows release, compresses and checks it, then creates target/dist/upx.\n\
-                    UPX must be installed and available on PATH."
+                    "cargo dist [--build-directory PATH] [--upx]\n\
+                    Builds and checks the Windows release in target/dist.\n\
+                    --upx optionally compresses it into target/dist/upx; requires UPX on PATH."
                 );
                 return Ok(());
             }
@@ -47,15 +49,17 @@ fn main() -> Result<()> {
             .parent()
             .context("xtask must be inside the project")?,
     )?;
-    ensure!(
-        command("upx")
-            .arg("--version")
-            .stdout(Stdio::null())
-            .status()
-            .context("UPX must be installed and available on PATH")?
-            .success(),
-        "UPX is unavailable"
-    );
+    if options.upx {
+        ensure!(
+            command("upx")
+                .arg("--version")
+                .stdout(Stdio::null())
+                .status()
+                .context("UPX must be installed and available on PATH")?
+                .success(),
+            "UPX is unavailable"
+        );
+    }
     let (source, version) = build(&root, options.build_directory)?;
     ensure!(
         source.is_file()
@@ -83,38 +87,43 @@ fn main() -> Result<()> {
         "invalid staging directory"
     );
     let candidate = stage.path().join(&file_name);
-    let bundle = stage.path().join("OpenUUYC-bundle.exe");
-    fs::copy(&source, &bundle)?;
-    check_startup(&bundle, &root, &version)?;
-    ensure!(
-        command("upx")
-            // D3D12.dll queries the EXE's D3D12SDKVersion export in DllMain,
-            // before UPX runs. Keep exports readable during loader initialization.
-            .args(["--best", "--compress-exports=0", "--overlay=copy", "-o"])
-            .arg(&candidate)
-            .arg(&bundle)
-            .status()
-            .context("compress executable")?
-            .success(),
-        "UPX compression failed; original build retained"
-    );
-    ensure!(
-        command("upx").arg("-t").arg(&candidate).status()?.success(),
-        "UPX integrity check failed"
-    );
-    if let Err(error) = check_startup(&candidate, &root, &version) {
-        eprintln!(
-            "Compressed image cannot start ({error}); using the verified uncompressed image."
+    if options.upx {
+        ensure!(
+            command("upx")
+                // D3D12.dll queries the EXE's D3D12SDKVersion export in DllMain,
+                // before UPX runs. Keep exports readable during loader initialization.
+                .args(["--best", "--compress-exports=0", "--overlay=copy", "-o"])
+                .arg(&candidate)
+                .arg(&source)
+                .status()
+                .context("compress executable")?
+                .success(),
+            "UPX compression failed; original build retained"
         );
-        fs::copy(&bundle, &candidate)?;
-        check_startup(&candidate, &root, &version)?;
+        ensure!(
+            command("upx").arg("-t").arg(&candidate).status()?.success(),
+            "UPX integrity check failed"
+        );
+        if let Err(error) = check_startup(&candidate, &root, &version) {
+            eprintln!(
+                "Compressed image cannot start ({error}); using the verified uncompressed image."
+            );
+            fs::copy(&source, &candidate)?;
+        }
+    } else {
+        fs::copy(&source, &candidate)?;
     }
+    check_startup(&candidate, &root, &version)?;
     ensure!(
         file_hash(&source)? == original_hash,
         "original build changed during packaging"
     );
 
-    let destination = target.join("dist").join("upx");
+    let destination = if options.upx {
+        target.join("dist").join("upx")
+    } else {
+        target.join("dist")
+    };
     fs::create_dir_all(&destination)?;
     let published = destination.join(file_name);
     fs::copy(&candidate, &published).context("publish executable (close it first if in use)")?;

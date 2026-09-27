@@ -66,7 +66,6 @@ pub fn run(options: GuiOptions) -> Result<()> {
             centered: true,
         },
         Box::new(move |ctx, graphics| {
-            crate::application::viewer::install_system_cjk_font(ctx);
             configure_visuals(ctx);
             ctx.request_repaint();
             let mut app = DeviceCenterApp::new(ctx, local_display, options.media, display_warning);

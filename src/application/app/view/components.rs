@@ -4,7 +4,7 @@ use crate::platform::windows::components::{self as install, Kind, Operation, Sta
 struct ResultState {
     status: Result<Status, String>,
     components: Vec<(Kind, Result<Status, String>)>,
-    operation: Option<(Operation, Result<bool, String>)>,
+    operation: Option<(Kind, Operation, Result<bool, String>)>,
 }
 #[derive(Default)]
 pub(in crate::application::app) struct Manager {
@@ -12,16 +12,20 @@ pub(in crate::application::app) struct Manager {
     components: Vec<(Kind, Result<Status, String>)>,
     pending: Option<std::sync::mpsc::Receiver<ResultState>>,
     confirm: Option<Operation>,
+    audio_confirm: Option<Operation>,
     error: Option<String>,
     reboot: bool,
     allow_sas: bool,
-    remove_display: bool,
+    removal: install::RemovalOptions,
     offered: bool,
     completed: bool,
     handoff: bool,
 }
 impl Manager {
     fn work(&mut self, operation: Option<Operation>, ctx: egui::Context) {
+        self.work_kind(Kind::Suite, operation, ctx);
+    }
+    fn work_kind(&mut self, kind: Kind, operation: Option<Operation>, ctx: egui::Context) {
         if self.pending.is_some() {
             return;
         }
@@ -29,13 +33,23 @@ impl Manager {
         self.pending = Some(rx);
         self.error = None;
         let allow_sas = self.allow_sas;
-        let remove_display = self.remove_display;
+        let removal = self.removal;
         std::thread::spawn(move || {
             let operation = operation.map(|op| {
                 (
+                    kind,
                     op,
-                    install::request(Kind::Suite, op, allow_sas, remove_display, false)
-                        .map_err(|e| format!("{e:#}")),
+                    install::request(
+                        kind,
+                        op,
+                        kind == Kind::Suite && op == Operation::Install && allow_sas,
+                        if kind == Kind::Suite && op == Operation::Uninstall {
+                            removal
+                        } else {
+                            Default::default()
+                        },
+                    )
+                    .map_err(|e| format!("{e:#}")),
                 )
             });
             let status = install::status(Kind::Suite).map_err(|e| format!("{e:#}"));
@@ -61,12 +75,13 @@ impl Manager {
                     Ok(status) => self.status = Some(status),
                     Err(error) => self.error = Some(error),
                 }
-                if let Some((operation, result)) = result.operation {
+                if let Some((kind, operation, result)) = result.operation {
                     match result {
                         Ok(reboot) => {
                             self.reboot |= reboot;
                             self.completed = true;
-                            self.handoff = operation == Operation::Install && !reboot;
+                            self.handoff =
+                                kind == Kind::Suite && operation == Operation::Install && !reboot;
                         }
                         Err(error) => self.error = Some(error),
                     }
@@ -149,17 +164,90 @@ impl Manager {
                 })
                 .clicked()
             {
-                self.remove_display = false;
+                self.removal = Default::default();
                 self.confirm = Some(Operation::Uninstall);
             }
         });
+        self.audio_management(ui, active);
+    }
+    fn audio_management(&mut self, ui: &mut egui::Ui, active: bool) {
+        let audio = self
+            .components
+            .iter()
+            .find(|(kind, _)| *kind == Kind::AudioDriver)
+            .and_then(|(_, status)| status.as_ref().ok());
+        let installed = audio.is_some_and(|s| s.installed);
+        let removable = audio.is_some_and(|s| s.removable);
+        let label = audio.map_or("正在检查…", |s| s.label.as_str());
+        form_row(ui, "虚拟声卡", label, |ui| {
+            if !audio.is_some_and(|status| status.ready)
+                && ui
+                    .add_enabled(
+                        !active && self.pending.is_none(),
+                        egui::Button::new(if installed {
+                            "更新驱动"
+                        } else {
+                            "安装驱动"
+                        }),
+                    )
+                    .clicked()
+            {
+                self.audio_confirm = Some(Operation::Install);
+            }
+            if ui
+                .add_enabled(
+                    !active && self.pending.is_none() && removable,
+                    egui::Button::new("卸载驱动"),
+                )
+                .clicked()
+            {
+                self.audio_confirm = Some(Operation::Uninstall);
+            }
+        });
+    }
+    fn audio_dialog(&mut self, ctx: &egui::Context, active: bool) {
+        if let Some(operation) = self.audio_confirm {
+            let title = if operation == Operation::Install {
+                if self.components.iter().any(|(kind, status)| {
+                    *kind == Kind::AudioDriver && status.as_ref().is_ok_and(|s| s.installed)
+                }) {
+                    "更新虚拟声卡"
+                } else {
+                    "安装虚拟声卡"
+                }
+            } else {
+                "卸载虚拟声卡"
+            };
+            let mut accepted = false;
+            let mut dismissed = false;
+            let result = egui::Modal::new(egui::Id::new("audio-driver-confirm"))
+                .frame(crate::ui::controls::dialog_frame()).show(ctx, |ui| {
+                    ui.set_width(460.0);
+                    dismissed = crate::ui::controls::dialog_header(ui, title, crate::ui::controls::DialogIcon::Warning, true);
+                    ui.label(if operation == Operation::Install {
+                        "安装 OpenUUYC 虚拟扬声器和虚拟麦克风。此构建使用测试签名驱动，需要在允许测试驱动的启动环境中安装；是否允许加载由 Windows 判断。"
+                    } else { "移除 OpenUUYC 虚拟扬声器和虚拟麦克风。请先关闭正在使用它们的应用。" });
+                    let (yes, close) = crate::ui::controls::dialog_actions(ui,
+                        Some(crate::ui::controls::DialogAction::new(title).enabled(!active && self.pending.is_none())), Some("取消"));
+                    accepted = yes;
+                    dismissed |= close;
+                });
+            if accepted {
+                self.audio_confirm = None;
+                self.work_kind(Kind::AudioDriver, Some(operation), ctx.clone());
+            } else if dismissed || result.should_close() {
+                self.audio_confirm = None;
+            }
+        }
     }
     fn dialogs(&mut self, ctx: &egui::Context, active: bool, home: bool) {
+        self.audio_dialog(ctx, active);
         if home
             && !self.offered
             && !active
             && self.pending.is_none()
             && self.confirm.is_none()
+            && self.audio_confirm.is_none()
             && self.error.is_none()
             && self.status.is_some()
             && ctx.memory(|m| m.top_modal_layer().is_none())
@@ -212,7 +300,8 @@ impl Manager {
                     });
                 } else {
                     ui.label("停止开机被控，卸载服务和输入驱动，移除自启动与后台账号授权。");
-                    ui.checkbox(&mut self.remove_display, "同时卸载 OpenUUYC 虚拟显示驱动");
+                    ui.checkbox(&mut self.removal.remove_display_driver, "同时卸载 OpenUUYC 虚拟显示驱动" );
+                    ui.checkbox(&mut self.removal.remove_audio_driver, "同时卸载 OpenUUYC 虚拟声卡" );
                     ui.label("保留程序本体、当前账号和设置，仍可在普通桌面以便携模式使用。");
                 }
                 for (kind,status) in &self.components { ui.horizontal(|ui| { ui.label(kind.label()); ui.label(match status { Ok(s) => s.label.as_str(), Err(e) => e.as_str() }); }); }
@@ -250,6 +339,7 @@ impl DeviceCenterApp {
         }
         if self.needs_login() || self.logout_pending {
             self.center_ui.components.confirm = None;
+            self.center_ui.components.audio_confirm = None;
             return;
         }
         let active = self

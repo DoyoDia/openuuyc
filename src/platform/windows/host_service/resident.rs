@@ -48,6 +48,9 @@ pub(crate) enum Request {
         account: String,
         allowed: bool,
         encoding: host::EncodingSettings,
+        audio_device: Option<host::audio::Device>,
+        audio_defaults: host::audio::DefaultDevices,
+        audio_quality: crate::media::audio::encoder::Quality,
     },
     Disconnect {
         account: String,
@@ -65,6 +68,12 @@ pub(crate) struct Snapshot {
     pub online: PresenceState,
     pub allowed: bool,
     pub encoding: host::EncodingSettings,
+    #[serde(default)]
+    pub audio_device: Option<host::audio::Device>,
+    #[serde(default)]
+    pub audio_defaults: host::audio::DefaultDevices,
+    #[serde(default)]
+    pub audio_quality: crate::media::audio::encoder::Quality,
     pub status: host::Status,
     pub capabilities: Option<host::desktop::Capabilities>,
 }
@@ -382,6 +391,30 @@ fn wait_for_session(
         std::thread::sleep(Duration::from_millis(20));
     }
 }
+pub(crate) fn paused() -> Result<bool> {
+    use windows::{
+        Win32::{Foundation::ERROR_FILE_NOT_FOUND, System::Registry::*},
+        core::w,
+    };
+    let mut value = 0u32;
+    let mut length = 4;
+    let result = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            w!(r"SYSTEM\CurrentControlSet\Services\OpenUUYCInputService\Runtime"),
+            w!("Paused"),
+            RRF_RT_REG_DWORD,
+            None,
+            Some((&mut value as *mut u32).cast()),
+            Some(&mut length),
+        )
+    };
+    if result == ERROR_FILE_NOT_FOUND {
+        return Ok(false);
+    }
+    result.ok()?;
+    Ok(value != 0)
+}
 fn boot_pause(value: Option<bool>) -> Result<bool> {
     use windows::{Win32::System::Registry::*, core::w};
     let mut key = HKEY::default();
@@ -469,6 +502,11 @@ pub(crate) fn run(parent: u32) -> Result<()> {
     let parent_raw = parent_handle.0.0 as usize;
     let running = || unsafe { windows::Win32::System::Threading::WaitForSingleObject(windows::Win32::Foundation::HANDLE(stop_raw as *mut _), 0) == windows::Win32::Foundation::WAIT_TIMEOUT } && process::active_session() == session && unsafe { windows::Win32::System::Threading::WaitForSingleObject(windows::Win32::Foundation::HANDLE(parent_raw as *mut _), 0) == windows::Win32::Foundation::WAIT_TIMEOUT };
     OWNER.store(true, Ordering::Release);
+    if let Err(error) = super::super::virtual_audio::Defaults::recover_defaults() {
+        // Before Windows logon there is no user's default microphone to touch.
+        // A later authorized request retries recovery before selecting ours.
+        tracing::debug!(%error, "previous virtual microphone defaults not yet restored");
+    }
     let runtime = tokio::runtime::Runtime::new()?;
     let (tx, rx) = tokio::sync::mpsc::channel(8);
     let stop = tokio_util::sync::CancellationToken::new();
@@ -582,6 +620,9 @@ async fn run_account(mut incoming: Incoming, running: &impl Fn() -> bool) -> Res
                                     online: online.clone(),
                                     allowed: current.host.allowed(),
                                     encoding: current.host.encoding_settings(),
+                                    audio_device: current.host.audio_device(),
+                                    audio_defaults: current.host.audio_defaults(),
+                                    audio_quality: current.host.audio_quality(),
                                     status: current.host.status(),
                                     capabilities: current.host.capabilities().map(|v| (*v).clone()),
                                 }))),
@@ -589,9 +630,17 @@ async fn run_account(mut incoming: Incoming, running: &impl Fn() -> bool) -> Res
                                     account: expected,
                                     allowed,
                                     encoding,
+                                    audio_device,
+                                    audio_defaults,
+                                    audio_quality,
                                 } => {
                                     ensure!(expected == account, "账号已改变");
+                                    encoding.validate()?;
+                                    if let Some(device)=&audio_device {device.validate()?;}
                                     current.host.set_encoding_settings(encoding)?;
+                                    current.host.set_audio_device(audio_device)?;
+                                    current.host.set_audio_defaults(audio_defaults)?;
+                                    current.host.set_audio_quality(audio_quality)?;
                                     current.host.set_allowed(allowed);
                                     current.host.persist_settings().await;
                                     if let Some(error) = current.host.status().settings_error {

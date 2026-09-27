@@ -216,12 +216,14 @@ impl Controller {
         bytes: usize,
         pacing: PacedPacketInfo,
         burst: Option<u64>,
+        audio: bool,
     ) {
         let now = self.now();
         if let Some(group) = burst {
             self.burst.sent(group, sequence, bytes, now.us());
         }
         let sent = SentPacket {
+            audio,
             send_time: now,
             size: DataSize::from_bytes(bytes as i64),
             pacing_info: pacing,

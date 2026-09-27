@@ -71,10 +71,8 @@ enum Commands {
         allow_sas: bool,
         #[arg(long)]
         owner: Option<String>,
-        #[arg(long)]
-        remove_display_driver: bool,
-        #[arg(long)]
-        remove_data: bool,
+        #[command(flatten)]
+        removal: openuuyc::application::RemovalOptions,
     },
     #[command(hide = true)]
     DisplayRecovery { token: String },
@@ -185,8 +183,7 @@ fn main() -> Result<()> {
         operation,
         allow_sas,
         owner,
-        remove_display_driver,
-        remove_data,
+        removal,
     } = command
     {
         let reboot = openuuyc::application::component_operation(
@@ -194,11 +191,10 @@ fn main() -> Result<()> {
             operation,
             allow_sas,
             owner.as_deref(),
-            remove_display_driver,
-            remove_data,
+            removal,
         )?;
         drop(_logging);
-        if remove_data && !reboot {
+        if removal.remove_data && !reboot {
             openuuyc::application::purge_machine_data()?;
         }
         if reboot {

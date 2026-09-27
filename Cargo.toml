@@ -1,6 +1,6 @@
 [package]
 name = "openuuyc"
-version = "1.0.0-alpha.3"
+version = "1.0.0-alpha.4"
 edition = "2024"
 description = "Third-party Rust client for UU Remote protocol interoperability"
 license-file = "LICENSE"
@@ -15,7 +15,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1.0"
 async-trait = "0.1"
-bytemuck = { version = "1.25.2", features = ["derive"] }
+bytemuck = { version = "1.25.2", features = ["derive", "min_const_generics"] }
 base64 = "0.22.1"
 bytes = "1.11.1"
 crossbeam-queue = "0.3.14"
@@ -23,7 +23,7 @@ cpal = "0.18.2"
 clap = { version = "4.6.7", features = ["derive"] }
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 dunce = "1.0"
-egui = { version = "0.36.1", default-features = false, features = ["bytemuck", "default_fonts"] }
+egui = { version = "0.36.1", default-features = false, features = ["bytemuck"] }
 flate2 = "1.1.10"
 futures-util = "0.3.34"
 goog_cc = { path = "vendor/goog_cc" }
@@ -64,6 +64,8 @@ object = { version = "0.37.3", default-features = false, features = ["read_core"
 [build-dependencies]
 cc = "1.2"
 embed-resource = "3.0.11"
+epaint_default_fonts = "=0.36.1"
+flate2 = "1.1.10"
 
 [target.'cfg(windows)'.dependencies]
 # Required by the generated code of #[windows::core::implement].
@@ -81,6 +83,7 @@ windows = { version = "0.62.2", default-features = false, features = [
     "Win32_Devices_DeviceAndDriverInstallation",
     "Win32_System_IO",
     "Win32_Foundation",
+    "Win32_Media_Audio",
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Direct3D12",
@@ -118,6 +121,7 @@ windows = { version = "0.62.2", default-features = false, features = [
     "Win32_Security_Cryptography",
     "Win32_UI_Input_Ime",
     "Win32_UI_Shell",
+    "Win32_UI_Shell_PropertiesSystem",
     "Win32_UI_WindowsAndMessaging",
 ] }
 
@@ -136,13 +140,32 @@ webrtc-util = { path = "vendor/webrtc-util" }
 # speed settings. Cross-crate LTO changed hot-code layout in decoder comparisons.
 opt-level = 3
 lto = false
-codegen-units = 16
+# One unit avoids repeated async state machines and their unwind metadata.
+codegen-units = 1
 strip = "debuginfo"
 # Decoder workers rely on unwinding to contain failures and release resources.
 panic = "unwind"
 
 [profile.release.package.openuuyc]
 # Optimize application glue for size without changing decoder/DSP dependencies.
+opt-level = "s"
+
+# Preserve the validated code generation of the video/SIMD kernels.
+[profile.release.package.openuuyc-h264]
+codegen-units = 16
+
+[profile.release.package.yuv]
+codegen-units = 16
+
+# Startup, HTTP management and certificate parsing are outside the media path.
+# Keep the real-time transport, crypto, rendering and codecs at level 3.
+[profile.release.package.reqwest]
+opt-level = "s"
+
+[profile.release.package.clap_builder]
+opt-level = "s"
+
+[profile.release.package.x509-parser]
 opt-level = "s"
 
 [profile.dev.package.yuv]

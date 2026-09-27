@@ -17,14 +17,20 @@ try {
     if ((Get-Date) -lt $certificate.NotBefore -or (Get-Date) -gt $certificate.NotAfter) {
         throw 'The driver certificate is outside its validity period.'
     }
-    foreach ($kind in @('input', 'display')) {
-        $name = if ($kind -eq 'input') { 'OpenUUYCInput' } else { 'OpenUUYCDisplay' }
+    foreach ($kind in @('input', 'display', 'audio')) {
+        $name = switch ($kind) { 'input' { 'OpenUUYCInput' } 'display' { 'OpenUUYCDisplay' } 'audio' { 'OpenUUYCAudio' } }
         $package = Join-Path $assets $kind
         $inf = Join-Path $package "$name.inf"
-        $dll = Join-Path $package "$name.dll"
+        $extension = if ($kind -eq 'audio') { 'sys' } else { 'dll' }
+        $dll = Join-Path $package "$name.$extension"
         $catalog = Join-Path $package "$name.cat"
         $sourceInf = Join-Path $PSScriptRoot "$kind/$name.inf"
-        if ((Get-FileHash -LiteralPath $sourceInf).Hash -ne (Get-FileHash -LiteralPath $inf).Hash) {
+        $infMatches = if ($kind -eq 'audio') {
+            [IO.File]::ReadAllText($sourceInf, [Text.Encoding]::UTF8) -ceq [IO.File]::ReadAllText($inf, [Text.Encoding]::Unicode)
+        } else {
+            (Get-FileHash -LiteralPath $sourceInf).Hash -eq (Get-FileHash -LiteralPath $inf).Hash
+        }
+        if (!$infMatches) {
             throw "$kind driver source INF differs from the staged package."
         }
         foreach ($file in @($dll, $catalog)) {

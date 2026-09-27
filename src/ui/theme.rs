@@ -88,6 +88,7 @@ pub const DIAGNOSTICS_GAP: f32 = 10.0;
 pub const DIAGNOSTICS_ACTION_WIDTH: f32 = 112.0;
 pub const MENU_HEIGHT: f32 = 28.0;
 pub const MENU_GROUP_GAP: f32 = 8.0;
+pub const AUDIO_MENU_WIDTH: f32 = 320.0;
 pub const SHORTCUT_ROW_HEIGHT: f32 = 56.0;
 pub const SHORTCUT_LABEL_WIDTH: f32 = 184.0;
 pub const PERFORMANCE_WIDTH: f32 = 540.0;

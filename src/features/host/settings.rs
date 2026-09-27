@@ -1,4 +1,4 @@
-//! Persistent access policy, isolated by account and this registered device.
+//! Persistent controlled-device settings, isolated by account and registered device.
 use crate::account::auth::SecretEntry as Entry;
 use anyhow::{Result, bail, ensure};
 use keyring::Error;
@@ -14,6 +14,12 @@ struct Record {
     allow_control: bool,
     #[serde(default)]
     encoding: super::EncodingSettings,
+    #[serde(default)]
+    audio_device: Option<super::audio::Device>,
+    #[serde(default)]
+    audio_defaults: super::audio::DefaultDevices,
+    #[serde(default)]
+    audio_quality: crate::media::audio::encoder::Quality,
 }
 
 impl Store {
@@ -31,25 +37,65 @@ impl Store {
             Entry::new(&service, device).map_err(|_| anyhow::anyhow!("被控设置存储不可用"))?,
         )))
     }
-    pub fn load(&self) -> Result<(bool, super::EncodingSettings)> {
+    pub fn load(
+        &self,
+    ) -> Result<(
+        bool,
+        super::EncodingSettings,
+        Option<super::audio::Device>,
+        super::audio::DefaultDevices,
+        crate::media::audio::encoder::Quality,
+    )> {
         let bytes = match self.0.get_secret() {
             Ok(bytes) => bytes,
-            Err(Error::NoEntry) => return Ok((false, Default::default())),
+            Err(Error::NoEntry) => {
+                return Ok((
+                    false,
+                    Default::default(),
+                    None,
+                    Default::default(),
+                    Default::default(),
+                ));
+            }
             Err(_) => bail!("无法读取被控设置"),
         };
         let record: Record =
             serde_json::from_slice(&bytes).map_err(|_| anyhow::anyhow!("已保存的被控设置无效"))?;
         ensure!(record.schema == 1, "不支持的被控设置格式");
         record.encoding.validate()?;
-        Ok((record.allow_control, record.encoding))
+        let audio_quality = record.audio_quality.restore()?;
+        if let Some(device) = &record.audio_device {
+            device.validate()?;
+        }
+        Ok((
+            record.allow_control,
+            record.encoding,
+            record.audio_device,
+            record.audio_defaults,
+            audio_quality,
+        ))
     }
-    pub fn save(&self, allowed: bool, encoding: super::EncodingSettings) -> Result<()> {
+    pub fn save(
+        &self,
+        allowed: bool,
+        encoding: super::EncodingSettings,
+        audio_device: Option<super::audio::Device>,
+        audio_defaults: super::audio::DefaultDevices,
+        audio_quality: crate::media::audio::encoder::Quality,
+    ) -> Result<()> {
         encoding.validate()?;
+        audio_quality.validate()?;
+        if let Some(device) = &audio_device {
+            device.validate()?;
+        }
         self.0
             .set_secret(&serde_json::to_vec(&Record {
                 schema: 1,
                 allow_control: allowed,
                 encoding,
+                audio_device,
+                audio_defaults,
+                audio_quality,
             })?)
             .map_err(|_| anyhow::anyhow!("无法保存被控设置"))
     }
