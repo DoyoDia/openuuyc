@@ -23,6 +23,7 @@ pub(crate) struct Client {
     dxgi: bool,
     pub cursor: Option<crate::platform::windows::cursor_shape::Snapshot>,
     surface: Option<Surface>,
+    offer_surface: bool,
     pool: Vec<(ID3D11Texture2D, Arc<()>)>,
     pool_layout: Option<Layout>,
 }
@@ -64,6 +65,7 @@ impl Client {
             dxgi: reply.dxgi,
             cursor: reply.pointer,
             surface: None,
+            offer_surface: false,
             pool: Vec::new(),
             pool_layout: None,
         }))
@@ -79,8 +81,12 @@ impl Client {
         hdr: bool,
         maximum: (u32, u32),
     ) -> Result<Option<Frame>> {
-        let mut offered = None;
         for _ in 0..2 {
+            let offered = self
+                .surface
+                .as_ref()
+                .filter(|_| self.offer_surface)
+                .map(|s| s.handle.0.0 as usize as u64);
             self.pipe.send(
                 &Request::Next {
                     timeout,
@@ -110,6 +116,7 @@ impl Client {
             if self.screen.adapter != reply.screen.adapter {
                 (self.device, self.context) = capture::create_device(reply.screen.adapter)?;
                 self.surface = None;
+                self.offer_surface = false;
             }
             self.screen = reply.screen;
             self.generation = reply.generation;
@@ -122,12 +129,13 @@ impl Client {
                     "采集纹理适配器不匹配"
                 );
                 self.surface = Some(Surface::new(&self.device, layout)?);
-                offered = Some(self.surface.as_ref().unwrap().handle.0.0 as usize as u64);
+                self.offer_surface = true;
                 continue;
             }
             if !reply.frame {
                 return Ok(None);
             }
+            self.offer_surface = false;
             let source = self
                 .surface
                 .as_ref()
@@ -157,6 +165,17 @@ impl Client {
             };
             let (texture, storage) = &self.pool[index];
             let guard = source.acquire(1)?;
+            if guard.is_none() {
+                let layout = source.layout;
+                drop(guard);
+                self.surface = Some(Surface::new(&self.device, layout)?);
+                self.offer_surface = true;
+                // Discard this unconsumed frame. The next request explicitly
+                // replaces the producer's surface; do not extend GPU waits or
+                // reopen the capture source/encoder for a transient stall.
+                return Ok(None);
+            }
+            let guard = guard.unwrap();
             unsafe {
                 self.context.CopyResource(texture, &source.texture);
                 self.context.Flush();
@@ -176,7 +195,9 @@ impl Client {
                 _storage: Some(storage.clone()),
             }));
         }
-        anyhow::bail!("采集纹理配置连续变化")
+        // Keep the new handle pending across calls if the source changed again
+        // during negotiation. The capture worker already paces subsequent calls.
+        Ok(None)
     }
 }
 impl Drop for Client {

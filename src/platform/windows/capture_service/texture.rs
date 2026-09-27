@@ -120,35 +120,42 @@ impl Surface {
             layout,
         })
     }
-    pub fn acquire(&self, key: u64) -> Result<Guard<'_>> {
+    pub fn acquire(&self, key: u64) -> Result<Option<Guard<'_>>> {
         let status =
             unsafe { (Interface::vtable(&self.sync).AcquireSync)(self.sync.as_raw(), key, 100) };
+        // These are nonnegative HRESULTs, but neither grants usable ownership.
+        // Renegotiate the shared surface instead of ending the video session.
+        if status.0 == WAIT_TIMEOUT.0 as i32 || status.0 == WAIT_ABANDONED.0 as i32 {
+            tracing::debug!(?status, "capture shared surface needs replacement");
+            return Ok(None);
+        }
         ensure!(
             status == windows::core::HRESULT(0),
             "共享采集同步失败：{status:?}"
         );
-        Ok(Guard {
+        Ok(Some(Guard {
             sync: &self.sync,
-            release: key,
-        })
+            release: Some(key),
+        }))
     }
 }
 pub(super) struct Guard<'a> {
     sync: &'a IDXGIKeyedMutex,
-    release: u64,
+    release: Option<u64>,
 }
 impl Guard<'_> {
     pub fn release(mut self, key: u64) -> Result<()> {
-        self.release = key;
+        self.release = None;
         unsafe {
             self.sync.ReleaseSync(key)?;
         }
-        std::mem::forget(self);
         Ok(())
     }
 }
 impl Drop for Guard<'_> {
     fn drop(&mut self) {
-        let _ = unsafe { self.sync.ReleaseSync(self.release) };
+        if let Some(key) = self.release.take() {
+            let _ = unsafe { self.sync.ReleaseSync(key) };
+        }
     }
 }

@@ -492,6 +492,7 @@ struct Duplication {
     pub device: ID3D11Device,
     context: ID3D11DeviceContext,
     duplication: IDXGIOutputDuplication,
+    frame_acquired: bool,
     rotation: DXGI_MODE_ROTATION,
     pub screen: Screen,
     converter: super::preprocess::Converter,
@@ -569,6 +570,7 @@ impl Duplication {
                 device,
                 context: context.context("未创建采集上下文")?,
                 duplication,
+                frame_acquired: false,
                 rotation,
                 screen,
                 converter,
@@ -598,11 +600,17 @@ impl Duplication {
         unsafe {
             let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
             let mut resource = None;
+            // Keep ownership while the consumer encodes and waits for its next
+            // capture tick. Otherwise DXGI copies every desktop update during
+            // that interval, including game presents we will never transmit.
+            // Release immediately before acquiring, as required for efficient
+            // desktop duplication (IDXGIOutputDuplication::ReleaseFrame).
+            self.release_frame()?;
             match self
                 .duplication
                 .AcquireNextFrame(timeout_ms.min(50), &mut info, &mut resource)
             {
-                Ok(()) => {}
+                Ok(()) => self.frame_acquired = true,
                 Err(error) if error.code() == DXGI_ERROR_WAIT_TIMEOUT => {
                     // A quality change must also work on a completely static desktop.
                     if self.quality != Some(request) || self.cursor_capture != cursor_capture {
@@ -641,7 +649,9 @@ impl Duplication {
                 }
                 Err(error) => return Err(error).context("桌面采集失效，需要重建所选屏幕采集"),
             }
-            // Always release the acquired frame, including conversion and allocation errors.
+            // Conversion copies into our own texture; no borrowed duplication
+            // surface escapes this call. Successful acquisition stays owned
+            // until the next call, errors and Drop release it immediately.
             let captured = std::time::Instant::now();
             let result = (|| -> Result<Option<Frame>> {
                 self.cursor.update(&self.device, &self.duplication, &info)?;
@@ -694,10 +704,23 @@ impl Duplication {
                     hdr_metadata: if hdr { self.source_hdr } else { None },
                 }))
             })();
-            let released = self.duplication.ReleaseFrame();
-            let result = result?;
-            released.context("释放采集帧失败")?;
-            Ok(result)
+            if result.is_err() {
+                let _ = self.release_frame();
+            }
+            result
         }
+    }
+
+    fn release_frame(&mut self) -> Result<()> {
+        if std::mem::take(&mut self.frame_acquired) {
+            unsafe { self.duplication.ReleaseFrame() }.context("释放采集帧失败")?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Duplication {
+    fn drop(&mut self) {
+        let _ = self.release_frame();
     }
 }

@@ -12,7 +12,7 @@ OpenUUYC 是用 Rust 编写的 UU 远程第三方 Windows 客户端。使用已�
 
 从 [Releases](https://github.com/djkcyl/openuuyc/releases) 下载 Windows x64 客户端，双击运行，扫码或短信登录后选择设备连接。主控端支持连接 UU 官方客户端；本机被控功能见下文。
 
-最新稳定版为 [v0.7.0](https://github.com/djkcyl/openuuyc/releases/tag/v0.7.0)。[v1.0.0-alpha.4 预发布](https://github.com/djkcyl/openuuyc/releases/tag/v1.0.0-alpha.4)提供正在开发的本机被控能力。
+最新稳定版为 [v0.7.0](https://github.com/djkcyl/openuuyc/releases/tag/v0.7.0)。[v1.0.0-alpha.5 预发布](https://github.com/djkcyl/openuuyc/releases/tag/v1.0.0-alpha.5)提供正在开发的本机被控能力。
 
 ## 能力表
 

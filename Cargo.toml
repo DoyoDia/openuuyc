@@ -1,6 +1,6 @@
 [package]
 name = "openuuyc"
-version = "1.0.0-alpha.4"
+version = "1.0.0-alpha.5"
 edition = "2024"
 description = "Third-party Rust client for UU Remote protocol interoperability"
 license-file = "LICENSE"
