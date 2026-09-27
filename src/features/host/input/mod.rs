@@ -38,6 +38,8 @@ struct Gate {
     binding: u64,
     generation: u64,
     faulted: bool,
+    /// Why the last input was dropped, logged when it changes.
+    refused: Option<&'static str>,
 }
 struct Shared {
     gate: Mutex<Gate>,
@@ -202,11 +204,27 @@ impl Receiver {
     }
     fn enqueue(&self, stream: Option<u16>, event: wire::Event) {
         let mut gate = lock(&self.shared.gate);
-        if gate.stream.is_none()
-            || stream.is_some_and(|id| gate.stream != Some(id))
-            || gate.faulted
-            || !self.shared.permitted()
-        {
+        let refused = if gate.stream.is_none() {
+            Some("no input channel bound")
+        } else if stream.is_some_and(|id| gate.stream != Some(id)) {
+            Some("input on an unbound channel")
+        } else if gate.faulted {
+            Some("input generation faulted")
+        } else if !self.shared.permitted() {
+            Some("input not permitted")
+        } else {
+            None
+        };
+        if gate.refused != refused {
+            gate.refused = refused;
+            match refused {
+                Some(reason) => {
+                    tracing::warn!(reason, ?stream, bound = ?gate.stream, "host input dropped")
+                }
+                None => tracing::debug!(?stream, "host input accepted"),
+            }
+        }
+        if refused.is_some() {
             return;
         }
         let item = Envelope {
@@ -240,6 +258,7 @@ fn run(shared: Arc<Shared>, rx: mpsc::Receiver<Envelope>) {
     let mut attempts = 0u8;
     let mut prepare_at = std::time::Instant::now();
     let mut configuration = shared.configuration.subscribe();
+    let mut skipped = None;
     while !shared.cancel.is_cancelled() && shared.lease.requested() {
         let (current, current_binding) = {
             let gate = lock(&shared.gate);
@@ -334,10 +353,24 @@ fn run(shared: Arc<Shared>, rx: mpsc::Receiver<Envelope>) {
             }
         }
         if let Some(item) = item {
-            if generation != Some(item.generation)
-                || !shared.permitted()
-                || item.geometry != (shared.geometry)()
-            {
+            let stale = if generation != Some(item.generation) {
+                Some("stale input generation")
+            } else if !shared.permitted() {
+                Some("input not permitted")
+            } else if item.geometry != (shared.geometry)() {
+                Some("screen layout changed")
+            } else if engine.is_none() {
+                Some("no input backend")
+            } else {
+                None
+            };
+            if stale != skipped {
+                skipped = stale;
+                if let Some(reason) = stale {
+                    tracing::warn!(reason, "host input skipped");
+                }
+            }
+            if stale.is_some() {
                 continue;
             }
             let Some(engine) = engine.as_mut() else {

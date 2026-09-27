@@ -525,6 +525,18 @@ impl Lease {
     }
     pub(crate) fn input_status(&self, backend: Option<&str>, error: Option<String>) {
         self.modify(|state| {
+            // Input failures otherwise only change a status field; record each
+            // transition so a controller that "cannot move anything" can be
+            // explained from the log.
+            if state.status.input_backend.as_deref() != backend {
+                tracing::info!(backend, "host input backend");
+            }
+            if state.status.input_error != error {
+                match &error {
+                    Some(error) => tracing::warn!(backend, %error, "host input failed"),
+                    None => tracing::info!(backend, "host input recovered"),
+                }
+            }
             state.status.input_backend = backend.map(str::to_owned);
             state.status.input_error = error;
         });

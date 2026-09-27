@@ -474,7 +474,10 @@ mod session_tests {
         assert_eq!(injector.pointer().unwrap(), (123, 234));
         injector.move_by(10, -4).unwrap();
         assert_eq!(injector.pointer().unwrap(), (133, 230));
-        println!("caps lock on: {}", injector.toggled(super::Lock::Caps).unwrap());
+        println!(
+            "caps lock on: {}",
+            injector.toggled(super::Lock::Caps).unwrap()
+        );
         println!("foreground pid: {:?}", injector.foreground());
         injector.move_to(before.0, before.1).unwrap();
         injector.flush().unwrap();
