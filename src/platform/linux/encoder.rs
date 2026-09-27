@@ -1,11 +1,11 @@
-//! Linux host encoding: the Rust H.264 core fed with captured BGRA.
-//!
-//! VA-API encoding would need the captured pixels uploaded to a VA surface
-//! first; until that exists the software core is the only encoder offered, and
-//! the probe proves it on the selected desktop like the Windows candidates.
-use super::capture::{Desktop, Device};
+//! Linux host encoding: NVENC on the GPU driving the display when the driver
+//! offers it, the Rust H.264 core otherwise. As on Windows, hardware comes
+//! first and every candidate is proven on the selected desktop by encoding a
+//! frame and checking the SPS it produced.
+use super::capture::{Desktop, Device, Image};
+use super::cuda;
 use crate::media::encoding::software::{Encoder as SoftwareEncoder, MAXIMUM};
-use crate::media::encoding::{Backend, Capability, Format, Rate};
+use crate::media::encoding::{Backend, Capability, Codec, Format, Rate};
 use anyhow::{Context, Result, bail, ensure};
 
 pub(crate) use crate::media::encoding::{Encoded, FrameTiming};
@@ -25,35 +25,85 @@ pub(crate) fn probe(
         }
     }
     let frame = frame.context("尚未取得所选桌面画面")?;
-    let mut encoder = Encoder::software(&desktop.device, frame.width, frame.height, 30, 2_000_000)?;
-    let output = encoder
-        .encode(&frame.image, 0, true)?
-        .iter()
-        .find_map(|encoded| {
-            crate::media::video_format::parse_annex_b_format(
-                Format::AVC.codec.media(),
-                &encoded.data,
-            )
-        })
-        .context("编码器未输出可验证的SPS")?;
-    ensure!(
-        output.chroma_format_idc == Format::AVC.chroma
-            && output.bit_depth_luma == Format::AVC.depth
-            && output.bit_depth_chroma == Format::AVC.depth
-            && (output.visible_width, output.visible_height) == (frame.width, frame.height),
-        "编码器实际码流与请求格式不一致"
-    );
-    let capability = Capability {
-        adapter: desktop.screen.adapter,
-        backend: Backend::Software,
-        format: Format::AVC,
-        maximum: encoder.maximum_size(),
+    let mut candidates = Vec::new();
+    if crate::media::encoding::nvenc::Api::load().is_ok() {
+        for codec in [Codec::H264, Codec::H265] {
+            for chroma in [1, 3] {
+                let format = Format {
+                    codec,
+                    chroma,
+                    depth: 8,
+                };
+                if Backend::Nvidia.accepts(format) {
+                    candidates.push((Backend::Nvidia, format));
+                }
+            }
+        }
+    }
+    candidates.push((Backend::Software, Format::AVC));
+    let rate = Rate {
+        target: 2_000_000,
+        peak: 2_000_000,
+        fps: 30,
+        quality: 1,
     };
-    tracing::debug!(?capability, "host encoder capability verified from SPS");
-    Ok(vec![capability])
+    let mut result = Vec::new();
+    for (backend, format) in candidates {
+        if !is_active() {
+            bail!("被控准备已取消");
+        }
+        let probe = (|| -> Result<Capability> {
+            let size = (frame.width, frame.height);
+            let mut encoder = if backend == Backend::Software {
+                Encoder::software(&desktop.device, size.0, size.1, 30, rate.target)?
+            } else {
+                Encoder::hardware_format(&desktop.device, size, format, rate)?
+            };
+            let mut output = None;
+            for index in 0..20 {
+                output = encoder
+                    .encode(&frame.image, index * 333_333, true)?
+                    .iter()
+                    .find_map(|encoded| {
+                        crate::media::video_format::parse_annex_b_format(
+                            format.codec.media(),
+                            &encoded.data,
+                        )
+                    });
+                if output.is_some() {
+                    break;
+                }
+            }
+            let output = output.context("编码器未输出可验证的SPS")?;
+            ensure!(
+                output.chroma_format_idc == format.chroma
+                    && output.bit_depth_luma == format.depth
+                    && output.bit_depth_chroma == format.depth
+                    && (output.visible_width, output.visible_height) == size,
+                "编码器实际码流与请求格式不一致"
+            );
+            Ok(Capability {
+                adapter: desktop.screen.adapter,
+                backend,
+                format,
+                maximum: encoder.maximum_size(),
+            })
+        })();
+        match probe {
+            Ok(capability) => {
+                tracing::debug!(?capability, "host encoder capability verified from SPS");
+                result.push(capability);
+            }
+            Err(error) => {
+                tracing::debug!(?backend, ?format, %error, "host encoder capability rejected")
+            }
+        }
+    }
+    ensure!(!result.is_empty(), "所选桌面没有可用的视频编码器");
+    Ok(result)
 }
 
-/// Per-thread encoder runtime. The software core needs no setup.
+/// Per-thread encoder runtime. Neither encoder needs setup.
 pub(crate) struct Runtime;
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
@@ -64,16 +114,25 @@ impl Runtime {
     }
 }
 
-pub(crate) struct Encoder(SoftwareEncoder);
+pub(crate) enum Encoder {
+    Nvidia(super::nvenc::Encoder),
+    Software(SoftwareEncoder),
+}
 impl Encoder {
     pub(crate) fn hardware_format(
         _device: &Device,
-        _size: (u32, u32),
-        _format: Format,
-        _rate: Rate,
+        size: (u32, u32),
+        format: Format,
+        rate: Rate,
     ) -> Result<Self> {
-        // The probe never offers a hardware candidate on Linux.
-        bail!("Linux 被控端没有硬件编码器")
+        ensure!(
+            super::nvenc::Encoder::accepts(format),
+            "NVENC 的 CUDA 输入不支持该格式"
+        );
+        let context = cuda::display_context()?;
+        Ok(Self::Nvidia(super::nvenc::Encoder::new(
+            &context, size, format, rate,
+        )?))
     }
     pub(crate) fn software(
         _device: &Device,
@@ -82,26 +141,45 @@ impl Encoder {
         fps: u32,
         bitrate: u32,
     ) -> Result<Self> {
-        Ok(Self(SoftwareEncoder::new(width, height, fps, bitrate)?))
+        Ok(Self::Software(SoftwareEncoder::new(
+            width, height, fps, bitrate,
+        )?))
     }
     pub(crate) fn implementation(&self) -> i32 {
-        5
+        match self {
+            Self::Nvidia(_) => Backend::Nvidia.implementation(),
+            Self::Software(_) => Backend::Software.implementation(),
+        }
     }
     pub(crate) fn maximum_size(&self) -> (u32, u32) {
-        MAXIMUM
+        match self {
+            Self::Nvidia(encoder) => encoder.maximum_size(),
+            Self::Software(_) => MAXIMUM,
+        }
     }
     pub(crate) fn configure_rate(&mut self, rate: Rate) -> Result<bool> {
-        self.0.configure(rate)
+        match self {
+            Self::Nvidia(encoder) => encoder.configure_rate(rate),
+            Self::Software(encoder) => encoder.configure(rate),
+        }
     }
     pub(crate) fn encode(
         &mut self,
-        image: &[u8],
+        image: &Image,
         timestamp: i64,
         keyframe: bool,
     ) -> Result<Vec<Encoded>> {
-        let expected = self.0.width as usize * self.0.height as usize * 4;
-        ensure!(image.len() == expected, "采集画面尺寸与编码器不一致");
-        self.0.encode(image, timestamp, keyframe)
+        match self {
+            Self::Nvidia(encoder) => encoder.encode(image, timestamp, keyframe),
+            Self::Software(encoder) => {
+                let (width, height) = image.size();
+                ensure!(
+                    (width, height) == (encoder.width, encoder.height),
+                    "采集画面尺寸与编码器不一致"
+                );
+                encoder.encode(&image.pixels()?, timestamp, keyframe)
+            }
+        }
     }
 }
 
@@ -113,22 +191,67 @@ mod tests {
     fn probe_captures_and_encodes_the_desktop() {
         let screens = super::super::capture::screens().unwrap();
         println!("{screens:#?}");
-        let targets = super::super::display::topology::Topology::query(false)
-            .unwrap()
-            .targets()
-            .unwrap();
-        println!("{targets:#?}");
         let mut desktop = super::Desktop::open_selected(&screens[0]).unwrap();
         println!("backend {}", desktop.backend_name());
         let started = std::time::Instant::now();
         let caps = super::probe(&mut desktop, || true).unwrap();
-        println!("{caps:?} in {:?}", started.elapsed());
+        for cap in &caps {
+            println!("{cap:?}");
+        }
+        println!("probed in {:?}", started.elapsed());
+    }
+}
+
+#[cfg(test)]
+mod throughput_tests {
+    /// Needs a desktop and an NVIDIA GPU: capture and encode at full size.
+    #[test]
+    #[ignore]
+    fn capture_and_encode_throughput() {
+        use crate::media::encoding::{Format, Rate};
+        let screens = super::super::capture::screens().unwrap();
+        let mut desktop = super::Desktop::open_selected(&screens[0]).unwrap();
+        let size = (screens[0].width & !1, screens[0].height & !1);
+        let rate = Rate {
+            target: 20_000_000,
+            peak: 20_000_000,
+            fps: 60,
+            quality: 4,
+        };
+        let mut encoder =
+            super::Encoder::hardware_format(&desktop.device, size, Format::AVC, rate).unwrap();
         let started = std::time::Instant::now();
-        let frame = desktop.next(100, 4, true, false, (3840, 2160)).unwrap();
+        let (mut frames, mut capture, mut encode, mut bytes) = (
+            0u32,
+            std::time::Duration::ZERO,
+            std::time::Duration::ZERO,
+            0usize,
+        );
+        let mut cached = None;
+        while started.elapsed() < std::time::Duration::from_secs(3) {
+            let t = std::time::Instant::now();
+            if let Some(frame) = desktop.next(16, 4, false, false, (3840, 2160)).unwrap() {
+                cached = Some(frame);
+            }
+            capture += t.elapsed();
+            let Some(frame) = &cached else { continue };
+            let t = std::time::Instant::now();
+            for out in encoder
+                .encode(&frame.image, i64::from(frames) * 166_666, frames == 0)
+                .unwrap()
+            {
+                bytes += out.data.len();
+            }
+            encode += t.elapsed();
+            frames += 1;
+        }
         println!(
-            "full frame {:?} in {:?}",
-            frame.as_ref().map(|f| (f.width, f.height)),
-            started.elapsed()
+            "{}: {frames} frames in 3s ({:.0} fps), capture {:.2} ms/frame, encode {:.2} ms/frame, {} KiB",
+            desktop.backend_name(),
+            f64::from(frames) / 3.0,
+            capture.as_secs_f64() * 1000.0 / f64::from(frames.max(1)),
+            encode.as_secs_f64() * 1000.0 / f64::from(frames.max(1)),
+            bytes / 1024
         );
     }
 }

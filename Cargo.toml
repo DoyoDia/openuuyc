@@ -27,6 +27,8 @@ egui = { version = "0.36.1", default-features = false, features = ["bytemuck", "
 flate2 = "1.1.10"
 futures-util = "0.3.34"
 goog_cc = { path = "vendor/goog_cc" }
+# NVENC hardware encoding for the host role (driver library loaded at run time).
+openuuyc-nvenc-sys = { path = "vendor/nvenc-sys" }
 hmac = "0.12.1"
 hyper = { version = "1.11.1", default-features = false }
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "bmp", "tiff"] }
@@ -72,7 +74,6 @@ embed-resource = "3.0.11"
 [target.'cfg(windows)'.dependencies]
 # Required by the generated code of #[windows::core::implement].
 windows-core = "0.62.2"
-openuuyc-nvenc-sys = { path = "vendor/nvenc-sys" }
 # The host role's Intel VPL and AMD AMF encoders beside NVENC.
 openuuyc-amf-sys = { path = "vendor/amf-sys" }
 openuuyc-vpl-sys = { path = "vendor/vpl-sys" }
@@ -135,9 +136,11 @@ libc = "0.2"
 fuser = { version = "0.15", default-features = false }
 x11rb = { version = "0.13", features = ["randr", "shm", "xfixes", "xtest"] }
 # Notification-area icon (StatusNotifierItem), the counterpart of the Windows tray.
-ksni = { version = "0.3.6", features = ["blocking"] }
+# zbus must stay on async-io: its tokio feature is global, and makes the
+# blocking Secret Service calls of the keyring panic inside our runtime.
+ksni = { version = "0.3.6", default-features = false, features = ["blocking", "async-io"] }
 # Host capture through the XDG ScreenCast portal (Wayland, and X11 on request).
-ashpd = { version = "0.13.13", default-features = false, features = ["tokio", "screencast"] }
+ashpd = { version = "0.13.13", default-features = false, features = ["async-io", "screencast"] }
 pollster = "0.4"
 
 [patch.crates-io]

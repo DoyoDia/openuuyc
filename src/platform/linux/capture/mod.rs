@@ -1,16 +1,19 @@
 //! Screen capture for the host role, with backends tried in order of
 //! preference the way Sunshine picks its capture method.
 //!
+//! - NVIDIA NvFBC into CUDA (`nvfbc`): Xorg on NVIDIA, only while NVENC works,
+//!   so frames go from the display to the encoder without leaving the GPU.
 //! - X11 MIT-SHM (`x11`): Xorg sessions; no setup, no consent prompt.
 //! - XDG ScreenCast portal + PipeWire (`portal`): Wayland sessions, and any
 //!   desktop whose portal offers it; asks the local user once.
 //!
-//! On Xorg X11 comes first, on Wayland only the portal can see the desktop.
-//! `OPENUUYC_CAPTURE` (for example `portal` or `x11,portal`) overrides the
-//! order. Later backends (KMS, NvFBC, wlroots) slot into the same list.
+//! Sunshine puts KMS first; on this driver stack it finds no scanout buffer
+//! under Xorg (the NVIDIA X driver bypasses KMS), so it is not in the list
+//! yet. On Wayland only the portal can see the desktop. `OPENUUYC_CAPTURE`
+//! (for example `portal` or `nvfbc,x11`) overrides the order.
 //!
-//! Frames leave as BGRA in CPU memory: there is no GPU surface shared with the
-//! encoder here, so nothing pretends to be one.
+//! Frames are BGRA, in system memory or, from NvFBC, in CUDA device memory.
+mod nvfbc;
 mod pipewire;
 mod portal;
 mod x11;
@@ -59,13 +62,40 @@ pub(crate) fn session_locked() -> Option<bool> {
     None
 }
 
+/// A captured picture's BGRA pixels, wherever the capture left them.
+#[derive(Clone)]
+pub(crate) enum Image {
+    /// Tightly packed, `width * height * 4` bytes.
+    Cpu {
+        pixels: Arc<Vec<u8>>,
+        width: u32,
+        height: u32,
+    },
+    /// A pitched CUDA allocation on the GPU driving the display.
+    Cuda(Arc<super::cuda::Buffer>),
+}
+impl Image {
+    pub fn size(&self) -> (u32, u32) {
+        match self {
+            Self::Cpu { width, height, .. } => (*width, *height),
+            Self::Cuda(buffer) => (buffer.width, buffer.height),
+        }
+    }
+    /// The pixels in system memory, read back from the GPU if need be.
+    pub fn pixels(&self) -> Result<std::borrow::Cow<'_, [u8]>> {
+        Ok(match self {
+            Self::Cpu { pixels, .. } => std::borrow::Cow::Borrowed(pixels.as_slice()),
+            Self::Cuda(buffer) => std::borrow::Cow::Owned(buffer.download()?),
+        })
+    }
+}
+
 /// One captured picture, already scaled to the size the encoder was asked for.
 #[derive(Clone)]
 pub(crate) struct Frame {
     pub width: u32,
     pub height: u32,
-    /// Tightly packed BGRA, `width * height * 4` bytes.
-    pub image: Arc<Vec<u8>>,
+    pub image: Image,
     pub captured: Instant,
     pub is_new: bool,
     pub hdr_metadata: Option<crate::media::video_color::HdrMetadata>,
@@ -123,12 +153,14 @@ pub(crate) fn refresh(selected: &Screen) -> Result<Screen> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
+    NvFbc,
     X11,
     Portal,
 }
 impl Kind {
     fn label(self) -> &'static str {
         match self {
+            Self::NvFbc => "NvFBC",
             Self::X11 => "X11",
             Self::Portal => "XDG 门户",
         }
@@ -141,6 +173,7 @@ fn candidates() -> Result<Vec<Kind>> {
         let kinds = order
             .split(',')
             .map(|name| match name.trim() {
+                "nvfbc" => Ok(Kind::NvFbc),
                 "x11" => Ok(Kind::X11),
                 "portal" => Ok(Kind::Portal),
                 other => bail!("OPENUUYC_CAPTURE 中有未知的采集方式：{other}"),
@@ -152,32 +185,36 @@ fn candidates() -> Result<Vec<Kind>> {
     Ok(if wayland_session() {
         vec![Kind::Portal]
     } else {
-        vec![Kind::X11, Kind::Portal]
+        vec![Kind::NvFbc, Kind::X11, Kind::Portal]
     })
 }
 
 enum Backend {
+    NvFbc(nvfbc::Grab),
     X11(x11::Grab),
     Portal(portal::Grab),
 }
 impl Backend {
-    fn open(kind: Kind, screen: &Screen, cursor: bool) -> Result<Self> {
+    /// `size` is the frame size for backends that scale while capturing.
+    fn open(kind: Kind, screen: &Screen, cursor: bool, size: (u32, u32)) -> Result<Self> {
         Ok(match kind {
+            Kind::NvFbc => Self::NvFbc(nvfbc::Grab::open(screen, cursor, size)?),
             Kind::X11 => Self::X11(x11::Grab::open(screen)?),
             Kind::Portal => Self::Portal(portal::Grab::open(screen, cursor)?),
         })
     }
     fn kind(&self) -> Kind {
         match self {
+            Self::NvFbc(_) => Kind::NvFbc,
             Self::X11(_) => Kind::X11,
             Self::Portal(_) => Kind::Portal,
         }
     }
     /// Open the first capture method that works for `screen`.
-    fn select(screen: &Screen, cursor: bool) -> Result<Self> {
+    fn select(screen: &Screen, cursor: bool, size: (u32, u32)) -> Result<Self> {
         let mut failures = Vec::new();
         for kind in candidates()? {
-            match Self::open(kind, screen, cursor) {
+            match Self::open(kind, screen, cursor, size) {
                 Ok(backend) => {
                     tracing::info!(
                         backend = backend.name(),
@@ -196,6 +233,7 @@ impl Backend {
     }
     fn name(&self) -> &'static str {
         match self {
+            Self::NvFbc(grab) => grab.name(),
             Self::X11(grab) => grab.name(),
             Self::Portal(grab) => grab.name(),
         }
@@ -212,6 +250,7 @@ pub(crate) struct Desktop {
     pub cursor: Option<super::cursor_shape::Snapshot>,
     sampler: super::cursor_shape::Sampler,
     backend: Backend,
+    /// The last system-memory picture, which X11 compares against.
     last: Option<Arc<Vec<u8>>>,
     last_size: (u32, u32),
     refreshed: Instant,
@@ -220,7 +259,8 @@ pub(crate) struct Desktop {
 impl Desktop {
     pub fn open_selected(selected: &Screen) -> Result<Self> {
         let screen = refresh(selected)?;
-        let backend = Backend::select(&screen, false)?;
+        let size = (screen.width & !1, screen.height & !1);
+        let backend = Backend::select(&screen, false, size)?;
         Ok(Self {
             device: Device,
             screen,
@@ -258,8 +298,9 @@ impl Desktop {
             self.refreshed = Instant::now();
             self.screen.display_name.clone_from(&current.display_name);
             if current != self.screen {
-                let backend = Backend::open(self.backend.kind(), &current, cursor)
-                    .or_else(|_| Backend::select(&current, cursor))?;
+                let size = output(current.width, current.height, quality, maximum);
+                let backend = Backend::open(self.backend.kind(), &current, cursor, size)
+                    .or_else(|_| Backend::select(&current, cursor, size))?;
                 self.backend = backend;
                 self.screen = current;
                 self.generation = self.generation.wrapping_add(1);
@@ -274,6 +315,14 @@ impl Desktop {
             self.backend = Backend::Portal(portal::Grab::open(&self.screen, cursor)?);
             self.last = None;
         }
+        // NvFBC scales and draws the cursor as it captures; both are fixed
+        // per session, so a different request opens a new one.
+        let wanted = output(self.screen.width, self.screen.height, quality, maximum);
+        if let Backend::NvFbc(grab) = &self.backend
+            && !grab.matches(cursor, wanted)
+        {
+            self.backend = Backend::NvFbc(nvfbc::Grab::open(&self.screen, cursor, wanted)?);
+        }
         self.cursor = match self.sampler.sample() {
             Ok(pointer) => Some(pointer),
             Err(error) => {
@@ -283,6 +332,26 @@ impl Desktop {
         };
         let deadline = Instant::now() + Duration::from_millis(u64::from(timeout));
         let result = match &mut self.backend {
+            // The driver waits for a new frame and delivers it on the GPU.
+            Backend::NvFbc(grab) => {
+                return match grab.next(timeout) {
+                    Ok(frame) => {
+                        self.available = true;
+                        Ok(frame.map(|buffer| Frame {
+                            width: buffer.width,
+                            height: buffer.height,
+                            image: Image::Cuda(buffer),
+                            captured: Instant::now(),
+                            is_new: true,
+                            hdr_metadata: None,
+                        }))
+                    }
+                    Err(error) => {
+                        self.available = false;
+                        Err(error)
+                    }
+                };
+            }
             Backend::X11(grab) => loop {
                 if let Err(error) = grab.grab(&self.screen, cursor) {
                     break Err(error);
@@ -324,7 +393,11 @@ impl Desktop {
                 Ok(Some(Frame {
                     width: size.0,
                     height: size.1,
-                    image,
+                    image: Image::Cpu {
+                        pixels: image,
+                        width: size.0,
+                        height: size.1,
+                    },
                     captured: Instant::now(),
                     is_new: true,
                     hdr_metadata: None,
