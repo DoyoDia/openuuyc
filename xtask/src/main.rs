@@ -83,13 +83,16 @@ fn main() -> Result<()> {
         "invalid staging directory"
     );
     let candidate = stage.path().join(&file_name);
+    let bundle = stage.path().join("OpenUUYC-bundle.exe");
+    fs::copy(&source, &bundle)?;
+    check_startup(&bundle, &root, &version)?;
     ensure!(
         command("upx")
-            // NRV preserves startup on current Windows builds where the LZMA
-            // image can pass UPX integrity checking but fail loader initialization.
-            .args(["--best", "-o"])
+            // D3D12.dll queries the EXE's D3D12SDKVersion export in DllMain,
+            // before UPX runs. Keep exports readable during loader initialization.
+            .args(["--best", "--compress-exports=0", "--overlay=copy", "-o"])
             .arg(&candidate)
-            .arg(&source)
+            .arg(&bundle)
             .status()
             .context("compress executable")?
             .success(),
@@ -99,7 +102,13 @@ fn main() -> Result<()> {
         command("upx").arg("-t").arg(&candidate).status()?.success(),
         "UPX integrity check failed"
     );
-    check_startup(&candidate, &root, &version)?;
+    if let Err(error) = check_startup(&candidate, &root, &version) {
+        eprintln!(
+            "Compressed image cannot start ({error}); using the verified uncompressed image."
+        );
+        fs::copy(&bundle, &candidate)?;
+        check_startup(&candidate, &root, &version)?;
+    }
     ensure!(
         file_hash(&source)? == original_hash,
         "original build changed during packaging"
@@ -246,13 +255,21 @@ fn file_hash(path: &Path) -> Result<Vec<u8>> {
 }
 
 fn check_startup(executable: &Path, root: &Path, version: &str) -> Result<()> {
-    let mut child = command(executable)
+    // This unattended probe must report the actual loader exit code rather than
+    // wait behind a Windows application-error dialog until our timeout expires.
+    #[cfg(windows)]
+    let previous_error_mode = unsafe { SetErrorMode(GetErrorMode() | 0x0001 | 0x0002) };
+    let spawned = command(executable)
         .arg("--version")
         .current_dir(root)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
-        .context("start release check")?;
+        .spawn();
+    #[cfg(windows)]
+    unsafe {
+        SetErrorMode(previous_error_mode);
+    }
+    let mut child = spawned.context("start release check")?;
     let mut stdout = child.stdout.take().context("missing check output pipe")?;
     let mut stderr = child.stderr.take().context("missing check error pipe")?;
     let output = thread::spawn(move || {
@@ -292,4 +309,11 @@ fn check_startup(executable: &Path, root: &Path, version: &str) -> Result<()> {
         String::from_utf8_lossy(&errors)
     );
     Ok(())
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetErrorMode() -> u32;
+    fn SetErrorMode(mode: u32) -> u32;
 }

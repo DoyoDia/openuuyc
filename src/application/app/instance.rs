@@ -4,19 +4,26 @@ use anyhow::Result;
 #[cfg(windows)]
 mod platform {
     use anyhow::{Context, Result};
-    use windows::{
-        Win32::{
-            Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND, LPARAM},
-            System::Threading::CreateMutexW,
-            UI::WindowsAndMessaging::{
-                EnumWindows, GetPropW, IsIconic, MB_ICONERROR, MB_OK, MB_SETFOREGROUND,
-                MessageBoxW, SW_RESTORE, SetForegroundWindow, SetPropW, ShowWindowAsync,
-            },
-        },
-        core::{BOOL, PCWSTR, w},
+    use windows::Win32::Foundation::{
+        CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND, LPARAM, LRESULT, WPARAM,
     };
+    use windows::Win32::System::Threading::CreateMutexW;
+    use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        AllowSetForegroundWindow, EnumWindows, GetPropW, GetWindowThreadProcessId, MB_ICONERROR,
+        MB_OK, MB_SETFOREGROUND, MessageBoxW, PostMessageW, RegisterWindowMessageW, RemovePropW,
+        SetPropW, WM_NCDESTROY,
+    };
+    use windows::core::{BOOL, PCWSTR, w};
 
     pub struct Instance(HANDLE);
+    const SHOW_SUBCLASS: usize = 0x4f554943;
+
+    fn show_message() -> u32 {
+        static MESSAGE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        *MESSAGE
+            .get_or_init(|| unsafe { RegisterWindowMessageW(w!("OpenUUYC.ControlCenter.Show.v1")) })
+    }
 
     impl Drop for Instance {
         fn drop(&mut self) {
@@ -41,7 +48,10 @@ mod platform {
         let result = acquire_named(w!("Local\\OpenUUYC.ControlCenter.v1"));
         let message = match &result {
             Ok(Some(_)) => return result,
-            Ok(None) => "OpenUUYC 已在运行，请勿重复启动。".to_owned(),
+            Ok(None) => {
+                activate_existing()?;
+                return result;
+            }
             Err(error) => format!("无法启动 OpenUUYC：{error:#}"),
         };
         let message: Vec<u16> = message.encode_utf16().chain(Some(0)).collect();
@@ -53,9 +63,6 @@ mod platform {
                 MB_OK | MB_ICONERROR | MB_SETFOREGROUND,
             );
         }
-        if matches!(&result, Ok(None)) {
-            activate_existing();
-        }
         result
     }
 
@@ -65,17 +72,54 @@ mod platform {
             anyhow::bail!("控制中心窗口不是 Win32 窗口");
         };
         let hwnd = HWND(handle.hwnd.get() as *mut std::ffi::c_void);
+        anyhow::ensure!(show_message() != 0, "注册控制中心恢复消息失败");
         unsafe {
+            SetWindowSubclass(hwnd, Some(window_message), SHOW_SUBCLASS, 0).ok()?;
+        }
+        let result = unsafe {
             SetPropW(
                 hwnd,
                 w!("OpenUUYC.ControlCenter.Window.v1"),
                 Some(HANDLE(hwnd.0)),
             )
         }
-        .context("标记控制中心窗口失败")
+        .context("标记控制中心窗口失败");
+        if result.is_err() {
+            unsafe {
+                let _ = RemoveWindowSubclass(hwnd, Some(window_message), SHOW_SUBCLASS);
+            }
+        }
+        result
     }
 
-    fn activate_existing() {
+    unsafe extern "system" fn window_message(
+        hwnd: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+        _id: usize,
+        _data: usize,
+    ) -> LRESULT {
+        if message == show_message() {
+            // Updating visibility through the UI owner keeps winit's WindowFlags in
+            // sync. Showing the HWND directly leaves VISIBLE false after tray hide.
+            let _ = crate::ui::window_manager::send(crate::ui::window_manager::Request::ShowMain);
+            return LRESULT(0);
+        }
+        if message == WM_NCDESTROY {
+            unsafe {
+                let _ = RemovePropW(hwnd, w!("OpenUUYC.ControlCenter.Window.v1"));
+                let _ = RemoveWindowSubclass(hwnd, Some(window_message), SHOW_SUBCLASS);
+            }
+        }
+        unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
+    }
+    pub(crate) fn reserve_maintenance() -> Result<Instance> {
+        acquire_named(w!("Local\\OpenUUYC.ControlCenter.v1"))?
+            .context("请先从托盘退出 OpenUUYC，再安装更新或卸载程序")
+    }
+
+    fn activate_existing() -> Result<()> {
         unsafe extern "system" fn find(hwnd: HWND, data: LPARAM) -> BOOL {
             if !unsafe { GetPropW(hwnd, w!("OpenUUYC.ControlCenter.Window.v1")) }.is_invalid() {
                 unsafe {
@@ -89,12 +133,17 @@ mod platform {
         unsafe {
             let _ = EnumWindows(Some(find), LPARAM(&mut window as *mut _ as isize));
             if let Some(hwnd) = window {
-                if IsIconic(hwnd).as_bool() {
-                    let _ = ShowWindowAsync(hwnd, SW_RESTORE);
+                let mut pid = 0;
+                GetWindowThreadProcessId(hwnd, Some(&mut pid));
+                if pid != 0 {
+                    let _ = AllowSetForegroundWindow(pid);
                 }
-                let _ = SetForegroundWindow(hwnd);
+                let message = show_message();
+                anyhow::ensure!(message != 0, "注册控制中心恢复消息失败");
+                PostMessageW(Some(hwnd), message, WPARAM(0), LPARAM(0))?;
             }
         }
+        Ok(())
     }
 }
 
@@ -149,6 +198,8 @@ mod platform {
 
 pub use platform::Instance;
 pub(crate) use platform::register_window;
+#[cfg(windows)]
+pub(crate) use platform::reserve_maintenance;
 
 pub fn acquire() -> Result<Option<Instance>> {
     platform::acquire()

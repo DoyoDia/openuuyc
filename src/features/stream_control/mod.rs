@@ -431,7 +431,6 @@ struct StreamControlState {
     auto_mouse_declined: bool,
     /// Keeps the "still waiting" diagnostic to one line per session.
     auto_mouse_reported: bool,
-    remote_cursor: crate::features::remote_cursor::RemoteCursorState,
     peer_mouse_relative: Option<bool>,
     cursor_sync_needed: bool,
     cursor_desired_capture: bool,
@@ -514,7 +513,6 @@ impl StreamControlHandle {
             auto_mouse_declined: false,
             auto_mouse_reported: false,
             remote_notice: None,
-            remote_cursor: cursor.clone(),
             peer_mouse_relative: None,
             cursor_sync_needed: false,
             cursor_desired_capture: true,

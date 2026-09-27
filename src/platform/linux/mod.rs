@@ -8,6 +8,8 @@ pub(crate) mod display;
 pub(crate) mod display_hdr;
 pub(crate) mod encoder;
 pub(crate) mod graphics;
+pub(crate) mod host_service;
+pub(crate) mod input;
 pub(crate) mod surface;
 pub(crate) mod transfer;
 mod video_layer;

@@ -32,7 +32,6 @@ pub(super) struct EncodedFrame {
     pub(super) frame_sending_delay_ms: Option<u16>,
     pub(super) playout_delay: Option<PlayoutDelay>,
     pub(super) nack_count: u8,
-    pub(super) received_micros: u64,
     pub(super) received_at: Instant,
     pub(super) last_received_at: Instant,
     pub(super) assembled_at: Instant,
@@ -59,7 +58,6 @@ pub(super) struct SequenceUnwrapper {
 pub(super) struct PacketInsertResult {
     pub(super) frames: Vec<EncodedFrame>,
     pub(super) duplicate: bool,
-    pub(super) expansions: usize,
     pub(super) cleared: bool,
     pub(super) parameter_rejected: bool,
 }
@@ -141,7 +139,6 @@ impl PacketBuffer {
             result.duplicate = true;
             return result;
         }
-        let mut expansions = 0;
         while self.buffer[index].is_some() {
             let collided_sequence = self.buffer[index]
                 .as_ref()
@@ -149,7 +146,6 @@ impl PacketBuffer {
             if !self.expand() {
                 break;
             }
-            expansions += 1;
             index = sequence_number as usize % self.buffer.len();
             tracing::debug!(
                 sequence_number,
@@ -178,7 +174,6 @@ impl PacketBuffer {
             return PacketInsertResult {
                 frames: Vec::new(),
                 duplicate: false,
-                expansions,
                 cleared: true,
                 parameter_rejected: false,
             };
@@ -195,7 +190,6 @@ impl PacketBuffer {
         PacketInsertResult {
             frames: self.find_frames(sequence_number),
             duplicate: false,
-            expansions,
             cleared: false,
             parameter_rejected: false,
         }
@@ -207,7 +201,6 @@ impl PacketBuffer {
         PacketInsertResult {
             frames: self.find_frames(sequence_number.wrapping_add(1)),
             duplicate: false,
-            expansions: 0,
             cleared: false,
             parameter_rejected: false,
         }
@@ -361,7 +354,6 @@ impl PacketBuffer {
                 let mut frame_sending_delay_ms = None;
                 let mut playout_delay = None;
                 let mut nack_count = 0;
-                let mut received_micros = u64::MAX;
                 let mut received_at: Option<Instant> = None;
                 let mut last_received_at: Option<Instant> = None;
                 let timestamp = self.buffer[index]
@@ -403,7 +395,6 @@ impl PacketBuffer {
                     video_timing = video_timing.or(packet.packet.video_timing);
                     frame_sending_delay_ms =
                         frame_sending_delay_ms.or(packet.packet.frame_sending_delay_ms);
-                    received_micros = received_micros.min(packet.packet.received_micros);
                     received_at = Some(received_at.map_or(packet.packet.received_at, |current| {
                         current.min(packet.packet.received_at)
                     }));
@@ -439,7 +430,6 @@ impl PacketBuffer {
                     frame_sending_delay_ms,
                     playout_delay,
                     nack_count,
-                    received_micros,
                     received_at: received_at.expect("complete frame has at least one packet"),
                     last_received_at: last_received_at
                         .expect("complete frame has at least one packet"),
@@ -484,7 +474,6 @@ impl PacketInsertResult {
         Self {
             frames: Vec::new(),
             duplicate: false,
-            expansions: 0,
             cleared: false,
             parameter_rejected: false,
         }

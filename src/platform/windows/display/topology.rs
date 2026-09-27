@@ -172,6 +172,16 @@ impl Topology {
     }
 
     pub(crate) fn targets(&self) -> Result<Vec<Target>> {
+        let mut targets = self.metadata()?;
+        for target in &mut targets {
+            if !target.source.is_empty() {
+                target.modes = modes(&target.source)?;
+            }
+        }
+        Ok(targets)
+    }
+
+    pub(crate) fn metadata(&self) -> Result<Vec<Target>> {
         let mut targets: Vec<Target> = Vec::new();
         for path in &self.paths {
             let mut target = DISPLAYCONFIG_TARGET_DEVICE_NAME {
@@ -234,11 +244,7 @@ impl Topology {
             targets.push(Target {
                 identity,
                 name: text(&target.monitorFriendlyDeviceName),
-                modes: if source.is_empty() {
-                    Vec::new()
-                } else {
-                    modes(&source)?
-                },
+                modes: Vec::new(),
                 dpi: if active {
                     dpi(path.sourceInfo.adapterId, path.sourceInfo.id).ok()
                 } else {

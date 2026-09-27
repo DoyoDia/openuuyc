@@ -7,9 +7,7 @@ mod output;
 mod params;
 
 use super::*;
-use std::ffi::c_void;
 use windows::Win32::Graphics::Direct3D11::ID3D11Device;
-use windows::core::Interface;
 
 enum Decoder {
     Avc(avc::Avc),
@@ -26,11 +24,9 @@ impl Session {
         {
             return Err(DecodeError::InvalidInput);
         }
-        let Some(GpuDeviceHandle::DirectX11(handle)) = config.gpu_device else {
-            return Err(DecodeError::InvalidInput);
-        };
-        let raw = handle.get() as *mut c_void;
-        let device = unsafe { ID3D11Device::from_raw_borrowed(&raw) }
+        let device = config
+            .gpu_device
+            .as_ref()
             .ok_or(DecodeError::InvalidInput)?
             .clone();
         if !config.extra_data.is_empty()
@@ -40,9 +36,8 @@ impl Session {
             return Err(DecodeError::Unsupported);
         }
         let decoder = match config.codec {
-            CodecKind::H264 => Decoder::Avc(avc::Avc::new(device)),
-            CodecKind::Hevc => Decoder::Hevc(hevc::Hevc::new(device)),
-            _ => return Err(DecodeError::Unsupported),
+            VideoCodec::H264 => Decoder::Avc(avc::Avc::new(device)),
+            VideoCodec::H265 => Decoder::Hevc(hevc::Hevc::new(device)),
         };
         tracing::info!(codec=?config.codec, "Rust DXVA session created");
         Ok(Self {
@@ -52,8 +47,8 @@ impl Session {
         })
     }
     pub(super) fn probe(
-        handle: GpuDeviceHandle,
-        codec: CodecKind,
+        handle: ID3D11Device,
+        codec: VideoCodec,
         w: u32,
         h: u32,
         depth: u8,
@@ -62,30 +57,24 @@ impl Session {
         Self::check_format(handle, codec, w, h, depth, chroma).is_ok()
     }
     pub(super) fn check_format(
-        handle: GpuDeviceHandle,
-        codec: CodecKind,
+        handle: ID3D11Device,
+        codec: VideoCodec,
         w: u32,
         h: u32,
         depth: u8,
         chroma: u8,
     ) -> anyhow::Result<()> {
-        let GpuDeviceHandle::DirectX11(handle) = handle else {
-            anyhow::bail!("不是 D3D11 图形设备");
-        };
-        let raw = handle.get() as *mut c_void;
-        let Some(device) = (unsafe { ID3D11Device::from_raw_borrowed(&raw) }) else {
-            anyhow::bail!("D3D11 图形设备不可用");
-        };
+        let device = &handle;
         let codec = match codec {
-            CodecKind::H264 => dxva::Codec::H264,
-            CodecKind::Hevc => dxva::Codec::Hevc,
-            _ => anyhow::bail!("未实现此编码格式"),
+            VideoCodec::H264 => dxva::Codec::H264,
+            VideoCodec::H265 => dxva::Codec::Hevc,
         };
         dxva::Pool::probe(device, codec, w, h, depth, chroma)
     }
     pub(super) fn push(
         &mut self,
-        packet: &Packet,
+        payload: &[u8],
+        token: i64,
         notification: &DecoderNotification,
     ) -> Result<(), DecodeError> {
         if notification.is_cancelled() {
@@ -94,10 +83,10 @@ impl Session {
         let extra = self.extra.take().filter(|e| !e.is_empty());
         let combined;
         let data = if let Some(extra) = extra {
-            combined = [extra.as_ref(), packet.payload.as_ref()].concat();
+            combined = [extra.as_ref(), payload].concat();
             &combined[..]
         } else {
-            packet.payload.as_ref()
+            payload
         };
         let decoded = match &mut self.decoder {
             Decoder::Avc(d) => d.decode(data, notification.cancellation()).map(Some),
@@ -107,10 +96,10 @@ impl Session {
             if let Some(picture) = picture {
                 self.output.push(output::Frame {
                     picture,
-                    token: packet.pts,
+                    token: token,
                 })
             } else {
-                self.output.discard_token(packet.pts);
+                self.output.discard_token(token);
                 Ok(())
             }
         });

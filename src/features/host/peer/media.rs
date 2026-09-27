@@ -57,6 +57,7 @@ impl Worker {
         negotiated: Arc<crate::features::host::format::Negotiated>,
         transport: crate::features::host::transport::Transport,
         publication: tokio::sync::watch::Sender<Published>,
+        pointer: Arc<Mutex<Option<crate::platform::cursor_shape::Snapshot>>>,
     ) -> Result<Self> {
         let keyframe = Arc::new(AtomicBool::new(true));
         let request_keyframe = keyframe.clone();
@@ -219,7 +220,9 @@ impl Worker {
                     owner_transport,
                     negotiated,
                     publication,
+                    pointer.clone(),
                 );
+                *lock(&pointer) = None;
                 if let Err(error) = result {
                     if owner_cancel.is_cancelled() || !owner_handle.requested() {
                         return;

@@ -55,7 +55,7 @@ pub(crate) fn session_locked() -> Option<bool> {
 }
 
 fn outputs() -> Result<Vec<(IDXGIAdapter1, IDXGIOutput1, Screen)>> {
-    let displays = display_info::DisplayInfo::all().unwrap_or_default();
+    let displays = super::display::active_displays().unwrap_or_default();
     unsafe {
         let factory: IDXGIFactory1 = CreateDXGIFactory1()?;
         let mut result = Vec::new();
@@ -238,7 +238,7 @@ pub(crate) fn create_device(luid: u64) -> Result<(ID3D11Device, ID3D11DeviceCont
 }
 use super::adapter_type;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct EncodingAdapter {
     pub luid: u64,
     pub vendor: u32,
@@ -296,11 +296,13 @@ pub(crate) struct Frame {
     pub captured: std::time::Instant,
     pub is_new: bool,
     pub hdr_metadata: Option<crate::media::video_color::HdrMetadata>,
+    pub(crate) _storage: Option<std::sync::Arc<()>>,
 }
 
 enum Backend {
     Dxgi(Duplication),
     Gdi(super::gdi::Capture),
+    Remote(Box<super::capture_service::Client>),
 }
 pub(crate) struct Desktop {
     pub device: ID3D11Device,
@@ -311,9 +313,28 @@ pub(crate) struct Desktop {
     retry_at: std::time::Instant,
     retries: u8,
     refreshed: std::time::Instant,
+    sampler: super::cursor_shape::Sampler,
+    pub cursor: Option<super::cursor_shape::Snapshot>,
 }
 impl Desktop {
     pub fn open_selected(selected: &Screen) -> Result<Self> {
+        if let Some(remote) = super::capture_service::Client::connect(selected)? {
+            return Ok(Self {
+                device: remote.device.clone(),
+                screen: remote.screen.clone(),
+                generation: 0,
+                available: true,
+                backend: Backend::Remote(Box::new(remote)),
+                retry_at: std::time::Instant::now(),
+                retries: 0,
+                refreshed: std::time::Instant::now(),
+                sampler: Default::default(),
+                cursor: None,
+            });
+        }
+        Self::open_local(selected)
+    }
+    pub(super) fn open_local(selected: &Screen) -> Result<Self> {
         let screen = refresh(selected)?;
         let backend = match Duplication::open(&screen.device_name) {
             Ok(capture) => {
@@ -332,6 +353,7 @@ impl Desktop {
         let device = match &backend {
             Backend::Dxgi(d) => d.device.clone(),
             Backend::Gdi(g) => g.device.clone(),
+            Backend::Remote(_) => unreachable!(),
         };
         Ok(Self {
             device,
@@ -342,24 +364,29 @@ impl Desktop {
             retry_at: std::time::Instant::now() + std::time::Duration::from_secs(10),
             retries: 0,
             refreshed: std::time::Instant::now(),
+            sampler: Default::default(),
+            cursor: None,
         })
     }
     pub fn backend_name(&self) -> &'static str {
-        match self.backend {
+        match &self.backend {
             Backend::Dxgi(_) => "DXGI",
             Backend::Gdi(_) => "GDI",
+            Backend::Remote(r) => r.backend_name(),
         }
     }
     pub fn hdr_available(&self) -> bool {
         match &self.backend {
             Backend::Dxgi(d) => d.source_hdr.is_some(),
             Backend::Gdi(_) => false,
+            Backend::Remote(r) => r.hdr,
         }
     }
     fn replace(&mut self, backend: Backend) {
         self.device = match &backend {
             Backend::Dxgi(d) => d.device.clone(),
             Backend::Gdi(g) => g.device.clone(),
+            Backend::Remote(r) => r.device.clone(),
         };
         self.backend = backend;
         self.generation = self.generation.wrapping_add(1);
@@ -372,6 +399,22 @@ impl Desktop {
         hdr: bool,
         maximum: (u32, u32),
     ) -> Result<Option<Frame>> {
+        if let Backend::Remote(remote) = &mut self.backend {
+            let result = remote.next(timeout, quality, cursor, hdr, maximum);
+            self.device = remote.device.clone();
+            self.screen = remote.screen.clone();
+            self.available = remote.available;
+            self.generation = remote.generation;
+            self.cursor = remote.cursor.clone();
+            return result;
+        }
+        self.cursor = match self.sampler.sample() {
+            Ok(pointer) => Some(pointer),
+            Err(error) => {
+                tracing::debug!(%error,"host cursor sampling failed");
+                None
+            }
+        };
         let request = super::preprocess::Request {
             quality,
             maximum,
@@ -383,7 +426,7 @@ impl Desktop {
             // A presentation-only name change does not invalidate capture resources.
             self.screen.display_name.clone_from(&current.display_name);
             if current != self.screen {
-                let mut replacement = Self::open_selected(&current)?;
+                let mut replacement = Self::open_local(&current)?;
                 replacement.generation = self.generation.wrapping_add(1);
                 *self = replacement;
             }
@@ -411,6 +454,7 @@ impl Desktop {
         let frame = match &mut self.backend {
             Backend::Dxgi(d) => d.next(timeout, quality, cursor, hdr, maximum),
             Backend::Gdi(g) => g.next(request, cursor).map(Some),
+            Backend::Remote(_) => unreachable!(),
         };
         match frame {
             Ok(frame) => {
@@ -597,6 +641,7 @@ impl Duplication {
                                 image: texture,
                                 captured: std::time::Instant::now(),
                                 is_new: false,
+                                _storage: None,
                                 hdr_metadata: if hdr { self.source_hdr } else { None },
                             }));
                         }
@@ -652,6 +697,7 @@ impl Duplication {
                     height: desc.Height,
                     image: texture,
                     captured,
+                    _storage: None,
                     is_new: info.LastPresentTime != 0
                         || (cursor_capture && info.LastMouseUpdateTime != 0),
                     hdr_metadata: if hdr { self.source_hdr } else { None },

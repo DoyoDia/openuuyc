@@ -10,9 +10,7 @@
     )
 )]
 use super::software_slot::SoftwareSlot;
-use crate::media::decode_api::{
-    DecoderNotification, VideoDecoder, VideoDecoderConfig, VideoOutputPreference,
-};
+use crate::media::decode_api::{DecoderMode, DecoderNotification, VideoDecoderConfig};
 use crate::media::{LocalDisplayInfo, VideoCodec};
 #[cfg(windows)]
 use crate::platform::{
@@ -20,7 +18,7 @@ use crate::platform::{
     surface::D3D11SurfaceWriter,
 };
 use anyhow::{Context, Result, ensure};
-use mediaway_common::{Bytes, CodecKind, Packet, PixelFormat, Rational};
+use bytes::Bytes;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -46,13 +44,6 @@ impl Format {
             if self.chroma == 1 { "420" } else { "444" },
             self.depth
         )
-    }
-    fn kind(self) -> CodecKind {
-        if self.codec == VideoCodec::H264 {
-            CodecKind::H264
-        } else {
-            CodecKind::Hevc
-        }
     }
     fn sample(self, size: (u32, u32)) -> Option<&'static [u8]> {
         macro_rules! sample {
@@ -244,7 +235,7 @@ pub(crate) fn run(
                         if let Some(writer) = writer {
                             WindowsVideoDecoder::check_format(
                                 writer.device_handle(),
-                                format.kind(),
+                                format.codec,
                                 size.0,
                                 size.1,
                                 format.depth,
@@ -368,32 +359,20 @@ fn decode_sample(
         (w * 7 / 8, h * 7 / 8),
     ];
     let mut decoder = WindowsVideoDecoder::open(&VideoDecoderConfig {
-        codec: format.kind(),
+        codec: format.codec,
         width: w,
         height: h,
-        time_base: Rational::new(1, 90000),
-        pixel_format: PixelFormat::Nv12,
-        output: if writer.is_some() {
-            VideoOutputPreference::ZeroCopyGpu
+        mode: if writer.is_some() {
+            DecoderMode::Hardware
         } else {
-            VideoOutputPreference::CpuFramesOk
+            DecoderMode::Software
         },
         gpu_device: writer.map(|w| w.device_handle()),
         extra_data: Bytes::new(),
     })
     .context("创建指定后端")?;
     decoder.set_notification(DecoderNotification::new(cancel.clone()));
-    decoder
-        .push_packet(&Packet {
-            stream_id: 0,
-            pts: 1,
-            dts: 1,
-            duration: 3000,
-            is_keyframe: true,
-            is_discard: false,
-            payload: sample.into(),
-        })
-        .context("提交样本码流")?;
+    decoder.push_packet(&sample, 1).context("提交样本码流")?;
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
         ensure!(!cancel.load(Ordering::Acquire), "检查已取消");

@@ -1,23 +1,17 @@
 //! Official-compatible UU/WebRTC video receive state machine.
 //!
-//! The same depacketizer/FEC/PacketBuffer/reference/FrameBuffer implementation
-//! serves the live viewer and deterministic decrypted-RTP capture replay.
+//! Live depacketization, packet/reference buffering and decode scheduling.
 
-use crate::diagnostics::rtp_capture::CapturedCodec;
 use crate::media::codec_parameters::NaluInfo;
 use crate::media::decoder_result::VideoDecodeResult;
 use crate::media::video_color::{VideoColorHistory, VideoColorSpace};
 use crate::media::video_format::VideoFormatSignature;
-use crate::transport::rsfec::normalize_rtx_source;
 use crate::transport::rtc::PlayoutDelay;
 use crate::transport::timing::{DecodeSchedule, PlayoutSchedule, VideoPlayoutTiming};
 use anyhow::Result;
 use depacketize::{depacketize_h264, depacketize_h265, parse_video_timing};
 use packets::{EncodedFrame, PacketBuffer, PacketInsertResult};
 use references::{FrameBuffer, ReferenceResult, SeqNumOnlyRefFinder, rtp_timestamp_ahead_of};
-pub use replay::{ReplayOptions, replay_capture};
-use replay::{ReplayStats, ReplayTimeline};
-use sha2::Digest;
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 use webrtc::rtp::packet::Packet as RtpPacket;
@@ -73,7 +67,6 @@ pub(crate) struct ParsedVideoPacket {
     playout_delay: Option<PlayoutDelay>,
     nack_count: u8,
     payload: Vec<u8>,
-    received_micros: u64,
     received_at: Instant,
 }
 
@@ -222,8 +215,8 @@ impl OfficialVideoReceiver {
             return None;
         }
         let parsed = match codec {
-            VideoCodecKind::H264 => depacketize_h264(packet, 0, received_at),
-            VideoCodecKind::H265 => depacketize_h265(packet, 0, received_at),
+            VideoCodecKind::H264 => depacketize_h264(packet, received_at),
+            VideoCodecKind::H265 => depacketize_h265(packet, received_at),
         };
         let mut parsed = parsed?;
         let color_extension = self
@@ -627,242 +620,6 @@ impl ReceiveDecodeTimeout {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn process_media_packet(
-    mut packet: RtpPacket,
-    is_rtx: bool,
-    mut rsfec_source: Option<Vec<u8>>,
-    elapsed_micros: u64,
-    received_at: Instant,
-    media_ssrc: u32,
-    payload_codecs: &[CapturedCodec],
-    last_payload_type: &mut Option<u8>,
-    color_extension_id: Option<u8>,
-    color_history: &mut VideoColorHistory,
-    rtx_source: (bool, Option<u8>, Option<u8>, bool),
-    stats: &mut ReplayStats,
-    timeline: &mut ReplayTimeline,
-    packet_buffer: &mut PacketBuffer,
-    reference_finder: &mut SeqNumOnlyRefFinder,
-    frame_buffer: &mut FrameBuffer,
-) -> Option<(u16, Vec<u8>)> {
-    if is_rtx {
-        let payload_type = payload_codecs
-            .iter()
-            .find(|codec| {
-                codec.payload_type == packet.header.payload_type
-                    && codec.mime_type.eq_ignore_ascii_case("video/rtx")
-            })?
-            .fmtp
-            .split(';')
-            .find_map(|part| part.trim().strip_prefix("apt="))?
-            .parse::<u8>()
-            .ok()?;
-        if packet.payload.len() < 2 {
-            if packet.payload.is_empty() && packet.header.padding {
-                stats.padding_packets += 1;
-            } else {
-                stats.malformed_packets += 1;
-            }
-            return None;
-        }
-        packet.header.sequence_number = u16::from_be_bytes([packet.payload[0], packet.payload[1]]);
-        packet.header.payload_type = payload_type;
-        packet.header.ssrc = media_ssrc;
-        packet.header.padding = false;
-        packet.payload = packet.payload.slice(2..);
-        rsfec_source = if rtx_source.0 {
-            normalize_rtx_source(&packet, rtx_source.1, rtx_source.2, rtx_source.3)
-                .ok()
-                .map(|source| source.to_vec())
-        } else {
-            None
-        };
-    }
-    if packet.header.ssrc != media_ssrc {
-        return None;
-    }
-    let payload_codec = payload_codecs
-        .iter()
-        .find(|codec| codec.payload_type == packet.header.payload_type)?;
-    let codec = if payload_codec.mime_type.eq_ignore_ascii_case("video/H264") {
-        VideoCodecKind::H264
-    } else if payload_codec.mime_type.eq_ignore_ascii_case("video/H265") {
-        VideoCodecKind::H265
-    } else {
-        return None;
-    };
-    if *last_payload_type != Some(packet.header.payload_type) {
-        if codec == VideoCodecKind::H264 {
-            packet_buffer.install_h264_sprop(&payload_codec.fmtp);
-        }
-        *last_payload_type = Some(packet.header.payload_type);
-    }
-    let source = rsfec_source.map(|source| (packet.header.sequence_number, source));
-    if packet.payload.is_empty() {
-        stats.padding_packets += 1;
-        let decisions = reference_finder.padding_received(packet.header.sequence_number);
-        accept_reference_decisions(decisions, stats, frame_buffer);
-        drain_decodable(
-            stats,
-            timeline,
-            packet_buffer,
-            reference_finder,
-            frame_buffer,
-        );
-        let insert = packet_buffer.insert_padding(packet.header.sequence_number);
-        accept_completed_frames(
-            insert.frames,
-            stats,
-            timeline,
-            reference_finder,
-            frame_buffer,
-        );
-        drain_decodable(
-            stats,
-            timeline,
-            packet_buffer,
-            reference_finder,
-            frame_buffer,
-        );
-        return source;
-    }
-    let parsed = match codec {
-        VideoCodecKind::H264 => depacketize_h264(&packet, elapsed_micros, received_at),
-        VideoCodecKind::H265 => depacketize_h265(&packet, elapsed_micros, received_at),
-    };
-    let Some(mut parsed) = parsed else {
-        stats.malformed_packets += 1;
-        timeline.malformed_points.push((
-            packet.header.sequence_number,
-            packet.header.timestamp,
-            packet.payload.first().map(|value| match codec {
-                VideoCodecKind::H264 => value & 0x1f,
-                VideoCodecKind::H265 => (value >> 1) & 0x3f,
-            }),
-            packet.payload.len(),
-            elapsed_micros,
-        ));
-        return source;
-    };
-    let color_extension = color_extension_id.and_then(|id| packet.header.get_extension(id));
-    parsed.color_space = color_history.receive(
-        packet.header.marker,
-        parsed.packet_keyframe,
-        color_extension.as_deref(),
-    );
-    let insert = if packet_buffer.prepare_parameters(&mut parsed) {
-        packet_buffer.insert(parsed)
-    } else {
-        PacketInsertResult {
-            parameter_rejected: true,
-            ..PacketInsertResult::empty()
-        }
-    };
-    stats.parameter_requests += u64::from(insert.parameter_rejected);
-    stats.duplicate_packets += u64::from(insert.duplicate);
-    stats.packet_buffer_expansions += insert.expansions as u64;
-    stats.packet_buffer_clears += u64::from(insert.cleared);
-    if insert.cleared {
-        timeline.packet_buffer_clear_points.push((
-            packet.header.sequence_number,
-            packet.header.timestamp,
-            elapsed_micros,
-        ));
-    }
-    accept_completed_frames(
-        insert.frames,
-        stats,
-        timeline,
-        reference_finder,
-        frame_buffer,
-    );
-    drain_decodable(
-        stats,
-        timeline,
-        packet_buffer,
-        reference_finder,
-        frame_buffer,
-    );
-    source
-}
-
-fn accept_completed_frames(
-    frames: Vec<EncodedFrame>,
-    stats: &mut ReplayStats,
-    timeline: &mut ReplayTimeline,
-    reference_finder: &mut SeqNumOnlyRefFinder,
-    frame_buffer: &mut FrameBuffer,
-) {
-    for frame in frames {
-        stats.completed_frames += 1;
-        stats.keyframes += u64::from(frame.keyframe);
-        if frame.keyframe {
-            timeline.keyframe_points.push((
-                frame.first_sequence_number,
-                frame.last_sequence_number,
-                frame.timestamp,
-                frame.received_micros,
-            ));
-        }
-        accept_reference_decisions(reference_finder.manage(frame), stats, frame_buffer);
-    }
-}
-
-fn accept_reference_decisions(
-    result: ReferenceResult,
-    stats: &mut ReplayStats,
-    frame_buffer: &mut FrameBuffer,
-) {
-    stats.reference_stashed += result.stashed;
-    stats.reference_dropped += result.dropped;
-    for frame in result.frames {
-        frame_buffer.insert(frame);
-    }
-}
-
-fn drain_decodable(
-    stats: &mut ReplayStats,
-    timeline: &mut ReplayTimeline,
-    packet_buffer: &mut PacketBuffer,
-    reference_finder: &mut SeqNumOnlyRefFinder,
-    frame_buffer: &mut FrameBuffer,
-) {
-    while let Some(frame) = frame_buffer.extract_next_decodable() {
-        let gap_us = timeline.last_released_micros.map_or(0, |last| {
-            timeline.current_received_micros.saturating_sub(last)
-        });
-        if gap_us > 50_000 {
-            tracing::debug!(target: "openuuyc::replay_recovery",
-                at_us = timeline.current_received_micros,
-                gap_us, first_packet_us = frame.received_micros,
-                first_sequence = frame.first_sequence_number,
-                last_sequence = frame.last_sequence_number,
-                timestamp = frame.timestamp, keyframe = frame.keyframe,
-                stashed_frames = reference_finder.stashed.len(),
-                "offline recovered-frame release gap");
-        }
-        timeline.last_released_micros = Some(timeline.current_received_micros);
-        timeline
-            .first_decoded_timestamp
-            .get_or_insert(frame.timestamp);
-        timeline.last_decoded_timestamp = Some(frame.timestamp);
-        timeline
-            .first_decoded_arrival
-            .get_or_insert(frame.received_micros);
-        timeline.last_decoded_arrival = Some(frame.received_micros);
-        stats.decoded_frames += 1;
-        stats.decoded_bytes += frame.data.len() as u64;
-        timeline.frame_digest.update(frame.timestamp.to_be_bytes());
-        timeline
-            .frame_digest
-            .update((frame.data.len() as u64).to_be_bytes());
-        timeline.frame_digest.update(&frame.data);
-        packet_buffer.clear_to(frame.last_sequence_number);
-        reference_finder.clear_to(frame.last_sequence_number);
-    }
-}
-
 fn ahead_of(newer: u16, older: u16) -> bool {
     let distance = newer.wrapping_sub(older);
     distance != 0 && (distance < 0x8000 || (distance == 0x8000 && newer > older))
@@ -875,4 +632,3 @@ fn sequence_at_or_ahead(value: u16, reference: u16) -> bool {
 mod depacketize;
 mod packets;
 mod references;
-mod replay;

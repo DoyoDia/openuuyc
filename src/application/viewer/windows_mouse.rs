@@ -154,6 +154,9 @@ impl RawRouter {
         point.x >= rect.left && point.x < rect.right && point.y >= rect.top && point.y < rect.bottom
     }
     fn wheel(&self, owner: u64, delta: winit::event::MouseScrollDelta) {
+        if crate::platform::windows::input::system::own_message() {
+            return;
+        }
         let Some(target) = self.0.lock().unwrap_or_else(|p| p.into_inner()).clone() else {
             return;
         };
@@ -269,6 +272,11 @@ impl RawRouter {
             return false;
         }
         let mouse = unsafe { raw.data.mouse };
+        if mouse.ulExtraInformation as usize
+            == crate::platform::windows::input::system::INPUT_MARKER
+        {
+            return false;
+        }
         let flags = unsafe { mouse.Anonymous.Anonymous.usButtonFlags };
         let input = target.control.mouse();
         let mode = input.mode();

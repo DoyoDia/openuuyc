@@ -10,6 +10,10 @@ pub const MAX_TOTAL_MIB: u64 = 256;
 pub const RETENTION_DAYS: u64 = 14;
 
 pub(super) fn directories() -> Result<(PathBuf, PathBuf)> {
+    if crate::platform::host_service::vault::applies()? {
+        let base = crate::platform::host_service::vault::root()?;
+        return Ok((base.clone(), base.join("logs")));
+    }
     {
         let base = crate::platform::paths::require_local_app_data()?.join("OpenUUYC");
         Ok((base.clone(), base.join("logs")))

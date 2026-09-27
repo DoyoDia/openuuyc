@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 //! Low-delay software encoder for the desktop sender. Reference interpolation,
 //! prediction and deblocking share the decoder's checked byte-plane DSP.
-//! Selected transform primitives come from the existing oxideav dependency;
+//! Selected transform primitives are retained in the local syntax module;
 //! frame decisions, motion search, rate control and ownership live here.
 mod analysis;
 mod pixels;
@@ -9,6 +9,10 @@ mod quant_tables;
 mod rate;
 mod search;
 mod syntax;
+use crate::syntax::{
+    forward::forward_hadamard_4x4,
+    transform::{FLAT_4X4_16, inverse_hadamard_luma_dc_16x16},
+};
 use crate::{
     dsp::{
         self, Block,
@@ -16,10 +20,6 @@ use crate::{
         intra::Edges,
     },
     picture::Plane,
-};
-use oxideav_h264::{
-    encoder::transform::forward_hadamard_4x4,
-    transform::{FLAT_4X4_16, inverse_hadamard_luma_dc_16x16},
 };
 use search::Mv;
 use syntax::{BLOCKS, BitWriter, SCAN};

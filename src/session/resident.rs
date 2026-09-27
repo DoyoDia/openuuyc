@@ -1,0 +1,71 @@
+//! Requests between the desktop client and the resident host owner that an
+//! installed service runs. Plain data: the transport is platform-specific.
+use crate::{account::auth::NativeIdentity, features::host, session::presence::PresenceState};
+use anyhow::Result;
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize, Deserialize)]
+pub(crate) enum Request {
+    Resume,
+    Pause,
+    Snapshot,
+    Initialize {
+        force: bool,
+    },
+    Controllable(bool),
+    Name {
+        device: String,
+        value: String,
+    },
+    Settings {
+        account: String,
+        allowed: bool,
+        encoding: host::EncodingSettings,
+    },
+    Disconnect {
+        account: String,
+    },
+    Retry {
+        account: String,
+    },
+    Retire {
+        account: String,
+    },
+}
+#[derive(Serialize, Deserialize)]
+pub(crate) struct Snapshot {
+    pub account: String,
+    pub online: PresenceState,
+    pub allowed: bool,
+    pub encoding: host::EncodingSettings,
+    pub status: host::Status,
+    pub capabilities: Option<host::desktop::Capabilities>,
+}
+#[derive(Serialize, Deserialize)]
+pub(crate) enum Reply {
+    Done,
+    Snapshot(Box<Snapshot>),
+    Identity(Box<NativeIdentity>),
+    Error(String),
+    ApiError { code: i32, message: String },
+}
+impl Reply {
+    pub(crate) fn from_error(error: anyhow::Error) -> Self {
+        match error.downcast::<crate::account::api::ApiFailure>() {
+            Ok(error) => Self::ApiError {
+                code: error.code,
+                message: error.message,
+            },
+            Err(error) => Self::Error(format!("{error:#}")),
+        }
+    }
+    pub fn checked(self) -> Result<Self> {
+        match self {
+            Self::Error(e) => anyhow::bail!(e),
+            Self::ApiError { code, message } => {
+                Err(crate::account::api::ApiFailure { code, message }.into())
+            }
+            other => Ok(other),
+        }
+    }
+}

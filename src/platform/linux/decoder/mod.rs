@@ -2,10 +2,9 @@
 //! Both paths hand the picture over on the CPU; VA-API surfaces are copied
 //! out rather than shared with the renderer, so there is no zero-copy yet.
 #![cfg(not(windows))]
-use crate::media::decode_api::{
-    DecodeError, DecoderNotification, VideoDecoder, VideoDecoderConfig, VideoOutputPreference,
-};
-use mediaway_common::{Bytes, CodecKind, GpuDeviceHandle, Packet};
+use crate::media::VideoCodec;
+use crate::media::decode_api::{DecodeError, DecoderMode, DecoderNotification, VideoDecoderConfig};
+use bytes::Bytes;
 
 mod vaapi;
 use std::collections::VecDeque;
@@ -24,12 +23,16 @@ pub struct CpuVideoFrame {
     pub data: Bytes,
 }
 
+/// VA-API opens its own display; the decoder shares no device with the
+/// renderer, so there is none to pass in.
+pub(crate) type GpuDevice = std::convert::Infallible;
+
 pub enum PlatformDecodedFrame {
     Cpu(CpuVideoFrame),
 }
 
 /// Whether the local VA-API driver decodes this format in hardware.
-pub fn probe_hardware(codec: CodecKind, width: u32, height: u32, depth: u8, chroma: u8) -> bool {
+pub fn probe_hardware(codec: VideoCodec, width: u32, height: u32, depth: u8, chroma: u8) -> bool {
     vaapi::probe(codec, width, height, depth, chroma)
 }
 
@@ -60,14 +63,11 @@ fn software_error(error: openuuyc_h264::Error) -> DecodeError {
 
 impl LinuxVideoDecoder {
     pub fn open(config: &VideoDecoderConfig) -> Result<Self, DecodeError> {
-        let backend = match config.output {
-            // The GPU preference is what the pool uses to ask for hardware; the
-            // surfaces still come back on the CPU.
-            VideoOutputPreference::ZeroCopyGpu => {
-                Backend::Hardware(Box::new(vaapi::Session::open(config)?))
-            }
-            VideoOutputPreference::CpuFramesOk => {
-                if config.codec != CodecKind::H264 {
+        let backend = match config.mode {
+            // Hardware surfaces still come back on the CPU.
+            DecoderMode::Hardware => Backend::Hardware(Box::new(vaapi::Session::open(config)?)),
+            DecoderMode::Software => {
+                if config.codec != VideoCodec::H264 {
                     return Err(DecodeError::Unsupported);
                 }
                 if config.width == 0
@@ -90,8 +90,8 @@ impl LinuxVideoDecoder {
     }
 
     pub fn probe_format(
-        _device: GpuDeviceHandle,
-        codec: CodecKind,
+        _device: GpuDevice,
+        codec: VideoCodec,
         width: u32,
         height: u32,
         depth: u8,
@@ -124,21 +124,21 @@ impl LinuxVideoDecoder {
     }
 }
 
-impl VideoDecoder for LinuxVideoDecoder {
-    fn set_notification(&mut self, notification: DecoderNotification) {
+impl LinuxVideoDecoder {
+    pub fn set_notification(&mut self, notification: DecoderNotification) {
         self.notification = notification;
     }
 
-    fn push_packet(&mut self, packet: &Packet) -> Result<(), DecodeError> {
-        if packet.payload.len() > i32::MAX as usize || packet.duration > i64::MAX as u64 {
+    pub fn push_packet(&mut self, payload: &[u8], token: i64) -> Result<(), DecodeError> {
+        if payload.len() > i32::MAX as usize {
             return Err(DecodeError::InvalidInput);
         }
         let decoder = match &mut self.backend {
             Backend::Hardware(session) => {
-                let frame = session.decode(&packet.payload, self.notification.cancellation())?;
+                let frame = session.decode(payload, self.notification.cancellation())?;
                 self.pending
                     .push_back(PlatformDecodedFrame::Cpu(CpuVideoFrame {
-                        pts: packet.pts,
+                        pts: token,
                         width: frame.width,
                         height: frame.height,
                         format: CpuFormat::Nv12,
@@ -149,11 +149,7 @@ impl VideoDecoder for LinuxVideoDecoder {
             Backend::Software(decoder) => decoder,
         };
         let outputs = decoder
-            .submit_with_cancel(
-                &packet.payload,
-                packet.pts as u64,
-                self.notification.cancellation(),
-            )
+            .submit_with_cancel(payload, token as u64, self.notification.cancellation())
             .map_err(software_error)?;
         for output in outputs {
             let picture = output.picture;

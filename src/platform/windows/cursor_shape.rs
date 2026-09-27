@@ -2,6 +2,71 @@
 use anyhow::{Result, ensure};
 use windows::Win32::{Graphics::Gdi::*, UI::WindowsAndMessaging::*};
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Image {
+    pub width: u32,
+    pub height: u32,
+    pub hotspot: [u32; 2],
+    pub kind: i32,
+    pub png: String,
+}
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Snapshot {
+    pub showing: bool,
+    pub x: i32,
+    pub y: i32,
+    pub image: Option<Image>,
+}
+#[derive(Default)]
+pub(crate) struct Sampler {
+    handle: usize,
+    image: Option<Image>,
+    sampled: Option<std::time::Instant>,
+}
+impl Sampler {
+    pub fn sample(&mut self) -> Result<Snapshot> {
+        use base64::Engine;
+        use image::ImageEncoder;
+        let pointer = pointer()?;
+        if pointer.showing
+            && (self.handle != pointer.handle
+                || self.image.is_none()
+                || self
+                    .sampled
+                    .is_none_or(|at| at.elapsed() >= std::time::Duration::from_millis(250)))
+        {
+            let shape = shape(pointer.handle)?;
+            let mut png = Vec::new();
+            image::codecs::png::PngEncoder::new(&mut png).write_image(
+                &shape.rgba,
+                shape.width,
+                shape.height,
+                image::ExtendedColorType::Rgba8,
+            )?;
+            ensure!(png.len() <= 4 * 1024 * 1024, "光标图片过大");
+            self.image = Some(Image {
+                width: shape.width,
+                height: shape.height,
+                hotspot: shape.hotspot,
+                kind: shape.kind,
+                png: base64::engine::general_purpose::STANDARD.encode(png),
+            });
+            self.handle = pointer.handle;
+            self.sampled = Some(std::time::Instant::now());
+        }
+        Ok(Snapshot {
+            showing: pointer.showing,
+            x: pointer.x,
+            y: pointer.y,
+            image: if pointer.showing {
+                self.image.clone()
+            } else {
+                None
+            },
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Pointer {
     pub handle: usize,

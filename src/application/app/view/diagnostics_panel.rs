@@ -312,6 +312,14 @@ impl DeviceCenterApp {
         if let Some(host) = host {
             ui.strong("本机被控");
             diagnostics_row(ui, "连接状态", &host.message);
+            diagnostics_row(
+                ui,
+                "输入后端",
+                host.input_backend.as_deref().unwrap_or("等待控制"),
+            );
+            if let Some(error) = &host.input_error {
+                diagnostics_row(ui, "输入状态", error);
+            }
             for (index, stream) in host.streams {
                 let Some(active) = stream.video else {
                     continue;

@@ -88,18 +88,6 @@ pub(crate) fn status(controller: &str, target: &str) -> Option<Snapshot> {
         .map(Handle::snapshot)
 }
 
-pub(crate) fn active_service_count() -> usize {
-    lock(services())
-        .values()
-        .filter(|handle| {
-            if handle.stop.is_cancelled() || handle.commands.is_closed() {
-                return false;
-            }
-            let state = lock(&handle.state);
-            state.enabled || state.busy || state.connected
-        })
-        .count()
-}
 fn jobs() -> &'static Mutex<Vec<(CancellationToken, CancellationToken)>> {
     static JOBS: std::sync::OnceLock<Mutex<Vec<(CancellationToken, CancellationToken)>>> =
         std::sync::OnceLock::new();

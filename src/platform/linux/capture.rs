@@ -44,7 +44,7 @@ pub(crate) fn create_device(_adapter: u64) -> Result<(Device, ())> {
 
 /// GPU adapters a hardware encoder could run on. None are offered: encoding
 /// on Linux is the Rust H.264 core, which needs no adapter.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct EncodingAdapter {
     pub luid: u64,
     pub vendor: u32,
@@ -196,6 +196,9 @@ pub(crate) struct Desktop {
     pub screen: Screen,
     pub generation: u64,
     pub available: bool,
+    /// The pointer as of the latest `next`, for the cursor channel.
+    pub cursor: Option<super::cursor_shape::Snapshot>,
+    sampler: super::cursor_shape::Sampler,
     connection: RustConnection,
     root: Window,
     grabber: Grabber,
@@ -251,6 +254,8 @@ impl Desktop {
             screen,
             generation: 0,
             available: true,
+            cursor: None,
+            sampler: Default::default(),
             connection,
             root,
             grabber,
@@ -293,6 +298,13 @@ impl Desktop {
                 *self = replacement;
             }
         }
+        self.cursor = match self.sampler.sample() {
+            Ok(pointer) => Some(pointer),
+            Err(error) => {
+                tracing::debug!(%error, "host cursor sampling failed");
+                None
+            }
+        };
         let size =
             crate::media::geometry::output_size(self.screen.width, self.screen.height, quality);
         let size = crate::media::geometry::fit_size(size.0, size.1, maximum);

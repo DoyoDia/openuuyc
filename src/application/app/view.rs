@@ -7,13 +7,13 @@ use egui::{Align, Color32, FontId, RichText, Sense, Stroke, vec2};
 
 mod about;
 mod assist;
+// Installing the service and drivers is part of the Windows setup.
+#[cfg(windows)]
+mod components;
 mod device_details;
 mod device_visuals;
 mod devices;
 mod diagnostics_panel;
-// The host role's optional virtual display driver, which is Windows-only.
-#[cfg(windows)]
-mod display_driver;
 mod host_settings;
 mod logs;
 mod port_mapping;
@@ -60,7 +60,7 @@ impl Page {
 #[derive(Default)]
 pub(super) struct CenterUi {
     #[cfg(windows)]
-    display_driver: display_driver::DriverUi,
+    pub(super) components: components::Manager,
     page: Page,
     device_lists: [devices::ListUi; 2],
     detail_id: Option<String>,
@@ -588,21 +588,6 @@ impl DeviceCenterApp {
     pub(super) fn draw_center(&mut self, ui: &mut egui::Ui) {
         self.center_ui.wallpapers.poll(ui.ctx());
         if self.needs_login() {
-            if self.center_ui.page == Page::Logs {
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::new().fill(BG).inner_margin(24))
-                    .show(ui, |ui| {
-                        if crate::ui::controls::back_button(ui, "返回登录").clicked()
-                            || ui.input_mut(|i| {
-                                i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)
-                            })
-                        {
-                            self.center_ui.page = Page::Mine;
-                        }
-                        self.logs_page(ui);
-                    });
-                return;
-            }
             if self.login_restoring {
                 self.loading_page(ui);
             } else {
@@ -815,6 +800,15 @@ impl DeviceCenterApp {
                 }
                 ui.with_layout(egui::Layout::bottom_up(Align::Min), |ui| {
                     self.draw_account_footer(ui);
+                    ui.add_space(8.0);
+                    #[cfg(windows)]
+                    {
+                        let active = self
+                            .host
+                            .as_ref()
+                            .is_some_and(|h| h.status().session_active);
+                        self.center_ui.components.button(ui, active);
+                    }
                 });
             });
     }
@@ -1211,12 +1205,19 @@ impl DeviceCenterApp {
                         });
                 },
             );
+            #[cfg(windows)]
+            {
+                let active = self
+                    .host
+                    .as_ref()
+                    .is_some_and(|h| h.status().session_active);
+                self.center_ui.components.management(ui, active);
+            }
         });
     }
 
     pub(super) fn draw_dialogs(&mut self, ctx: &egui::Context) {
-        if self.close_confirmation {
-            self.close_center_dialog(ctx);
+        if self.exit_requested {
             return;
         }
         if self.needs_login() {
@@ -1242,58 +1243,6 @@ impl DeviceCenterApp {
             && !self.logout_confirmation
         {
             self.assist_dialogs(ctx);
-        }
-    }
-
-    fn close_center_dialog(&mut self, ctx: &egui::Context) {
-        let mut confirm = false;
-        let mut cancel = false;
-        let response = egui::Modal::new(egui::Id::new("close-control-center"))
-            .frame(dialog_frame())
-            .show(ctx, |ui| {
-                ui.set_width(theme::CLOSE_CENTER_DIALOG_WIDTH);
-                cancel = crate::ui::controls::dialog_header(
-                    ui,
-                    "关闭控制中心？",
-                    crate::ui::controls::DialogIcon::Warning,
-                    true,
-                );
-                ui.label("关闭后将结束观看连接，并停止已开启的端口转发服务。");
-                if let Some(session) = &self.active_session {
-                    ui.add_space(10.0);
-                    ui.label(RichText::new(format!("观看设备：{}", session.alias)).color(MUTED));
-                } else if self.opening_viewer {
-                    ui.add_space(10.0);
-                    ui.label(RichText::new("正在建立观看连接").color(MUTED));
-                }
-                let services = crate::features::port_mapping::service::active_service_count();
-                let files = crate::features::file_transfer::service::active_count();
-                if files > 0 {
-                    ui.add_space(6.0);
-                    ui.label(
-                        RichText::new(format!("文件传输连接：{files} 个，未完成任务将暂停"))
-                            .color(MUTED),
-                    );
-                }
-                if services > 0 {
-                    ui.add_space(6.0);
-                    ui.label(RichText::new(format!("端口转发服务：{services} 个")).color(MUTED));
-                }
-                let (accept, dismiss) = crate::ui::controls::dialog_actions(
-                    ui,
-                    Some(crate::ui::controls::DialogAction::new("关闭程序")),
-                    Some("取消"),
-                );
-                confirm = accept;
-                cancel |= dismiss;
-            });
-        if confirm {
-            self.close_confirmed = true;
-            self.close_confirmation = false;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        } else if cancel || response.should_close() {
-            self.close_confirmation = false;
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
     }
 
@@ -1548,15 +1497,6 @@ impl DeviceCenterApp {
     }
 
     fn login_page(&mut self, root: &mut egui::Ui) {
-        egui::Panel::top("login-log-settings")
-            .frame(egui::Frame::new().fill(BG).inner_margin(12))
-            .show(root, |ui| {
-                ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                    if ui.link("日志设置").clicked() {
-                        self.center_ui.page = Page::Logs;
-                    }
-                });
-            });
         let locked = self.login_restoring
             || self.logout_pending
             || self.active_session.is_some()

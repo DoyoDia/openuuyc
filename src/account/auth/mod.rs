@@ -8,6 +8,60 @@ use std::fmt;
 
 use anyhow::{Context, Result, bail};
 use keyring::{Entry, Error as KeyringError};
+mod secret;
+pub(crate) use secret::SecretEntry;
+
+pub(crate) fn enroll_resident() -> Result<()> {
+    use crate::platform::host_service::vault;
+    if vault::applies()? {
+        return Ok(());
+    }
+    ensure_resident_owner()?;
+    let identity = KeyringIdentityStore::new()?
+        .load_existing()?
+        .context("尚未建立本机身份")?;
+    let session = KeyringSessionStore::new()?
+        .load()?
+        .context("请先登录账号")?;
+    SecretEntry::new(SERVICE, IDENTITY_ACCOUNT)?.enroll()?;
+    SecretEntry::new(SERVICE, SESSION_ACCOUNT)?.enroll()?;
+    crate::features::host::enroll_settings(
+        session.user_id(),
+        &identity.client_identity()?.device_id,
+    )?;
+    crate::features::host::displays::transfer_preferences(true)?;
+    std::fs::write(vault::root()?.join("enabled"), b"OpenUUYC unattended v1\n")?;
+    SecretEntry::new(SERVICE, SESSION_ACCOUNT)?.clear_portable()?;
+    Ok(())
+}
+fn ensure_resident_owner() -> Result<()> {
+    use crate::platform::host_service::vault;
+    anyhow::ensure!(
+        vault::owner()? == Some(vault::sid(std::process::id())?),
+        "服务未登记到当前 Windows 用户"
+    );
+    Ok(())
+}
+pub(crate) fn restore_portable() -> Result<()> {
+    use crate::platform::host_service::vault;
+    if !vault::applies()? {
+        return Ok(());
+    }
+    ensure_resident_owner()?;
+    let identity = KeyringIdentityStore::new()?.load_existing()?;
+    let session = KeyringSessionStore::new()?.load()?;
+    if let (Some(identity), Some(session)) = (identity, session) {
+        crate::features::host::restore_portable_settings(
+            session.user_id(),
+            &identity.client_identity()?.device_id,
+        )?;
+    }
+    SecretEntry::new(SERVICE, IDENTITY_ACCOUNT)?.restore_portable()?;
+    SecretEntry::new(SERVICE, SESSION_ACCOUNT)?.restore_portable()?;
+    crate::features::host::displays::transfer_preferences(false)?;
+    Ok(())
+}
+
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -48,6 +102,13 @@ impl LoginSession {
         Ok(session)
     }
 
+    pub(crate) fn generation(&self) -> String {
+        use sha2::{Digest, Sha256};
+        format!(
+            "{:x}",
+            Sha256::digest(format!("{}\0{}", self.user_id, self.token))
+        )
+    }
     pub fn token(&self) -> &str {
         &self.token
     }
@@ -297,16 +358,16 @@ impl fmt::Debug for NativeIdentity {
 }
 
 pub struct KeyringSessionStore {
-    entry: Entry,
+    entry: SecretEntry,
 }
 
 pub struct KeyringIdentityStore {
-    entry: Entry,
+    entry: SecretEntry,
 }
 
 impl KeyringIdentityStore {
     pub fn new() -> Result<Self> {
-        let entry = Entry::new(SERVICE, IDENTITY_ACCOUNT)
+        let entry = SecretEntry::new(SERVICE, IDENTITY_ACCOUNT)
             .context("native secure credential store is unavailable")?;
         Ok(Self { entry })
     }
@@ -383,13 +444,9 @@ impl KeyringIdentityStore {
 
 impl KeyringSessionStore {
     pub fn new() -> Result<Self> {
-        let entry = Entry::new(SERVICE, SESSION_ACCOUNT)
+        let entry = SecretEntry::new(SERVICE, SESSION_ACCOUNT)
             .context("native secure credential store is unavailable")?;
         Ok(Self { entry })
-    }
-
-    pub fn platform_store_available() -> bool {
-        Entry::store_status().is_ok()
     }
 
     /// An old room/API completion must not erase a newer QR login. The lock
@@ -467,7 +524,11 @@ fn credential_store_lock(filename: &str) -> Result<std::fs::File> {
     let base = crate::platform::paths::local_app_data()
         .context("用户数据目录不可用，无法协调登录态存储")?;
 
-    let directory = base.join("openuuyc");
+    let directory = if crate::platform::host_service::vault::applies()? {
+        crate::platform::host_service::vault::root()?
+    } else {
+        base.join("openuuyc")
+    };
     std::fs::create_dir_all(&directory).context("create session coordination directory")?;
     let mut options = std::fs::OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);

@@ -21,7 +21,7 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use viewing::run_viewer_window;
-pub use viewing::{run_assist_viewer_window, run_native_viewer_session, run_saved_viewer_window};
+pub use viewing::{run_native_viewer_session, run_saved_viewer_window};
 
 pub type ConnectionProgressReporter = Arc<dyn Fn(ConnectionProgress) + Send + Sync>;
 pub(crate) fn has_gui_connection(controller: &str, target: &str) -> bool {

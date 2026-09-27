@@ -306,6 +306,9 @@ impl Session {
                         .cloned()
                         .context("缺少主控解码能力")?,
                 )?;
+                tracing::info!(client_type=options.client_type,kind=options.kind,connect_type=options.connect_type,
+                    decoders=?options.decoders,formats=?remote.video_codec_capability,
+                    "host incoming media capabilities");
                 anyhow::ensure!(
                     options.kind == 1 && options.connect_type == 1,
                     "不支持的被控连接类型"
@@ -346,6 +349,7 @@ impl Session {
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
                 let network = crate::features::host::network::Policy::from_signal(value);
+                let configuration_client = self.client.clone();
                 let task = tokio::spawn(async move {
                     let result = async {
                         let screen = displays.prepare(options.clone()).await?;
@@ -354,7 +358,7 @@ impl Session {
                         let capabilities = encoding_settings.select(&media.codecs)?;
                         let prepared =
                             desktop::Prepared::new(&options, screen, &capabilities, &remote)?;
-                        let peer = Peer::new(
+                        let mut peer = Peer::new(
                             prepared.screen,
                             owner,
                             task_cancel,
@@ -365,8 +369,12 @@ impl Session {
                             options.control_screen_reports(),
                             prepared.negotiated,
                             network,
+                            crate::features::host::input::wire::Policy::from_client_type(
+                                options.client_type,
+                            ),
                         )
                         .await?;
+                        peer.load_input_configuration(configuration_client);
                         Ok(PreparedPeer { peer, capabilities })
                     }
                     .await;

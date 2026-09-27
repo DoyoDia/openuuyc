@@ -1,5 +1,5 @@
 //! Capture source identity; backend handles never enter this descriptor.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Screen {
     pub id: i32,
     pub device_name: String,

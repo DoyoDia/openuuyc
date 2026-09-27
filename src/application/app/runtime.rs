@@ -110,6 +110,15 @@ pub(super) async fn gui_worker_loop(
     events: Sender<GuiEvent>,
     mut foreground: watch::Receiver<bool>,
 ) {
+    if crate::platform::host_service::resident::managed() {
+        if let Err(error) = crate::platform::host_service::resident::request(
+            crate::platform::host_service::resident::Request::Resume,
+        )
+        .await
+        {
+            let _ = events.send(GuiEvent::Warning(format!("后台启动失败：{error:#}")));
+        }
+    }
     let device_runtime = match crate::session::device_session::DeviceRuntime::start() {
         Ok(runtime) => runtime,
         Err(error) => {
@@ -149,6 +158,7 @@ pub(super) async fn gui_worker_loop(
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut host_signal: Option<ActivePresence> = None;
     let mut presence_stopped = false;
+    let mut resident_mode = crate::platform::host_service::resident::managed();
 
     loop {
         let command = tokio::select! {
@@ -163,6 +173,12 @@ pub(super) async fn gui_worker_loop(
             },
             _ = tick.tick() => None,
         };
+        let mode = crate::platform::host_service::resident::managed();
+        if mode != resident_mode {
+            stop_active_signal(&mut host_signal).await;
+            resident_mode = mode;
+            presence_stopped = false;
+        }
         if let Some(command) = command {
             match command {
                 GuiCommand::SaveHostSettings { generation } => {
@@ -443,6 +459,19 @@ pub(super) async fn gui_worker_loop(
                             }
                         }));
                     }
+                }
+                GuiCommand::PrepareExit => {
+                    let result = if crate::platform::host_service::resident::managed() {
+                        crate::platform::host_service::resident::request(
+                            crate::platform::host_service::resident::Request::Pause,
+                        )
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| format!("{e:#}"))
+                    } else {
+                        Ok(())
+                    };
+                    let _ = events.send(GuiEvent::ExitReady(result));
                 }
                 GuiCommand::Shutdown => break,
                 GuiCommand::Refresh => {

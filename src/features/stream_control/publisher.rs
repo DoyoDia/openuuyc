@@ -24,6 +24,8 @@ pub(crate) struct ConnectOptions {
     pub virtual_modes: Vec<VirtualMode>,
     #[prost(message, optional, tag = "7")]
     pub virtual_initial: Option<Resolution>,
+    #[prost(int32, tag = "8")]
+    pub client_type: i32,
     #[prost(string, tag = "9")]
     pub device_id: String,
     #[prost(int32, tag = "10")]
@@ -67,6 +69,27 @@ pub(crate) struct DecoderCapability {
     #[prost(int32, tag = "5")]
     pub chroma: i32,
 }
+impl DecoderCapability {
+    pub fn chroma_sampling(&self) -> u8 {
+        // S DB77E0 -> DB75F0: protobuf's unspecified value means 4:2:0.
+        // Android currently leaves this field unset, including for HEVC.
+        match self.chroma {
+            2..=4 => self.chroma as u8,
+            _ => 1,
+        }
+    }
+
+    pub fn maximum_fps(&self) -> u32 {
+        // S DB77E0 -> DB72A0 converts a numeric rate to the protocol's tiers;
+        // this is distinct from CaptureParams' 1/2/3/4 frame-rate enum.
+        match self.fps as u32 {
+            117.. => 144,
+            75..=116 => 90,
+            45..=74 => 60,
+            _ => 30,
+        }
+    }
+}
 #[derive(Clone, PartialEq, prost::Message)]
 pub(crate) struct CaptureParams {
     #[prost(int32, tag = "1")]
@@ -97,6 +120,9 @@ fn flags() -> PbFeatureFlag {
     PbFeatureFlag {
         capture_setting: 6,
         qos_stat: 1,
+        // Current Windows input protocol generation, not an installed/active
+        // driver assertion. RpcRequest 11 retains its no-install support reply.
+        virtual_mouse_device: 1,
         ..Default::default()
     }
 }
@@ -268,13 +294,13 @@ pub(crate) fn config(params: Option<&CaptureParams>) -> VideoConfig {
             144
         },
         bitrate: bitrate(p.quality, p.auto_quality, p.bitrate),
-        quality: p.quality.clamp(1, 6),
-        auto_quality: p.auto_quality.clamp(1, 4),
+        quality: quality(p.quality),
+        auto_quality: auto_quality(p.auto_quality),
         revision: 0,
         reported_quality: if p.quality == 5 {
-            p.auto_quality.clamp(1, 4)
+            auto_quality(p.auto_quality)
         } else {
-            p.quality.clamp(1, 6)
+            quality(p.quality)
         },
         sending: true,
         capturing: true,
@@ -296,6 +322,20 @@ fn fps(level: i32, count: i32) -> u32 {
         requested
     }
 }
+fn quality(value: i32) -> i32 {
+    // S DB7E50: unspecified and unknown quality use the general tier.
+    match value {
+        1..=6 => value,
+        _ => 2,
+    }
+}
+fn auto_quality(value: i32) -> i32 {
+    // S DB75C0: the automatic baseline is general, HD, or Blu-ray.
+    match value {
+        3 | 4 => value,
+        _ => 2,
+    }
+}
 fn bitrate(quality: i32, auto: i32, custom: i32) -> u32 {
     match if quality == 5 { auto } else { quality } {
         4 => 30_000_000,
@@ -307,6 +347,53 @@ fn bitrate(quality: i32, auto: i32, custom: i32) -> u32 {
 }
 
 /// Unsupported operations never succeed silently or reach a local side-effect handler.
+pub(crate) fn input_event(bytes: &[u8]) -> Result<Option<Vec<u8>>> {
+    Ok(match PbControlMessage::decode(bytes)?.payload {
+        Some(PbPayload::InputEvent(bytes)) => Some(bytes),
+        _ => None,
+    })
+}
+pub(crate) fn input_action(
+    bytes: &[u8],
+) -> Result<Option<crate::features::host::input::wire::Event>> {
+    use crate::features::host::input::wire::{Command, Event};
+    let Some(PbPayload::SimpleAction(action)) = PbControlMessage::decode(bytes)?.payload else {
+        return Ok(None);
+    };
+    Ok(Some(match action.action {
+        2 => Event::Command(Command::Desktop),
+        3 => Event::Command(Command::TaskView),
+        10 => Event::Command(Command::Lock),
+        13 => Event::Command(Command::TaskManager),
+        11 => {
+            #[derive(Clone, PartialEq, prost::Message)]
+            struct Toggle {
+                #[prost(int32, tag = "1")]
+                key: i32,
+                #[prost(int32, tag = "2")]
+                state: i32,
+            }
+            let Some(PbSimpleActionParams::KeyToggle(bytes)) = action.params else {
+                anyhow::bail!("缺少锁定键参数")
+            };
+            let toggle = Toggle::decode(bytes.as_slice())?;
+            let key = match toggle.key {
+                1 => 20,
+                2 => 144,
+                3 => 145,
+                _ => anyhow::bail!("无效锁定键类型"),
+            };
+            Event::Key {
+                key,
+                down: false,
+                interruptible: false,
+                toggle: Some(toggle.state == 2),
+            }
+        }
+        _ => return Ok(None),
+    }))
+}
+
 pub(crate) fn receive(
     bytes: &[u8],
     control: bool,
@@ -391,21 +478,6 @@ pub(crate) fn receive(
             let payload = if let Some(PbRpcRequestPayload::CaptureSetting(setting)) =
                 request.payload
             {
-                tracing::info!(
-                    screen_id = setting.screen_id,
-                    width = setting.resolution_width,
-                    height = setting.resolution_height,
-                    dpi = setting.dpi_scale,
-                    fps = setting.fps,
-                    fps_count = setting.fps_count,
-                    quality = setting.frame_quality,
-                    chroma = setting.chroma_format,
-                    codec = setting.codec_type,
-                    hdr = setting.enable_hdr,
-                    max_scale_width = setting.max_scale_width,
-                    max_scale_height = setting.max_scale_height,
-                    "host capture setting received"
-                );
                 let mut errors = Vec::new();
                 if (setting.resolution_width > 0 && setting.resolution_width as u32 != screen.width)
                     || (setting.resolution_height > 0
@@ -461,8 +533,8 @@ pub(crate) fn receive(
                         setting.auto_frame_quality,
                         setting.max_custom_bitrate,
                     );
-                    next.quality = setting.frame_quality.clamp(1, 6);
-                    next.auto_quality = setting.auto_frame_quality.clamp(1, 4);
+                    next.quality = quality(setting.frame_quality);
+                    next.auto_quality = auto_quality(setting.auto_frame_quality);
                     next.revision = next.revision.wrapping_add(1);
                     let codec = crate::features::host::format::Codec::from_wire(setting.codec_type);
                     let selected = if (0..=2).contains(&setting.codec_type) {
@@ -574,6 +646,12 @@ pub(crate) fn receive(
     }
 }
 
-pub(crate) fn cursor_report(state: Vec<u8>, sequence: i64) -> Vec<u8> {
-    super::wire::encode_envelope(sequence, PbPayload::SystemStateChange(state))
+pub(crate) fn cursor_report(state: Vec<u8>) -> Vec<u8> {
+    // ControllerWrapper::onReceiveControlData consumes this notification before
+    // generic PB dispatch. TEXT and signal callbacks do not update its cursor.
+    PbControlMessage {
+        payload: Some(PbPayload::SystemStateChange(state)),
+        ..Default::default()
+    }
+    .encode_to_vec()
 }

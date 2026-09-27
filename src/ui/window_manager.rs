@@ -18,6 +18,8 @@ pub(crate) enum Event {
     Request(Request),
 }
 pub(crate) enum Request {
+    ShowMain,
+    Exit,
     Open {
         key: String,
         config: WindowConfig,

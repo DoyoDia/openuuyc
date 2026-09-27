@@ -215,6 +215,7 @@ impl Capture {
                 image: texture,
                 captured,
                 is_new: true,
+                _storage: None,
                 hdr_metadata: None,
             })
         }

@@ -5,13 +5,13 @@ use winit::dpi::PhysicalSize;
 
 // The platform layer owns the presenter and its device; the shell only needs
 // their names.
+#[cfg(windows)]
+pub(crate) use crate::platform::graphics::window_hwnd;
 #[allow(
     unused_imports,
     reason = "The platform-neutral names of the presenter types; not every caller spells them out."
 )]
 pub(crate) use crate::platform::graphics::{Graphics, UiPresenter, create_device, split_output};
-#[cfg(windows)]
-pub(crate) use crate::platform::graphics::{create_backbuffer, window_hwnd};
 
 /// Opt-in, aggregated UI-only diagnostics. No RTP hot-path counters or HUD.
 pub(crate) struct UiTimingAudit {

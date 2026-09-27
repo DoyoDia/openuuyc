@@ -6,7 +6,6 @@
 //! and every Linux frame takes the CPU path. A real zero-copy path here would
 //! be a dmabuf export from VA-API, with its own ownership rules.
 use anyhow::{Result, bail};
-use mediaway_common::GpuDeviceHandle;
 
 #[derive(Clone)]
 pub(crate) enum D3D11SurfaceWriter {}
@@ -23,7 +22,7 @@ impl D3D11SurfaceWriter {
         Ok(Vec::new())
     }
 
-    pub(crate) fn device_handle(&self) -> GpuDeviceHandle {
+    pub(crate) fn device_handle(&self) -> super::decoder::GpuDevice {
         match *self {}
     }
 

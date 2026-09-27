@@ -1,7 +1,7 @@
 //! Progressive H.264 VA-API picture preparation.
 //!
 //! The bitstream work — NAL parsing, POC derivation, DPB marking and reference
-//! list construction — is the same `oxideav_h264` machinery the Windows DXVA
+//! list construction — is the same `openuuyc_h264` machinery the Windows DXVA
 //! backend uses. Only the parameter buffers differ: VA-API always wants full
 //! per-slice parameters, including the reference lists, where DXVA's short
 //! slice-control format leaves the driver to parse the slice headers itself.
@@ -12,14 +12,11 @@ use cros_libva::{
     PictureParameter, PictureParameterBufferH264, SliceParameter, SliceParameterBufferH264,
     VAProfile, VASurfaceID,
 };
-use oxideav_h264::{
-    decoder::{Decoder, Event},
+use openuuyc_h264::headers::Headers;
+use openuuyc_h264::syntax::{
     poc::{PocSlice, PocSps, PocState, derive_poc},
     pps::Pps,
-    ref_list::{
-        DpbEntry, PicStructure, RefMarking, RplmOp, init_ref_pic_list_p, init_ref_pic_lists_b,
-        modify_ref_pic_list, perform_marking,
-    },
+    ref_list::{DpbEntry, PicStructure, RefMarking, perform_marking},
     slice_header::{RefPicListModificationOp, SliceHeader, SliceType},
     sps::Sps,
     transform::{select_scaling_list_4x4, select_scaling_list_8x8},
@@ -27,6 +24,7 @@ use oxideav_h264::{
 
 use super::display::{self, Pool};
 use super::output;
+use super::ref_list::{RplmOp, init_ref_pic_list_p, init_ref_pic_lists_b, modify_ref_pic_list};
 use crate::media::decode_api::DecodeError;
 
 /// VA flags for a reference entry in `VAPictureParameterBufferH264`.
@@ -52,7 +50,7 @@ struct Slice<'a> {
 }
 
 pub(super) struct Avc {
-    parser: Decoder,
+    parser: Headers,
     pool: Option<Pool>,
     profile: VAProfile::Type,
     poc: PocState,
@@ -67,7 +65,7 @@ pub(super) struct Avc {
 impl Avc {
     pub(super) fn new() -> Self {
         Self {
-            parser: Decoder::new(),
+            parser: Headers::new(),
             pool: None,
             profile: VAProfile::VAProfileH264High,
             poc: PocState::default(),
@@ -111,12 +109,8 @@ impl Avc {
         }
         let mut slices: Vec<Slice<'_>> = Vec::new();
         let mut first: Option<(u8, u8, SliceHeader, Sps, Pps)> = None;
-        for nal in oxideav_h264::nal::AnnexBSplitter::new(data) {
-            let event = self
-                .parser
-                .process_nal(nal)
-                .map_err(|error| parse_error(&error))?;
-            let Event::Slice {
+        for nal in openuuyc_h264::syntax::nal::AnnexBSplitter::new(data) {
+            let Some(openuuyc_h264::headers::Slice {
                 nal_unit_type,
                 nal_ref_idc,
                 header,
@@ -124,7 +118,7 @@ impl Avc {
                 pps,
                 sps,
                 ..
-            } = event
+            }) = self.parser.process(nal).map_err(parse_error)?
             else {
                 continue;
             };
@@ -433,20 +427,22 @@ fn slice_data_bit_offset(nal: &[u8], cursor: (usize, u8)) -> u32 {
     (raw_byte as u32) * 8 + u32::from(bit)
 }
 
-fn parse_error(error: &oxideav_h264::decoder::DecoderError) -> DecodeError {
-    use oxideav_h264::decoder::DecoderError;
+fn parse_error(error: openuuyc_h264::Error) -> DecodeError {
+    use openuuyc_h264::Error;
     match error {
-        DecoderError::FmoNotSupported(_) => DecodeError::Unsupported,
-        DecoderError::NoActiveParameterSets
-        | DecoderError::UnknownPps(_)
-        | DecoderError::UnknownSps(_) => DecodeError::NeedKeyframe,
-        _ => DecodeError::InvalidInput,
+        Error::Unsupported(_) => DecodeError::Unsupported,
+        Error::NeedKeyframe => DecodeError::NeedKeyframe,
+        Error::Cancelled | Error::Closed => DecodeError::Closed,
+        Error::Allocation => DecodeError::Backend,
+        Error::Truncated | Error::Invalid(_) => DecodeError::InvalidInput,
     }
 }
 
-fn map_mmco(op: &oxideav_h264::slice_header::MmcoOp) -> oxideav_h264::ref_list::MmcoOp {
-    use oxideav_h264::ref_list::MmcoOp;
-    use oxideav_h264::slice_header::MmcoOp as Parsed;
+fn map_mmco(
+    op: &openuuyc_h264::syntax::slice_header::MmcoOp,
+) -> openuuyc_h264::syntax::ref_list::MmcoOp {
+    use openuuyc_h264::syntax::ref_list::MmcoOp;
+    use openuuyc_h264::syntax::slice_header::MmcoOp as Parsed;
     match *op {
         Parsed::MarkShortTermUnused(value) => MmcoOp::MarkShortTermUnused(value),
         Parsed::MarkLongTermUnused(value) => MmcoOp::MarkLongTermUnused(value),
@@ -495,7 +491,7 @@ fn picture_parameter(
     head: &SliceHeader,
     is_reference: bool,
     idr: bool,
-    poc: &oxideav_h264::poc::PocResult,
+    poc: &openuuyc_h264::syntax::poc::PocResult,
     surface: VASurfaceID,
     refs: &[DpbEntry],
     pool: &Pool,

@@ -342,6 +342,9 @@ impl RemoteInput {
     /// Reported by the window that tried to take the pointer. It stays off for
     /// the rest of the session: whatever holds the pointer is outside this
     /// process, and retrying would only swing the mode back and forth.
+    /// Only an X11/Wayland pointer grab can be refused by another client;
+    /// the Windows player's raw-input capture has no such failure.
+    #[cfg_attr(windows, allow(dead_code))]
     pub fn set_relative_available(&self, available: bool) {
         let mut s = self.lock();
         if s.relative_denied != available {

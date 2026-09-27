@@ -2,6 +2,8 @@
 mod adapter_type;
 pub(crate) mod amf;
 pub(crate) mod capture;
+pub(crate) mod capture_service;
+pub(crate) mod components;
 pub(crate) mod cursor;
 pub(crate) mod cursor_shape;
 pub(crate) mod decoder;
@@ -10,6 +12,8 @@ pub(crate) mod display_hdr;
 pub(crate) mod encoder;
 pub(crate) mod gdi;
 pub(crate) mod gpu_conversion;
+pub(crate) mod host_service;
+pub(crate) mod input;
 pub(crate) mod nvenc;
 pub(crate) mod preprocess;
 pub(crate) mod qsv;

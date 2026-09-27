@@ -80,6 +80,9 @@ impl StreamControlHandle {
 
     /// Whether the host is drawing its own pointer into the captured frames.
     /// While it is not, nothing but this client can put a pointer on screen.
+    /// The Linux player draws the remote pointer itself and asks; the Windows
+    /// player shows it as the system cursor, which needs no such check.
+    #[cfg_attr(windows, allow(dead_code))]
     pub(crate) fn remote_cursor_captured(&self) -> bool {
         lock(&self.shared).baseline.cursor_capture
     }

@@ -4,6 +4,11 @@ use anyhow::Result;
 pub(crate) mod chrome;
 pub(crate) mod gfx;
 
+#[cfg(windows)]
+mod tray;
+#[cfg(target_os = "linux")]
+#[path = "tray_linux.rs"]
+mod tray;
 pub(crate) mod window_manager;
 mod windows;
 

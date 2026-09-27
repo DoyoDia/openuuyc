@@ -200,6 +200,7 @@ impl ThreadedWindowsApp {
             ..
         } = event
             && window.has_focus()
+            && !crate::platform::windows::input::system::own_message()
             && !self.egui_context.text_edit_focused()
             && key.state == winit::event::ElementState::Pressed
             && let Some(shortcut) = viewer_shortcut(self.modifiers, key.physical_key)

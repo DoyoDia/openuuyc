@@ -10,3 +10,16 @@ pub(crate) mod timing;
 pub(crate) mod ulpfec;
 pub(crate) mod uu_kcp;
 pub(crate) mod xor_fec;
+
+/// HTTP can start before signaling (for example, the release check).
+/// Install the same TLS provider before reqwest constructs its configuration.
+pub(crate) fn http_client() -> reqwest::ClientBuilder {
+    init_tls();
+    reqwest::Client::builder()
+}
+
+pub(crate) fn init_tls() {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+}

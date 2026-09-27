@@ -2,7 +2,6 @@ use std::sync::{Arc, Mutex};
 
 use crate::platform::decoder::WindowsGpuVideoFrame;
 use anyhow::{Context, Result, bail};
-use mediaway_common::{GpuDeviceHandle, NativeHandle};
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
 use windows::Win32::Graphics::Direct3D11::{
@@ -212,10 +211,8 @@ impl D3D11SurfaceWriter {
         })
     }
 
-    pub(crate) fn device_handle(&self) -> GpuDeviceHandle {
-        let handle = NativeHandle::new(Interface::as_raw(&self.shared.device) as usize)
-            .expect("a live D3D11 device has a non-null COM pointer");
-        GpuDeviceHandle::DirectX11(handle)
+    pub(crate) fn device_handle(&self) -> ID3D11Device {
+        self.shared.device.clone()
     }
 
     pub(crate) fn create_renderer_device(&self) -> Result<(ID3D11Device, ID3D11DeviceContext)> {

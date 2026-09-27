@@ -2,8 +2,7 @@
 //! Progressive H.264 DXVA picture preparation; Rust parser and DPB metadata only.
 use super::dxva::{Codec, Failure, Lease, Picture, Pool};
 use anyhow::{Result, ensure};
-use oxideav_h264::{
-    decoder::{Decoder, Event},
+use openuuyc_h264::syntax::{
     poc::*,
     pps::Pps,
     ref_list::{DpbEntry, MmcoOp, PicStructure, RefMarking, perform_marking},
@@ -64,7 +63,7 @@ impl Default for Params {
     }
 }
 pub struct Avc {
-    parser: Decoder,
+    parser: openuuyc_h264::headers::Headers,
     device: ID3D11Device,
     pool: Option<Arc<Pool>>,
     poc: PocState,
@@ -79,7 +78,7 @@ pub struct Avc {
 impl Avc {
     pub fn new(device: ID3D11Device) -> Self {
         Self {
-            parser: Decoder::new(),
+            parser: openuuyc_h264::headers::Headers::new(),
             device,
             pool: None,
             poc: PocState::default(),
@@ -113,15 +112,15 @@ impl Avc {
         let mut first: Option<(u8, u8, SliceHeader, Sps, Pps)> = None;
         let mut slices = vec![];
         let mut all_intra = true;
-        for nal in oxideav_h264::nal::AnnexBSplitter::new(data) {
-            if let Event::Slice {
+        for nal in openuuyc_h264::syntax::nal::AnnexBSplitter::new(data) {
+            if let Some(openuuyc_h264::headers::Slice {
                 nal_unit_type,
                 nal_ref_idc,
                 header,
                 sps,
                 pps,
                 ..
-            } = self.parser.process_nal(nal)?
+            }) = self.parser.process(nal)?
             {
                 ensure!(
                     sps.frame_mbs_only_flag
@@ -431,8 +430,8 @@ fn parameters(
     v.redundant_pic_cnt_present_flag = p.redundant_pic_cnt_present_flag as u8;
     Ok(v)
 }
-fn map_mmco(op: &oxideav_h264::slice_header::MmcoOp) -> MmcoOp {
-    use oxideav_h264::slice_header::MmcoOp as S;
+fn map_mmco(op: &openuuyc_h264::syntax::slice_header::MmcoOp) -> MmcoOp {
+    use openuuyc_h264::syntax::slice_header::MmcoOp as S;
     match *op {
         S::MarkShortTermUnused(x) => MmcoOp::MarkShortTermUnused(x),
         S::MarkLongTermUnused(x) => MmcoOp::MarkLongTermUnused(x),

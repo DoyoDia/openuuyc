@@ -1,4 +1,4 @@
-//! SudoVDA's public 0.2.1 IOCTL contract. This adapter never installs drivers,
+//! OpenUUYC Display's private 1.0.0 IOCTL contract. This adapter never installs drivers,
 //! changes certificate trust, or removes devices by a display-name heuristic.
 use super::topology::{luid, native_luid};
 use anyhow::{Context, Result, ensure};
@@ -14,9 +14,9 @@ use windows::{
     core::{GUID, PCWSTR},
 };
 
-const INTERFACE: GUID = GUID::from_u128(0xe5bcc234_1e0c_418a_a0d4_ef8b7501414d);
+const INTERFACE: GUID = GUID::from_u128(0x0340a7d5_63b2_4a81_80cd_6f6454875011);
 const fn ioctl(function: u32) -> u32 {
-    (0x22 << 16) | (function << 2)
+    (0x22 << 16) | (3 << 14) | (function << 2)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -81,13 +81,13 @@ impl Driver {
             ..Default::default()
         };
         unsafe { SetupDiEnumDeviceInterfaces(devices.0, None, &INTERFACE, 0, &mut interface) }
-            .context("SudoVDA尚未安装或未启动")?;
+            .context("OpenUUYC虚拟显示驱动尚未安装或未启动")?;
         let mut other = SP_DEVICE_INTERFACE_DATA {
             cbSize: size_of::<SP_DEVICE_INTERFACE_DATA>() as u32,
             ..Default::default()
         };
         match unsafe { SetupDiEnumDeviceInterfaces(devices.0, None, &INTERFACE, 1, &mut other) } {
-            Ok(()) => anyhow::bail!("存在多个SudoVDA设备，无法确定驱动拥有者"),
+            Ok(()) => anyhow::bail!("存在多个OpenUUYC虚拟显示设备，无法确定驱动拥有者"),
             Err(error)
                 if error.code()
                     == windows::core::HRESULT::from_win32(
@@ -172,7 +172,7 @@ impl Driver {
         let mut version = [0u8; 4];
         let returned = driver.control(0x8ff, &[], &mut version)?;
         ensure!(
-            returned == version.len() && version[..3] == [0, 2, 1],
+            returned == version.len() && version == [1, 0, 0, 0],
             "不支持的虚拟显示驱动协议：{:?}",
             version
         );

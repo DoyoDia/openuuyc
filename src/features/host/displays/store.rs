@@ -57,9 +57,64 @@ pub(super) struct Journal {
 }
 
 pub(super) fn root() -> Result<PathBuf> {
+    // The installed service keeps display state in its protected vault.
+    if crate::platform::host_service::vault::applies()? {
+        return Ok(crate::platform::host_service::vault::root()?.join("displays"));
+    }
+    portable_root()
+}
+fn portable_root() -> Result<PathBuf> {
     Ok(crate::platform::paths::local_app_data()
         .context("本地显示配置目录不可用")?
         .join("OpenUUYC/displays"))
+}
+pub(super) fn transfer_preferences(to_service: bool) -> Result<()> {
+    let portable = portable_root()?.join("preferences");
+    let service = crate::platform::host_service::vault::root()?.join("displays/preferences");
+    let (from, to) = if to_service {
+        (portable, service)
+    } else {
+        (service, portable)
+    };
+    if !from.exists() {
+        return Ok(());
+    }
+    use crate::platform::host_service::reject_reparse;
+    reject_reparse(&from)?;
+    for scope in fs::read_dir(from)? {
+        let scope = scope?;
+        let name = scope.file_name();
+        let text = name.to_string_lossy();
+        if text.len() != 64 || !text.bytes().all(|c| c.is_ascii_hexdigit()) {
+            continue;
+        }
+        reject_reparse(&scope.path())?;
+        if !scope.file_type()?.is_dir() {
+            continue;
+        }
+        let destination = to.join(name);
+        reject_reparse(&destination)?;
+        for file in fs::read_dir(scope.path())? {
+            let file = file?;
+            let name = file.file_name();
+            let text = name.to_string_lossy();
+            if text.len() != 69
+                || !text.ends_with(".json")
+                || !text[..64].bytes().all(|c| c.is_ascii_hexdigit())
+            {
+                continue;
+            }
+            reject_reparse(&file.path())?;
+            let target = destination.join(name);
+            if to_service && target.exists() {
+                continue;
+            }
+            if let Some(value) = read::<Preference>(&file.path())? {
+                write(&target, &value)?;
+            }
+        }
+    }
+    Ok(())
 }
 pub(super) fn read<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
     let file = match fs::File::open(path) {

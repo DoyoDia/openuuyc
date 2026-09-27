@@ -35,6 +35,7 @@ pub(super) struct Reports {
     pub current: AtomicI32,
     pub sequence: std::sync::atomic::AtomicI64,
     pub publications: Vec<Mutex<Option<watch::Receiver<Published>>>>,
+    pub pointers: Vec<Arc<Mutex<Option<crate::platform::cursor_shape::Snapshot>>>>,
     pub changed: watch::Sender<u64>,
 }
 impl Reports {
@@ -120,6 +121,7 @@ impl Screens {
             current: AtomicI32::new(selected.id),
             sequence: std::sync::atomic::AtomicI64::new(1),
             publications: (0..TRACK_COUNT).map(|_| Mutex::new(None)).collect(),
+            pointers: (0..TRACK_COUNT).map(|_| Arc::default()).collect(),
             changed: watch::channel(0).0,
         });
         let mut slots = Vec::new();
@@ -352,6 +354,7 @@ impl Screens {
             slot.negotiated.clone(),
             slot.transport.clone(),
             tx,
+            self.reports.pointers[index].clone(),
         )?;
         *lock(&self.reports.publications[index]) = Some(rx.clone());
         let reports = self.reports.clone();
@@ -383,6 +386,7 @@ impl Screens {
         slot.transport.pause();
         slot.screen = None;
         *lock(&self.reports.publications[index]) = None;
+        *lock(&self.reports.pointers[index]) = None;
         self.reports.notify();
     }
     pub(crate) async fn stop(&mut self, screen: i32) -> Result<()> {

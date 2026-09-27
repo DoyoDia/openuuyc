@@ -237,34 +237,3 @@ fn is_retryable_poll_error(error: &Error) -> bool {
             .is_some_and(|error| error.is_timeout() || error.is_connect() || error.is_request())
     })
 }
-
-pub fn auth_status() -> Result<()> {
-    println!(
-        "platform credential store: {}",
-        if KeyringSessionStore::platform_store_available() {
-            "available"
-        } else {
-            "unavailable"
-        }
-    );
-    let store = KeyringSessionStore::new()?;
-    println!(
-        "saved login session: {}",
-        if store.load()?.is_some() {
-            "present"
-        } else {
-            "absent"
-        }
-    );
-    Ok(())
-}
-
-pub fn clear_local_session() -> Result<()> {
-    clear_saved_session()?;
-    println!("saved login session: removed");
-    Ok(())
-}
-
-pub fn clear_saved_session() -> Result<()> {
-    KeyringSessionStore::new()?.clear()
-}

@@ -29,6 +29,7 @@ pub(super) fn capture_loop(
     transport: crate::features::host::transport::Transport,
     negotiated: Arc<crate::features::host::format::Negotiated>,
     publication: tokio::sync::watch::Sender<Published>,
+    pointer: Arc<Mutex<Option<crate::platform::cursor_shape::Snapshot>>>,
 ) -> Result<()> {
     let _runtime = encoder::Runtime::new()?;
     let mut desktop = None;
@@ -275,6 +276,7 @@ pub(super) fn capture_loop(
         );
         let captured = captured?;
         let capture_state = desktop.as_ref().context("缺少采集源")?;
+        *lock(&pointer) = capture_state.cursor.clone();
         if generation != capture_state.generation {
             generation = capture_state.generation;
             encoder = None;

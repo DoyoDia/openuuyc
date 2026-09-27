@@ -3,7 +3,7 @@ use super::{capture, lock, settings};
 use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Status {
     pub ready: bool,
     pub connected: bool,
@@ -11,6 +11,8 @@ pub(crate) struct Status {
     pub message: String,
     pub error: Option<String>,
     pub settings_error: Option<String>,
+    pub input_backend: Option<String>,
+    pub input_error: Option<String>,
     pub saving: bool,
     pub encoder: Option<(i32, (u32, u32))>,
     pub capture: Option<String>,
@@ -19,7 +21,7 @@ pub(crate) struct Status {
     pub streams: std::collections::BTreeMap<usize, StreamStatus>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct StreamStatus {
     pub encoder: Option<(i32, (u32, u32))>,
     pub capture: Option<String>,
@@ -39,7 +41,7 @@ fn update_media_summary(status: &mut Status) {
     status.video = current.and_then(|s| s.video);
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ActiveEncoding {
     pub backend: super::format::Backend,
     pub adapter: u64,
@@ -64,6 +66,7 @@ struct Ownership {
     active: bool,
     dirty: bool,
     last_controlled: Option<std::time::Instant>,
+    remote_action: Option<bool>,
     status: Status,
 }
 
@@ -75,6 +78,7 @@ pub(crate) struct Handle {
     saving: Arc<tokio::sync::Mutex<()>>,
     media: Arc<super::desktop::Cache>,
     scope: String,
+    account: String,
 }
 
 impl Default for Handle {
@@ -91,12 +95,14 @@ impl Default for Handle {
                 active: true,
                 dirty: false,
                 last_controlled: None,
+                remote_action: None,
                 status: Status::default(),
             })),
             store: None,
             saving: Arc::new(tokio::sync::Mutex::new(())),
             media: Arc::default(),
             scope: String::new(),
+            account: String::new(),
         }
     }
 }
@@ -111,15 +117,49 @@ fn finish_session(state: &mut Ownership) {
     state.status.capture = None;
     state.status.screen = None;
     state.status.video = None;
+    state.status.input_backend = None;
+    state.status.input_error = None;
     state.status.streams.clear();
     state.stream_generations.clear();
 }
 
 impl Handle {
+    pub(crate) fn bind_account(&mut self, account: String) {
+        self.account = account;
+    }
+    pub(crate) fn take_remote_action(&self) -> Option<bool> {
+        lock(&self.ownership).remote_action.take()
+    }
+    pub(crate) async fn apply_remote(
+        &self,
+        snapshot: crate::platform::host_service::resident::Snapshot,
+    ) {
+        self.media.replace(snapshot.capabilities).await;
+        let mut state = lock(&self.ownership);
+        if !state.active {
+            return;
+        }
+        if state.dirty {
+            return;
+        }
+        state.allowed = snapshot.allowed;
+        state.encoding = snapshot.encoding;
+        state.status = snapshot.status;
+    }
+    pub(crate) fn remote_failed(&self, error: String) {
+        let mut state = lock(&self.ownership);
+        finish_session(&mut state);
+        state.status.ready = false;
+        state.status.error = Some(error);
+        state.status.message = "后台连接中断".into();
+    }
     pub(crate) async fn prepare_startup(
         &self,
         cancel: tokio_util::sync::CancellationToken,
     ) -> anyhow::Result<()> {
+        if crate::platform::host_service::resident::managed() {
+            return Ok(());
+        }
         tokio::task::spawn_blocking(super::displays::recovery::recover_abandoned).await??;
         let screens = capture::screens()?;
         let Some(screen) = screens
@@ -220,7 +260,17 @@ impl Handle {
                 }
                 (state.settings_revision, state.allowed, state.encoding)
             };
-            let result = if let Some(store) = self.store.clone() {
+            let result = if crate::platform::host_service::resident::managed() {
+                crate::platform::host_service::resident::request(
+                    crate::platform::host_service::resident::Request::Settings {
+                        account: self.account.clone(),
+                        allowed,
+                        encoding,
+                    },
+                )
+                .await
+                .map(|_| ())
+            } else if let Some(store) = self.store.clone() {
                 tokio::task::spawn_blocking(move || store.save(allowed, encoding))
                     .await
                     .map_err(|_| anyhow::anyhow!("被控设置保存任务中断"))
@@ -239,6 +289,10 @@ impl Handle {
         }
     }
     pub(crate) fn retry(&self) {
+        if crate::platform::host_service::resident::managed() {
+            lock(&self.ownership).remote_action = Some(true);
+            return;
+        }
         let mut state = lock(&self.ownership);
         if !state.active || !state.allowed {
             return;
@@ -273,6 +327,10 @@ impl Handle {
             }));
     }
     pub(crate) fn disconnect(&self) {
+        if crate::platform::host_service::resident::managed() {
+            lock(&self.ownership).remote_action = Some(false);
+            return;
+        }
         let mut state = lock(&self.ownership);
         if !state.status.session_active {
             return;
@@ -463,6 +521,12 @@ impl Lease {
         self.modify(|state| {
             state.status.error = None;
             state.status.message = "正在被远程访问".into();
+        });
+    }
+    pub(crate) fn input_status(&self, backend: Option<&str>, error: Option<String>) {
+        self.modify(|state| {
+            state.status.input_backend = backend.map(str::to_owned);
+            state.status.input_error = error;
         });
     }
     pub(crate) fn recovery_failed(&self, error: impl Into<String>) {

@@ -5,10 +5,11 @@
 mod avc;
 mod display;
 mod output;
+mod ref_list;
 
 use cros_libva::VAProfile;
-use mediaway_common::CodecKind;
 
+use crate::media::VideoCodec;
 use crate::media::decode_api::{DecodeError, VideoDecoderConfig};
 
 pub(super) use avc::Frame;
@@ -17,7 +18,7 @@ pub(super) struct Session {
     codec: Codec,
     /// The parameter sets from the negotiation, prepended to the first access
     /// unit so the parser can activate an SPS/PPS before the first slice.
-    extra: Option<mediaway_common::Bytes>,
+    extra: Option<bytes::Bytes>,
 }
 
 enum Codec {
@@ -37,10 +38,10 @@ impl Session {
             return Err(DecodeError::Unsupported);
         }
         match config.codec {
-            CodecKind::H264 => {
+            VideoCodec::H264 => {
                 // The profile the stream actually uses is only known once its
                 // SPS arrives; this rejects drivers that decode no H.264 at all.
-                if !probe(CodecKind::H264, config.width, config.height, 8, 1) {
+                if !probe(VideoCodec::H264, config.width, config.height, 8, 1) {
                     return Err(DecodeError::Unsupported);
                 }
                 Ok(Self {
@@ -48,7 +49,7 @@ impl Session {
                     extra: Some(config.extra_data.clone()),
                 })
             }
-            _ => Err(DecodeError::Unsupported),
+            VideoCodec::H265 => Err(DecodeError::Unsupported),
         }
     }
 
@@ -79,13 +80,13 @@ impl Session {
 }
 
 /// Whether the local driver decodes this codec at this size in hardware.
-pub(super) fn probe(codec: CodecKind, width: u32, height: u32, depth: u8, chroma: u8) -> bool {
+pub(super) fn probe(codec: VideoCodec, width: u32, height: u32, depth: u8, chroma: u8) -> bool {
     if depth != 8 || chroma != 1 {
         // 10-bit and 4:4:4 need surface formats this backend does not read back.
         return false;
     }
     let profiles: &[VAProfile::Type] = match codec {
-        CodecKind::H264 => &[
+        VideoCodec::H264 => &[
             VAProfile::VAProfileH264High,
             VAProfile::VAProfileH264Main,
             VAProfile::VAProfileH264ConstrainedBaseline,

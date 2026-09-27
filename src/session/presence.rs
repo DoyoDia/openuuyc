@@ -20,7 +20,7 @@ use std::{
 use tokio::{sync::oneshot, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) enum PresenceState {
     Connecting,
     Online,
@@ -48,7 +48,13 @@ impl ActivePresence {
         let (events, receiver) = mpsc::channel();
         let task = tokio::spawn(async move {
             let ended = client.ended();
-            let run = run_presence(Arc::clone(&client), events.clone(), task_cancel.clone());
+            let run = async {
+                if crate::platform::host_service::resident::managed() {
+                    run_remote(Arc::clone(&client), events.clone(), task_cancel.clone()).await
+                } else {
+                    run_presence(Arc::clone(&client), events.clone(), task_cancel.clone()).await
+                }
+            };
             tokio::pin!(run);
             tokio::select! {
                 biased;
@@ -83,6 +89,17 @@ async fn run_presence(
     events: Sender<PresenceEvent>,
     task_cancel: CancellationToken,
 ) -> Result<()> {
+    // Reservation lifetime (not mutex thread ownership) spans the whole room.
+    // During installation the new background waits for the portable room's
+    // normal close; two account owners must never kick each other off the server.
+    let _owner = loop {
+        if let Some(reservation) =
+            crate::platform::host_service::reserve_presence(&client.device_id())?
+        {
+            break reservation;
+        }
+        tokio::select! { _ = task_cancel.cancelled() => return Ok(()), _ = tokio::time::sleep(Duration::from_millis(100)) => () }
+    };
     let mut policy = HostRoomRetry::default();
     let mut initial_requests = 0;
     let mut backoff = false;
@@ -256,4 +273,63 @@ impl HostRoomRetry {
             .max(1);
         Duration::from_secs(self.delay_seconds as u64)
     }
+}
+
+async fn run_remote(
+    client: Arc<AuthenticatedClient>,
+    events: Sender<PresenceEvent>,
+    cancel: CancellationToken,
+) -> Result<()> {
+    use crate::platform::host_service::resident::{self, Reply, Request};
+    let mut tick = tokio::time::interval(Duration::from_millis(500));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    while !cancel.is_cancelled() {
+        tokio::select! { _ = cancel.cancelled() => break, _ = tick.tick() => () }
+        if crate::platform::host_service::maintaining() {
+            continue;
+        }
+        use crate::account::auth::SessionStore;
+        let saved = crate::account::auth::KeyringSessionStore::new()?
+            .load()?
+            .map(|s| s.generation());
+        if saved.as_deref() != Some(client.account_generation().as_str()) {
+            client.retire();
+            break;
+        }
+        if let Some(retry) = client.host.take_remote_action() {
+            let action = if retry {
+                Request::Retry {
+                    account: client.account_generation(),
+                }
+            } else {
+                Request::Disconnect {
+                    account: client.account_generation(),
+                }
+            };
+            if let Err(e) = resident::request(action).await {
+                let _ = events.send(PresenceEvent::Warning(format!("后台操作失败：{e:#}")));
+            }
+        }
+        match resident::request(Request::Snapshot).await {
+            Ok(Reply::Snapshot(snapshot)) if snapshot.account == client.account_generation() => {
+                let _ = events.send(PresenceEvent::State(snapshot.online.clone()));
+                client.host.apply_remote(*snapshot).await;
+            }
+            Ok(Reply::Snapshot(_)) => {
+                let _ = events.send(PresenceEvent::State(PresenceState::Connecting));
+            }
+            Ok(_) => (),
+            Err(e) => {
+                // Installation intentionally replaces the endpoint; uninstall
+                // hands ownership back to portable presence. Do not publish a
+                // stale RPC failure after that handoff.
+                if crate::platform::host_service::maintaining() || !resident::managed() {
+                    continue;
+                }
+                client.host.remote_failed(format!("{e:#}"));
+                let _ = events.send(PresenceEvent::State(PresenceState::Offline));
+            }
+        }
+    }
+    Ok(())
 }

@@ -245,6 +245,8 @@ impl Loader {
                         .stdin(Stdio::piped())
                         .stdout(Stdio::piped())
                         .stderr(Stdio::null());
+                    #[cfg(windows)]
+                    command.creation_flags(0x08000000);
                     crate::diagnostics::logging::configure_child(&mut command);
                     let mut spawned = command.spawn()?;
                     let job = match super::process::Job::attach(&spawned) {

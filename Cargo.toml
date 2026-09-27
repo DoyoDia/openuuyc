@@ -1,6 +1,6 @@
 [package]
 name = "openuuyc"
-version = "1.0.0-alpha.1"
+version = "1.0.0-alpha.3"
 edition = "2024"
 description = "Third-party Rust client for UU Remote protocol interoperability"
 license-file = "LICENSE"
@@ -18,38 +18,37 @@ async-trait = "0.1"
 bytemuck = { version = "1.25.2", features = ["derive"] }
 base64 = "0.22.1"
 bytes = "1.11.1"
-crossbeam-queue = "0.3.12"
+crossbeam-queue = "0.3.14"
 cpal = "0.18.2"
-clap = { version = "4.6.6", features = ["derive"] }
+clap = { version = "4.6.7", features = ["derive"] }
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
-display-info = "0.5.9"
 dunce = "1.0"
 egui = { version = "0.36.1", default-features = false, features = ["bytemuck", "default_fonts"] }
-flate2 = "1.1"
+flate2 = "1.1.10"
 futures-util = "0.3.34"
 goog_cc = { path = "vendor/goog_cc" }
 hmac = "0.12.1"
-hyper = { version = "1.10.1", default-features = false }
+hyper = { version = "1.11.1", default-features = false }
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "bmp", "tiff"] }
 keyring = "4.1.6"
+keyring-core = "=1.0.0"
 kcp = { path = "vendor/kcp" }
-mediaway-common = "=0.1.8"
 opusic-c = "1.6.1"
 qrcode = { version = "0.14.1", default-features = false }
 rand = "0.9"
 prost = "0.14"
-reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "system-proxy", "gzip"] }
-rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls-no-provider", "system-proxy", "gzip"] }
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "0.8.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 semver = "1.0"
 sha2 = "0.10.9"
-tokio = { version = "1.49", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time", "fs"] }
-tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-native-roots"] }
-tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
+tokio = { version = "1.49", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
+tokio-rustls = { version = "0.26.5", default-features = false, features = ["ring", "tls12"] }
 tokio-util = { version = "0.7", features = ["rt"] }
-thiserror = "2.0"
+thiserror = "2.0.21"
 tracing = "0.1.44"
 tracing-appender = "0.2.4"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt"] }
@@ -62,8 +61,7 @@ object = { version = "0.37.3", default-features = false, features = ["read_core"
 openuuyc-plugin-api = { path = "plugins/sdk" }
 libloading = "0.8.9"
 openuuyc-h264 = { path = "crates/h264-core" }
-oxideav-h264 = { version = "=0.1.8" }
-oxideav-h265 = { version = "=0.0.10" }
+openuuyc-h265-syntax = { path = "crates/h265-syntax" }
 egui-winit = { version = "0.36.1", default-features = false, features = ["clipboard", "links"] }
 winit = { version = "0.30.13", default-features = false, features = ["rwh_06"] }
 
@@ -72,6 +70,7 @@ cc = "1.2"
 embed-resource = "3.0.11"
 
 [target.'cfg(windows)'.dependencies]
+# Required by the generated code of #[windows::core::implement].
 windows-core = "0.62.2"
 openuuyc-nvenc-sys = { path = "vendor/nvenc-sys" }
 # The host role's Intel VPL and AMD AMF encoders beside NVENC.
@@ -97,7 +96,11 @@ windows = { version = "0.62.2", default-features = false, features = [
     "Win32_System_Ole",
     "Win32_System_DataExchange",
     "Win32_System_Memory",
+    "Win32_System_Performance",
     "Win32_System_Threading",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_SystemInformation",
     "Win32_System_Registry",
     "Win32_System_JobObjects",
     "Win32_System_RemoteDesktop",
@@ -105,12 +108,23 @@ windows = { version = "0.62.2", default-features = false, features = [
     "Win32_System_LibraryLoader",
     "Win32_Security",
     "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Input_Pointer",
+    "Win32_UI_HiDpi",
+    "Win32_System_StationsAndDesktops",
+    "Win32_System_Services",
+    "Win32_System_Pipes",
+    "Win32_System_Shutdown",
+    "Win32_Security_Authorization",
+    "Win32_Security_WinTrust",
+    "Win32_Security_Cryptography",
     "Win32_UI_Input_Ime",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+# Local display geometry for the viewer, on X11 and Wayland alike.
+display-info = "0.5.9"
 cros-libva = { path = "vendor/cros-libva" }
 egui-wgpu = { version = "0.36.1", default-features = false }
 wgpu = { version = "30.0", default-features = false, features = ["vulkan", "gles", "wgsl"] }
@@ -119,7 +133,9 @@ winit = { version = "0.30.13", default-features = false, features = ["rwh_06", "
 arboard = { version = "3.6.1", default-features = false, features = ["image-data", "wayland-data-control"] }
 libc = "0.2"
 fuser = { version = "0.15", default-features = false }
-x11rb = { version = "0.13", features = ["randr", "shm", "xfixes"] }
+x11rb = { version = "0.13", features = ["randr", "shm", "xfixes", "xtest"] }
+# Notification-area icon (StatusNotifierItem), the counterpart of the Windows tray.
+ksni = { version = "0.3.6", default-features = false, features = ["blocking", "async-io"] }
 pollster = "0.4"
 
 [patch.crates-io]
@@ -151,17 +167,12 @@ opt-level = 3
 debug-assertions = false
 overflow-checks = false
 
-[profile.dev.package.oxideav-h264]
-opt-level = 3
-debug-assertions = false
-overflow-checks = false
-
-[profile.dev.package.oxideav-h265]
-opt-level = 3
-debug-assertions = false
-overflow-checks = false
-
 [profile.dev.package.openuuyc-h264]
 opt-level = 3
 
 
+
+[profile.dev.package.openuuyc-h265-syntax]
+opt-level = 3
+debug-assertions = false
+overflow-checks = false

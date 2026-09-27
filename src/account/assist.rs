@@ -1,5 +1,5 @@
 //! Outgoing remote assistance and server-synchronized saved devices.
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -18,13 +18,12 @@ pub(crate) fn validate_connect_code(code: &str) -> Result<()> {
     Ok(())
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone)]
 pub struct AssistRequest {
     pub connect_id: String,
     pub(crate) connect_code: String,
-    /// Validated preflight result passed only over local child stdin.
+    /// Validated preflight result shared with the in-process viewer.
     pub(crate) control_mode: Option<String>,
-    #[serde(default)]
     pub(crate) expected_publisher_id: Option<String>,
 }
 impl AssistRequest {
@@ -164,21 +163,4 @@ pub(crate) struct FavoriteItem<'a> {
     pub connect_id: &'a str,
     pub remark: &'a str,
     pub favorited_at: i64,
-}
-
-/// Child launch data is never placed in argv, environment or a plaintext file.
-pub fn read_launch_request() -> Result<AssistRequest> {
-    use std::io::Read;
-    let mut bytes = Vec::new();
-    std::io::stdin()
-        .take(4097)
-        .read_to_end(&mut bytes)
-        .context("读取远程协助参数失败")?;
-    if bytes.len() > 4096 {
-        bail!("远程协助参数过长");
-    }
-    let request: AssistRequest =
-        serde_json::from_slice(&bytes).map_err(|_| anyhow::anyhow!("远程协助参数格式不正确"))?;
-    request.validate()?;
-    Ok(request)
 }

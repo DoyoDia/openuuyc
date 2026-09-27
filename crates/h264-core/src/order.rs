@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 //! Picture order is independent of pixel/DPB ownership and input identity.
-use crate::{Error, Result};
-use oxideav_h264::{
+use crate::syntax::{
     poc::{PocSlice, PocSps, PocState, derive_poc},
     slice_header::{MmcoOp, SliceHeader},
     sps::Sps,
 };
+use crate::{Error, Result};
 
 #[derive(Default)]
 pub(crate) struct Order {

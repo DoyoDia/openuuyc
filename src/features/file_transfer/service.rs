@@ -272,23 +272,6 @@ pub(crate) fn is_transferring(controller: &str, target: &str) -> bool {
         .any(|record| matches!(record.state, TaskState::Queued | TaskState::Running))
 }
 
-pub(crate) fn active_count() -> usize {
-    lock(services())
-        .values()
-        .filter(|service| {
-            if service.stop.is_cancelled() || service.commands.is_closed() {
-                return false;
-            }
-            let s = lock(&service.state);
-            s.connected
-                || s.connecting
-                || s.operation_busy
-                || s.records
-                    .iter()
-                    .any(|r| matches!(r.state, TaskState::Queued | TaskState::Running))
-        })
-        .count()
-}
 pub(crate) async fn shutdown_all() {
     let tasks = std::mem::take(&mut *lock(jobs()));
     for (stop, _) in &tasks {

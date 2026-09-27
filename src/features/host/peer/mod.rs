@@ -43,6 +43,7 @@ pub(crate) struct Peer {
     transport: super::transport::Transport,
     ice_servers: Vec<RTCIceServer>,
     relay_only: AtomicBool,
+    input: super::input::Session,
 }
 
 #[derive(Default)]
@@ -104,6 +105,7 @@ impl Peer {
         control_screens: bool,
         negotiated: Arc<super::format::Negotiated>,
         network: super::network::Policy,
+        input_policy: super::input::wire::Policy,
     ) -> Result<Self> {
         let handle = owner.with_cancellation(cancel.clone());
         tracing::info!(?network, "host network switch policy");
@@ -298,45 +300,6 @@ impl Peer {
             Box::pin(async {})
         }));
         let connected = Arc::new(AtomicBool::new(false));
-        let ready = connected.clone();
-        let state_handle = handle.clone();
-        let state_transport = transport.clone();
-        let state_dtls = Arc::downgrade(&connection.sctp().transport());
-        let stopped = cancel.clone();
-        connection.on_peer_connection_state_change(Box::new(move |state| {
-            tracing::info!(?state, "host peer connection state changed");
-            state_transport.network(state == RTCPeerConnectionState::Connected);
-            ready.store(
-                state == RTCPeerConnectionState::Connected,
-                Ordering::Release,
-            );
-            state_handle.update(
-                true,
-                state == RTCPeerConnectionState::Connected,
-                match state {
-                    RTCPeerConnectionState::Connected => "正在被远程访问",
-                    RTCPeerConnectionState::Disconnected => "连接暂时中断",
-                    RTCPeerConnectionState::Failed => "连接已中断",
-                    RTCPeerConnectionState::Closed => "等待连接",
-                    _ => "正在建立远程连接",
-                },
-            );
-            if matches!(
-                state,
-                RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed
-            ) {
-                stopped.cancel();
-            }
-            let dtls = state_dtls.clone();
-            let transport = state_transport.clone();
-            Box::pin(async move {
-                if state == RTCPeerConnectionState::Connected {
-                    if let Some(dtls) = dtls.upgrade() {
-                        transport.srtp_overhead(dtls.rtp_authentication_overhead().await);
-                    }
-                }
-            })
-        }));
         let audio = Arc::new(TrackLocalStaticRTP::new(
             RTCRtpCodecCapability {
                 mime_type: "audio/opus".into(),
@@ -365,12 +328,74 @@ impl Peer {
         .await?;
         let sender = screen_pool.slots[0].sender.clone();
         let reports = screen_pool.reports.clone();
+        let input_reports = reports.clone();
+        let input = super::input::Session::new(
+            handle.clone(),
+            cancel.clone(),
+            connected.clone(),
+            input_policy,
+            move || super::input::Geometry {
+                current: input_reports.current.load(Ordering::Acquire),
+                screens: lock(&input_reports.catalog)
+                    .iter()
+                    .map(|s| super::input::Screen {
+                        id: s.screen.id,
+                        left: s.screen.left,
+                        top: s.screen.top,
+                        width: s.screen.width,
+                        height: s.screen.height,
+                    })
+                    .collect(),
+            },
+        )?;
         let stream_transports: Vec<_> = screen_pool
             .slots
             .iter()
             .map(|s| s.transport.clone())
             .collect();
         let screens = Arc::new(tokio::sync::Mutex::new(screen_pool));
+        let ready = connected.clone();
+        let state_handle = handle.clone();
+        let state_transport = transport.clone();
+        let state_dtls = Arc::downgrade(&connection.sctp().transport());
+        let stopped = cancel.clone();
+        let state_input = input.receiver();
+        connection.on_peer_connection_state_change(Box::new(move |state| {
+            tracing::info!(?state, "host peer connection state changed");
+            state_transport.network(state == RTCPeerConnectionState::Connected);
+            let was_ready =
+                ready.swap(state == RTCPeerConnectionState::Connected, Ordering::AcqRel);
+            if was_ready && state != RTCPeerConnectionState::Connected {
+                state_input.transport_lost();
+            }
+            state_handle.update(
+                true,
+                state == RTCPeerConnectionState::Connected,
+                match state {
+                    RTCPeerConnectionState::Connected => "正在被远程访问",
+                    RTCPeerConnectionState::Disconnected => "连接暂时中断",
+                    RTCPeerConnectionState::Failed => "连接已中断",
+                    RTCPeerConnectionState::Closed => "等待连接",
+                    _ => "正在建立远程连接",
+                },
+            );
+            if matches!(
+                state,
+                RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed
+            ) {
+                stopped.cancel();
+            }
+            let dtls = state_dtls.clone();
+            let transport = state_transport.clone();
+            Box::pin(async move {
+                if state == RTCPeerConnectionState::Connected {
+                    if let Some(dtls) = dtls.upgrade() {
+                        transport.srtp_overhead(dtls.rtp_authentication_overhead().await);
+                    }
+                }
+            })
+        }));
+
         let route_transport = transport.clone();
         sender
             .transport()
@@ -416,6 +441,7 @@ impl Peer {
             report_receiver.clone(),
             cancel.clone(),
             handle.clone(),
+            kcp.clone(),
         ));
         let publisher = tokio::spawn(publish_state(
             screens.clone(),
@@ -425,16 +451,24 @@ impl Peer {
             cancel.clone(),
             kcp.clone(),
             screen.clone(),
+            input.receiver().mouse_policy(),
         ));
-        let (control_tx, mut control_rx) = mpsc::unbounded_channel::<(u16, Vec<u8>)>();
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel::<(u16, u64, Vec<u8>)>();
         let control_screen = screen.clone();
         let control_config = config.clone();
         let control_stop = cancel.clone();
         let control_negotiated = negotiated.clone();
         let control_target = report_target.clone();
+        let control_input = input.receiver();
         let control_receiver: crate::transport::uu_kcp::ControlReceiver =
             Arc::new(move |stream_id, bytes| {
                 if control_stop.is_cancelled() {
+                    return Ok(());
+                }
+                let Some(generation) = control_input.generation(stream_id) else {
+                    return Ok(());
+                };
+                if control_input.receive(stream_id, bytes)? {
                     return Ok(());
                 }
                 let responses = crate::features::stream_control::publisher::receive(
@@ -447,19 +481,23 @@ impl Peer {
                 control_target.send_if_modified(|routes| routes.received(&responses));
                 for response in responses.messages {
                     control_tx
-                        .send((stream_id, response))
+                        .send((stream_id, generation, response))
                         .context("host CONTROL response queue closed")?;
                 }
                 Ok(())
             });
         let control_kcp = kcp.clone();
         let control_stop = cancel.clone();
+        let response_input = input.receiver();
         let control_responses = tokio::spawn(async move {
             loop {
                 let item = tokio::select! { _=control_stop.cancelled()=>break, item=control_rx.recv()=>item };
-                let Some((id, bytes)) = item else {
+                let Some((id, generation, bytes)) = item else {
                     break;
                 };
+                if !response_input.ready(id, generation).await {
+                    continue;
+                }
                 let result = tokio::select! { _=control_stop.cancelled()=>break, result=control_kcp.send(id, bytes)=>result };
                 if let Err(error) = result {
                     tracing::warn!(%error,"host KCP CONTROL response failed");
@@ -469,13 +507,15 @@ impl Peer {
         let channel_screens = screens.clone();
         let channel_cancel = cancel.clone();
         let channel_kcp = kcp.clone();
+        let channel_input = input.receiver();
         connection.on_data_channel(Box::new(move |channel| {
             let screens = channel_screens.clone();
             let stop = channel_cancel.clone();
             let kcp = channel_kcp.clone();
             let report_target = report_target.clone();
+            let input = channel_input.clone();
             Box::pin(async move {
-                bind_channel(channel, screens, stop, kcp, report_target).await;
+                bind_channel(channel, screens, stop, kcp, report_target, input).await;
             })
         }));
         let mut stream_tasks = Vec::new();
@@ -555,6 +595,7 @@ impl Peer {
             transport: peer_transport,
             ice_servers,
             relay_only: AtomicBool::new(relay),
+            input,
         })
     }
 
@@ -738,6 +779,7 @@ impl Peer {
     }
     pub(crate) async fn close(mut self) {
         self.cancel.cancel();
+        self.input.close();
         let _ = self.core.close().await;
         for task in self.tasks.drain(..) {
             let _ = task.await;
@@ -745,10 +787,22 @@ impl Peer {
         self.screens.lock().await.close().await;
         self.handle.finish();
     }
+    pub(crate) fn load_input_configuration(
+        &mut self,
+        client: Arc<crate::account::client::AuthenticatedClient>,
+    ) {
+        let input = self.input.receiver();
+        let cancel = self.cancel.clone();
+        self.tasks.push(tokio::spawn(async move{
+            let result=tokio::select!{_=cancel.cancelled()=>return,result=client.host_input_configuration()=>result};
+            match result{Ok(configuration)=>input.configure(configuration),Err(error)=>tracing::warn!(%error,"host input configuration unavailable; defaults retained")}
+        }));
+    }
 }
 impl Drop for Peer {
     fn drop(&mut self) {
         self.cancel.cancel();
+        self.input.close();
         for task in &self.tasks {
             task.abort();
         }

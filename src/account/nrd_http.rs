@@ -41,7 +41,7 @@ impl NrdHttp {
         // is owned by the API caller, not leaked through a global client.
         static ROUTE: OnceLock<Arc<Mutex<Route>>> = OnceLock::new();
         Ok(Self {
-            client: Client::builder()
+            client: crate::transport::http_client()
                 .https_only(true)
                 .http1_only()
                 .redirect(reqwest::redirect::Policy::none())
