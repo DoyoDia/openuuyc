@@ -296,18 +296,23 @@ impl StreamControlHandle {
         lock(&self.shared).topology.status.dismissed = true;
     }
 
-    pub fn frame_rate_needs_super_screen(&self, settings: StreamControlSettings) -> bool {
+    pub fn frame_rate_needs_super_screen(
+        &self,
+        screen_id: i32,
+        settings: StreamControlSettings,
+    ) -> bool {
         let state = lock(&self.shared);
         support(&state).fps_conversion
             && settings.frame_rate != state.settings.frame_rate
-            && state.screens.iter().any(|s| {
-                s.fps > 0
-                    && s.fps
-                        < settings
-                            .frame_rate
-                            .value(state.local_display)
-                            .min(state.local_display.refresh_hz)
-            })
+            && state
+                .screens
+                .iter()
+                .find(|s| s.id == screen_id)
+                .is_some_and(|s| {
+                    settings
+                        .frame_rate
+                        .requires_faster_screen(state.local_display, s.fps)
+                })
     }
 
     /// Caller has shown the specific topology effect and received explicit confirmation.

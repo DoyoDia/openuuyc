@@ -201,3 +201,11 @@ The optional OpenUUYC Audio driver references Microsoft's ACX sample circuit
 and stream implementation (Microsoft Public License). See drivers/audio/LICENSE
 and drivers/audio/UPSTREAM.md. No sample tone generation, file recording, or APO
 effects are included.
+
+AV1 syntax parsing
+
+The cros-codecs 0.0.6 AV1 parser is used without its Linux/VAAPI/V4L2 backends.
+Copyright The ChromiumOS Authors. BSD-3-Clause; see licenses/cros-codecs.txt.
+Source: https://github.com/chromeos/cros-codecs
+The D3D11 AV1 parameter mapping references FFmpeg's dxva2_av1.c and remains
+covered by the existing LGPL-2.1-or-later notice and COPYING.FFmpeg.

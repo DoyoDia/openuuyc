@@ -1,6 +1,6 @@
 [package]
 name = "openuuyc"
-version = "1.0.0-alpha.5"
+version = "1.0.0-alpha.6"
 edition = "2024"
 description = "Third-party Rust client for UU Remote protocol interoperability"
 license-file = "LICENSE"
@@ -75,6 +75,7 @@ libloading = "0.8.9"
 openuuyc-nvenc-sys = { path = "vendor/nvenc-sys" }
 openuuyc-h264 = { path = "crates/h264-core" }
 openuuyc-h265-syntax = { path = "crates/h265-syntax" }
+cros-codecs = { version = "=0.0.6", default-features = false }
 egui-directx11 = { path = "vendor/egui-directx11" }
 egui-winit = { version = "0.36.1", default-features = false, features = ["clipboard", "links"] }
 winit = { version = "0.30.13", default-features = false, features = ["rwh_06"] }

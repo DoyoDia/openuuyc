@@ -317,9 +317,10 @@ pub(super) async fn sample_network_performance(
                     let current = pair.current_round_trip_time;
                     let average = (pair.responses_received != 0)
                         .then(|| pair.total_round_trip_time / pair.responses_received as f64);
-                    let candidate = (current.is_finite() && current >= 0.0)
-                        .then_some(current)
-                        .or(average.filter(|value| value.is_finite() && *value >= 0.0));
+                    let candidate =
+                        (pair.responses_received != 0 && current.is_finite() && current >= 0.0)
+                            .then_some(current)
+                            .or(average.filter(|value| value.is_finite() && *value >= 0.0));
                     if candidate.is_some() {
                         delay_seconds = candidate;
                     }
@@ -341,6 +342,9 @@ pub(super) async fn sample_network_performance(
                 _ => {}
             }
         }
+        stream_control
+            .network_control()
+            .observe_rtt(delay_seconds.map(Duration::from_secs_f64));
         performance.set_measured_media_rtt(rtcp_rtt);
         for track in tracks.all() {
             let measured = rtcp_timing.rtt_for(track.metadata.ssrc);
@@ -381,6 +385,8 @@ pub(super) async fn sample_network_performance(
                 final_loss_percent = format_args!("{:.2}", snapshot.packet_loss_percent),
                 predecode_drops = snapshot.predecode_dropped_frames,
                 decoder_queue = snapshot.decoder_queue_frames,
+                frame_buffer = snapshot.frame_buffer_frames,
+                frame_buffer_peak = snapshot.frame_buffer_peak_frames,
                 presentation_queue = snapshot.presentation_queue_frames,
                 receive_fps = format_args!("{:.1}", snapshot.receive_fps),
                 decode_fps = format_args!("{:.1}", snapshot.decode_fps),

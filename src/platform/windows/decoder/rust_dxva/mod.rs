@@ -1,5 +1,7 @@
 //! Rust D3D11 decoding for Windows 4:2:0 / HEVC 4:4:4 hardware playback.
 //! Hardware preparation never calls the native video bridge.
+mod av1;
+mod av1_params;
 mod avc;
 pub(super) mod dxva;
 mod hevc;
@@ -12,6 +14,7 @@ use windows::Win32::Graphics::Direct3D11::ID3D11Device;
 enum Decoder {
     Avc(avc::Avc),
     Hevc(hevc::Hevc),
+    Av1(av1::Av1),
 }
 pub(super) struct Session {
     decoder: Decoder,
@@ -29,7 +32,8 @@ impl Session {
             .as_ref()
             .ok_or(DecodeError::InvalidInput)?
             .clone();
-        if !config.extra_data.is_empty()
+        if config.codec != VideoCodec::Av1
+            && !config.extra_data.is_empty()
             && !config.extra_data.starts_with(&[0, 0, 1])
             && !config.extra_data.starts_with(&[0, 0, 0, 1])
         {
@@ -38,6 +42,7 @@ impl Session {
         let decoder = match config.codec {
             VideoCodec::H264 => Decoder::Avc(avc::Avc::new(device)),
             VideoCodec::H265 => Decoder::Hevc(hevc::Hevc::new(device)),
+            VideoCodec::Av1 => Decoder::Av1(av1::Av1::new(device)),
         };
         tracing::info!(codec=?config.codec, "Rust DXVA session created");
         Ok(Self {
@@ -68,6 +73,7 @@ impl Session {
         let codec = match codec {
             VideoCodec::H264 => dxva::Codec::H264,
             VideoCodec::H265 => dxva::Codec::Hevc,
+            VideoCodec::Av1 => dxva::Codec::Av1,
         };
         dxva::Pool::probe(device, codec, w, h, depth, chroma)
     }
@@ -91,6 +97,7 @@ impl Session {
         let decoded = match &mut self.decoder {
             Decoder::Avc(d) => d.decode(data, notification.cancellation()).map(Some),
             Decoder::Hevc(d) => d.decode(data, notification.cancellation()),
+            Decoder::Av1(d) => d.decode(data, notification.cancellation()),
         };
         let result = decoded.and_then(|picture| {
             if let Some(picture) = picture {
@@ -148,6 +155,7 @@ impl Session {
         match &mut self.decoder {
             Decoder::Avc(d) => d.reset(),
             Decoder::Hevc(d) => d.reset(),
+            Decoder::Av1(d) => d.reset(),
         }
     }
     pub(super) fn poll_dropped(&mut self) -> Option<i64> {

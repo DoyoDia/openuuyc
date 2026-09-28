@@ -5,7 +5,7 @@ use windows::Win32::Graphics::Direct3D11::ID3D11Device;
 use yuv::{YuvBiPlanarImage, YuvConversionMode, YuvRange, YuvStandardMatrix, yuv_nv12_to_rgba};
 
 use crate::media::video_color::{ColorMatrix, RenderColor};
-use crate::media::{CodecPreference, ConnectionMediaProfile, VideoCodec};
+use crate::media::{ConnectionMediaProfile, VideoCodec};
 use crate::protocol::capability::{CodecCapability, DeviceCapability, QUALITY_DIMENSIONS};
 use crate::transport::rtc::EncodedVideoFrame;
 
@@ -197,7 +197,7 @@ impl NativeVideoDecoder {
         if width == 0 || height == 0 || frame_rate == 0 {
             return Err(DecodeError::InvalidInput.into());
         }
-        let format = crate::media::video_format::parse_annex_b_format(codec, &extra_data);
+        let format = crate::media::video_format::parse_stream_format(codec, &extra_data);
         let depth = format.map_or(8, |f| f.bit_depth_luma);
         let chroma = format.map_or(1, |f| f.chroma_format_idc);
         match candidate {
@@ -395,12 +395,12 @@ pub(crate) fn detect_native_decoder_support(
         if profile.hardware_decode
             && let Ok(writers) = windows_surface::D3D11SurfaceWriter::available()
         {
-            for (codec, id) in [(VideoCodec::H264, 1), (VideoCodec::H265, 2)] {
-                if matches!(
-                    (profile.codec, codec),
-                    (CodecPreference::H264, VideoCodec::H265)
-                        | (CodecPreference::H265, VideoCodec::H264)
-                ) {
+            for (codec, id) in [
+                (VideoCodec::H264, 1),
+                (VideoCodec::H265, 2),
+                (VideoCodec::Av1, 5),
+            ] {
+                if !profile.codec.accepts(codec) {
                     continue;
                 }
                 for chroma in [1, 3] {
@@ -431,7 +431,7 @@ pub(crate) fn detect_native_decoder_support(
                 }
             }
         }
-        if profile.codec != CodecPreference::H265 {
+        if profile.codec.accepts(VideoCodec::H264) {
             // streamer 958290: this is the advertised software ceiling, not
             // an arbitrary decoder rejection of a larger hardware-fallback AU.
             for chroma_sampling in [1, 3] {

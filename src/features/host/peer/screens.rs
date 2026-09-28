@@ -1,4 +1,5 @@
 mod actions;
+mod headless;
 // Fixed negotiated video-track pool; captures are attached/detached independently.
 use super::{Published, media};
 use crate::features::host::{
@@ -31,6 +32,7 @@ pub(crate) struct ScreenInfo {
     pub resolution_type: i32,
 }
 pub(super) struct Reports {
+    pub capabilities: Mutex<Option<Vec<crate::features::host::format::Capability>>>,
     pub catalog: Mutex<Vec<ScreenInfo>>,
     pub current: AtomicI32,
     pub sequence: std::sync::atomic::AtomicI64,
@@ -77,10 +79,102 @@ pub(crate) struct Screens {
     base: VideoConfig,
     originals: BTreeMap<i32, capture::Screen>,
     source_generation: u16,
-    initial: capture::Screen,
+    initial: Option<capture::Screen>,
+    deferred: Option<Deferred>,
     before_super: Option<actions::Running>,
+    headless: headless::State,
+}
+pub(crate) struct Deferred {
+    pub options: crate::features::stream_control::publisher::ConnectOptions,
+    pub remote: crate::protocol::capability::DeviceCapability,
+    pub encoding: crate::features::host::EncodingSettings,
 }
 impl Screens {
+    pub(crate) async fn resume_capture(&mut self) -> Result<()> {
+        if let Some(id) = self.prepare_video().await? {
+            return self.start(id).await;
+        }
+        self.refresh()?;
+        let ids: Vec<_> = self
+            .slots
+            .iter()
+            .filter_map(|s| s.screen.as_ref().or(s.suspended.as_ref()))
+            .filter(|s| {
+                self.info(s.id)
+                    .is_ok_and(|v| v.screen.identity == s.identity)
+            })
+            .map(|s| s.id)
+            .collect();
+        if !ids.is_empty() {
+            for id in ids {
+                self.start(id).await?;
+            }
+            return Ok(());
+        }
+        let current = {
+            let catalog = lock(&self.reports.catalog);
+            catalog
+                .iter()
+                .find(|s| s.screen.primary)
+                .or(catalog.first())
+                .map(|s| s.screen.id)
+        };
+        if let Some(id) = current {
+            return self.start(id).await;
+        }
+        let index = *self.registered.first().context("没有可用的视频轨道")?;
+        self.slots[index].suspended = self.initial.clone();
+        self.slots[index].awaiting_source = true;
+        self.maintain_headless().await?;
+        ensure!(
+            self.slots.iter().any(|s| s.screen.is_some()),
+            "没有可用显示器，画面尚未恢复"
+        );
+        Ok(())
+    }
+    pub(crate) async fn prepare_video(&mut self) -> Result<Option<i32>> {
+        let Some(deferred) = self.deferred.as_ref() else {
+            return Ok(None);
+        };
+        let preparation = async {
+            let screen = self.displays.prepare(deferred.options.clone()).await?;
+            let media = self.lease.prepare_media(screen.clone()).await?;
+            let capabilities = deferred.encoding.select(&media.codecs)?;
+            let prepared = crate::features::host::desktop::Prepared::new(
+                &deferred.options,
+                screen,
+                &capabilities,
+                &deferred.remote,
+            )?;
+            Ok::<_, anyhow::Error>((prepared, capabilities))
+        }
+        .await;
+        let (prepared, capabilities) = match preparation {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                if let Err(restore) = self.displays.rollback_preparation().await {
+                    tracing::error!(%restore,"failed video preparation layout recovery");
+                }
+                return Err(error);
+            }
+        };
+        self.base = prepared.config;
+        self.initial = Some(prepared.screen.clone());
+        for slot in &mut self.slots {
+            let negotiated = Arc::new(prepared.negotiated.for_track());
+            slot.track.configure(negotiated.clone());
+            slot.negotiated = negotiated;
+            *lock(&slot.config) = prepared.config;
+        }
+        *lock(&self.reports.capabilities) = Some(capabilities);
+        self.reports
+            .current
+            .store(prepared.screen.id, Ordering::Release);
+        self.deferred = None;
+        self.refresh()?;
+        self.reports.notify();
+        Ok(Some(prepared.screen.id))
+    }
     pub(crate) fn set_fps_limit(&mut self, limit: u32) {
         self.base.fps_limit = limit;
         self.base.fps = self
@@ -99,7 +193,7 @@ impl Screens {
     pub(crate) fn set_media_default(&mut self, config: VideoConfig) {
         self.base = config;
     }
-    pub(crate) fn handshake_source(&self) -> capture::Screen {
+    pub(crate) fn handshake_source(&self) -> Option<capture::Screen> {
         self.initial.clone()
     }
     pub(crate) fn authorization(&self) -> Lease {
@@ -113,12 +207,14 @@ impl Screens {
         initial: VideoConfig,
         negotiated: Arc<Negotiated>,
         network: Transport,
-        selected: capture::Screen,
+        selected: Option<capture::Screen>,
         displays: Arc<crate::features::host::displays::Session>,
+        deferred: Option<Deferred>,
     ) -> Result<Self> {
         let reports = Arc::new(Reports {
+            capabilities: Mutex::new(None),
             catalog: Mutex::default(),
-            current: AtomicI32::new(selected.id),
+            current: AtomicI32::new(selected.as_ref().map_or(-1, |s| s.id)),
             sequence: std::sync::atomic::AtomicI64::new(1),
             publications: (0..TRACK_COUNT).map(|_| Mutex::new(None)).collect(),
             pointers: (0..TRACK_COUNT).map(|_| Arc::default()).collect(),
@@ -172,10 +268,14 @@ impl Screens {
             originals: BTreeMap::new(),
             source_generation: 0,
             initial: selected.clone(),
+            deferred,
             before_super: None,
+            headless: Default::default(),
         };
         state.refresh()?;
-        state.start_at(0, selected, initial).await?;
+        if let Some(selected) = selected {
+            state.start_at(0, selected, initial).await?;
+        }
         Ok(state)
     }
     pub(crate) fn refresh(&mut self) -> Result<()> {
@@ -257,8 +357,10 @@ impl Screens {
             self.lease.requested() && !self.cancel.is_cancelled(),
             "被控许可已失效"
         );
+        let id = self.prepare_video().await?.unwrap_or(id);
         self.refresh()?;
         let screen = self.info(id)?.screen;
+        self.headless.choose(id);
         if let Some(index) = self.active_slot(id) {
             if self.slots[index]
                 .worker
@@ -334,6 +436,8 @@ impl Screens {
             visible: false,
             quality: 0,
             fps: config.fps,
+            format: config.format,
+            budget_size: (screen.width, screen.height),
             encoder: None,
             capture: String::new(),
         });
@@ -391,6 +495,10 @@ impl Screens {
     }
     pub(crate) async fn stop(&mut self, screen: i32) -> Result<()> {
         ensure!(self.lease.requested(), "被控许可已失效");
+        self.headless.stop(screen);
+        self.stop_media(screen).await
+    }
+    async fn stop_media(&mut self, screen: i32) -> Result<()> {
         if screen == -1 {
             for slot in &mut self.slots {
                 slot.awaiting_source = false;
@@ -406,19 +514,35 @@ impl Screens {
             self.slots[index].suspended = self.slots[index].screen.clone();
             self.stop_at(index).await;
         } else {
+            let mut known = self.headless.knows_screen(screen);
             for slot in &mut self.slots {
                 if slot.suspended.as_ref().is_some_and(|s| s.id == screen) {
+                    known = true;
                     slot.awaiting_source = false;
                 }
             }
-            self.info(screen)?;
+            if !known {
+                self.info(screen)?;
+            }
         }
         Ok(())
     }
     pub(crate) async fn maintain(&mut self) -> Result<()> {
         self.refresh()?;
+        let selected = self.reports.current.load(Ordering::Acquire);
         let mut fatal = false;
         for index in 0..self.slots.len() {
+            let disappeared = self.slots[index].screen.as_ref().is_some_and(|screen| {
+                !lock(&self.reports.catalog).iter().any(|info| {
+                    info.screen.id == screen.id
+                        && (screen.identity.is_none() || info.screen.identity == screen.identity)
+                })
+            });
+            if disappeared {
+                self.slots[index].awaiting_source = true;
+                self.slots[index].suspended = self.slots[index].screen.clone();
+                self.stop_at(index).await;
+            }
             if self.slots[index]
                 .worker
                 .as_ref()
@@ -432,11 +556,11 @@ impl Screens {
                     self.slots[index].awaiting_source = true;
                     self.slots[index].suspended = self.slots[index].screen.clone();
                 } else {
-                    fatal = true;
+                    fatal |= !self.headless.owns_slot(index);
                 }
                 self.stop_at(index).await;
             }
-            if self.slots[index].awaiting_source {
+            if self.slots[index].awaiting_source && !self.headless.owns_slot(index) {
                 if let Some(old) = self.slots[index].suspended.clone() {
                     if let Ok(info) = self.info(old.id) {
                         // A returning target must have the same monitor identity; never
@@ -449,7 +573,15 @@ impl Screens {
                 }
             }
         }
+        if self.active_slot(selected).is_some() {
+            self.reports.current.store(selected, Ordering::Release);
+        }
+        if let Err(error) = self.maintain_headless().await {
+            tracing::warn!(%error, "headless display recovery failed");
+            self.lease.fail(format!("显示器恢复失败：{error:#}"));
+        }
         if fatal
+            && self.headless.recovery.is_none()
             && self
                 .slots
                 .iter()
@@ -460,6 +592,7 @@ impl Screens {
         Ok(())
     }
     pub(super) async fn close(&mut self) {
+        self.headless.close().await;
         for index in 0..self.slots.len() {
             self.stop_at(index).await;
         }

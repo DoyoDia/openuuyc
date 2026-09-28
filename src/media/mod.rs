@@ -1,6 +1,7 @@
 //! Media ownership and module boundaries.
 
 pub(crate) mod audio;
+pub(crate) mod av1;
 pub(crate) mod codec_parameters;
 pub(crate) mod decoder;
 pub(crate) mod decoder_pool;

@@ -9,6 +9,7 @@ use super::{Lease, lock};
 use anyhow::{Context, Result};
 use backend::Backend;
 use std::{
+    collections::VecDeque,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -25,12 +26,46 @@ struct Envelope {
     event: wire::Event,
     geometry: Geometry,
 }
+impl Envelope {
+    fn coalesce(&mut self, next: &Self) -> bool {
+        if self.generation != next.generation || self.geometry != next.geometry {
+            return false;
+        }
+        match (&mut self.event, &next.event) {
+            (
+                wire::Event::Absolute { screen, x, y },
+                wire::Event::Absolute {
+                    screen: target,
+                    x: nx,
+                    y: ny,
+                },
+            ) if screen == target => {
+                *x = *nx;
+                *y = *ny;
+                true
+            }
+            (wire::Event::Heartbeat, wire::Event::Heartbeat) => true,
+            // Preserve relative acceleration, drawing/contact paths and every
+            // button/key boundary. Never merge across another event.
+            _ => false,
+        }
+    }
+}
 #[derive(Default)]
 struct Gate {
     stream: Option<u16>,
     binding: u64,
     generation: u64,
     faulted: bool,
+    pending: VecDeque<Envelope>,
+}
+impl Gate {
+    // Called only after the previous generation's holds have been released.
+    fn resume(&mut self, generation: u64) {
+        if self.generation == generation && self.stream.is_some() {
+            self.faulted = false;
+        }
+    }
 }
 struct Shared {
     gate: Mutex<Gate>,
@@ -46,7 +81,7 @@ struct Shared {
 #[derive(Clone)]
 pub(crate) struct Receiver {
     shared: Arc<Shared>,
-    tx: mpsc::SyncSender<Envelope>,
+    tx: mpsc::SyncSender<()>,
 }
 pub(crate) struct Session {
     receiver: Receiver,
@@ -61,7 +96,7 @@ impl Session {
         policy: wire::Policy,
         geometry: impl Fn() -> Geometry + Send + Sync + 'static,
     ) -> Result<Self> {
-        let (tx, rx) = mpsc::sync_channel::<Envelope>(64);
+        let (tx, rx) = mpsc::sync_channel(1);
         let shared = Arc::new(Shared {
             gate: Default::default(),
             lease,
@@ -207,15 +242,27 @@ impl Receiver {
             event,
             geometry: (self.shared.geometry)(),
         };
-        if self.tx.try_send(item).is_err() {
+        if gate
+            .pending
+            .back_mut()
+            .is_some_and(|last| last.coalesce(&item))
+        {
+            return;
+        }
+        if gate.pending.len() >= 64 {
             // A lost up cannot be repaired by dropping one event. Invalidate this
-            // channel's complete input generation; reconnect establishes a new one.
+            // generation, release all owned holds, then accept only fresh input.
             gate.faulted = true;
             gate.generation = gate.generation.wrapping_add(1);
+            gate.pending.clear();
+            tracing::warn!("host input queue saturated; discarding generation and releasing holds");
             self.shared
                 .lease
-                .input_status(None, Some("输入队列已中断，请重新连接".into()));
+                .input_status(None, Some("输入暂时阻塞，正在释放并恢复".into()));
+        } else {
+            gate.pending.push_back(item);
         }
+        let _ = self.tx.try_send(());
     }
 }
 impl Shared {
@@ -225,7 +272,7 @@ impl Shared {
             && self.connected.load(Ordering::Acquire)
     }
 }
-fn run(shared: Arc<Shared>, rx: mpsc::Receiver<Envelope>) {
+fn run(shared: Arc<Shared>, rx: mpsc::Receiver<()>) {
     let mut engine: Option<Backend> = None;
     let mut generation = None;
     let mut require_service = false;
@@ -250,14 +297,32 @@ fn run(shared: Arc<Shared>, rx: mpsc::Receiver<Envelope>) {
         }
         if current != generation {
             shared.mouse_policy.send_replace(Default::default());
+            let mut released = true;
             if let Some(engine) = &mut engine {
                 if let Err(error) = engine.release() {
+                    released = false;
                     shared
                         .lease
                         .input_status(Some(engine.backend()), Some(error.to_string()));
                 }
             }
+            if !released {
+                // Do not reopen the gate until outstanding holds were discharged.
+                if engine.as_ref().is_some_and(|engine| !engine.healthy()) {
+                    engine.take();
+                    prepare_at = std::time::Instant::now()
+                        + Duration::from_secs(1u64 << attempts.saturating_sub(1));
+                }
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
             generation = current;
+            let mut gate = lock(&shared.gate);
+            gate.pending.retain(|item| Some(item.generation) == current);
+            if let Some(current) = current.filter(|_| engine.as_ref().is_some_and(Backend::healthy))
+            {
+                gate.resume(current);
+            }
         }
         if let Some(current) = current {
             if engine.is_none() && attempts < 5 && std::time::Instant::now() >= prepare_at {
@@ -301,11 +366,16 @@ fn run(shared: Arc<Shared>, rx: mpsc::Receiver<Envelope>) {
                 });
             }
         }
-        let item = match rx.recv_timeout(Duration::from_millis(5)) {
-            Ok(item) => Some(item),
-            Err(mpsc::RecvTimeoutError::Timeout) => None,
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-        };
+        let mut item = lock(&shared.gate).pending.pop_front();
+        if item.is_none() {
+            if matches!(
+                rx.recv_timeout(Duration::from_millis(5)),
+                Err(mpsc::RecvTimeoutError::Disconnected)
+            ) {
+                break;
+            }
+            item = lock(&shared.gate).pending.pop_front();
+        }
         if configuration.has_changed().unwrap_or(false)
             && let Some(engine) = &mut engine
         {

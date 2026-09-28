@@ -274,6 +274,7 @@ impl DesktopWindow {
                             &self.window,
                             &self.window.title(),
                             Some(&mut self.window_move),
+                            true,
                         ) {
                             self.exiting = false;
                             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);

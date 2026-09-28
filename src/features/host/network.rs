@@ -1,6 +1,6 @@
 //! Sender-initiated route switching: primary RR statistics, 15-sample minima.
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     time::{Duration, Instant},
 };
 use webrtc::ice_transport::{
@@ -53,14 +53,25 @@ impl Policy {
         policy
     }
 }
-pub(super) struct AutoSwitch {
-    policy: Policy,
+struct Stream {
+    automatic: bool,
+    quality: i32,
     latest: Option<(u8, Duration)>,
     window: VecDeque<(u8, Duration)>,
+}
+impl Stream {
+    fn clear_samples(&mut self) {
+        self.latest = None;
+        self.window.clear();
+    }
+}
+
+pub(super) struct AutoSwitch {
+    policy: Policy,
+    streams: BTreeMap<usize, Stream>,
     at: Option<Instant>,
     route: Option<(bool, bool)>,
     attempt: u8,
-    quality: Option<(bool, i32)>,
 }
 impl AutoSwitch {
     pub fn attempt(&self) -> u8 {
@@ -69,21 +80,35 @@ impl AutoSwitch {
     pub fn new(policy: Policy) -> Self {
         Self {
             policy,
-            latest: None,
-            window: VecDeque::with_capacity(15),
+            streams: BTreeMap::new(),
             at: None,
             route: None,
             attempt: 0,
-            quality: None,
         }
     }
-    pub fn quality(&mut self, automatic: bool, quality: i32, settings_changed: bool) {
-        if settings_changed || self.quality != Some((automatic, quality)) {
-            // T C8FF40 (new settings) and C90330 (automatic tier change)
-            // reset the loss/RTT windows before evaluating the next tier.
-            self.window.clear();
+    pub fn quality(&mut self, index: usize, automatic: bool, quality: i32, settings_changed: bool) {
+        let stream = self.streams.entry(index).or_insert_with(|| Stream {
+            automatic,
+            quality,
+            latest: None,
+            window: VecDeque::with_capacity(15),
+        });
+        if settings_changed || stream.automatic != automatic || stream.quality != quality {
+            // Only this stream's settings changed. A healthy second screen
+            // must not erase another screen's sustained loss/RTT evidence.
+            stream.clear_samples();
         }
-        self.quality = Some((automatic, quality));
+        stream.automatic = automatic;
+        stream.quality = quality;
+    }
+    pub fn remove(&mut self, index: usize) {
+        self.streams.remove(&index);
+    }
+    pub fn reset_samples(&mut self) {
+        self.at = None;
+        for stream in self.streams.values_mut() {
+            stream.clear_samples();
+        }
     }
     pub fn route(&mut self, pair: &RTCIceCandidatePair) {
         self.route = Some((
@@ -92,60 +117,73 @@ impl AutoSwitch {
             pair.local.relay_protocol.eq_ignore_ascii_case("tls")
                 && pair.remote.relay_protocol.eq_ignore_ascii_case("tls"),
         ));
-        self.window.clear();
-        self.latest = None;
+        self.reset_samples();
     }
-    pub fn report(&mut self, loss: u8, rtt: Duration) {
-        self.latest = Some((loss, rtt));
+    pub fn report(&mut self, index: usize, loss: u8, rtt: Duration) {
+        // Late reports from paused/removed streams do not recreate observers.
+        if let Some(stream) = self.streams.get_mut(&index) {
+            stream.latest = Some((loss, rtt));
+        }
     }
-    pub fn tick(&mut self, connected: bool) -> Option<u8> {
+    pub fn tick(&mut self, connected: bool, now: Instant) -> Option<u8> {
         if !connected {
-            self.window.clear();
-            self.latest = None;
+            self.reset_samples();
             return None;
         }
-        if !self.policy.enabled
-            || self.policy.loss < 10
-            || self.policy.latency < 200
-            || self
-                .quality
-                .is_some_and(|(automatic, quality)| automatic && quality != 2)
-        {
+        if !self.policy.enabled || self.policy.loss < 10 || self.policy.latency < 200 {
             return None;
         }
         let (relay, tls) = self.route?;
-        let latest = self.latest?;
-        let now = Instant::now();
         if self
             .at
-            .is_some_and(|at| now.duration_since(at) < Duration::from_secs(1))
+            .is_some_and(|at| now.saturating_duration_since(at) < Duration::from_secs(1))
         {
             return None;
         }
         self.at = Some(now);
-        if self.window.len() == 15 {
-            self.window.pop_front();
+        let mut reason = None;
+        for (&index, stream) in &mut self.streams {
+            // Retain per-screen automatic quality. A stream at its lowest
+            // usable tier may request rerouting without lowering healthy peers.
+            if stream.automatic && stream.quality > 2 {
+                continue;
+            }
+            let Some(latest) = stream.latest else {
+                continue;
+            };
+            if stream.window.len() == 15 {
+                stream.window.pop_front();
+            }
+            stream.window.push_back(latest);
+            if stream.window.len() < 15 {
+                continue;
+            }
+            let loss = stream
+                .window
+                .iter()
+                .map(|v| u32::from(v.0) * 100 / 256)
+                .min()
+                .unwrap_or(0);
+            let latency = stream.window.iter().map(|v| v.1).min().unwrap_or_default();
+            if loss > self.policy.loss
+                || latency > Duration::from_millis(self.policy.latency.into())
+            {
+                reason.get_or_insert((index, loss, latency));
+            }
         }
-        self.window.push_back(latest);
-        if self.window.len() < 15 {
-            return None;
-        }
-        let loss = self
-            .window
-            .iter()
-            .map(|v| u32::from(v.0) * 100 / 256)
-            .min()
-            .unwrap_or(0);
-        let latency = self.window.iter().map(|v| v.1).min().unwrap_or_default();
-        if loss <= self.policy.loss && latency <= Duration::from_millis(self.policy.latency.into())
-        {
-            return None;
-        }
+        let (index, loss, latency) = reason?;
         if tls {
             return None;
         }
         self.attempt = if self.attempt == 2 || relay { 2 } else { 1 };
-        self.window.clear();
+        tracing::info!(
+            stream = index,
+            loss_percent = loss,
+            latency_ms = latency.as_millis(),
+            attempt = self.attempt,
+            "host automatic route switch requested"
+        );
+        self.reset_samples();
         Some(self.attempt)
     }
 }

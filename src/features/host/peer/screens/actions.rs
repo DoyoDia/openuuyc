@@ -157,7 +157,8 @@ impl Screens {
         }
         let mut running = self.running();
         running.streams.retain(|(_, id, _)| *id == info.screen.id);
-        self.stop(info.screen.id).await?;
+        // Resizing the current temporary screen is not a new screen selection.
+        self.stop_media(info.screen.id).await?;
         let result = self.displays.set_resolution(target, width, height).await;
         self.resume(running).await?;
         Ok(result?.id)

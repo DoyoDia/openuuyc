@@ -42,15 +42,18 @@ impl Controller {
     pub fn decide(&mut self, rate: Rate) -> Option<Update> {
         self.frames.set_maximum(rate.fps);
         let old = self.applied;
-        let control_changed = old.maximum != rate.fps || old.rate.quality != rate.quality;
+        let control_changed = old.maximum != rate.fps
+            || old.rate.quality != rate.quality
+            || old.rate.quality_target != rate.quality_target;
         if control_changed {
-            // C48020 is a frame-control update using the previously accepted
-            // feedback. It does not fabricate a fresh SetRates sample.
+            // Apply configuration and the latest network allowance together;
+            // a quality change must not spend another frame at an old rate.
             return Some(Update {
                 rate: Rate {
                     fps: self.frames.configured,
                     quality: rate.quality,
-                    ..old.rate
+                    quality_target: rate.quality_target,
+                    ..rate
                 },
                 buffer_fps: old.buffer_fps.min(rate.fps).max(1),
                 control_changed: true,
@@ -58,16 +61,17 @@ impl Controller {
                 feedback: None,
             });
         }
-        let observed = self.frames.observed.min(rate.fps).max(1);
+        // Settling depends on elapsed time even when feedback is unchanged.
+        // Advance it before consulting the feedback cache.
+        let (configured, observed) = self.frames.settings(rate.fps);
         let feedback = (rate.target, rate.peak, observed);
-        if self.feedback == Some(feedback) {
+        if self.feedback == Some(feedback) && old.rate.fps == configured {
             return None;
         }
-        let (configured, observed) = self.frames.settings(rate.fps);
         if !control_changed
             && !bitrate_changed(old.rate.target, rate.target)
             && !bitrate_changed(old.rate.peak, rate.peak)
-            && old.rate.fps.abs_diff(configured) <= 5
+            && old.rate.fps == configured
             && old.buffer_fps.abs_diff(observed) <= 5
         {
             self.feedback = Some(feedback);

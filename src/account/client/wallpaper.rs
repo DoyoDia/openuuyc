@@ -1,4 +1,4 @@
-//! Own virtual-device wallpaper. One bounded job per identity/account generation.
+//! This application's registered-device wallpaper. One bounded job per identity/account generation.
 use super::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -75,9 +75,9 @@ impl AuthenticatedClient {
                 _ = ended.cancelled() => {},
                 result = synchronize(api, device, identity, session, key, current_url) => {
                     match result {
-                        Ok(true) => tracing::info!("virtual device wallpaper uploaded and verified"),
-                        Ok(false) => tracing::info!("virtual device wallpaper already current; upload skipped"),
-                        Err(error) => tracing::warn!(%error, "virtual device wallpaper not confirmed; no automatic replay in this account generation"),
+                        Ok(true) => tracing::info!("device wallpaper uploaded and verified"),
+                        Ok(false) => tracing::info!("device wallpaper already current; upload skipped"),
+                        Err(error) => tracing::warn!(%error, "device wallpaper not confirmed; no automatic replay in this account generation"),
                     }
                 }
             }
@@ -95,14 +95,14 @@ async fn verify_owner(
         || live.client_id != expected.client_id
         || live.system_id != expected.system_id
     {
-        bail!("virtual wallpaper identity changed");
+        bail!("wallpaper identity changed");
     }
     let expected = expected.clone();
     let session = session.clone();
     tokio::task::spawn_blocking(move || {
         let saved = KeyringIdentityStore::new()?
             .load_existing()?
-            .context("virtual wallpaper identity no longer exists")?
+            .context("wallpaper identity no longer exists")?
             .client_identity()?;
         let account = KeyringSessionStore::new()?
             .load()?
@@ -113,7 +113,7 @@ async fn verify_owner(
             || account.user_id() != session.user_id()
             || account.token() != session.token()
         {
-            bail!("virtual wallpaper owner changed");
+            bail!("wallpaper owner changed");
         }
         Ok(())
     })
@@ -155,17 +155,8 @@ async fn synchronize(
         return Ok(false);
     }
 
-    let detail = api
-        .device_detail(&identity.device_id)
-        .await
-        .map_err(|_| anyhow::anyhow!("virtual wallpaper device check failed"))?
-        .into_data()
-        .map_err(|_| anyhow::anyhow!("virtual wallpaper device check rejected"))?;
-    if !crate::account::virtual_hardware::matches(
-        detail.details.iter().map(|(k, v)| (k.as_str(), v.as_str())),
-    ) {
-        bail!("current device does not report OpenUUYC virtual hardware; wallpaper unchanged");
-    }
+    // The account snapshot and verify_owner bind this job to this application's
+    // current registered identity. Hardware descriptions are not identity proofs.
     let grant = api
         .wallpaper_grant()
         .await

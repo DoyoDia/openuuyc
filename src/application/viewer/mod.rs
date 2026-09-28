@@ -9,7 +9,6 @@ use crate::transport::rtc::{
 use anyhow::{Context, Result, anyhow, bail};
 use decode_pipeline::{DecodeActivity, DecoderConfig, decoder_manager};
 pub(super) use hud::{PerformancePanelMode, show_performance_overlay};
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc as std_mpsc};
 use std::thread::JoinHandle;
@@ -17,8 +16,10 @@ use std::time::{Duration, Instant};
 use stream_menu::{StreamControlUi, show_stream_control_window};
 use tokio::sync::{mpsc, oneshot};
 
+mod audio_view;
 pub(crate) mod device_switch;
 mod performance_panel;
+pub(crate) use audio_view::AudioView;
 mod screens;
 mod stream_menu;
 
@@ -131,6 +132,7 @@ pub(crate) fn run_connecting_viewer_window(
 
 pub(crate) enum ViewerWindowEvent {
     Close,
+    Listening(AudioView),
     Playing(Box<NativeViewerSession>),
     Reconnect {
         alias: String,
@@ -223,16 +225,17 @@ struct DecodedVideoFrame {
 
 const OFFICIAL_DECODER_INFLIGHT_LIMIT: usize = 100;
 
-type FrameQueue = Arc<Mutex<VecDeque<DecodedVideoFrame>>>;
+// Presentation owns at most one pending decoded picture. Replacing that
+// picture releases its display lease; the decoder retains its own references.
+type FrameQueue = Arc<Mutex<Option<DecodedVideoFrame>>>;
 
-/// UU's configured direct path serially presents every decoded frame. Receive
-/// timing has already controlled decoder admission; there is no second clock.
+/// The presentation clock must not throttle decoding of reference pictures.
 fn take_next_frame(
-    queue: &mut VecDeque<DecodedVideoFrame>,
+    queue: &mut Option<DecodedVideoFrame>,
     performance: &PerformanceMonitor,
 ) -> Option<DecodedVideoFrame> {
-    let frame = queue.pop_front();
-    performance.set_presentation_queue_frames(queue.len());
+    let frame = queue.take();
+    performance.set_presentation_queue_frames(0);
     frame
 }
 
@@ -324,7 +327,7 @@ impl NativeViewerSession {
             display,
         } = config;
         let (video_sink, video_source) = mpsc::unbounded_channel();
-        let frame_queue = Arc::new(Mutex::new(VecDeque::new()));
+        let frame_queue = Arc::new(Mutex::new(None));
         let frame_wake = FrameWake::default();
         let shutdown = Arc::new(AtomicBool::new(false));
         let fatal_error = Arc::new(Mutex::new(None));
@@ -491,7 +494,7 @@ impl NativeViewerSession {
             (screen.id as u32 as u64) | ((screen.display.screen_type as u32 as u64) << 32);
         let changed = self.screen_binding.swap(binding, Ordering::AcqRel) != binding;
         if changed {
-            mutex_lock(&self.frame_queue).clear();
+            mutex_lock(&self.frame_queue).take();
             self.manager_wake.unpark();
         }
         changed
@@ -555,6 +558,7 @@ impl Drop for NativeViewerSession {
             render_queue_delay_ms = format_args!("{:.1}", stats.render_queue_delay_ms),
             presentation_queue_frames = stats.presentation_queue_frames,
             presentation_queue_peak_frames = stats.presentation_queue_peak_frames,
+            frame_buffer_peak_frames = stats.frame_buffer_peak_frames,
             rtx_packets_received = stats.rtx_packets_received,
             rtx_packets_accepted = stats.rtx_packets_accepted,
             fec_packets_received = stats.fec_packets_received,
@@ -574,7 +578,7 @@ impl Drop for NativeViewerSession {
         self.frame_wake.notify();
         // Return queued GPU samples before joining: the closing window will
         // no longer consume them. Never hold the queue mutex across join.
-        mutex_lock(&self.frame_queue).clear();
+        mutex_lock(&self.frame_queue).take();
         if let Some(thread) = self.manager_thread.take() {
             let started = Instant::now();
             if thread.join().is_err() {
@@ -587,7 +591,7 @@ impl Drop for NativeViewerSession {
         }
         // A poll already in progress when shutdown was set can publish its last
         // completed output. The joined worker cannot add any further surfaces.
-        mutex_lock(&self.frame_queue).clear();
+        mutex_lock(&self.frame_queue).take();
     }
 }
 

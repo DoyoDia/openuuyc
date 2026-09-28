@@ -74,6 +74,9 @@ impl VideoTrackSource {
     pub(crate) fn start(&self) {
         self.started.send_replace(true);
     }
+    pub(crate) fn pause(&self) {
+        self.started.send_replace(false);
+    }
 }
 
 impl Drop for RtpForwarder {
@@ -200,6 +203,12 @@ pub(crate) struct PlayoutDelay {
 }
 
 impl RtpForwarder {
+    pub(crate) fn select_registered_video(&mut self, index: i32) -> Option<ForwardedTrack> {
+        let source = self.tracks.get(index)?;
+        let metadata = source.metadata.clone();
+        self.selected_video = Some(source);
+        Some(metadata)
+    }
     pub(crate) fn selected_metadata(&self) -> Option<ForwardedTrack> {
         self.selected_video.as_ref().map(|v| v.metadata.clone())
     }
@@ -262,6 +271,9 @@ impl RtpForwarder {
         if let Some(track) = &self.selected_video {
             track.start();
         }
+    }
+    pub(crate) fn start_audio(&self) {
+        self.forwarding_started.send_replace(true);
     }
 }
 

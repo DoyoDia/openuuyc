@@ -93,9 +93,8 @@ impl Api {
     fn init_version(&self) -> u32 {
         self.structure(if self.level < 0xc1 { 5 } else { 6 }, true)
     }
-    fn preset(&self, quality: i32) -> (nv::GUID, nv::NV_ENC_TUNING_INFO) {
+    fn preset(&self, codec: Codec) -> (nv::GUID, nv::NV_ENC_TUNING_INFO) {
         if self.level < 0xa0 {
-            // T C4DC10/C4DC50 both select the legacy low-latency-HQ preset.
             (
                 nv::GUID {
                     Data1: 0xc5f733b9,
@@ -105,14 +104,15 @@ impl Api {
                 },
                 nv::NV_ENC_TUNING_INFO(0),
             )
-        } else if quality == 4 {
-            (
-                nv::NV_ENC_PRESET_P4_GUID,
-                nv::NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_HIGH_QUALITY,
-            )
         } else {
+            // AV1 benefits from P3; AVC/HEVC retain P1's lower encode cost.
+            // Quality tiers change rate/size, never switch to latency-tolerant HQ.
             (
-                nv::NV_ENC_PRESET_P1_GUID,
+                if codec == Codec::Av1 {
+                    nv::NV_ENC_PRESET_P3_GUID
+                } else {
+                    nv::NV_ENC_PRESET_P1_GUID
+                },
                 nv::NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY,
             )
         }
@@ -190,9 +190,8 @@ impl Encoder {
     ) -> Result<Self> {
         let Rate {
             target: bitrate,
-            peak,
             fps,
-            quality: _,
+            ..
         } = rate;
         ensure!(
             Backend::Nvidia.accepts(format),
@@ -207,9 +206,13 @@ impl Encoder {
             "NVENC 编码参数无效"
         );
         let api = Api::load()?;
-        // T C49E10 always starts from the P1 configuration. Frame controls may
-        // subsequently change preset/tuning while retaining those base fields.
-        let (preset_guid, tuning) = api.preset(3);
+        ensure!(
+            format.codec != Codec::Av1 || api.level >= 0xc0,
+            "AV1需要NVENC API 12及支持的显卡驱动"
+        );
+        // Query the actual codec-specific preset; changing only its GUID on
+        // reconfigure would leave the old preset configuration in place.
+        let (preset_guid, tuning) = api.preset(format.codec);
         let mut encoder = Self {
             frame_rate: super::encoder_rate::Controller::new(Rate { quality: 0, ..rate }),
             api,
@@ -315,40 +318,65 @@ impl Encoder {
             config.rcParams.lookaheadDepth = 0;
             config.rcParams.multiPass = nv::NV_ENC_MULTI_PASS::NV_ENC_MULTI_PASS_DISABLED;
             config.rcParams.lowDelayKeyFrameScale = u8::from(encoder.api.level >= 0xa0);
-            set_rate(&mut config, bitrate, peak, fps);
-            let vui = if format.codec == Codec::H264 {
-                let h264 = &mut config.encodeCodecConfig.h264Config;
-                h264.idrPeriod = u32::MAX;
-                h264.maxNumRefFrames = 1;
-                h264.chromaFormatIDC = u32::from(format.chroma);
-                h264.sliceMode = 3;
-                h264.sliceModeData = 1;
-                h264.set_repeatSPSPPS(0);
-                h264.set_outputAUD(0);
-                h264.set_enableFillerDataInsertion(0);
-                &mut h264.h264VUIParameters
+            set_rate(&mut config, format.codec, rate, fps, (width, height));
+            if format.codec == Codec::Av1 {
+                config.profileGUID = nv::NV_ENC_AV1_PROFILE_MAIN_GUID;
+                let av1 = &mut config.encodeCodecConfig.av1Config;
+                av1.idrPeriod = u32::MAX;
+                av1.maxNumRefFramesInDPB = 1;
+                av1.numFwdRefs = nv::NV_ENC_NUM_REF_FRAMES::NV_ENC_NUM_REF_FRAMES_1;
+                av1.numBwdRefs = nv::NV_ENC_NUM_REF_FRAMES::NV_ENC_NUM_REF_FRAMES_1;
+                av1.set_chromaFormatIDC(1);
+                av1.set_inputPixelBitDepthMinus8(u32::from(format.depth - 8));
+                av1.set_pixelBitDepthMinus8(u32::from(format.depth - 8));
+                av1.set_repeatSeqHdr(1);
+                av1.set_outputAnnexBFormat(0);
+                av1.set_enableBitstreamPadding(0);
+                av1.maxTemporalLayersMinus1 = 0;
+                let color = format.color(None);
+                av1.colorPrimaries = nv::NV_ENC_VUI_COLOR_PRIMARIES(color.primaries.into());
+                av1.transferCharacteristics =
+                    nv::NV_ENC_VUI_TRANSFER_CHARACTERISTIC(color.transfer.into());
+                av1.matrixCoefficients = nv::NV_ENC_VUI_MATRIX_COEFFS(color.matrix.into());
+                av1.colorRange = u32::from(color.range == 2);
             } else {
-                let hevc = &mut config.encodeCodecConfig.hevcConfig;
-                hevc.idrPeriod = u32::MAX;
-                hevc.maxNumRefFramesInDPB = 1;
-                hevc.set_chromaFormatIDC(u32::from(format.chroma));
-                hevc.set_pixelBitDepthMinus8(u32::from(format.depth - 8));
-                hevc.sliceMode = 3;
-                hevc.sliceModeData = 1;
-                hevc.set_repeatSPSPPS(0);
-                hevc.set_outputAUD(0);
-                hevc.set_enableFillerDataInsertion(0);
-                &mut hevc.hevcVUIParameters
-            };
-            let color = format.color(None);
-            vui.videoSignalTypePresentFlag = 1;
-            vui.videoFormat = nv::NV_ENC_VUI_VIDEO_FORMAT::NV_ENC_VUI_VIDEO_FORMAT_UNSPECIFIED;
-            vui.videoFullRangeFlag = u32::from(color.range == 2);
-            vui.colourDescriptionPresentFlag = 1;
-            vui.colourPrimaries = nv::NV_ENC_VUI_COLOR_PRIMARIES(color.primaries.into());
-            vui.transferCharacteristics =
-                nv::NV_ENC_VUI_TRANSFER_CHARACTERISTIC(color.transfer.into());
-            vui.colourMatrix = nv::NV_ENC_VUI_MATRIX_COEFFS(color.matrix.into());
+                let vui = if format.codec == Codec::H264 {
+                    let h264 = &mut config.encodeCodecConfig.h264Config;
+                    h264.idrPeriod = u32::MAX;
+                    h264.maxNumRefFrames = 1;
+                    h264.chromaFormatIDC = u32::from(format.chroma);
+                    h264.sliceMode = 3;
+                    h264.sliceModeData = 1;
+                    h264.set_repeatSPSPPS(0);
+                    h264.set_outputAUD(0);
+                    h264.set_enableFillerDataInsertion(0);
+                    // Without this, decoders may infer a full DPB of reorder
+                    // delay even though frameIntervalP=1 disables B frames.
+                    h264.h264VUIParameters.bitstreamRestrictionFlag = 1;
+                    &mut h264.h264VUIParameters
+                } else {
+                    let hevc = &mut config.encodeCodecConfig.hevcConfig;
+                    hevc.idrPeriod = u32::MAX;
+                    hevc.maxNumRefFramesInDPB = 1;
+                    hevc.set_chromaFormatIDC(u32::from(format.chroma));
+                    hevc.set_pixelBitDepthMinus8(u32::from(format.depth - 8));
+                    hevc.sliceMode = 3;
+                    hevc.sliceModeData = 1;
+                    hevc.set_repeatSPSPPS(0);
+                    hevc.set_outputAUD(0);
+                    hevc.set_enableFillerDataInsertion(0);
+                    &mut hevc.hevcVUIParameters
+                };
+                let color = format.color(None);
+                vui.videoSignalTypePresentFlag = 1;
+                vui.videoFormat = nv::NV_ENC_VUI_VIDEO_FORMAT::NV_ENC_VUI_VIDEO_FORMAT_UNSPECIFIED;
+                vui.videoFullRangeFlag = u32::from(color.range == 2);
+                vui.colourDescriptionPresentFlag = 1;
+                vui.colourPrimaries = nv::NV_ENC_VUI_COLOR_PRIMARIES(color.primaries.into());
+                vui.transferCharacteristics =
+                    nv::NV_ENC_VUI_TRANSFER_CHARACTERISTIC(color.transfer.into());
+                vui.colourMatrix = nv::NV_ENC_VUI_MATRIX_COEFFS(color.matrix.into());
+            }
             encoder.config = config;
             let mut init = nv::NV_ENC_INITIALIZE_PARAMS::default();
             init.version = encoder.api.init_version();
@@ -434,22 +462,21 @@ impl Encoder {
         let Some(update) = self.frame_rate.decide(rate) else {
             return Ok(false);
         };
-        let Rate {
-            target: bitrate,
-            peak,
-            fps,
-            quality,
-        } = update.rate;
+        let fps = update.rate.fps;
+        let quality = update.rate.quality;
         let changed_quality = self.quality != quality;
         let mut config = self.config;
-        set_rate(&mut config, bitrate, peak, update.buffer_fps);
+        set_rate(
+            &mut config,
+            self.format.codec,
+            update.rate,
+            update.buffer_fps,
+            (self.init.encodeWidth, self.init.encodeHeight),
+        );
         let mut params = nv::NV_ENC_RECONFIGURE_PARAMS::default();
         params.version = self.api.structure(1, true);
         params.reInitEncodeParams = self.init;
         params.reInitEncodeParams.frameRateNum = fps;
-        let (preset, tuning) = self.api.preset(quality);
-        params.reInitEncodeParams.presetGUID = preset;
-        params.reInitEncodeParams.tuningInfo = tuning;
         params.reInitEncodeParams.encodeConfig = &mut config;
         let result = unsafe {
             self.api.check(
@@ -563,19 +590,48 @@ impl Encoder {
     }
 }
 fn codec_guid(format: Format) -> nv::GUID {
-    if format.codec == Codec::H264 {
-        nv::NV_ENC_CODEC_H264_GUID
-    } else {
-        nv::NV_ENC_CODEC_HEVC_GUID
+    match format.codec {
+        Codec::H264 => nv::NV_ENC_CODEC_H264_GUID,
+        Codec::H265 => nv::NV_ENC_CODEC_HEVC_GUID,
+        Codec::Av1 => nv::NV_ENC_CODEC_AV1_GUID,
     }
 }
-fn set_rate(config: &mut nv::NV_ENC_CONFIG, bitrate: u32, peak: u32, fps: u32) {
-    config.rcParams.averageBitRate = bitrate;
-    config.rcParams.maxBitRate = peak.max(bitrate);
-    config.rcParams.vbvBufferSize = ((u64::from(bitrate)
-        * if bitrate < 120_000_000 { 5 } else { 1 })
-        / u64::from(fps.max(1))) as u32;
+fn set_rate(
+    config: &mut nv::NV_ENC_CONFIG,
+    codec: Codec,
+    rate: Rate,
+    buffer_fps: u32,
+    size: (u32, u32),
+) {
+    config.rcParams.averageBitRate = rate.target;
+    config.rcParams.maxBitRate = rate.peak.max(rate.target);
+    // VBV is a bit allocation window, not queued input frames. AVC/HEVC need
+    // burst headroom for detail; one-frame VBV works better for our AV1 path.
+    // No B frames, lookahead, filler or startup buffer delay for any codec.
+    let frames = if codec == Codec::Av1 { 1 } else { 5 };
+    config.rcParams.vbvBufferSize = (u64::from(rate.target) * frames / u64::from(buffer_fps.max(1)))
+        .min(u64::from(u32::MAX)) as u32;
     config.rcParams.vbvInitialDelay = 0;
+    if codec == Codec::Av1 {
+        let qp = av1_minimum_qp(rate.quality_target.bitrate, size, rate.quality_target.fps);
+        config.rcParams.set_enableMinQP(u32::from(qp != 0));
+        config.rcParams.minQP = nv::NV_ENC_QP {
+            qpInterP: qp,
+            qpInterB: qp,
+            qpIntra: qp,
+        };
+    }
+}
+fn av1_minimum_qp(bitrate: u32, size: (u32, u32), fps: u32) -> u32 {
+    // The selected ceiling/FPS stay stable through congestion and idle input.
+    // One policy for every tier, custom rate and bit depth. Keep the measured
+    // conservative floor at <=0.1 bits/pixel/frame, then smoothly release it
+    // by 0.2 so a generous budget can still improve precision. This limits
+    // refinement, never forces frames to spend the available bandwidth.
+    let pixels_per_second =
+        f64::from(size.0.max(1)) * f64::from(size.1.max(1)) * f64::from(fps.max(1));
+    let density = f64::from(bitrate) / pixels_per_second;
+    ((0.2 - density) * 400.0).round().clamp(0.0, 40.0) as u32
 }
 struct Mapped<'a> {
     api: &'a Api,

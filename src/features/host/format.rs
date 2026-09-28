@@ -1,5 +1,5 @@
 //! Publisher negotiation and format selection policy.
-pub(crate) use crate::media::encoding::{Backend, Capability, Codec, Format, Rate};
+pub(crate) use crate::media::encoding::{Backend, Capability, Codec, Format, QualityTarget, Rate};
 use crate::media::video_color::VideoColorSpace;
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -30,11 +30,22 @@ pub(crate) struct Negotiated {
     encoder_true_color: bool,
 }
 impl Negotiated {
+    pub(crate) fn deferred() -> Self {
+        Self {
+            choices: Vec::new(),
+            dual: crate::protocol::capability::DualCapability::negotiate(
+                &Default::default(),
+                Default::default(),
+            ),
+            codecs: AtomicU8::new(7),
+            encoder_true_color: false,
+        }
+    }
     pub(crate) fn for_track(&self) -> Self {
         Self {
             choices: self.choices.clone(),
             dual: self.dual.clone(),
-            codecs: AtomicU8::new(3),
+            codecs: AtomicU8::new(7),
             encoder_true_color: self.encoder_true_color,
         }
     }
@@ -125,7 +136,7 @@ impl Negotiated {
         Ok(Self {
             choices,
             dual,
-            codecs: AtomicU8::new(3),
+            codecs: AtomicU8::new(7),
             // S543170 computes this from local encoder caps before intersection.
             encoder_true_color: local.iter().any(|c| c.format.chroma == 3),
         })
@@ -138,16 +149,23 @@ impl Negotiated {
         codecs: &[webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecParameters],
     ) {
         let bits = codecs.iter().fold(0, |bits, codec| {
-            bits | match codec.capability.mime_type.to_ascii_lowercase().as_str() {
-                "video/h264" => 1,
-                "video/h265" => 2,
-                _ => 0,
+            bits | match Codec::from_mime(&codec.capability.mime_type) {
+                Some(Codec::H264) => 1,
+                Some(Codec::H265) => 2,
+                Some(Codec::Av1) => 4,
+                None => 0,
             }
         });
         self.codecs.store(bits, Ordering::Release);
     }
     pub fn permits_codec(&self, codec: Codec) -> bool {
-        self.codecs.load(Ordering::Acquire) & if codec == Codec::H264 { 1 } else { 2 } != 0
+        self.codecs.load(Ordering::Acquire)
+            & match codec {
+                Codec::H264 => 1,
+                Codec::H265 => 2,
+                Codec::Av1 => 4,
+            }
+            != 0
     }
     pub fn maximum_quality(&self, format: Format, source: (u32, u32), maximum: (u32, u32)) -> i32 {
         let json_limit = self

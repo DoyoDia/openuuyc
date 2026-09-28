@@ -13,7 +13,10 @@ pub(crate) struct VideoFormatSignature {
     pub bit_depth_chroma: u8,
 }
 
-pub(crate) fn parse_annex_b_format(codec: VideoCodec, data: &[u8]) -> Option<VideoFormatSignature> {
+pub(crate) fn parse_stream_format(codec: VideoCodec, data: &[u8]) -> Option<VideoFormatSignature> {
+    if codec == VideoCodec::Av1 {
+        return super::av1::format(data);
+    }
     annex_b_units(data)
         .into_iter()
         .find_map(|unit| match codec {

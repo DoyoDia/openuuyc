@@ -343,6 +343,7 @@ fn codec(value: &str) -> Result<VideoCodec> {
     match value.to_ascii_lowercase().as_str() {
         "video/h264" => Ok(VideoCodec::H264),
         "video/h265" | "video/hevc" => Ok(VideoCodec::H265),
+        "video/av1" => Ok(VideoCodec::Av1),
         _ => bail!("不支持的视频编码：{value}"),
     }
 }

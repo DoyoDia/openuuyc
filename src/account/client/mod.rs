@@ -504,7 +504,7 @@ impl AuthenticatedClient {
 
     pub(crate) async fn remove_account_device(&self, id: &str) -> Result<String> {
         if id == self.device_id() {
-            bail!("移除本机观看身份请使用退出登录，以完成本地会话清理");
+            bail!("移除本机设备请使用退出登录，以完成本地会话清理");
         }
         let present = self
             .device_groups()
@@ -541,7 +541,7 @@ impl AuthenticatedClient {
         let id = expected.validated_device_id()?;
         let groups = self.device_groups().await?;
         if id == self.device_id() || id == groups.current_device_id {
-            bail!("本机观看身份不支持电源操作，未发送请求");
+            bail!("本机设备不支持电源操作，未发送请求");
         }
         let device = groups
             .desktop_devices
@@ -555,15 +555,6 @@ impl AuthenticatedClient {
             bail!("该设备新增了远控连接，请刷新后重新确认影响");
         }
         action.check(device, &self.features)?;
-        let detail = self
-            .device_detail(id)
-            .await
-            .context("无法核实设备类型，未发送电源请求")?;
-        if crate::account::virtual_hardware::matches(
-            detail.details.iter().map(|(k, v)| (k.as_str(), v.as_str())),
-        ) {
-            bail!("虚拟观看身份不支持电源操作，未发送请求");
-        }
         // The envelope, unlike request(), distinguishes a preflight error from
         // a power request whose acknowledgement may have been lost. Never replay.
         on_send();
@@ -593,7 +584,7 @@ impl AuthenticatedClient {
         crate::account::api::validate_device_id(device_id)?;
         let devices = self.list_devices().await?;
         if device_id == devices.current_device.device_id {
-            bail!("不能通过远端更新入口更新本机观看身份");
+            bail!("不能通过远端更新入口更新本机设备");
         }
         let device = devices
             .my_binded_devices

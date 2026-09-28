@@ -121,6 +121,8 @@ impl DeviceCenterApp {
                     include_str!("../../../../drivers/audio/UPSTREAM.md"),
                     "\n\nAppendix: OxideAV MIT license (retained AVC/HEVC syntax primitives)\n\n",
                     include_str!("../../../../crates/h264-core/COPYING.OxideAV"),
+                    "\n\nAppendix: ChromiumOS AV1 parser (BSD-3-Clause)\n\n",
+                    include_str!("../../../../licenses/cros-codecs.txt"),
                     "\n\n--- Bundled fonts ---\n\n",
                     include_str!("../../../../assets/fonts/LICENSE")
                 ),

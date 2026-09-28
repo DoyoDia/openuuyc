@@ -1,4 +1,4 @@
-//! Receiver RTCP timing. Evidence and limits are recorded in
+//! Shared RTCP receiver measurements and sender RRTR/DLRR responses. Evidence is in
 //! docs/official-full-chain-audit-2026-09-05.md (R06). No ICE/default RTT is
 //! admitted as an RTCP measurement or as an RTP/NTP clock calibration input.
 
@@ -83,6 +83,7 @@ struct State {
     anchor_ntp: u64,
     streams: HashMap<u32, StreamTiming>,
     local_senders: Vec<u32>,
+    sender_rrtr: HashMap<u32, VecDeque<ReceivedRrtr>>,
     receive_order: Vec<u32>,
     selected_video: Option<u32>,
 }
@@ -122,6 +123,7 @@ impl RtcpTiming {
             anchor_ntp: (u64::from(seconds) << 32) | u64::from(fraction),
             streams: HashMap::new(),
             local_senders: Vec::new(),
+            sender_rrtr: HashMap::new(),
             receive_order: Vec::new(),
             selected_video: None,
         })))
@@ -213,6 +215,32 @@ impl RtcpTiming {
             return;
         }
         let now = state.compact_ntp(received_at);
+        for block in &xr.reports {
+            if let Some(rrtr) = block
+                .as_any()
+                .downcast_ref::<ReceiverReferenceTimeReportBlock>()
+            {
+                for pending in state.sender_rrtr.values_mut() {
+                    let remote = (rrtr.ntp_timestamp >> 16) as u32;
+                    if let Some(entry) = pending
+                        .iter_mut()
+                        .find(|entry| entry.sender_ssrc == xr.sender_ssrc)
+                    {
+                        // One compound datagram can be delivered to several local SSRCs.
+                        if entry.remote_compact_ntp != remote {
+                            entry.remote_compact_ntp = remote;
+                            entry.arrival_compact_ntp = now;
+                        }
+                    } else if pending.len() < 300 {
+                        pending.push_back(ReceivedRrtr {
+                            sender_ssrc: xr.sender_ssrc,
+                            remote_compact_ntp: remote,
+                            arrival_compact_ntp: now,
+                        });
+                    }
+                }
+            }
+        }
         // The official Call routes RTCP to each receive module. Each module
         // owns its RRTR list and validates DLRR against its own local SSRC.
         for stream in state.streams.values_mut() {
@@ -262,6 +290,28 @@ impl RtcpTiming {
                 }
             }
         }
+    }
+
+    fn sender_extensions(&self, ssrc: u32) -> Option<RtcpPacket> {
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let now = state.compact_ntp(Instant::now());
+        let pending = state.sender_rrtr.get_mut(&ssrc)?;
+        let count = pending.len().min(50);
+        if count == 0 {
+            return None;
+        }
+        let reports = pending
+            .drain(..count)
+            .map(|entry| DLRRReport {
+                ssrc: entry.sender_ssrc,
+                last_rr: entry.remote_compact_ntp,
+                dlrr: now.wrapping_sub(entry.arrival_compact_ntp),
+            })
+            .collect();
+        Some(Box::new(ExtendedReport {
+            sender_ssrc: ssrc,
+            reports: vec![Box::new(DLRRReportBlock { reports })],
+        }))
     }
 
     fn report_extensions(
@@ -376,6 +426,9 @@ impl RTCPWriter for TimingWriter {
         let mut outgoing: Vec<RtcpPacket> = Vec::new();
         let mut report_extensions = Vec::new();
         for packet in packets {
+            if let Some(sr) = packet.as_any().downcast_ref::<SenderReport>() {
+                report_extensions.extend(self.timing.sender_extensions(sr.ssrc));
+            }
             if let Some(rr) = packet.as_any().downcast_ref::<ReceiverReport>() {
                 let mut rr = rr.clone();
                 let module_ssrc = attributes
@@ -506,14 +559,17 @@ impl Interceptor for RtcpTiming {
         if !state.local_senders.contains(&info.ssrc) {
             state.local_senders.push(info.ssrc);
         }
+        if info.associated_stream.is_none()
+            && (info.mime_type.starts_with("video/") || info.mime_type.starts_with("audio/"))
+        {
+            state.sender_rrtr.entry(info.ssrc).or_default();
+        }
         writer
     }
     async fn unbind_local_stream(&self, info: &StreamInfo) {
-        self.0
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .local_senders
-            .retain(|ssrc| *ssrc != info.ssrc);
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        state.local_senders.retain(|ssrc| *ssrc != info.ssrc);
+        state.sender_rrtr.remove(&info.ssrc);
     }
     async fn bind_remote_stream(
         &self,
@@ -524,6 +580,7 @@ impl Interceptor for RtcpTiming {
         if (info.associated_stream.is_none()
             && (info.mime_type.eq_ignore_ascii_case("video/H264")
                 || info.mime_type.eq_ignore_ascii_case("video/H265")
+                || info.mime_type.eq_ignore_ascii_case("video/AV1")
                 || is_audio))
             || info.mime_type.eq_ignore_ascii_case("video/rs-fec-cm256")
             || info.mime_type.eq_ignore_ascii_case("video/flexfec-03")
@@ -605,6 +662,7 @@ impl Interceptor for RtcpTiming {
         let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
         state.streams.clear();
         state.local_senders.clear();
+        state.sender_rrtr.clear();
         state.receive_order.clear();
         state.selected_video = None;
         Ok(())

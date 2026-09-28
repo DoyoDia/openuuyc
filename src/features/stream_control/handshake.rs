@@ -31,6 +31,9 @@ impl StreamControlHandle {
     }
 
     pub(crate) fn set_data_channel_open(&self, label: &str, open: bool) {
+        if label == "TEXT_DATA_CHANNEL" && !open {
+            self.disconnect_audio_quality();
+        }
         let mut state = lock(&self.shared);
         match label {
             "CONTROL_DATA_CHANNEL" => {
@@ -103,6 +106,7 @@ impl StreamControlHandle {
             state.baseline.codec_type = match codec {
                 VideoCodec::H264 => 1,
                 VideoCodec::H265 => 2,
+                VideoCodec::Av1 => 5,
             };
         }
         refresh_active_screen(&mut state);
@@ -204,6 +208,9 @@ impl StreamControlHandle {
         source: PbMessageSource,
     ) -> Result<()> {
         if payload.iter().find(|byte| !byte.is_ascii_whitespace()) == Some(&b'{') {
+            if source == PbMessageSource::Text && self.handle_audio_quality(payload)? {
+                return Ok(());
+            }
             return self.handle_mouse_command(payload, source);
         }
         let message = PbControlMessage::decode(payload)

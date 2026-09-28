@@ -97,7 +97,7 @@ impl ResolvedConnection {
         }
         self.client.schedule_feature_refresh(true);
         if self.target_device_id == self.controller_device_id {
-            bail!("cannot connect the virtual device to itself");
+            bail!("cannot connect the device to itself");
         }
         report_progress(reporter, 3, "创建远程会话", "正在创建会话并获取信令凭据");
         let room = if let Some(assist) = &mut self.assist {
@@ -265,7 +265,11 @@ impl ResolvedConnection {
             self.audio_preferences.expect("resolved audio settings"),
             reporter,
             cancel,
-            crate::session::negotiation::ControlPurpose::Viewing,
+            if self.profile.audio_only {
+                crate::session::negotiation::ControlPurpose::Audio
+            } else {
+                crate::session::negotiation::ControlPurpose::Viewing
+            },
         )
         .await?;
         let handle = connection.stream_control_handle();
@@ -347,13 +351,13 @@ pub(super) async fn resolve_connection_with_client(
         reporter,
         1,
         "验证本地会话",
-        "正在读取登录态、虚拟设备身份与本机显示能力",
+        "正在读取登录态、本机设备身份与显示能力",
     );
     report_progress(
         reporter,
         2,
         "恢复账号会话",
-        format!("正在初始化本虚拟设备、核验保存的登录态，然后检查 {alias} 的在线与可观看状态"),
+        format!("正在初始化本机设备、核验保存的登录态，然后检查 {alias} 的在线与可观看状态"),
     );
     let devices = client.list_devices().await?;
     if let Some(id) = target_id {
@@ -362,7 +366,7 @@ pub(super) async fn resolve_connection_with_client(
     if target_id.map_or(devices.current_device.alias == alias, |id| {
         devices.current_device.device_id == id
     }) {
-        bail!("cannot connect the current virtual device to itself");
+        bail!("cannot connect the current device to itself");
     }
 
     let matches = devices

@@ -26,14 +26,16 @@ pub(crate) enum EncoderCodec {
     Automatic,
     H264,
     H265,
+    Av1,
 }
 impl EncoderCodec {
-    pub const ALL: [Self; 3] = [Self::Automatic, Self::H264, Self::H265];
+    pub const ALL: [Self; 4] = [Self::Automatic, Self::Av1, Self::H265, Self::H264];
     pub fn label(self) -> &'static str {
         match self {
-            Self::Automatic => "自动协商 H.265 / H.264",
+            Self::Automatic => "自动协商 AV1 / H.265 / H.264",
             Self::H264 => "仅 H.264",
             Self::H265 => "仅 H.265",
+            Self::Av1 => "仅 AV1",
         }
     }
 }
@@ -54,12 +56,14 @@ impl EncodingSettings {
             EncoderCodec::Automatic => true,
             EncoderCodec::H264 => capability.format.codec == Codec::H264,
             EncoderCodec::H265 => capability.format.codec == Codec::H265,
+            EncoderCodec::Av1 => capability.format.codec == Codec::Av1,
         }
     }
     pub fn validate(self) -> anyhow::Result<()> {
         anyhow::ensure!(
-            self.mode != EncoderMode::Software || self.codec != EncoderCodec::H265,
-            "软件编码不支持 H.265，请选择自动或 H.264"
+            self.mode != EncoderMode::Software
+                || matches!(self.codec, EncoderCodec::Automatic | EncoderCodec::H264),
+            "软件编码仅支持 H.264，请选择自动或 H.264"
         );
         Ok(())
     }

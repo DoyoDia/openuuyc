@@ -70,6 +70,7 @@ pub(crate) fn window_title_bar(
     window: &Window,
     alias: &str,
     move_state: Option<&mut WindowMoveState>,
+    tooltips: bool,
 ) -> bool {
     ui.set_min_height(crate::ui::theme::WINDOW_TITLE_CONTENT_HEIGHT);
     let rect = egui::Rect::from_min_size(
@@ -79,7 +80,12 @@ pub(crate) fn window_title_bar(
             crate::ui::theme::WINDOW_TITLE_CONTENT_HEIGHT,
         ),
     );
-    let (caption_rect, controls_rect) = title_regions(rect);
+    let (caption_rect, controls_rect) = title_regions(
+        rect,
+        window
+            .enabled_buttons()
+            .contains(winit::window::WindowButtons::MAXIMIZE),
+    );
     let drag = ui.interact(
         caption_rect,
         ui.id().with("window-title-drag"),
@@ -111,13 +117,19 @@ pub(crate) fn window_title_bar(
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
     controls.spacing_mut().item_spacing.x = 4.0;
-    let close = window_buttons(&mut controls, window);
+    let close = window_buttons_impl(&mut controls, window, tooltips);
     ui.allocate_rect(rect, egui::Sense::hover());
     close
 }
 
-fn title_regions(rect: egui::Rect) -> (egui::Rect, egui::Rect) {
-    let controls_left = (rect.right() - crate::ui::theme::WINDOW_CONTROLS_WIDTH).max(rect.left());
+fn title_regions(rect: egui::Rect, maximize: bool) -> (egui::Rect, egui::Rect) {
+    let width = crate::ui::theme::WINDOW_CONTROLS_WIDTH
+        - if maximize {
+            0.0
+        } else {
+            crate::ui::theme::VIEWER_CAPTION_BUTTON + 4.0
+        };
+    let controls_left = (rect.right() - width).max(rect.left());
     (
         egui::Rect::from_min_max(rect.min, egui::pos2(controls_left, rect.bottom())),
         egui::Rect::from_min_max(egui::pos2(controls_left, rect.top()), rect.max),
@@ -147,7 +159,13 @@ pub(crate) fn handle_title_drag(window: &Window, response: &egui::Response) -> b
         return false;
     }
     if response.double_clicked() {
-        window.set_maximized(!window.is_maximized());
+        if window.is_resizable()
+            && window
+                .enabled_buttons()
+                .contains(winit::window::WindowButtons::MAXIMIZE)
+        {
+            window.set_maximized(!window.is_maximized());
+        }
         false
     } else {
         response.drag_started()
@@ -155,29 +173,60 @@ pub(crate) fn handle_title_drag(window: &Window, response: &egui::Response) -> b
 }
 
 pub(crate) fn window_buttons(ui: &mut egui::Ui, window: &Window) -> bool {
+    window_buttons_impl(ui, window, true)
+}
+fn window_buttons_impl(ui: &mut egui::Ui, window: &Window, tooltips: bool) -> bool {
     let expanded = window.is_maximized() || window.fullscreen().is_some();
-    let minimize = title_icon_button(ui, TitleIcon::Minimize, false, "最小化");
+    let minimize = title_icon_button(
+        ui,
+        TitleIcon::Minimize,
+        false,
+        if tooltips { "最小化" } else { "" },
+    );
     if minimize.clicked() {
         window.set_minimized(true);
     }
-    let maximize = title_icon_button(
-        ui,
-        if expanded {
-            TitleIcon::Restore
-        } else {
-            TitleIcon::Maximize
-        },
-        false,
-        if expanded { "还原" } else { "最大化" },
-    );
-    if maximize.clicked() {
-        if window.fullscreen().is_some() {
-            window.set_fullscreen(None);
-        } else {
-            window.set_maximized(!window.is_maximized());
+    if window
+        .enabled_buttons()
+        .contains(winit::window::WindowButtons::MAXIMIZE)
+    {
+        let maximize = title_icon_button(
+            ui,
+            if expanded {
+                TitleIcon::Restore
+            } else {
+                TitleIcon::Maximize
+            },
+            false,
+            if !tooltips {
+                ""
+            } else if expanded {
+                "还原"
+            } else {
+                "最大化"
+            },
+        );
+        if maximize.clicked() {
+            if window.fullscreen().is_some() {
+                window.set_fullscreen(None);
+            } else {
+                if window.is_resizable()
+                    && window
+                        .enabled_buttons()
+                        .contains(winit::window::WindowButtons::MAXIMIZE)
+                {
+                    window.set_maximized(!window.is_maximized());
+                }
+            }
         }
     }
-    title_icon_button(ui, TitleIcon::Close, false, "关闭").clicked()
+    title_icon_button(
+        ui,
+        TitleIcon::Close,
+        false,
+        if tooltips { "关闭" } else { "" },
+    )
+    .clicked()
 }
 
 pub(crate) fn configure_dwm_window(window: &Window) {
@@ -395,7 +444,13 @@ pub(crate) fn update_nonmodal_window_move(
         if state.start.take().is_some() {
             let _ = unsafe { ReleaseCapture() };
         }
-        window.set_maximized(!window.is_maximized());
+        if window.is_resizable()
+            && window
+                .enabled_buttons()
+                .contains(winit::window::WindowButtons::MAXIMIZE)
+        {
+            window.set_maximized(!window.is_maximized());
+        }
         return;
     }
     if response.drag_started() {

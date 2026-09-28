@@ -175,9 +175,9 @@ impl VirtualDeviceProfile {
             name: short_virtual_name(&machine_guid),
             machine_guid,
             os: "Microsoft Windows 11 Pro".into(),
-            base_board: crate::account::virtual_hardware::BOARD.into(),
-            cpu: crate::account::virtual_hardware::CPU.into(),
-            video: vec![crate::account::virtual_hardware::VIDEO.into()],
+            base_board: "OpenUUYC Virtual Device".into(),
+            cpu: "Virtual CPU (8 Core)".into(),
+            video: vec!["Virtual Display Adapter".into()],
             mac: mac[..6]
                 .iter()
                 .map(|byte| format!("{byte:02X}"))

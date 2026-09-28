@@ -44,10 +44,10 @@ pub async fn interactive_login() -> Result<LoginOutcome> {
             println!("正在验证保存的登录态……");
         }
         LoginProgress::RegisteringDevice => {
-            println!("正在初始化虚拟设备身份……");
+            println!("正在初始化本机设备身份……");
         }
         LoginProgress::DeviceRegistered => {
-            println!("虚拟设备身份已注册，并保存到系统凭据存储。");
+            println!("本机设备已注册，并保存到系统凭据存储。");
         }
         LoginProgress::QrReady(content) => {
             if let Ok(code) = QrCode::with_error_correction_level(content.as_bytes(), EcLevel::L) {

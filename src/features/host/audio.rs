@@ -8,7 +8,7 @@ use crossbeam_queue::ArrayQueue;
 use std::{
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -83,6 +83,9 @@ struct Shared {
     cancel: CancellationToken,
     connected: Arc<AtomicBool>,
     encoding: Mutex<Option<Config>>,
+    quality_control: AtomicBool,
+    remote_quality: AtomicU32,
+    quality_report: Mutex<(u64, Option<(crate::media::audio::encoder::Quality, u32)>)>,
     status: Mutex<Status>,
     generation: AtomicU64,
     active: AtomicBool,
@@ -108,6 +111,9 @@ impl Audio {
             cancel,
             connected,
             encoding: Mutex::default(),
+            quality_control: AtomicBool::new(false),
+            remote_quality: AtomicU32::new(0),
+            quality_report: Mutex::new((0, None)),
             status: Mutex::default(),
             generation: AtomicU64::new(0),
             active: AtomicBool::new(false),
@@ -119,6 +125,76 @@ impl Audio {
             transmitter: Transmitter::default(),
             transport,
         }))
+    }
+    pub fn enable_quality_control(&self, enabled: bool, audio_only: bool) {
+        self.0.quality_control.store(enabled, Ordering::Release);
+        if enabled && audio_only {
+            self.0.remote_quality.store(256, Ordering::Relaxed);
+        }
+    }
+    fn quality(&self) -> crate::media::audio::encoder::Quality {
+        let kbps = self.0.remote_quality.load(Ordering::Relaxed);
+        if kbps == 0 {
+            self.0.lease.audio_quality()
+        } else {
+            crate::media::audio::encoder::Quality { kbps }
+        }
+    }
+    fn quality_status(&self) -> Option<(u64, crate::media::audio::encoder::Quality, Config)> {
+        let mut report = lock(&self.0.quality_report);
+        let quality = self.quality();
+        let config = (*lock(&self.0.encoding))?.quality(quality);
+        let values = (quality, config.bitrate);
+        if report.1 != Some(values) {
+            report.0 = report.0.wrapping_add(1);
+            report.1 = Some(values);
+        }
+        Some((report.0, quality, config))
+    }
+    pub fn quality_hello(&self) -> Option<Vec<u8>> {
+        if !self.0.quality_control.load(Ordering::Acquire) {
+            return None;
+        }
+        let (revision, quality, config) = self.quality_status()?;
+        Some(crate::protocol::audio_control::encode(
+            crate::protocol::audio_control::Message::Hello {
+                revision,
+                kbps: quality.kbps,
+                effective_bps: config.bitrate,
+            },
+        ))
+    }
+    pub fn quality_request(&self, bytes: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
+        use crate::protocol::audio_control::{self, Message};
+        if !self.0.quality_control.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let Some(message) = audio_control::decode(bytes)? else {
+            return Ok(None);
+        };
+        let Message::Set { request, kbps } = message else {
+            anyhow::bail!("unexpected audio control message");
+        };
+        let result = (|| -> anyhow::Result<_> {
+            crate::media::audio::encoder::Quality { kbps }.validate()?;
+            anyhow::ensure!(self.allowed(), "当前会话未开放桌面声音");
+            self.0.remote_quality.store(kbps, Ordering::Relaxed);
+            self.0.wake.notify_one();
+            self.quality_status()
+                .ok_or_else(|| anyhow::anyhow!("音频轨道未协商"))
+        })();
+        Ok(Some(audio_control::encode(match result {
+            Ok((revision, quality, config)) => Message::Applied {
+                request,
+                revision,
+                kbps: quality.kbps,
+                effective_bps: config.bitrate,
+            },
+            Err(error) => Message::Rejected {
+                request,
+                message: error.to_string(),
+            },
+        })))
     }
     pub fn configure(&self, encoding: Option<Config>) {
         let mut current = lock(&self.0.encoding);
@@ -364,7 +440,7 @@ impl Source for Audio {
     }
     fn encoding(&self) -> Option<Config> {
         let config = *lock(&self.0.encoding);
-        config.map(|config| config.quality(self.0.lease.audio_quality()))
+        config.map(|config| config.quality(self.quality()))
     }
     fn frames(&self) -> &ArrayQueue<Frame> {
         &self.0.frames

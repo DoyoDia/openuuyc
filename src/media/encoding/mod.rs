@@ -6,30 +6,40 @@ use crate::protocol::capability::CodecCapability;
 pub(crate) enum Codec {
     H264,
     H265,
+    Av1,
 }
 impl Codec {
+    pub fn from_mime(value: &str) -> Option<Self> {
+        [Self::H264, Self::H265, Self::Av1]
+            .into_iter()
+            .find(|codec| value.eq_ignore_ascii_case(codec.mime()))
+    }
     pub fn media(self) -> crate::media::VideoCodec {
         match self {
             Self::H264 => crate::media::VideoCodec::H264,
             Self::H265 => crate::media::VideoCodec::H265,
+            Self::Av1 => crate::media::VideoCodec::Av1,
         }
     }
     pub fn wire(self) -> i32 {
         match self {
             Self::H264 => 1,
             Self::H265 => 2,
+            Self::Av1 => crate::protocol::capability::AV1_CODEC_ID,
         }
     }
     pub fn mime(self) -> &'static str {
         match self {
             Self::H264 => "video/H264",
             Self::H265 => "video/H265",
+            Self::Av1 => "video/AV1",
         }
     }
     pub fn from_wire(value: i32) -> Option<Self> {
         match value {
             1 => Some(Self::H264),
             2 => Some(Self::H265),
+            crate::protocol::capability::AV1_CODEC_ID => Some(Self::Av1),
             _ => None,
         }
     }
@@ -48,7 +58,9 @@ impl Format {
         depth: 8,
     };
     pub fn valid(self) -> bool {
-        matches!(self.chroma, 1 | 3) && matches!(self.depth, 8 | 10)
+        matches!(self.chroma, 1 | 3)
+            && matches!(self.depth, 8 | 10)
+            && (self.codec != Codec::Av1 || self.chroma == 1)
     }
     pub fn hdr(self) -> bool {
         self.depth == 10
@@ -146,11 +158,20 @@ impl Capability {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct QualityTarget {
+    /// Selected quality/custom ceiling, independent of congestion feedback.
+    pub bitrate: u32,
+    /// Negotiated frame-rate limit, not the observed input frame rate.
+    pub fps: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Rate {
     pub target: u32,
     pub peak: u32,
     pub fps: u32,
     pub quality: i32,
+    pub quality_target: QualityTarget,
 }
 
 pub(crate) struct Encoded {

@@ -1,123 +1,119 @@
-//! T D7BFB0/D7C110/B402E0/B40910/B361A0, not the UI's bitrate labels.
+//! Shared streaming budgets for actual output geometry and negotiated format.
+//! Quality is a bandwidth ceiling, not a promise of constant traffic or fidelity.
+use super::format::{Codec, Format};
 use std::{
     collections::VecDeque,
     time::{Duration, Instant},
 };
 
-// The current ordinary Windows sender's numerical budget table, in Mbps:
-// FPS tier -> quality -> source pixel-area tier. Cloud platform 51 is excluded.
-const BUDGET: [[[f64; 4]; 4]; 5] = [
-    [
-        [1., 1., 1., 1.],
-        [3.5, 5.5, 5.5, 5.5],
-        [8., 10., 12., 12.],
-        [10., 20., 30., 40.],
-    ],
-    [
-        [1.5, 1.5, 1.5, 1.5],
-        [5.5, 7.5, 7.5, 7.5],
-        [10., 14., 16., 16.],
-        [20., 30., 40., 50.],
-    ],
-    [
-        [1.5, 1.5, 1.5, 1.5],
-        [6., 10., 10., 10.],
-        [20., 30., 40., 40.],
-        [30., 40., 50., 60.],
-    ],
-    [
-        [1.5, 1.5, 1.5, 1.5],
-        [8., 12., 12., 12.],
-        [25., 35., 45., 45.],
-        [35., 45., 55., 65.],
-    ],
-    [
-        [1.5, 1.5, 1.5, 1.5],
-        [10., 15., 15., 15.],
-        [30., 40., 50., 50.],
-        [40., 50., 60., 70.],
-    ],
-];
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Bounds {
-    pub minimum: u32,
+    /// Preferred allocation, reduced when the link cannot satisfy all streams.
+    pub reservation: u32,
     pub maximum: u32,
     pub initial: u32,
     pub probe: u32,
-    pub adaptive: bool,
 }
 impl Bounds {
+    fn video(maximum: u32) -> Self {
+        Self {
+            reservation: NETWORK_FLOOR.min(maximum),
+            maximum,
+            initial: (maximum / 5)
+                .clamp(NETWORK_FLOOR, STARTUP_CEILING)
+                .min(maximum),
+            probe: 0,
+        }
+    }
     pub fn network_maximum(self) -> u32 {
         self.maximum.max(self.probe)
     }
 }
 
+pub(crate) const NETWORK_FLOOR: u32 = 300_000;
+pub(crate) const STARTUP_CEILING: u32 = 3_000_000;
+pub(crate) const MIN_ENCODER_RATE: u32 = 30_000;
+
+// A quality decision threshold, never a network allocation guarantee.
+fn downgrade_threshold(maximum: u32) -> u32 {
+    (maximum / 5 * 2).clamp(200_000, 15_000_000)
+}
+
 pub(crate) use crate::media::geometry::dimensions;
 
-fn standard(quality: i32, size: (u32, u32), fps: u32) -> Bounds {
-    let f = match fps {
-        0..=30 => 0,
-        31..=60 => 1,
-        61..=90 => 2,
-        91..=120 => 3,
-        _ => 4,
+// 60 FPS ceilings in Mbps at 720p, 1080p, 1440p and 4K. Each codec has
+// independent quality anchors; compression savings are content-dependent.
+// 10-bit preserves gradients without a blanket raw-bit-depth surcharge.
+fn standard(format: Format, quality: i32, source: (u32, u32), fps: u32) -> Bounds {
+    let rates = match (format.codec, quality) {
+        (Codec::H264, 1) => [1.5, 1.5, 1.5, 1.5],
+        (Codec::H264, 3) => [8.0, 14.0, 24.0, 24.0],
+        (Codec::H264, 4) => [12.0, 20.0, 36.0, 60.0],
+        (Codec::H264, _) => [5.5, 8.0, 8.0, 8.0],
+        (Codec::H265, 1) => [1.3, 1.3, 1.3, 1.3],
+        (Codec::H265, 3) => [7.0, 12.0, 22.0, 22.0],
+        (Codec::H265, 4) => [10.0, 17.0, 32.0, 48.0],
+        (Codec::H265, _) => [4.5, 7.0, 7.0, 7.0],
+        (Codec::Av1, 1) => [1.2, 1.2, 1.2, 1.2],
+        (Codec::Av1, 3) => [6.0, 11.0, 18.0, 18.0],
+        (Codec::Av1, 4) => [8.0, 15.0, 28.0, 42.0],
+        (Codec::Av1, _) => [4.0, 6.0, 6.0, 6.0],
     };
-    let q = match quality {
-        1 => 0,
-        3 => 2,
-        4 => 3,
-        _ => 1,
-    };
-    let area = u64::from(size.0) * u64::from(size.1);
-    let a = if area < 1920 * 1080 {
-        0
-    } else if area < 2560 * 1440 {
-        1
-    } else if area < 3840 * 2160 {
-        2
+    let size = crate::media::geometry::output_size(source.0, source.1, quality);
+    let pixels = u64::from(size.0) * u64::from(size.1);
+    let anchors = [1280u64 * 720, 1920 * 1080, 2560 * 1440, 3840 * 2160];
+    let base = if pixels <= anchors[0] {
+        rates[0] * (pixels as f64 / anchors[0] as f64).max(0.25)
     } else {
-        3
+        (1..anchors.len())
+            .find(|&i| pixels <= anchors[i])
+            .map_or(rates[3], |i| {
+                let fraction =
+                    (pixels - anchors[i - 1]) as f64 / (anchors[i] - anchors[i - 1]) as f64;
+                rates[i - 1] + (rates[i] - rates[i - 1]) * fraction
+            })
     };
-    let rate = BUDGET[f][q][a] * 1_000_000.;
-    Bounds {
-        minimum: if rate * 0.4 > 15_000_000. {
-            (15_000_000. + rate / 1_000_000.) as u32
-        } else {
-            (rate * 0.4) as u32
-        },
-        maximum: (rate * 0.95) as u32,
-        initial: (rate * 0.2) as u32,
-        probe: 0,
-        adaptive: false,
-    }
+    // Like Moonlight's default-rate curve, high FPS grows sublinearly: adjacent
+    // frames share more information. No 30/60/90/120 tier discontinuities.
+    let ratio = f64::from(fps.clamp(1, 144)) / 60.0;
+    let color = if format.chroma == 3 { 2.0 } else { 1.0 };
+    let rate = (base * 1_000_000.0 * color * if fps <= 60 { ratio } else { ratio.sqrt() })
+        .round()
+        .clamp(500_000.0, 500_000_000.0) as u32;
+    Bounds::video(rate)
 }
 
-pub(crate) fn fixed(quality: i32, custom: u32, size: (u32, u32), fps: u32) -> Bounds {
+pub(crate) fn fixed(
+    format: Format,
+    quality: i32,
+    custom: u32,
+    size: (u32, u32),
+    fps: u32,
+) -> Bounds {
     if quality != 6 {
-        return standard(quality, size, fps);
+        return standard(format, quality, size, fps);
     }
-    let rate = f64::from(custom.clamp(1_000_000, 500_000_000));
-    Bounds {
-        minimum: (rate * 0.02 + rate / 1_000_000.).max(500_000. + rate / 1_000_000.) as u32,
-        maximum: rate as u32,
-        initial: (rate * 0.05 + rate / 1_000_000.) as u32,
-        probe: 0,
-        adaptive: true,
-    }
+    Bounds::video(custom.clamp(1_000_000, 500_000_000))
 }
 
-pub(crate) fn automatic(quality: i32, fps: u32, initial: bool) -> Bounds {
-    let size = dimensions(quality);
-    let mut result = standard(quality, size, fps);
+pub(crate) fn automatic(
+    format: Format,
+    quality: i32,
+    source: (u32, u32),
+    fps: u32,
+    initial: bool,
+) -> Bounds {
+    let mut result = standard(format, quality, source, fps);
     result.probe = if quality >= 4 {
         result.maximum
     } else {
-        let next = standard(quality + 1, size, fps);
+        let next = standard(format, quality + 1, source, fps);
         if initial {
             next.maximum
         } else {
-            ((f64::from(next.minimum) + f64::from(next.maximum)) * 0.8) as u32
+            (((f64::from(downgrade_threshold(next.maximum)) + f64::from(next.maximum)) * 0.8)
+                as u32)
+                .min(next.maximum)
         }
     };
     result
@@ -130,6 +126,15 @@ pub(crate) struct AutoQuality {
     probes: VecDeque<u32>,
     lower: VecDeque<u32>,
     at: Option<Instant>,
+    policy: Option<(Format, (u32, u32), u32, u64)>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct NetworkSample {
+    pub probe: u32,
+    pub lower: u32,
+    pub loss: f64,
+    pub generation: u64,
 }
 impl AutoQuality {
     pub fn new(startup: i32, maximum: i32) -> Self {
@@ -142,6 +147,7 @@ impl AutoQuality {
             probes: VecDeque::with_capacity(15),
             lower: VecDeque::with_capacity(15),
             at: None,
+            policy: None,
         }
     }
     pub fn quality(&self) -> i32 {
@@ -154,12 +160,19 @@ impl AutoQuality {
     pub fn observe(
         &mut self,
         now: Instant,
+        format: Format,
+        source: (u32, u32),
         fps: u32,
         has_frames: bool,
-        probe: u32,
-        lower: u32,
-        loss: f64,
+        sample: NetworkSample,
     ) -> Option<i32> {
+        let policy = (format, source, fps, sample.generation);
+        if self.policy != Some(policy) {
+            self.policy = Some(policy);
+            self.probes.clear();
+            self.lower.clear();
+            self.at = None;
+        }
         if self
             .at
             .is_some_and(|at| now.saturating_duration_since(at) < Duration::from_secs(1))
@@ -170,7 +183,10 @@ impl AutoQuality {
         if !has_frames {
             return None;
         }
-        for (window, value) in [(&mut self.probes, probe), (&mut self.lower, lower)] {
+        for (window, value) in [
+            (&mut self.probes, sample.probe),
+            (&mut self.lower, sample.lower),
+        ] {
             if window.len() == 15 {
                 window.pop_front();
             }
@@ -184,16 +200,18 @@ impl AutoQuality {
         };
         let probe = mean(&self.probes);
         let lower = mean(&self.lower);
-        let bounds = standard(self.current, dimensions(self.current), fps);
+        let bounds = standard(format, self.current, source, fps);
         let mut selected = self.current;
-        if probe > bounds.maximum && loss <= f64::EPSILON && self.current < self.maximum {
-            let next = standard(self.current + 1, dimensions(self.current), fps);
-            if f64::from(probe) > (f64::from(next.minimum) + f64::from(next.maximum)) * 0.5 {
+        if probe > bounds.maximum && sample.loss <= f64::EPSILON && self.current < self.maximum {
+            let next = standard(format, self.current + 1, source, fps);
+            if f64::from(probe)
+                > (f64::from(downgrade_threshold(next.maximum)) + f64::from(next.maximum)) * 0.5
+            {
                 selected += 1;
             }
         }
         // The lower-limit decision takes precedence over a simultaneous probe.
-        if lower != 0 && lower <= bounds.minimum {
+        if lower != 0 && lower <= downgrade_threshold(bounds.maximum) {
             selected = (self.current - 1).max(2);
         }
         selected = selected.min(self.maximum);

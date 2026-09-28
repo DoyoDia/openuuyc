@@ -3,7 +3,9 @@ use super::theme::{self, HOVER, LINE, MUTED, SURFACE, TEXT};
 use egui::{Color32, RichText, Stroke, vec2};
 mod audio_quality;
 mod diagnostics;
-pub(crate) use audio_quality::{audio_quality, audio_quality_segments};
+pub(crate) use audio_quality::{
+    audio_quality, audio_quality_segments, remote_audio_quality, remote_audio_quality_inline,
+};
 mod dialogs;
 pub(crate) use diagnostics::{
     diagnostics_action, diagnostics_empty, diagnostics_label, diagnostics_row, diagnostics_table,
@@ -864,7 +866,6 @@ pub(crate) fn audio_output_button(ui: &mut egui::Ui, hint: &str, size: f32) -> e
     let (rect, response) = icon_button_area(ui, size);
     response
         .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), hint));
-    let center = rect.center();
     let color = if !ui.is_enabled() {
         theme::DISABLED
     } else if response.hovered() {
@@ -872,6 +873,12 @@ pub(crate) fn audio_output_button(ui: &mut egui::Ui, hint: &str, size: f32) -> e
     } else {
         MUTED
     };
+    paint_headphones(ui.painter(), rect, color);
+    response.on_hover_text(hint)
+}
+
+pub(crate) fn paint_headphones(painter: &egui::Painter, rect: egui::Rect, color: Color32) {
+    let center = rect.center();
     let stroke = Stroke::new(theme::ICON_STROKE, color);
     let band = (0..=20)
         .map(|step| {
@@ -879,17 +886,16 @@ pub(crate) fn audio_output_button(ui: &mut egui::Ui, hint: &str, size: f32) -> e
             center + vec2(6.0 * angle.cos(), 6.0 * angle.sin() - 1.0)
         })
         .collect();
-    ui.painter().add(egui::Shape::line(band, stroke));
+    painter.add(egui::Shape::line(band, stroke));
     // Join the band at each earcup's top center, away from its rounded corners.
     for x in [-6.0, 6.0] {
-        ui.painter().rect_stroke(
+        painter.rect_stroke(
             egui::Rect::from_center_size(center + vec2(x, 2.5), vec2(4.0, 7.0)),
             1.0,
             stroke,
             egui::StrokeKind::Middle,
         );
     }
-    response.on_hover_text(hint)
 }
 
 /// Compact display tabs for the viewer caption.

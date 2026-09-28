@@ -163,7 +163,7 @@ struct DeviceCenterApp {
     exit_pending: bool,
     exit_ready: bool,
     logout_confirmation: bool,
-    takeover_confirmation: Option<(u64, DeviceInfo)>,
+    takeover_confirmation: Option<(u64, DeviceInfo, bool)>,
     logout_pending: bool,
     logout_sent: bool,
     login_generation: u64,
@@ -542,9 +542,7 @@ impl DeviceCenterApp {
                         (Some(error), None) => StatusMessage::warning(format!(
                             "已清除本地登录，服务端退出未确认：{error}"
                         )),
-                        (None, None) => {
-                            StatusMessage::success("已退出登录，本虚拟设备已从账号移除")
-                        }
+                        (None, None) => StatusMessage::success("已退出登录，本机设备已从账号移除"),
                     };
                     self.login_restoring = false;
                     self.login_running = false;
@@ -650,8 +648,11 @@ impl DeviceCenterApp {
                         "与 {alias} 的连接已结束，可能已被其他设备断开或接管"
                     ))
                 }
-                Ok(crate::session::controller::windows::ViewerEnd::TakeoverRequired(device)) => {
-                    self.takeover_confirmation = Some((self.login_generation, *device));
+                Ok(crate::session::controller::windows::ViewerEnd::TakeoverRequired(
+                    device,
+                    audio_only,
+                )) => {
+                    self.takeover_confirmation = Some((self.login_generation, *device, audio_only));
                     StatusMessage::info("等待确认接管")
                 }
                 Err(error) => StatusMessage::error(format!(
@@ -824,56 +825,23 @@ impl DeviceCenterApp {
 
     fn is_viewing_target(&self, id: &str) -> bool {
         self.devices.as_ref().is_some_and(|list| {
-            list.current_device.device_id != id
-                && all_devices(list).any(|(_, d)| d.device_id == id && matches!(d.platform, 1 | 4))
-        }) && !self.catalog.as_ref().is_some_and(|c| {
-            c.is_virtual(id)
-                || c.groups
-                    .mobile_devices
-                    .iter()
-                    .chain(&c.groups.tv_devices)
-                    .any(|d| d.device_id == id)
+            all_devices(list).any(|(_, d)| d.device_id == id && self.show_in_watching_list(d))
         })
     }
 
     fn show_in_watching_list(&self, device: &DeviceInfo) -> bool {
         matches!(device.platform, 1 | 4)
             && self
-                .catalog
+                .devices
                 .as_ref()
-                .is_some_and(|c| c.virtual_status(&device.device_id) == Some(false))
-    }
-
-    fn watching_list_resolution(&self) -> (usize, usize) {
-        let Some(list) = &self.devices else {
-            return (0, 0);
-        };
-        let (mut pending, mut unresolved) = (0, 0);
-        for (_, device) in all_devices(list).filter(|(_, d)| matches!(d.platform, 1 | 4)) {
-            if self
-                .catalog
-                .as_ref()
-                .and_then(|c| c.virtual_status(&device.device_id))
-                .is_some()
-            {
-                continue;
-            }
-            let failed = self.catalog_error.is_some()
-                || self.catalog.as_ref().is_some_and(|c| {
-                    c.details.contains_key(&device.device_id)
-                        || !c
-                            .groups
-                            .desktop_devices
-                            .iter()
-                            .any(|d| d.device_id == device.device_id)
-                });
-            if failed {
-                unresolved += 1;
-            } else {
-                pending += 1;
-            }
-        }
-        (pending, unresolved)
+                .is_some_and(|list| list.current_device.device_id != device.device_id)
+            && !self.catalog.as_ref().is_some_and(|c| {
+                c.groups
+                    .mobile_devices
+                    .iter()
+                    .chain(&c.groups.tv_devices)
+                    .any(|d| d.device_id == device.device_id)
+            })
     }
 
     fn open_details(&mut self, id: String) {
@@ -955,6 +923,9 @@ impl DeviceCenterApp {
     }
 
     fn start_viewer(&mut self) {
+        self.start_viewer_mode(false);
+    }
+    fn start_viewer_mode(&mut self, audio_only: bool) {
         if self.logout_pending || self.mutation_pending {
             return;
         }
@@ -972,6 +943,7 @@ impl DeviceCenterApp {
         }
         if let Some(session) = &self.active_session {
             if session.device_id.as_ref() == Some(&device.device_id) {
+                session.handle.request_audio_only(audio_only);
                 session.handle.focus();
                 return;
             }
@@ -980,13 +952,15 @@ impl DeviceCenterApp {
         }
 
         if self.needs_takeover(&device) {
-            self.takeover_confirmation = Some((self.login_generation, device));
+            self.takeover_confirmation = Some((self.login_generation, device, audio_only));
             return;
         }
-        self.spawn_viewer(
+        self.spawn_viewer_with_takeover(
             display_alias(&device).to_owned(),
             Some(device.device_id.clone()),
             None,
+            None,
+            audio_only,
         );
     }
 
@@ -1039,7 +1013,7 @@ impl DeviceCenterApp {
         device_id: Option<String>,
         assist_request: Option<crate::account::assist::AssistRequest>,
     ) {
-        self.spawn_viewer_with_takeover(alias, device_id, assist_request, None);
+        self.spawn_viewer_with_takeover(alias, device_id, assist_request, None, false);
     }
 
     fn spawn_viewer_with_takeover(
@@ -1048,6 +1022,7 @@ impl DeviceCenterApp {
         device_id: Option<String>,
         assist_request: Option<crate::account::assist::AssistRequest>,
         takeover: Option<crate::session::controller::takeover::Approval>,
+        audio_only: bool,
     ) {
         if self.opening_viewer {
             return;
@@ -1072,7 +1047,10 @@ impl DeviceCenterApp {
                 alias,
                 device_id,
                 assist: assist_request,
-                options: self.media,
+                options: ConnectionMediaOptions {
+                    audio_only,
+                    ..self.media
+                },
                 background,
                 takeover,
             })

@@ -63,6 +63,8 @@ struct Published {
     visible: bool,
     quality: i32,
     fps: u32,
+    format: super::format::Format,
+    budget_size: (u32, u32),
     encoder: Option<super::format::Backend>,
     capture: String,
 }
@@ -98,7 +100,7 @@ type ReportTarget = tokio::sync::watch::Sender<ReportRoutes>;
 
 impl Peer {
     pub(crate) async fn new(
-        screen: capture::Screen,
+        screen: Option<capture::Screen>,
         owner: super::SessionLease,
         cancel: CancellationToken,
         displays: Arc<super::displays::Session>,
@@ -109,7 +111,10 @@ impl Peer {
         negotiated: Arc<super::format::Negotiated>,
         network: super::network::Policy,
         input_policy: super::input::wire::Policy,
+        deferred: Option<screens::Deferred>,
+        audio_control: bool,
     ) -> Result<Self> {
+        let audio_only = deferred.is_some();
         let handle = owner.with_cancellation(cancel.clone());
         tracing::info!(?network, "host network switch policy");
         let initial_quality = if initial.quality == 5 {
@@ -117,14 +122,33 @@ impl Peer {
         } else {
             initial.quality
         };
-        let initial_bounds = if initial.quality == 5 {
-            super::parameters::automatic(initial_quality, initial.fps, true)
+        let initial_fps = initial
+            .fps
+            .min(screen.as_ref().map_or(144, |s| s.fps))
+            .max(1);
+        let size = screen.as_ref().map_or((0, 0), |s| (s.width, s.height));
+        let initial_bounds = if screen.is_none() {
+            super::parameters::Bounds {
+                reservation: 0,
+                maximum: 0,
+                initial: 0,
+                probe: 0,
+            }
+        } else if initial.quality == 5 {
+            super::parameters::automatic(
+                initial.format,
+                initial_quality,
+                crate::media::geometry::fit_size(size.0, size.1, initial.maximum),
+                initial_fps,
+                true,
+            )
         } else {
             super::parameters::fixed(
+                initial.format,
                 initial_quality,
                 initial.bitrate,
-                (screen.width, screen.height),
-                initial.fps,
+                crate::media::geometry::fit_size(size.0, size.1, initial.maximum),
+                initial_fps,
             )
         };
         let transport = super::transport::Transport::new(
@@ -135,6 +159,7 @@ impl Peer {
         );
         let mut registry = webrtc::interceptor::registry::Registry::new();
         registry.add(Box::new(transport.clone()));
+        registry.add(Box::new(crate::transport::rtcp_timing::RtcpTiming::new()));
         let mut media = MediaEngine::default();
         media.register_codec(
             RTCRtpCodecParameters {
@@ -164,6 +189,10 @@ impl Peer {
                             .into(),
                     rtcp_feedback: vec![
                         RTCPFeedback {
+                            typ: "rrtr".into(),
+                            parameter: String::new(),
+                        },
+                        RTCPFeedback {
                             typ: "transport-cc".into(),
                             parameter: String::new(),
                         },
@@ -187,51 +216,66 @@ impl Peer {
             },
             RTPCodecType::Video,
         )?;
-        if negotiated.supports_codec(super::format::Codec::H265) {
-            media.register_codec(
-                RTCRtpCodecParameters {
-                    capability: RTCRtpCodecCapability {
-                        mime_type: "video/H265".into(),
-                        clock_rate: 90_000,
-                        sdp_fmtp_line: String::new(),
-                        rtcp_feedback: vec![
-                            RTCPFeedback {
-                                typ: "transport-cc".into(),
-                                parameter: String::new(),
-                            },
-                            RTCPFeedback {
-                                typ: "nack".into(),
-                                parameter: String::new(),
-                            },
-                            RTCPFeedback {
-                                typ: "nack".into(),
-                                parameter: "pli".into(),
-                            },
-                            RTCPFeedback {
-                                typ: "ccm".into(),
-                                parameter: "fir".into(),
-                            },
-                        ],
+        for (kind, mime, pt, fmtp, rtx) in [
+            (super::format::Codec::H265, "video/H265", 96, "", "apt=96"),
+            (
+                super::format::Codec::Av1,
+                "video/AV1",
+                104,
+                "profile=0;level-idx=17;tier=0",
+                "apt=104",
+            ),
+        ] {
+            if screen.is_none() || negotiated.supports_codec(kind) {
+                media.register_codec(
+                    RTCRtpCodecParameters {
+                        capability: RTCRtpCodecCapability {
+                            mime_type: mime.into(),
+                            clock_rate: 90_000,
+                            sdp_fmtp_line: fmtp.into(),
+                            rtcp_feedback: vec![
+                                RTCPFeedback {
+                                    typ: "rrtr".into(),
+                                    parameter: String::new(),
+                                },
+                                RTCPFeedback {
+                                    typ: "transport-cc".into(),
+                                    parameter: String::new(),
+                                },
+                                RTCPFeedback {
+                                    typ: "nack".into(),
+                                    parameter: String::new(),
+                                },
+                                RTCPFeedback {
+                                    typ: "nack".into(),
+                                    parameter: "pli".into(),
+                                },
+                                RTCPFeedback {
+                                    typ: "ccm".into(),
+                                    parameter: "fir".into(),
+                                },
+                            ],
+                            ..Default::default()
+                        },
+                        payload_type: pt,
                         ..Default::default()
                     },
-                    payload_type: 96,
-                    ..Default::default()
-                },
-                RTPCodecType::Video,
-            )?;
-            media.register_codec(
-                RTCRtpCodecParameters {
-                    capability: RTCRtpCodecCapability {
-                        mime_type: "video/rtx".into(),
-                        clock_rate: 90_000,
-                        sdp_fmtp_line: "apt=96".into(),
+                    RTPCodecType::Video,
+                )?;
+                media.register_codec(
+                    RTCRtpCodecParameters {
+                        capability: RTCRtpCodecCapability {
+                            mime_type: "video/rtx".into(),
+                            clock_rate: 90_000,
+                            sdp_fmtp_line: rtx.into(),
+                            ..Default::default()
+                        },
+                        payload_type: pt + 1,
                         ..Default::default()
                     },
-                    payload_type: 97,
-                    ..Default::default()
-                },
-                RTPCodecType::Video,
-            )?;
+                    RTPCodecType::Video,
+                )?;
+            }
         }
         media.register_codec(
             RTCRtpCodecParameters {
@@ -338,6 +382,7 @@ impl Peer {
             connected.clone(),
             transport.clone(),
         );
+        audio.enable_quality_control(audio_control, audio_only);
         let screen_pool = screens::Screens::new(
             connection.clone(),
             handle.clone(),
@@ -348,6 +393,7 @@ impl Peer {
             transport.clone(),
             screen.clone(),
             displays,
+            deferred,
         )
         .await?;
         let sender = screen_pool.slots[0].sender.clone();
@@ -541,7 +587,7 @@ impl Peer {
                 let responses = crate::features::stream_control::publisher::receive(
                     bytes,
                     true,
-                    &control_screen,
+                    control_screen.as_ref(),
                     &mut lock(&control_config),
                     &control_negotiated,
                 )?;
@@ -576,6 +622,7 @@ impl Peer {
         let channel_kcp = kcp.clone();
         let channel_input = input.receiver();
         let channel_microphone = microphone.receiver();
+        let channel_audio = audio.clone();
         connection.on_data_channel(Box::new(move |channel| {
             let screens = channel_screens.clone();
             let stop = channel_cancel.clone();
@@ -583,6 +630,7 @@ impl Peer {
             let report_target = report_target.clone();
             let input = channel_input.clone();
             let microphone = channel_microphone.clone();
+            let audio = channel_audio.clone();
             Box::pin(async move {
                 bind_channel(
                     channel,
@@ -592,6 +640,7 @@ impl Peer {
                     report_target,
                     input,
                     microphone,
+                    audio,
                 )
                 .await;
             })
@@ -872,6 +921,9 @@ impl Peer {
                 hdr: i32::from(info.screen.hdr),
             })
             .collect()
+    }
+    pub(crate) fn take_prepared_capabilities(&self) -> Option<Vec<super::format::Capability>> {
+        lock(&self.reports.capabilities).take()
     }
     pub(crate) fn ended(&self) -> bool {
         self.cancel.is_cancelled()

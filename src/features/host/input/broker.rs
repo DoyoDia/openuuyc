@@ -212,7 +212,6 @@ pub(crate) fn agent(name: &str, parent: u32) -> Result<()> {
             continue;
         }
         let request: Request = pipe.receive(permitted)?;
-        last = Instant::now();
         let close = matches!(request, Request::Close);
         let result = match request {
             Request::Input { event, geometry } => {
@@ -245,6 +244,9 @@ pub(crate) fn agent(name: &str, parent: u32) -> Result<()> {
             },
             permitted,
         )?;
+        // A slow Windows input call is not a silent/disconnected client.
+        // Start the idle lease only after its serialized reply is delivered.
+        last = Instant::now();
         if close {
             break;
         }
@@ -286,7 +288,6 @@ pub(crate) fn serve(pipe: Pipe, permitted: impl Fn() -> bool) -> Result<()> {
             }
             let request: Request = pipe.receive(&permitted)?;
             let close = matches!(request, Request::Close);
-            last = Instant::now();
             agent_pipe.send(&request, &permitted)?;
             let mut reply: Reply = agent_pipe.receive(&permitted)?;
             if reply.sas {
@@ -299,6 +300,7 @@ pub(crate) fn serve(pipe: Pipe, permitted: impl Fn() -> bool) -> Result<()> {
                 }
             }
             pipe.send(&reply, &permitted)?;
+            last = Instant::now();
             if close {
                 break;
             }

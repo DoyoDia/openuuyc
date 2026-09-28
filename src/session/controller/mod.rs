@@ -230,8 +230,12 @@ impl ControllerConnection {
         })
     }
     async fn activate_viewing(&self) -> Result<()> {
+        if self.profile.audio_only {
+            return self.start_listening().await;
+        }
         self.wait_port_mapping_ready().await?;
         let handle = self.stream_control_handle();
+        handle.set_viewing_enabled(true);
         let snapshot = handle.snapshot();
         let screen = snapshot
             .screens
@@ -239,6 +243,16 @@ impl ControllerConnection {
             .context("被控端尚未提供显示器列表")?;
         handle.set_screen_capture(screen.id, true).await?;
         handle.set_viewing_enabled(true);
+        Ok(())
+    }
+    async fn start_listening(&self) -> Result<()> {
+        let handle = self.stream_control_handle();
+        handle.wait_media_control().await?;
+        self.peer.pause_video();
+        handle.set_video_enabled(false).await?;
+        self.forwarder.start_audio();
+        handle.audio().start()?;
+        self.performance_monitor().set_decoder("仅音频");
         Ok(())
     }
     pub(crate) fn port_mapping_transport(&self) -> Arc<crate::features::port_mapping::Transport> {
@@ -273,17 +287,29 @@ impl ControllerConnection {
     async fn select_video_track(&mut self) -> Result<(ForwardedTrack, VideoCodec)> {
         let video = tokio::time::timeout(Duration::from_secs(12), async {
             loop {
-                let track = if let Some(track) = self.forwarder.selected_metadata() {
+                let snapshot = self.stream_control_handle().snapshot();
+                let current = snapshot.remote_display.as_ref().map(|d| d.screen_id);
+                let preferred = snapshot.screens.iter()
+                    .filter(|s| s.video_track_index >= 0)
+                    .min_by_key(|s| (Some(s.id) != current, !s.primary))
+                    .map(|s| s.video_track_index);
+                if let Some(index) = preferred
+                    && let Some(track) = self.forwarder.select_registered_video(index)
+                {
+                    return Ok::<_, anyhow::Error>(track);
+                }
+                let track = if preferred.is_none() && let Some(track) = self.forwarder.selected_metadata() {
                     track
                 } else {
-                    self.forwarder
-                        .next_track()
-                        .await
-                        .ok_or_else(|| anyhow!("remote RTP track channel closed"))?
+                    tokio::select! {
+                        track = self.forwarder.next_track() => track.ok_or_else(|| anyhow!("remote RTP track channel closed"))?,
+                        _ = tokio::time::sleep(Duration::from_millis(20)) => continue,
+                    }
                 };
                 match track.kind {
                     MediaKind::Audio => {}
-                    MediaKind::Video => return Ok::<_, anyhow::Error>(track),
+                    MediaKind::Video if preferred.is_none() || track.id == format!("video_{}", preferred.unwrap()) => return Ok::<_, anyhow::Error>(track),
+                    MediaKind::Video => {}
                 }
             }
         })
@@ -293,6 +319,7 @@ impl ControllerConnection {
         let codec = match video.codec.to_ascii_lowercase() {
             value if value.contains("h265") || value.contains("hevc") => VideoCodec::H265,
             value if value.contains("h264") => VideoCodec::H264,
+            value if value.contains("av1") => VideoCodec::Av1,
             _ => bail!(
                 "remote device selected unsupported video codec {}",
                 video.codec
@@ -543,7 +570,11 @@ impl ControllerConnection {
         Self::from_shared(
             session,
             profile,
-            purpose == crate::session::negotiation::ControlPurpose::Viewing,
+            matches!(
+                purpose,
+                crate::session::negotiation::ControlPurpose::Viewing
+                    | crate::session::negotiation::ControlPurpose::Audio
+            ),
         )
     }
 
@@ -585,6 +616,7 @@ impl ControllerConnection {
                 match codec {
                     VideoCodec::H264 => "H.264/AVC",
                     VideoCodec::H265 => "H.265/HEVC",
+                    VideoCodec::Av1 => "AV1",
                 },
                 video.payload_type,
                 video.ssrc,
@@ -604,6 +636,7 @@ impl ControllerConnection {
         performance.set_video_codec(match codec {
             VideoCodec::H264 => format!("H.264/AVC · RTP PT {}", video.payload_type),
             VideoCodec::H265 => format!("H.265/HEVC · RTP PT {}", video.payload_type),
+            VideoCodec::Av1 => format!("AV1 · RTP PT {}", video.payload_type),
         });
         let stream_control = self.peer.stream_control_handle();
         let receiver_feedback = self.forwarder.video_receiver_feedback();
@@ -622,6 +655,7 @@ impl ControllerConnection {
                 match codec {
                     VideoCodec::H264 => "H.264",
                     VideoCodec::H265 => "H.265",
+                    VideoCodec::Av1 => "AV1",
                 },
             ),
         );
@@ -694,6 +728,7 @@ impl ControllerConnection {
             codec: match codec {
                 VideoCodec::H264 => "H.264",
                 VideoCodec::H265 => "H.265",
+                VideoCodec::Av1 => "AV1",
             },
             payload_type: video.payload_type,
             requested_keyframe: true,

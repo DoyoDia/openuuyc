@@ -28,6 +28,7 @@ const START_CODE: [u8; 4] = [0, 0, 0, 1];
 pub(crate) enum VideoCodecKind {
     H264,
     H265,
+    Av1,
 }
 
 /// WebRTC/UU video-timing header extension. All six values are milliseconds
@@ -116,6 +117,7 @@ pub(crate) struct ReceiverResult {
     pub frame_buffer_frames: usize,
 }
 
+#[derive(Clone)]
 pub(crate) struct VideoHeaderExtensions {
     pub orientation: Option<u8>,
     pub content_type: Option<u8>,
@@ -156,6 +158,20 @@ struct InFlightFrame {
 }
 
 impl OfficialVideoReceiver {
+    pub(crate) fn reset_after_pause(&mut self) {
+        let codec = match self.current_codec.unwrap_or(VideoCodecKind::H264) {
+            VideoCodecKind::H264 => "video/H264",
+            VideoCodecKind::H265 => "video/H265",
+            VideoCodecKind::Av1 => "video/AV1",
+        };
+        let anchor = self
+            .last_completed_picture_id
+            .saturating_add(i64::from(u16::MAX));
+        let mut next = Self::new(codec, self.extensions.clone(), "").expect("known video codec");
+        next.reference_finder = SeqNumOnlyRefFinder::with_unwrap_anchor(anchor);
+        next.last_completed_picture_id = anchor;
+        *self = next;
+    }
     pub(crate) fn new(
         mime_type: &str,
         extensions: VideoHeaderExtensions,
@@ -163,6 +179,8 @@ impl OfficialVideoReceiver {
     ) -> Result<Self> {
         let codec = if mime_type.eq_ignore_ascii_case("video/H264") {
             VideoCodecKind::H264
+        } else if mime_type.eq_ignore_ascii_case("video/AV1") {
+            VideoCodecKind::Av1
         } else if mime_type.eq_ignore_ascii_case("video/H265")
             || mime_type.eq_ignore_ascii_case("video/HEVC")
         {
@@ -217,6 +235,7 @@ impl OfficialVideoReceiver {
         let parsed = match codec {
             VideoCodecKind::H264 => depacketize_h264(packet, received_at),
             VideoCodecKind::H265 => depacketize_h265(packet, received_at),
+            VideoCodecKind::Av1 => depacketize::depacketize_av1(packet, received_at),
         };
         let mut parsed = parsed?;
         let color_extension = self

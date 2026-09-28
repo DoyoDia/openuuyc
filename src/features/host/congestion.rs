@@ -25,6 +25,7 @@ pub(crate) struct Controller {
     reference: Option<i64>,
     remote_offset: Option<i64>,
     available: bool,
+    generation: u64,
     route_at: Timestamp,
     pub target: u32,
     pub pacing: u32,
@@ -82,7 +83,7 @@ impl Controller {
                     requests_alr_probing: Some(true),
                     max_total_allocated_bitrate: Some(DataRate::from_bits_per_sec(maximum.into())),
                     min_total_allocated_bitrate: Some(DataRate::from_bits_per_sec(
-                        bounds.minimum.into(),
+                        bounds.reservation.into(),
                     )),
                     ..Default::default()
                 },
@@ -102,6 +103,7 @@ impl Controller {
             reference: None,
             remote_offset: None,
             available: false,
+            generation: 0,
             route_at: at,
             target: bounds.initial,
             pacing: bounds.initial.saturating_mul(16) / 10,
@@ -150,6 +152,7 @@ impl Controller {
             return;
         }
         self.available = available;
+        self.generation = self.generation.wrapping_add(1);
         let update = self.core.on_network_availability(NetworkAvailability {
             at_time: self.now(),
             network_available: available,
@@ -160,6 +163,7 @@ impl Controller {
         }
     }
     pub fn route_changed(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
         self.route_at = self.now();
         let update = self.core.on_network_route_change(NetworkRouteChange {
             at_time: self.now(),
@@ -190,12 +194,14 @@ impl Controller {
         let update = self.core.on_streams_config(StreamsConfig {
             at_time: self.now(),
             max_total_allocated_bitrate: Some(DataRate::from_bits_per_sec(maximum.into())),
-            min_total_allocated_bitrate: Some(DataRate::from_bits_per_sec(bounds.minimum.into())),
+            min_total_allocated_bitrate: Some(DataRate::from_bits_per_sec(
+                bounds.reservation.into(),
+            )),
             ..Default::default()
         });
         self.apply(update);
     }
-    pub fn estimates(&self) -> (u32, u32, f64) {
+    pub fn estimates(&self) -> (u32, u32, f64, u64) {
         (
             self.target,
             self.core
@@ -203,6 +209,7 @@ impl Controller {
                 .bps_or(0)
                 .clamp(0, self.maximum as i64) as u32,
             self.loss,
+            self.generation,
         )
     }
     pub fn next_sequence(&mut self) -> i64 {
@@ -385,7 +392,9 @@ fn constraints(at_time: Timestamp, maximum: u32, start: Option<u32>) -> TargetRa
     TargetRateConstraints {
         at_time,
         // UU product field trial PcFactoryDefaultBitrates/min:300 (kbps).
-        min_data_rate: Some(DataRate::from_bits_per_sec(300_000)),
+        min_data_rate: Some(DataRate::from_bits_per_sec(
+            super::parameters::NETWORK_FLOOR.min(maximum).into(),
+        )),
         max_data_rate: Some(DataRate::from_bits_per_sec(maximum.into())),
         starting_rate: start.map(|v| DataRate::from_bits_per_sec(v.into())),
     }

@@ -28,6 +28,7 @@ pub(super) struct WindowContext {
     pub takeover: Option<super::takeover::Approval>,
 }
 pub(crate) struct ViewerHandle {
+    controller_id: String,
     cancel: CancellationToken,
     info: Arc<Mutex<ViewerInfo>>,
     result: Arc<Mutex<Option<std::result::Result<ViewerEnd, String>>>>,
@@ -38,22 +39,25 @@ pub(crate) struct ViewerHandle {
 pub(crate) enum ViewerEnd {
     Closed,
     RoomReleased,
-    TakeoverRequired(Box<crate::account::api::DeviceInfo>),
+    TakeoverRequired(Box<crate::account::api::DeviceInfo>, bool),
 }
 
 impl ViewerEnd {
-    fn from_result(result: Result<()>) -> std::result::Result<Self, String> {
+    fn from_result(result: Result<()>, audio_only: bool) -> std::result::Result<Self, String> {
         match result {
             Ok(()) => Ok(Self::Closed),
             Err(error) if super::room_released(&error) => Ok(Self::RoomReleased),
             Err(error) if error.downcast_ref::<super::takeover::Required>().is_some() => {
-                Ok(Self::TakeoverRequired(Box::new(
-                    error
-                        .downcast_ref::<super::takeover::Required>()
-                        .unwrap()
-                        .0
-                        .clone(),
-                )))
+                Ok(Self::TakeoverRequired(
+                    Box::new(
+                        error
+                            .downcast_ref::<super::takeover::Required>()
+                            .unwrap()
+                            .0
+                            .clone(),
+                    ),
+                    audio_only,
+                ))
             }
             Err(error) => Err(format!("{error:#}")),
         }
@@ -64,6 +68,17 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 impl ViewerHandle {
+    pub fn request_audio_only(&self, enabled: bool) {
+        if let Some(target) = lock(&self.info).target.as_ref()
+            && let Some(session) =
+                super::shared::get(&super::shared::key(&self.controller_id, &target.device_id))
+        {
+            session
+                .peer
+                .stream_control_handle()
+                .request_audio_only(enabled);
+        }
+    }
     pub fn request_close(&self) {
         self.cancel.cancel();
     }
@@ -110,6 +125,7 @@ pub(crate) fn start(
     background: Option<crate::application::wallpaper::Source>,
     takeover: Option<super::takeover::Approval>,
 ) -> ViewerHandle {
+    let controller_id = client.device_id();
     let cancel = client.ended().child_token();
     let done = CancellationToken::new();
     {
@@ -164,11 +180,12 @@ pub(crate) fn start(
     tokio::spawn(async move {
         let _done = done.clone().drop_guard();
         let outcome = super::run_viewer_window(alias, options, id, assist, Some(context)).await;
-        *lock(&job_result) = Some(ViewerEnd::from_result(outcome));
+        *lock(&job_result) = Some(ViewerEnd::from_result(outcome, options.audio_only));
         done.cancel();
         let _ = information.await;
     });
     ViewerHandle {
+        controller_id,
         cancel,
         info,
         result,

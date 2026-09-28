@@ -59,6 +59,12 @@ impl FrameRateChoice {
             format!("{value} FPS")
         }
     }
+    pub(crate) fn requires_faster_screen(self, display: LocalDisplayInfo, refresh_hz: u32) -> bool {
+        // Levels are ceilings: a 120Hz screen fits in the 144 tier, and a
+        // 75Hz screen in the 90 tier. Only a higher tier needs a virtual mode.
+        refresh_hz > 0
+            && self.value(display).min(display.refresh_hz) > max_frame_rate_level(refresh_hz)
+    }
 }
 
 impl std::str::FromStr for FrameRateChoice {
@@ -81,20 +87,31 @@ pub enum CodecPreference {
     Auto,
     H264,
     H265,
+    Av1,
 }
 
 impl CodecPreference {
+    pub(crate) fn accepts(self, codec: VideoCodec) -> bool {
+        match self {
+            Self::Auto => true,
+            Self::H264 => codec == VideoCodec::H264,
+            Self::H265 => codec == VideoCodec::H265,
+            Self::Av1 => codec == VideoCodec::Av1,
+        }
+    }
     pub fn label(self) -> &'static str {
         match self {
-            Self::Auto => "自动 H.265/H.264",
+            Self::Auto => "自动 AV1/H.265/H.264",
             Self::H264 => "H.264",
             Self::H265 => "H.265",
+            Self::Av1 => "AV1",
         }
     }
 
     pub fn next(self) -> Self {
         match self {
-            Self::Auto => Self::H265,
+            Self::Auto => Self::Av1,
+            Self::Av1 => Self::H265,
             Self::H265 => Self::H264,
             Self::H264 => Self::Auto,
         }
@@ -109,6 +126,7 @@ impl std::str::FromStr for CodecPreference {
             "auto" => Ok(Self::Auto),
             "h264" | "avc" => Ok(Self::H264),
             "h265" | "hevc" => Ok(Self::H265),
+            "av1" => Ok(Self::Av1),
             _ => bail!("unsupported codec preference: {value}"),
         }
     }
@@ -146,6 +164,7 @@ impl std::str::FromStr for TransportChoice {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct ConnectionMediaOptions {
+    pub audio_only: bool,
     pub muted: bool,
     pub frame_rate: FrameRateChoice,
     pub codec: CodecPreference,
@@ -156,6 +175,7 @@ pub struct ConnectionMediaOptions {
 impl Default for ConnectionMediaOptions {
     fn default() -> Self {
         Self {
+            audio_only: false,
             muted: false,
             frame_rate: FrameRateChoice::Auto,
             codec: CodecPreference::Auto,
@@ -167,6 +187,7 @@ impl Default for ConnectionMediaOptions {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) struct ConnectionMediaProfile {
+    pub audio_only: bool,
     pub muted: bool,
     pub local_display: LocalDisplayInfo,
     pub stream_fps: u32,
@@ -179,6 +200,7 @@ impl ConnectionMediaOptions {
     pub(crate) fn resolve(self, display: LocalDisplayInfo) -> Result<ConnectionMediaProfile> {
         let stream_fps = self.frame_rate.value(display);
         Ok(ConnectionMediaProfile {
+            audio_only: self.audio_only,
             muted: self.muted,
             local_display: display,
             stream_fps,
@@ -200,6 +222,7 @@ fn max_frame_rate_level(refresh_hz: u32) -> u32 {
 pub enum VideoCodec {
     H264,
     H265,
+    Av1,
 }
 
 impl std::str::FromStr for VideoCodec {
@@ -209,6 +232,7 @@ impl std::str::FromStr for VideoCodec {
         match value.to_ascii_lowercase().as_str() {
             "h264" | "avc" => Ok(Self::H264),
             "h265" | "hevc" => Ok(Self::H265),
+            "av1" => Ok(Self::Av1),
             _ => bail!("unsupported video codec: {value}"),
         }
     }

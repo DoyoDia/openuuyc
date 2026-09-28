@@ -123,7 +123,7 @@ pub(super) async fn gui_worker_loop(
         Ok(runtime) => runtime,
         Err(error) => {
             let _ = events.send(GuiEvent::SessionUnavailable(format!(
-                "无法打开虚拟设备身份：{error:#}"
+                "无法打开本机设备身份：{error:#}"
             )));
             return;
         }
@@ -755,7 +755,7 @@ pub(super) async fn gui_worker_loop(
             client = None;
             allow_load = false;
             let _ = events.send(GuiEvent::AccountEnded(
-                "本虚拟设备的账号会话已结束，正在关闭观看连接；请重新登录".into(),
+                "本机设备的账号会话已结束，正在关闭观看连接；请重新登录".into(),
             ));
             stop_active_signal(&mut host_signal).await;
         }

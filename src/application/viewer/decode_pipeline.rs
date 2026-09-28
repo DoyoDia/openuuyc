@@ -8,7 +8,7 @@ use crate::media::decoder::{DecodedBatch, DecodedFrame, DecoderOutputIssue, Nati
 use crate::media::decoder_pool::DecoderPool;
 use crate::media::decoder_result::VideoDecodeResult;
 use crate::media::video_color::RenderColor;
-use crate::media::video_format::{VideoFormatSignature, parse_annex_b_format};
+use crate::media::video_format::{VideoFormatSignature, parse_stream_format};
 use crate::transport::rtc::{EncodedVideoFrame, FrameSenderTiming, VideoReceiverFeedback};
 use anyhow::Result;
 use bytes::Bytes;
@@ -31,7 +31,7 @@ pub(super) struct FrameTiming {
 }
 
 pub(super) struct DecodedForwardContext<'a> {
-    pub(super) frame_queue: &'a Mutex<VecDeque<DecodedVideoFrame>>,
+    pub(super) frame_queue: &'a Mutex<Option<DecodedVideoFrame>>,
     pub(super) frame_wake: &'a FrameWake,
     pub(super) performance: &'a PerformanceMonitor,
     pub(super) receiver_feedback: &'a mpsc::UnboundedSender<VideoReceiverFeedback>,
@@ -247,7 +247,7 @@ pub(super) fn decoder_manager(
                 timings.clear();
                 inflight.clear();
                 cutover_state.replace_instance();
-                mutex_lock(&frame_queue).clear();
+                mutex_lock(&frame_queue).take();
                 config.decode_idle.send_replace(epoch);
             }
             match video_source.try_recv() {
@@ -259,14 +259,9 @@ pub(super) fn decoder_manager(
             }
             continue 'decode;
         }
-        // Decoded GPU surfaces are leased from a finite pool. Hand off one
-        // ready frame before decoding again, including renderer startup.
-        // The render worker, hide/pause and shutdown paths unpark this worker.
-        // No extra playout clock, frame dropping or timed polling is involved.
-        if frame_wake.visible.load(Ordering::Acquire) && !mutex_lock(&frame_queue).is_empty() {
-            std::thread::park();
-            continue 'decode;
-        }
+        // Keep decoding reference pictures even when presentation is waiting
+        // for the display. Only the latest ready picture retains a display
+        // lease, so a slow renderer cannot fill the pool or stall admissions.
         if let Some(current) = pool.as_mut() {
             let output = current
                 .decoder()
@@ -286,11 +281,6 @@ pub(super) fn decoder_manager(
         }
         if shutdown.load(Ordering::Acquire) {
             break;
-        }
-        // Poll may itself have delivered an older reordered output. Let the
-        // renderer consume it before admitting another compressed picture.
-        if frame_wake.visible.load(Ordering::Acquire) && !mutex_lock(&frame_queue).is_empty() {
-            continue 'decode;
         }
         performance.set_decoder_queue_frames(video_source.len());
         let frame = match video_source.try_recv() {
@@ -312,7 +302,7 @@ pub(super) fn decoder_manager(
         let timestamp = frame.rtp_timestamp;
         let format = frame
             .parameter_format
-            .or_else(|| parse_annex_b_format(frame.codec, &frame.data));
+            .or_else(|| parse_stream_format(frame.codec, &frame.data));
         if pool.is_none() {
             if startup_sender.is_none() && !keyframe {
                 completion.complete(VideoDecodeResult::RequestKeyframe);
@@ -457,6 +447,7 @@ pub(super) fn decoder_manager(
             performance.set_video_codec(match active_codec {
                 VideoCodec::H264 => "H.264/AVC",
                 VideoCodec::H265 => "H.265/HEVC",
+                VideoCodec::Av1 => "AV1",
             });
         }
         if let Some(format) = format {
@@ -568,6 +559,9 @@ pub(super) fn decoder_manager(
 /// assembled frame, preserving start codes. The first complete keyframe
 /// supplies these independently of the selected decoder backend.
 pub(super) fn extract_parameter_sets(codec: VideoCodec, data: &[u8]) -> Option<Bytes> {
+    if codec == VideoCodec::Av1 {
+        return crate::media::av1::parameters(data);
+    }
     fn nal_start(data: &[u8], at: usize) -> bool {
         at + 3 <= data.len() && data[at] == 0 && data[at + 1] == 0 && data[at + 2] == 1
             || at + 4 <= data.len()
@@ -593,6 +587,7 @@ pub(super) fn extract_parameter_sets(codec: VideoCodec, data: &[u8]) -> Option<B
             let keep = match codec {
                 VideoCodec::H264 => matches!(header & 0x1f, 7 | 8),
                 VideoCodec::H265 => matches!((header >> 1) & 0x3f, 32..=34),
+                VideoCodec::Av1 => false,
             };
             if keep {
                 out.extend_from_slice(&data[cursor..end]);
@@ -662,6 +657,7 @@ pub(super) fn video_format_label(codec: VideoCodec, format: VideoFormatSignature
     let codec = match codec {
         VideoCodec::H264 => "H.264/AVC",
         VideoCodec::H265 => "H.265/HEVC",
+        VideoCodec::Av1 => "AV1",
     };
     let chroma = match format.chroma_format_idc {
         0 => "4:0:0",
@@ -765,7 +761,7 @@ pub(super) fn forward_decoded_frames(
             continue;
         }
         let mut queue = mutex_lock(context.frame_queue);
-        queue.push_back(DecodedVideoFrame {
+        let replaced = queue.replace(DecodedVideoFrame {
             is_new_picture: timing.is_new_picture,
             width: image.width,
             height: image.height,
@@ -779,10 +775,12 @@ pub(super) fn forward_decoded_frames(
             rotation: timing.rotation,
             sender_timing: timing.sender_timing,
         });
-        context
-            .performance
-            .set_presentation_queue_frames(queue.len());
+        context.performance.set_presentation_queue_frames(1);
         drop(queue);
+        if replaced.is_some() {
+            context.performance.record_dropped_present_frame();
+        }
+        drop(replaced);
         context.frame_wake.notify();
     }
 }

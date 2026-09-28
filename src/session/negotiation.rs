@@ -33,6 +33,7 @@ pub(crate) enum ControlConnectType {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ControlPurpose {
     Viewing,
+    Audio,
     PortMapping,
     FileTransfer,
 }
@@ -82,6 +83,8 @@ fn build_control_frames_with_id(
     }
     let streamer_data = serde_json::to_string(&json!({
         "control_id": app_control_id,
+        "openuuyc_audio_only": purpose == ControlPurpose::Audio,
+        "openuuyc_audio_control": 1,
         "device_capability": decoder_support
     }))?;
     let event = json!([
@@ -182,7 +185,7 @@ fn encode_connect_options(
         &mut options,
         1,
         match purpose {
-            ControlPurpose::Viewing => 1,
+            ControlPurpose::Viewing | ControlPurpose::Audio => 1,
             ControlPurpose::PortMapping => 9,
             ControlPurpose::FileTransfer => 5,
         },

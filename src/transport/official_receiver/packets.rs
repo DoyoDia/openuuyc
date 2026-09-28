@@ -49,6 +49,7 @@ pub(super) struct PacketBuffer {
     pub(super) received_padding: HashSet<u16>,
     pub(super) last_keyframe_first_sequence: Option<u16>,
     pub(super) parameters: ParameterTracker,
+    malformed_av1: bool,
 }
 
 pub(super) struct SequenceUnwrapper {
@@ -76,6 +77,7 @@ impl PacketBuffer {
             received_padding: HashSet::new(),
             last_keyframe_first_sequence: None,
             parameters: ParameterTracker::default(),
+            malformed_av1: false,
         }
     }
 
@@ -85,6 +87,7 @@ impl PacketBuffer {
 
     pub(super) fn prepare_parameters(&mut self, packet: &mut ParsedVideoPacket) -> bool {
         let tracked = match packet.codec {
+            VideoCodecKind::Av1 => return true,
             VideoCodecKind::H264 => self.parameters.h264(
                 &mut packet.nalus,
                 packet.is_first_packet_in_frame,
@@ -191,7 +194,7 @@ impl PacketBuffer {
             frames: self.find_frames(sequence_number),
             duplicate: false,
             cleared: false,
-            parameter_rejected: false,
+            parameter_rejected: std::mem::take(&mut self.malformed_av1),
         }
     }
 
@@ -202,7 +205,7 @@ impl PacketBuffer {
             frames: self.find_frames(sequence_number.wrapping_add(1)),
             duplicate: false,
             cleared: false,
-            parameter_rejected: false,
+            parameter_rejected: std::mem::take(&mut self.malformed_av1),
         }
     }
 
@@ -406,9 +409,24 @@ impl PacketBuffer {
                     data.extend_from_slice(&packet.packet.payload);
                     cursor = cursor.wrapping_add(1);
                 }
+                if codec == VideoCodecKind::Av1 {
+                    match crate::media::av1::assemble(&data) {
+                        Ok(bytes) => {
+                            parameter_format = crate::media::av1::format(&bytes);
+                            data = bytes;
+                        }
+                        Err(error) => {
+                            tracing::debug!(%error,"invalid AV1 RTP frame");
+                            self.malformed_av1 = true;
+                            sequence_number = sequence_number.wrapping_add(1);
+                            continue;
+                        }
+                    }
+                }
                 let keyframe = match codec {
                     VideoCodecKind::H264 => idr,
                     VideoCodecKind::H265 => sps && pps && idr,
+                    VideoCodecKind::Av1 => idr && parameter_format.is_some(),
                 };
                 if keyframe {
                     self.last_keyframe_first_sequence = Some(start);
