@@ -1,4 +1,4 @@
-//! Single management boundary for three independently optional components.
+//! Single management boundary for the application, service and optional drivers.
 pub(crate) mod application;
 pub(crate) mod driver;
 pub(crate) mod files;
@@ -23,11 +23,65 @@ pub enum Kind {
     InputDriver,
     #[value(skip)]
     DisplayDriver,
+    AudioDriver,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum Operation {
     Install,
     Uninstall,
+}
+#[derive(Clone, Copy, Debug, Default, clap::Args)]
+pub struct RemovalOptions {
+    #[arg(long)]
+    pub remove_display_driver: bool,
+    #[arg(long)]
+    pub remove_audio_driver: bool,
+    #[arg(long)]
+    pub remove_data: bool,
+}
+impl RemovalOptions {
+    fn validate(self, kind: Kind, operation: Operation) -> Result<()> {
+        ensure!(
+            !(self.remove_display_driver || self.remove_audio_driver || self.remove_data)
+                || (operation == Operation::Uninstall
+                    && matches!(kind, Kind::Suite | Kind::Application)),
+            "附加卸载选项只适用于整套卸载"
+        );
+        ensure!(
+            !self.remove_data || kind == Kind::Application,
+            "清除数据仅适用于卸载程序"
+        );
+        Ok(())
+    }
+    pub(super) fn arguments(self) -> String {
+        [
+            (self.remove_display_driver, " --remove-display-driver"),
+            (self.remove_audio_driver, " --remove-audio-driver"),
+            (self.remove_data, " --remove-data"),
+        ]
+        .into_iter()
+        .filter_map(|(enabled, flag)| enabled.then_some(flag))
+        .collect()
+    }
+    pub(super) fn preflight(self) -> Result<()> {
+        if self.remove_display_driver {
+            super::display::install::preflight(Operation::Uninstall)?;
+        }
+        if self.remove_audio_driver {
+            super::virtual_audio::install::preflight()?;
+        }
+        Ok(())
+    }
+    pub(super) fn remove_optional_drivers(self) -> Result<bool> {
+        let mut reboot = false;
+        if self.remove_audio_driver {
+            reboot |= super::virtual_audio::install::execute(Operation::Uninstall)?;
+        }
+        if self.remove_display_driver {
+            reboot |= super::display::install::uninstall()?;
+        }
+        Ok(reboot)
+    }
 }
 static MAINTENANCE: AtomicBool = AtomicBool::new(false);
 pub(crate) fn maintaining() -> bool {
@@ -46,7 +100,12 @@ pub(crate) struct Status {
     pub ready: bool,
 }
 impl Kind {
-    pub(crate) const ALL: [Self; 3] = [Self::HostService, Self::InputDriver, Self::DisplayDriver];
+    pub(crate) const ALL: [Self; 4] = [
+        Self::HostService,
+        Self::InputDriver,
+        Self::DisplayDriver,
+        Self::AudioDriver,
+    ];
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Application => "程序",
@@ -54,12 +113,13 @@ impl Kind {
             Self::HostService => "被控服务",
             Self::InputDriver => "输入驱动",
             Self::DisplayDriver => "虚拟显示驱动",
+            Self::AudioDriver => "虚拟音频驱动",
         }
     }
     pub(crate) fn certificate(self) -> Option<(&'static str, &'static str, &'static [u8])> {
         match self {
             Self::HostService | Self::Suite | Self::Application => None,
-            Self::InputDriver | Self::DisplayDriver => Some((
+            Self::InputDriver | Self::DisplayDriver | Self::AudioDriver => Some((
                 "CN=OpenUUYC Drivers",
                 "CCDA4E99C26E394C8A0AFD3B85AB03A608C66611",
                 include_bytes!("../../../../assets/drivers/OpenUUYCDrivers.cer"),
@@ -121,6 +181,7 @@ pub(crate) fn status(kind: Kind) -> Result<Status> {
         Kind::HostService => super::host_service::install::status(),
         Kind::InputDriver => super::input::install::status(),
         Kind::DisplayDriver => super::display::install::status(),
+        Kind::AudioDriver => super::virtual_audio::install::status(),
     }
 }
 pub(crate) fn execute(
@@ -128,44 +189,37 @@ pub(crate) fn execute(
     operation: Operation,
     allow_sas: bool,
     owner: Option<&str>,
-    remove_display: bool,
-    remove_data: bool,
+    removal: RemovalOptions,
 ) -> Result<bool> {
     let result = (|| {
         ensure!(
-            matches!(kind, Kind::Application | Kind::Suite),
+            matches!(kind, Kind::Application | Kind::Suite | Kind::AudioDriver),
             "请使用统一安装或卸载入口"
         );
         ensure!(
             owner.is_none() || (kind == Kind::Suite && operation == Operation::Install),
             "安装用户只适用于安装服务"
         );
-        ensure!(
-            !remove_data || (kind == Kind::Application && operation == Operation::Uninstall),
-            "清除数据仅适用于卸载程序"
-        );
+        removal.validate(kind, operation)?;
         ensure!(
             (kind == Kind::Suite && operation == Operation::Install) || !allow_sas,
             "SAS策略只属于被控服务"
         );
-        ensure!(
-            !remove_display
-                || (matches!(kind, Kind::Suite | Kind::Application)
-                    && operation == Operation::Uninstall),
-            "显示驱动卸载选项只属于整套卸载"
-        );
         let _serial = Serial::acquire()?;
         super::host_service::install::preflight()?;
         match (kind, operation) {
-            (Kind::Application, Operation::Uninstall) => application::uninstall(remove_display),
+            (Kind::Application, Operation::Uninstall) => application::uninstall(removal),
             (Kind::Application, Operation::Install) => anyhow::bail!("请使用程序安装入口"),
-            (Kind::Suite, operation) => suite::execute(operation, owner, allow_sas, remove_display),
+            (Kind::Suite, operation) => suite::execute(operation, owner, allow_sas, removal),
+            (Kind::AudioDriver, operation) => super::virtual_audio::install::execute(operation),
             _ => unreachable!("component target checked above"),
         }
     })();
     match &result {
         Ok(reboot) => tracing::info!(?kind, ?operation, reboot, "component operation completed"),
-        Err(error) => tracing::error!(?kind,?operation,%error,"component operation failed"),
+        Err(error) => {
+            tracing::error!(?kind, ?operation, error = %format!("{error:#}"), "component operation failed")
+        }
     }
     result
 }
@@ -188,13 +242,14 @@ impl Drop for Serial {
         let _ = unsafe { ReleaseMutex(self.0.0) };
     }
 }
+
 pub(crate) fn request(
     kind: Kind,
     operation: Operation,
     allow_sas: bool,
-    remove_display: bool,
-    remove_data: bool,
+    removal: RemovalOptions,
 ) -> Result<bool> {
+    removal.validate(kind, operation)?;
     ensure!(
         MAINTENANCE
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -204,11 +259,23 @@ pub(crate) fn request(
     let _maintenance = Maintenance;
     if kind == Kind::Application {
         ensure!(operation == Operation::Uninstall, "无效程序操作");
-        return application::request_uninstall(remove_display, remove_data);
+        return application::request_uninstall(removal);
     }
-    ensure!(!remove_data, "清除数据仅适用于卸载程序");
     if kind == Kind::Suite {
-        return suite::request(operation, allow_sas, remove_display);
+        return suite::request(operation, allow_sas, removal);
+    }
+    if kind == Kind::AudioDriver {
+        return elevate(
+            &format!(
+                "component audio-driver {}",
+                if operation == Operation::Install {
+                    "install"
+                } else {
+                    "uninstall"
+                }
+            ),
+            kind,
+        );
     }
     anyhow::bail!("请使用统一安装或卸载入口")
 }

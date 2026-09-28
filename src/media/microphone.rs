@@ -5,13 +5,11 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 pub(crate) use crate::media::audio::encoder::Config as Encoding;
-use crate::media::audio::encoder::create_encoder as make_encoder;
+use crate::media::audio::sender::{Frame, Source, Transmitter};
 use anyhow::{Context, Result, anyhow, ensure};
-use bytes::Bytes;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crossbeam_queue::ArrayQueue;
 use tokio::sync::Notify;
-use webrtc::rtp::packet::Packet;
 use webrtc::rtp_transceiver::rtp_sender::RTCRtpSender;
 use webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP;
 
@@ -48,6 +46,7 @@ pub(crate) struct InputDevices {
 
 #[derive(Default)]
 struct State {
+    quality: crate::media::audio::encoder::Quality,
     selected_input: Option<cpal::DeviceId>,
     faulted: bool,
     cleanup_on_connect: bool,
@@ -60,22 +59,8 @@ struct State {
     error: Option<String>,
 }
 
-struct Frame {
-    samples: [f32; BLOCK * 2],
-    timestamp: u32,
-    generation: u64,
-    created: Instant,
-}
-
-#[derive(Clone, Copy)]
-struct SentClock {
-    timestamp: u32,
-    at: Instant,
-    generation: u64,
-    first: Instant,
-}
-
 struct Shared {
+    quality_updates: tokio::sync::watch::Sender<Option<crate::media::audio::encoder::Quality>>,
     input_devices: Mutex<InputDevices>,
     refresh_devices: AtomicBool,
     state: Mutex<State>,
@@ -84,15 +69,11 @@ struct Shared {
     capturing: AtomicBool,
     stopped: AtomicBool,
     peak: AtomicU32,
-    loss: AtomicU32,
     frames: ArrayQueue<Frame>,
     wake: Notify,
     owner: OnceLock<std::thread::Thread>,
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
-    sent: AtomicU64,
-    reports: AtomicU64,
-    octets: AtomicU64,
-    sent_clock: Mutex<Option<SentClock>>,
+    transmitter: Transmitter,
     report_wake: Notify,
 }
 
@@ -128,8 +109,33 @@ impl Shared {
 pub(crate) struct Microphone(Arc<Shared>);
 
 impl Microphone {
+    pub(crate) fn quality(&self) -> crate::media::audio::encoder::Quality {
+        lock(&self.0.state).quality
+    }
+    pub(crate) fn set_quality(&self, quality: crate::media::audio::encoder::Quality) -> Result<()> {
+        quality.validate()?;
+        let mut state = lock(&self.0.state);
+        if state.quality != quality {
+            state.quality = quality;
+            self.0.quality_updates.send_replace(Some(quality));
+            self.0.wake.notify_one();
+        }
+        Ok(())
+    }
+    pub(crate) fn quality_updates(
+        &self,
+    ) -> tokio::sync::watch::Receiver<Option<crate::media::audio::encoder::Quality>> {
+        self.0.quality_updates.subscribe()
+    }
+    pub(crate) fn target_bitrate(&self) -> Option<u32> {
+        let state = lock(&self.0.state);
+        state
+            .encoding
+            .map(|config| config.quality(state.quality).bitrate)
+    }
     pub(crate) fn new() -> Self {
         Self(Arc::new(Shared {
+            quality_updates: tokio::sync::watch::channel(None).0,
             input_devices: Mutex::new(InputDevices::default()),
             refresh_devices: AtomicBool::new(false),
             state: Mutex::new(State::default()),
@@ -138,15 +144,11 @@ impl Microphone {
             capturing: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
             peak: AtomicU32::new(0),
-            loss: AtomicU32::new(0),
             frames: ArrayQueue::new(10),
             wake: Notify::new(),
             owner: OnceLock::new(),
             thread: Mutex::new(None),
-            sent: AtomicU64::new(0),
-            reports: AtomicU64::new(0),
-            octets: AtomicU64::new(0),
-            sent_clock: Mutex::new(None),
+            transmitter: Transmitter::default(),
             report_wake: Notify::new(),
         }))
     }
@@ -216,7 +218,7 @@ impl Microphone {
         s.enabled = enabled;
         s.faulted = false;
         if enabled {
-            self.0.loss.store(0, Ordering::Relaxed);
+            self.0.transmitter.reset_loss();
         }
         s.confirmed = false;
         // A host can send MicOpened before the policy reply; retain that event
@@ -312,8 +314,8 @@ impl Microphone {
             let _ = tokio::task::spawn_blocking(move || t.join()).await;
         }
         tracing::info!(
-            packets = self.0.sent.load(Ordering::Relaxed),
-            reports = self.0.reports.load(Ordering::Relaxed),
+            packets = self.0.transmitter.sent.load(Ordering::Relaxed),
+            reports = self.0.transmitter.reports.load(Ordering::Relaxed),
             "microphone sender closed"
         );
     }
@@ -330,265 +332,48 @@ impl Microphone {
         Ok(())
     }
     pub(crate) async fn feedback(&self, sender: Arc<RTCRtpSender>) {
-        while let Ok((packets, _)) = sender.read_rtcp().await {
-            let params = sender.get_parameters().await;
-            for packet in packets {
-                let reports = if let Some(p) = packet
-                    .as_any()
-                    .downcast_ref::<webrtc::rtcp::receiver_report::ReceiverReport>(
-                ) {
-                    &p.reports
-                } else if let Some(p) = packet
-                    .as_any()
-                    .downcast_ref::<webrtc::rtcp::sender_report::SenderReport>()
-                {
-                    &p.reports
-                } else {
-                    continue;
-                };
-                for report in reports {
-                    if params.encodings.iter().any(|e| e.ssrc == report.ssrc) {
-                        self.0.loss.store(
-                            (u32::from(report.fraction_lost) * 100 + 128) / 256,
-                            Ordering::Relaxed,
-                        );
-                        self.0.reports.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-            }
-        }
+        self.0.transmitter.feedback(sender).await;
     }
-
     pub(crate) async fn send_reports(
         &self,
         connection: std::sync::Weak<webrtc::peer_connection::RTCPeerConnection>,
         sender: Arc<RTCRtpSender>,
     ) {
-        use webrtc::rtcp::{
-            packet::Packet as RtcpPacket,
-            sender_report::SenderReport,
-            source_description::{
-                SdesType, SourceDescription, SourceDescriptionChunk, SourceDescriptionItem,
-            },
-        };
-        let anchor = (Instant::now(), std::time::SystemTime::now());
-        let mut epoch = None;
-        let mut due = None;
-        loop {
-            let wake = self.0.report_wake.notified();
-            tokio::pin!(wake);
-            wake.as_mut().enable();
-            if self.0.stopped.load(Ordering::Acquire) {
-                break;
-            }
-            let clock = (*lock(&self.0.sent_clock)).filter(|c| self.0.current(c.generation));
-            match clock {
-                Some(c) if epoch != Some(c.generation) => {
-                    epoch = Some(c.generation);
-                    due = Some(c.first + Duration::from_millis(2500));
-                }
-                None => {
-                    epoch = None;
-                    due = None;
-                }
-                _ => {}
-            }
-            let Some(deadline) = due else {
-                wake.await;
-                continue;
-            };
-            tokio::select! {
-                _=&mut wake=>continue,
-                _=tokio::time::sleep_until(deadline.into())=>{}
-            }
-            let Some(c) = (*lock(&self.0.sent_clock)).filter(|c| self.0.current(c.generation))
-            else {
-                continue;
-            };
-            let Some(peer) = connection.upgrade() else {
-                break;
-            };
-            let params = sender.get_parameters().await;
-            let Some(encoding) = params.encodings.first() else {
-                continue;
-            };
-            let now = Instant::now();
-            let report = SenderReport {
-                ssrc: encoding.ssrc,
-                ntp_time: webrtc::rtp::extension::abs_send_time_extension::unix2ntp(
-                    anchor.1 + anchor.0.elapsed(),
-                ),
-                rtp_time: c.timestamp.wrapping_add(
-                    (now.duration_since(c.at).as_secs_f64() * f64::from(RATE)) as u32,
-                ),
-                packet_count: self.0.sent.load(Ordering::Relaxed) as u32,
-                octet_count: self.0.octets.load(Ordering::Relaxed) as u32,
-                ..Default::default()
-            };
-            // webrtc builds SDP CNAME from TrackLocal::stream_id (audio_0).
-            let sdes = SourceDescription {
-                chunks: vec![SourceDescriptionChunk {
-                    source: encoding.ssrc,
-                    items: vec![SourceDescriptionItem {
-                        sdes_type: SdesType::SdesCname,
-                        text: Bytes::from_static(b"audio_0"),
-                    }],
-                }],
-            };
-            let packets: Vec<Box<dyn RtcpPacket + Send + Sync>> =
-                vec![Box::new(report), Box::new(sdes)];
-            if self.0.current(c.generation) {
-                match peer.write_rtcp(&packets).await {
-                    Ok(_) => tracing::debug!(
-                        packets = self.0.sent.load(Ordering::Relaxed),
-                        "microphone sender report sent"
-                    ),
-                    Err(error) => tracing::debug!(%error,"microphone sender report failed"),
-                }
-            }
-            due = Some(Instant::now() + Duration::from_secs_f64(2.5 + rand::random::<f64>() * 5.0));
-        }
+        self.0
+            .transmitter
+            .send_reports(self, connection, sender)
+            .await;
     }
     pub(crate) async fn send(&self, track: Arc<TrackLocalStaticRTP>) {
-        let wall_clock = (Instant::now(), std::time::SystemTime::now());
-        let mut sequence = rand::random::<u16>();
-        let origin = rand::random::<u32>();
-        let mut generation = u64::MAX;
-        let mut encoder = None;
-        let mut encoding = None;
-        let mut pcm = Vec::with_capacity(RATE as usize * 2 * 120 / 1000);
-        let mut first_timestamp = 0;
-        let mut next_timestamp = 0;
-        let mut marker = true;
-        let mut output = [0u8; 4000];
-        loop {
-            let wake = self.0.wake.notified();
-            tokio::pin!(wake);
-            wake.as_mut().enable();
-            if self.0.stopped.load(Ordering::Acquire) {
-                break;
-            }
-            let Some(frame) = self.0.frames.pop() else {
-                wake.await;
-                continue;
-            };
-            if !self.0.current(frame.generation)
-                || frame.created.elapsed() > Duration::from_millis(100)
-            {
-                continue;
-            }
-            if generation != frame.generation {
-                generation = frame.generation;
-                encoding = lock(&self.0.state).encoding;
-                let Some(config) = encoding else {
-                    continue;
-                };
-                encoder = match make_encoder(config) {
-                    Ok(e) => Some(e),
-                    Err(e) => {
-                        self.fault(format!("麦克风编码初始化失败：{e:?}"));
-                        None
-                    }
-                };
-                pcm.clear();
-                marker = true;
-            }
-            let (Some(config), Some(encoder)) = (encoding, encoder.as_mut()) else {
-                continue;
-            };
-            if !pcm.is_empty() && frame.timestamp != next_timestamp {
-                pcm.clear();
-                marker = true;
-            }
-            if pcm.is_empty() {
-                first_timestamp = frame.timestamp;
-            }
-            next_timestamp = frame.timestamp.wrapping_add(BLOCK as u32);
-            if config.stereo {
-                pcm.extend_from_slice(&frame.samples);
-            } else {
-                pcm.extend(frame.samples.chunks_exact(2).map(|p| (p[0] + p[1]) * 0.5));
-            }
-            let channels = if config.stereo { 2 } else { 1 };
-            if pcm.len() < RATE as usize * config.packet_ms as usize / 1000 * channels {
-                continue;
-            }
-            let loss = self.0.loss.load(Ordering::Relaxed).min(100) as u8;
-            let encoded = encoder
-                .set_packet_loss(loss)
-                .and_then(|_| encoder.encode_float_to_slice(&pcm, &mut output));
-            let rms = (pcm.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>()
-                / pcm.len().max(1) as f64)
-                .sqrt();
-            let level = if rms > 0.0 {
-                (-20.0 * rms.log10()).round().clamp(0.0, 127.0) as u8
-            } else {
-                127
-            };
-            pcm.clear();
-            let length = match encoded {
-                Ok(n) => n,
-                Err(e) => {
-                    self.fault(format!("麦克风编码失败：{e:?}"));
-                    continue;
-                }
-            };
-            if !self.0.current(generation) || track.all_binding_paused().await {
-                marker = true;
-                continue;
-            }
-            let packet = Packet {
-                header: webrtc::rtp::header::Header {
-                    version: 2,
-                    marker,
-                    sequence_number: sequence,
-                    timestamp: origin.wrapping_add(first_timestamp),
-                    ..Default::default()
-                },
-                payload: Bytes::copy_from_slice(&output[..length]),
-            };
-            use webrtc::rtp::extension::{
-                HeaderExtension, abs_send_time_extension::AbsSendTimeExtension,
-                audio_level_extension::AudioLevelExtension,
-            };
-            let extensions = [
-                HeaderExtension::AudioLevel(AudioLevelExtension {
-                    level,
-                    voice: false,
-                }),
-                HeaderExtension::AbsSendTime(AbsSendTimeExtension::new(
-                    wall_clock.1 + wall_clock.0.elapsed(),
-                )),
-            ];
-            match track.write_rtp_with_extensions(&packet, &extensions).await {
-                Ok(n) if n > 0 => {
-                    self.0.sent.fetch_add(1, Ordering::Relaxed);
-                    self.0.octets.fetch_add(length as u64, Ordering::Relaxed);
-                    let mut clock = lock(&self.0.sent_clock);
-                    let now = Instant::now();
-                    let first = clock
-                        .filter(|c| c.generation == generation)
-                        .map_or(now, |c| c.first);
-                    *clock = Some(SentClock {
-                        timestamp: packet.header.timestamp,
-                        at: now,
-                        generation,
-                        first,
-                    });
-                    drop(clock);
-                    self.0.report_wake.notify_one();
-                    marker = false;
-                }
-                Ok(_) => marker = true,
-                Err(e) => {
-                    lock(&self.0.state).error = Some(format!("麦克风发送失败：{e}"));
-                    marker = true;
-                }
-            }
-            // A failed write may already have encrypted/submitted the packet.
-            // Never reuse its SRTP sequence number on a later payload.
-            sequence = sequence.wrapping_add(1);
-        }
+        self.0.transmitter.send(self, track).await;
+    }
+}
+
+impl Source for Microphone {
+    fn current(&self, generation: u64) -> bool {
+        self.0.current(generation)
+    }
+    fn stopped(&self) -> &AtomicBool {
+        &self.0.stopped
+    }
+    fn encoding(&self) -> Option<Encoding> {
+        let state = lock(&self.0.state);
+        state.encoding.map(|config| config.quality(state.quality))
+    }
+    fn frames(&self) -> &ArrayQueue<Frame> {
+        &self.0.frames
+    }
+    fn wake(&self) -> &Notify {
+        &self.0.wake
+    }
+    fn report_wake(&self) -> &Notify {
+        &self.0.report_wake
+    }
+    fn fault(&self, error: String) {
+        Microphone::fault(self, error);
+    }
+    fn send_error(&self, error: String) {
+        lock(&self.0.state).error = Some(error);
     }
 }
 

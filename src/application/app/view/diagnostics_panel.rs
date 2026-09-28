@@ -320,6 +320,44 @@ impl DeviceCenterApp {
             if let Some(error) = &host.input_error {
                 diagnostics_row(ui, "输入状态", error);
             }
+            diagnostics_row(
+                ui,
+                "桌面声音",
+                if host.audio.capturing {
+                    "正在采集"
+                } else if host.audio.configured {
+                    "等待播放设备"
+                } else {
+                    "未协商音频"
+                },
+            );
+            if !host.audio.device.is_empty() {
+                diagnostics_row(ui, "音频设备", &host.audio.device);
+            }
+            if host.audio.target_bitrate != 0 {
+                diagnostics_row(
+                    ui,
+                    "目标音频码率",
+                    &format!("{} kbps", host.audio.target_bitrate / 1000),
+                );
+            }
+            if let Some(error) = &host.audio.error {
+                diagnostics_row(ui, "音频状态", error);
+            }
+            diagnostics_row(
+                ui,
+                "虚拟麦克风",
+                if host.microphone.active {
+                    "应用正在使用"
+                } else if host.microphone.enabled {
+                    "等待本机应用使用"
+                } else {
+                    "未开启"
+                },
+            );
+            if let Some(error) = &host.microphone.error {
+                diagnostics_row(ui, "麦克风状态", error);
+            }
             for (index, stream) in host.streams {
                 let Some(active) = stream.video else {
                     continue;

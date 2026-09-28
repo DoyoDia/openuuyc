@@ -13,6 +13,10 @@ pub(crate) struct Status {
     pub settings_error: Option<String>,
     pub input_backend: Option<String>,
     pub input_error: Option<String>,
+    #[serde(default)]
+    pub audio: super::audio::Status,
+    #[serde(default)]
+    pub microphone: super::microphone::Status,
     pub saving: bool,
     pub encoder: Option<(i32, (u32, u32))>,
     pub capture: Option<String>,
@@ -60,6 +64,10 @@ struct Ownership {
     permission: u64,
     settings_revision: u64,
     encoding: super::EncodingSettings,
+    audio_device: watch::Sender<Option<super::audio::Device>>,
+    audio_defaults: super::audio::DefaultDevices,
+    audio_quality: crate::media::audio::encoder::Quality,
+    audio_inventory: super::audio::Inventory,
     media: u64,
     stream_generations: std::collections::BTreeMap<usize, u64>,
     allowed: bool,
@@ -89,6 +97,10 @@ impl Default for Handle {
                 permission: 0,
                 settings_revision: 0,
                 encoding: Default::default(),
+                audio_device: watch::channel(None).0,
+                audio_defaults: Default::default(),
+                audio_quality: Default::default(),
+                audio_inventory: Default::default(),
                 media: 0,
                 stream_generations: Default::default(),
                 allowed: false,
@@ -119,6 +131,8 @@ fn finish_session(state: &mut Ownership) {
     state.status.video = None;
     state.status.input_backend = None;
     state.status.input_error = None;
+    state.status.audio = Default::default();
+    state.status.microphone = Default::default();
     state.status.streams.clear();
     state.stream_generations.clear();
 }
@@ -144,6 +158,9 @@ impl Handle {
         }
         state.allowed = snapshot.allowed;
         state.encoding = snapshot.encoding;
+        state.audio_device.send_replace(snapshot.audio_device);
+        state.audio_defaults = snapshot.audio_defaults;
+        state.audio_quality = snapshot.audio_quality;
         state.status = snapshot.status;
     }
     pub(crate) fn remote_failed(&self, error: String) {
@@ -190,10 +207,13 @@ impl Handle {
             store.load()
         });
         match result {
-            Ok((allowed, encoding)) => {
+            Ok((allowed, encoding, audio_device, audio_defaults, audio_quality)) => {
                 handle.set_allowed(allowed);
                 let mut state = lock(&handle.ownership);
                 state.encoding = encoding;
+                state.audio_device.send_replace(audio_device);
+                state.audio_defaults = audio_defaults;
+                state.audio_quality = audio_quality;
                 state.dirty = false;
                 state.status.saving = false;
             }
@@ -203,6 +223,116 @@ impl Handle {
     }
     pub(crate) fn allowed(&self) -> bool {
         lock(&self.ownership).allowed
+    }
+    pub(crate) fn audio_device(&self) -> Option<super::audio::Device> {
+        lock(&self.ownership).audio_device.borrow().clone()
+    }
+    pub(crate) fn audio_defaults(&self) -> super::audio::DefaultDevices {
+        lock(&self.ownership).audio_defaults
+    }
+    pub(crate) fn audio_quality(&self) -> crate::media::audio::encoder::Quality {
+        lock(&self.ownership).audio_quality
+    }
+    pub(crate) fn set_audio_quality(
+        &self,
+        quality: crate::media::audio::encoder::Quality,
+    ) -> anyhow::Result<()> {
+        quality.validate()?;
+        let mut state = lock(&self.ownership);
+        anyhow::ensure!(state.active, "账号会话已结束");
+        if state.audio_quality != quality {
+            state.audio_quality = quality;
+            state.settings_revision = state.settings_revision.wrapping_add(1);
+            state.dirty = true;
+            state.status.saving = true;
+            state.status.settings_error = None;
+        }
+        Ok(())
+    }
+    pub(crate) fn set_audio_defaults(
+        &self,
+        selected: super::audio::DefaultDevices,
+    ) -> anyhow::Result<()> {
+        let mut state = lock(&self.ownership);
+        anyhow::ensure!(state.active, "账号会话已结束");
+        if state.audio_defaults != selected {
+            state.audio_defaults = selected;
+            state.settings_revision = state.settings_revision.wrapping_add(1);
+            state.dirty = true;
+            state.status.saving = true;
+            state.status.settings_error = None;
+        }
+        Ok(())
+    }
+    pub(crate) fn set_audio_device(
+        &self,
+        device: Option<super::audio::Device>,
+    ) -> anyhow::Result<()> {
+        if let Some(device) = &device {
+            device.validate()?;
+        }
+        let mut state = lock(&self.ownership);
+        anyhow::ensure!(state.active, "账号会话已结束");
+        let changed = *state.audio_device.borrow() != device;
+        if changed {
+            state.audio_device.send_replace(device);
+            state.settings_revision = state.settings_revision.wrapping_add(1);
+            state.dirty = true;
+            state.status.saving = true;
+            state.status.settings_error = None;
+        }
+        Ok(())
+    }
+    pub(crate) fn audio_devices(&self) -> super::audio::Inventory {
+        lock(&self.ownership).audio_inventory.clone()
+    }
+    pub(crate) fn request_audio_devices(&self) -> bool {
+        let mut state = lock(&self.ownership);
+        let list = &mut state.audio_inventory;
+        if list.pending
+            || list
+                .updated
+                .is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(2))
+        {
+            return false;
+        }
+        list.pending = true;
+        true
+    }
+    pub(crate) fn audio_devices_failed(&self) {
+        let mut state = lock(&self.ownership);
+        state.audio_inventory.pending = false;
+        state.audio_inventory.updated = Some(std::time::Instant::now());
+        state.audio_inventory.error = Some("读取播放设备失败".into());
+    }
+    pub(crate) async fn refresh_audio_devices(&self) {
+        let result =
+            tokio::task::spawn_blocking(|| -> anyhow::Result<Vec<super::audio::Device>> {
+                let devices = crate::platform::loopback::Devices::new()?;
+                let mut result: Vec<_> = devices
+                    .list()?
+                    .into_iter()
+                    .map(|device| super::audio::Device {
+                        name: device.name(),
+                        id: device.id,
+                    })
+                    .collect();
+                result.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
+                Ok(result)
+            })
+            .await;
+        let mut state = lock(&self.ownership);
+        let list = &mut state.audio_inventory;
+        list.pending = false;
+        list.updated = Some(std::time::Instant::now());
+        match result {
+            Ok(Ok(devices)) => {
+                list.devices = devices;
+                list.error = None;
+            }
+            Ok(Err(error)) => list.error = Some(format!("读取播放设备失败：{error:#}")),
+            Err(_) => list.error = Some("读取播放设备任务中断".into()),
+        }
     }
     pub(crate) fn encoding_settings(&self) -> super::EncodingSettings {
         lock(&self.ownership).encoding
@@ -253,12 +383,19 @@ impl Handle {
     pub(crate) async fn persist_settings(&self) {
         let _saving = self.saving.lock().await;
         loop {
-            let (revision, allowed, encoding) = {
+            let (revision, allowed, encoding, audio_device, audio_defaults, audio_quality) = {
                 let state = lock(&self.ownership);
                 if !state.dirty {
                     return;
                 }
-                (state.settings_revision, state.allowed, state.encoding)
+                (
+                    state.settings_revision,
+                    state.allowed,
+                    state.encoding,
+                    state.audio_device.borrow().clone(),
+                    state.audio_defaults,
+                    state.audio_quality,
+                )
             };
             let result = if crate::platform::host_service::resident::managed() {
                 crate::platform::host_service::resident::request(
@@ -266,15 +403,26 @@ impl Handle {
                         account: self.account.clone(),
                         allowed,
                         encoding,
+                        audio_device,
+                        audio_defaults,
+                        audio_quality,
                     },
                 )
                 .await
                 .map(|_| ())
             } else if let Some(store) = self.store.clone() {
-                tokio::task::spawn_blocking(move || store.save(allowed, encoding))
-                    .await
-                    .map_err(|_| anyhow::anyhow!("被控设置保存任务中断"))
-                    .and_then(|r| r)
+                tokio::task::spawn_blocking(move || {
+                    store.save(
+                        allowed,
+                        encoding,
+                        audio_device,
+                        audio_defaults,
+                        audio_quality,
+                    )
+                })
+                .await
+                .map_err(|_| anyhow::anyhow!("被控设置保存任务中断"))
+                .and_then(|r| r)
             } else {
                 Err(anyhow::anyhow!("被控设置存储不可用"))
             };
@@ -401,6 +549,15 @@ impl Drop for SessionLease {
     }
 }
 impl Lease {
+    pub(crate) fn audio_quality(&self) -> crate::media::audio::encoder::Quality {
+        self.handle.audio_quality()
+    }
+    pub(crate) fn audio_defaults(&self) -> super::audio::DefaultDevices {
+        self.handle.audio_defaults()
+    }
+    pub(crate) fn audio_device_changes(&self) -> watch::Receiver<Option<super::audio::Device>> {
+        lock(&self.handle.ownership).audio_device.subscribe()
+    }
     pub(crate) fn with_cancellation(&self, stop: tokio_util::sync::CancellationToken) -> Self {
         let mut lease = self.clone();
         lease.stop = Some(stop);
@@ -522,6 +679,12 @@ impl Lease {
             state.status.error = None;
             state.status.message = "正在被远程访问".into();
         });
+    }
+    pub(crate) fn audio_status(&self, audio: super::audio::Status) {
+        self.modify(|state| state.status.audio = audio);
+    }
+    pub(crate) fn microphone_status(&self, microphone: super::microphone::Status) {
+        self.modify(|state| state.status.microphone = microphone);
     }
     pub(crate) fn input_status(&self, backend: Option<&str>, error: Option<String>) {
         self.modify(|state| {

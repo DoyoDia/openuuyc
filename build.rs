@@ -13,6 +13,69 @@ fn main() {
             .expect("compile Windows application icon");
     }
     build_neteq(windows);
+    build_fonts();
+    // The virtual audio device is a Windows kernel driver package.
+    if windows {
+        bundle_audio_driver();
+    }
+}
+
+fn bundle_audio_driver() {
+    use std::path::PathBuf;
+    println!("cargo:rerun-if-env-changed=OPENUUYC_AUDIO_DRIVER_DIR");
+    println!("cargo:rerun-if-changed=drivers/audio/OpenUUYCAudio.inf");
+    let output = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    let directory = std::env::var_os("OPENUUYC_AUDIO_DRIVER_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("assets/drivers/audio"));
+    // Match build.ps1's localized UTF-16LE package, including its BOM.
+    let inf_source = std::fs::read_to_string("drivers/audio/OpenUUYCAudio.inf").unwrap();
+    let inf: Vec<u8> = std::iter::once(0xfeffu16)
+        .chain(inf_source.encode_utf16())
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    let mut generated = String::from("pub(super) const FILES: &[(&str, &[u8])] = &[\n");
+    for extension in ["inf", "sys", "cat"] {
+        let name = format!("OpenUUYCAudio.{extension}");
+        let path = directory.join(&name);
+        println!("cargo:rerun-if-changed={}", path.display());
+        let bytes = std::fs::read(&path).expect("read bundled audio driver package");
+        assert!(
+            !bytes.is_empty(),
+            "audio driver package contains an empty file"
+        );
+        if extension == "inf" {
+            assert_eq!(bytes, inf, "audio driver INF differs from source");
+        }
+        std::fs::write(output.join(&name), bytes).unwrap();
+        generated.push_str(&format!(
+            "(\"{name}\", include_bytes!(concat!(env!(\"OUT_DIR\"), \"/{name}\"))),\n"
+        ));
+    }
+    generated.push_str("];\n");
+    std::fs::write(output.join("audio_driver.rs"), generated).unwrap();
+}
+
+fn build_fonts() {
+    use std::io::Write;
+    let directory = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    for (name, bytes) in [
+        ("Hack", epaint_default_fonts::HACK_REGULAR),
+        (
+            "NotoEmoji-Regular",
+            epaint_default_fonts::NOTO_EMOJI_REGULAR,
+        ),
+        ("Ubuntu-Light", epaint_default_fonts::UBUNTU_LIGHT),
+        ("emoji-icon-font", epaint_default_fonts::EMOJI_ICON),
+    ] {
+        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+        encoder.write_all(bytes).expect("compress bundled font");
+        std::fs::write(
+            directory.join(format!("{name}.zlib")),
+            encoder.finish().unwrap(),
+        )
+        .expect("write bundled font");
+    }
 }
 
 fn build_neteq(windows: bool) {

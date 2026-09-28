@@ -32,8 +32,7 @@ use crate::ui::window_manager::{Event as UiEvent, Repaint as UiRepaintEvent};
 use super::{
     ConnectionProgress, ConnectionProgressApp, DecodedVideoFrame, NativeViewerSession,
     PerformancePanelMode, StreamControlUi, ViewerDisplayHandle, ViewerWindowEvent,
-    configure_viewer_visuals, install_system_cjk_font, mutex_lock, show_stream_control_window,
-    take_next_frame,
+    configure_viewer_visuals, mutex_lock, show_stream_control_window, take_next_frame,
 };
 
 pub(super) use crate::application::viewer_shortcuts::Action as ViewerShortcut;
@@ -215,7 +214,7 @@ impl ConnectingWindowsRunner {
         configure_dwm_window(&window);
         let context = egui::Context::default();
         context.set_embed_viewports(true);
-        install_system_cjk_font(&context);
+        crate::ui::fonts::install(&context);
         configure_viewer_visuals(&context);
         let window_id = window.id();
         let proxy = self.proxy.clone();

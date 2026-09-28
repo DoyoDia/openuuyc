@@ -108,6 +108,9 @@ The package licenses of egui and image are MIT OR Apache-2.0; winit is
 Apache-2.0. The object crate (0.37.3, Apache-2.0 OR MIT) is used to read
 embedded plugin descriptors from native library files without executing them.
 Source: https://github.com/gimli-rs/object
+The complete Hack, Ubuntu-Light, NotoEmoji-Regular and emoji-icon-font
+fonts from epaint_default_fonts 0.36.1 are embedded with lossless compression.
+Their original font licenses and attributions are in assets/fonts/LICENSE.
 Other Rust dependencies, system API bindings, and tools remain
 subject to their own package licenses and copyright notices. Cargo.lock
 pins dependency versions but does not replace licenses, attribution, or
@@ -190,3 +193,11 @@ Copyright (c) 2015 Microsoft; see drivers/display/LICENSE.
 The package is embedded for explicit optional installation only; it is not
 an official UU driver, and installing it requires separate administrator
 consent and trust of the shared OpenUUYC Drivers publisher certificate.
+
+
+Optional OpenUUYC Audio driver
+
+The optional OpenUUYC Audio driver references Microsoft's ACX sample circuit
+and stream implementation (Microsoft Public License). See drivers/audio/LICENSE
+and drivers/audio/UPSTREAM.md. No sample tone generation, file recording, or APO
+effects are included.

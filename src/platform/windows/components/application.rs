@@ -269,37 +269,32 @@ pub(crate) fn register() -> Result<()> {
     integration::register(true)
 }
 
-pub(crate) fn request_uninstall(remove_display: bool, remove_data: bool) -> Result<bool> {
+pub(crate) fn request_uninstall(removal: super::RemovalOptions) -> Result<bool> {
     use crate::platform::windows::host_service::{startup, vault};
     if let Some(owner) = vault::owner()? {
         ensure!(
             owner == vault::sid(std::process::id())?,
             "请由安装此程序的Windows用户卸载"
         );
-        if !remove_data {
+        if !removal.remove_data {
             crate::account::auth::restore_portable()?;
         }
     }
-    let args = format!(
-        "component application uninstall{}{}",
-        if remove_display {
-            " --remove-display-driver"
-        } else {
-            ""
-        },
-        if remove_data { " --remove-data" } else { "" }
-    );
+    let args = format!("component application uninstall{}", removal.arguments());
     let reboot = super::elevate(&args, super::Kind::Application)?;
     startup::set(false)?;
     integration::shortcuts(false)?;
-    if remove_data && !reboot {
+    if removal.remove_data && !reboot {
         data::user()?;
     }
     Ok(reboot)
 }
-pub(crate) fn uninstall(remove_display: bool) -> Result<bool> {
-    use crate::platform::windows::{display, host_service, input};
+pub(crate) fn uninstall(removal: super::RemovalOptions) -> Result<bool> {
+    use crate::platform::windows::{host_service, input};
     let directory = active_directory()?;
+    removal.preflight()?;
+    crate::platform::windows::virtual_audio::Defaults::recover_defaults()
+        .context("卸载前恢复默认音频设备失败")?;
     if !directory.exists() {
         // Allow a failed data-cleanup step to be retried after the application
         // image has already been removed. All component removals remain scoped.
@@ -307,26 +302,19 @@ pub(crate) fn uninstall(remove_display: bool) -> Result<bool> {
             !host_service::install::status()?.installed,
             "服务安装目录缺失，请先修复安装"
         );
-        let mut reboot = input::install::uninstall()?;
-        if remove_display {
-            reboot |= display::install::uninstall()?;
-        }
+        let mut reboot = removal.remove_optional_drivers()?;
+        reboot |= input::install::uninstall()?;
         integration::register(false)?;
         return Ok(reboot);
     }
     verify_directory(&directory)?;
     let reboot = if directory.join("suite.json").is_file() {
-        super::suite::execute(super::Operation::Uninstall, None, false, remove_display)?
+        super::suite::execute(super::Operation::Uninstall, None, false, removal)?
     } else {
         host_service::install::preflight()?;
-        if remove_display {
-            display::install::preflight(super::Operation::Uninstall)?;
-        }
         host_service::install::stop_for_maintenance()?;
-        let mut reboot = input::install::uninstall()?;
-        if remove_display {
-            reboot |= display::install::uninstall()?;
-        }
+        let mut reboot = removal.remove_optional_drivers()?;
+        reboot |= input::install::uninstall()?;
         reboot | host_service::install::uninstall()?
     };
     ensure!(!reboot, "组件移除需要重启Windows；重启后可继续卸载程序");

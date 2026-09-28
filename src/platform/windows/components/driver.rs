@@ -216,9 +216,25 @@ impl Package {
                 .collect::<Vec<_>>()
                 .join("\n")
         };
+        let text = |bytes: &[u8]| -> Option<String> {
+            if let Some(bytes) = bytes.strip_prefix(&[0xff, 0xfe]) {
+                if !bytes.len().is_multiple_of(2) {
+                    return None;
+                }
+                String::from_utf16(
+                    &bytes
+                        .chunks_exact(2)
+                        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                        .collect::<Vec<_>>(),
+                )
+                .ok()
+            } else {
+                std::str::from_utf8(bytes).ok().map(str::to_owned)
+            }
+        };
         Ok(bytes == expected
-            || match (std::str::from_utf8(&bytes), std::str::from_utf8(expected)) {
-                (Ok(a), Ok(b)) => identity(a) == identity(b),
+            || match (text(&bytes), text(expected)) {
+                (Some(a), Some(b)) => identity(&a) == identity(&b),
                 _ => false,
             })
     }
@@ -305,9 +321,9 @@ impl Package {
                 "现有驱动不是当前程序的包，已保留"
             );
         }
-        let stage = Staging::new(self.files)?;
-        super::trust_certificate(self.kind)?;
-        verify_catalog(&stage.path.join(self.catalog))?;
+        let stage = Staging::new(self.files).context("准备驱动安装文件失败")?;
+        super::trust_certificate(self.kind).context("注册驱动签名证书失败")?;
+        verify_catalog(&stage.path.join(self.catalog)).context("验证驱动目录签名失败")?;
         let mut info = nodes.first().copied().unwrap_or(SP_DEVINFO_DATA {
             cbSize: size_of::<SP_DEVINFO_DATA>() as u32,
             ..Default::default()

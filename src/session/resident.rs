@@ -21,6 +21,9 @@ pub(crate) enum Request {
         account: String,
         allowed: bool,
         encoding: host::EncodingSettings,
+        audio_device: Option<host::audio::Device>,
+        audio_defaults: host::audio::DefaultDevices,
+        audio_quality: crate::media::audio::encoder::Quality,
     },
     Disconnect {
         account: String,
@@ -38,6 +41,12 @@ pub(crate) struct Snapshot {
     pub online: PresenceState,
     pub allowed: bool,
     pub encoding: host::EncodingSettings,
+    #[serde(default)]
+    pub audio_device: Option<host::audio::Device>,
+    #[serde(default)]
+    pub audio_defaults: host::audio::DefaultDevices,
+    #[serde(default)]
+    pub audio_quality: crate::media::audio::encoder::Quality,
     pub status: host::Status,
     pub capabilities: Option<host::desktop::Capabilities>,
 }

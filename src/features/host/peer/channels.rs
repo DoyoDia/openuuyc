@@ -15,6 +15,7 @@ pub(super) async fn bind_channel(
     kcp: crate::transport::uu_kcp::UuKcpControl,
     report_target: ReportTarget,
     input: crate::features::host::input::Receiver,
+    microphone: crate::features::host::microphone::Receiver,
 ) {
     let control = channel.label() == "CONTROL_DATA_CHANNEL";
     let text = channel.label() == "TEXT_DATA_CHANNEL";
@@ -49,6 +50,7 @@ pub(super) async fn bind_channel(
     let close_channel = Arc::downgrade(&channel);
     let closing_target = report_target.clone();
     let closing_input = input.clone();
+    let closing_microphone = microphone.clone();
     channel.on_close(Box::new(move || {
         if control {
             if let Some(channel) = close_channel.upgrade() {
@@ -67,6 +69,9 @@ pub(super) async fn bind_channel(
                 .as_ref()
                 .is_some_and(|target| target.ptr_eq(&close_channel))
             {
+                if !control {
+                    closing_microphone.transport_lost();
+                }
                 *current = None;
                 routes.revision = routes.revision.wrapping_add(1);
                 true
@@ -126,6 +131,7 @@ pub(super) async fn bind_channel(
         let kcp = kcp.clone();
         let report_target = report_target.clone();
         let input = input.clone();
+        let microphone = microphone.clone();
         Box::pin(async move {
             if cancel.is_cancelled() {
                 return;
@@ -161,6 +167,36 @@ pub(super) async fn bind_channel(
                     Ok(false) => {}
                     Err(error) => {
                         tracing::warn!(%error,"rejected malformed host input action");
+                        return;
+                    }
+                }
+                match crate::features::stream_control::publisher::microphone_policy(&message.data) {
+                    Ok(Some(policy)) => {
+                        let result = microphone.policy(policy.enabled).await;
+                        if let Err(error) = &result {
+                            tracing::warn!(%error,"host microphone request failed");
+                        }
+                        if let Some(channel) = weak.upgrade() {
+                            if !cancel.is_cancelled() {
+                                let response = policy.response(
+                                    result
+                                        .as_ref()
+                                        .err()
+                                        .map_or(0, crate::features::host::microphone::error_code),
+                                );
+                                if let Err(error) =
+                                    channel.send_text_bytes(&Bytes::from(response)).await
+                                {
+                                    microphone.transport_lost();
+                                    tracing::debug!(%error,"host microphone response failed");
+                                }
+                            }
+                        }
+                        return;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(%error,"invalid microphone envelope");
                         return;
                     }
                 }
@@ -234,6 +270,8 @@ pub(super) async fn publish_state(
     mut mouse_policy: tokio::sync::watch::Receiver<
         crate::features::host::input::config::MousePolicy,
     >,
+    audio: super::super::audio::Audio,
+    mut microphone: tokio::sync::watch::Receiver<super::super::microphone::Status>,
 ) {
     use crate::features::stream_control::publisher;
     use std::sync::atomic::Ordering;
@@ -245,6 +283,8 @@ pub(super) async fn publish_state(
     let mut last_probe = None::<u32>;
     let mut last_locked = None;
     let mut last_mouse_policy = None;
+    let mut last_microphone = None;
+    let mut last_virtual_speaker = None;
     let mut revision = None;
     let mut secure_revision = None;
     let sequence = &reports.sequence;
@@ -256,6 +296,7 @@ pub(super) async fn publish_state(
             result=changed.changed()=>{if result.is_err(){break;} false},
             result=target.changed()=>{if result.is_err(){break;} false},
             result=mouse_policy.changed()=>{if result.is_err(){break;} false},
+            result=microphone.changed()=>{if result.is_err(){break;} false},
             _=timer.tick()=>true,
         };
         if refresh && let Ok(mut state) = screens.try_lock() {
@@ -273,6 +314,8 @@ pub(super) async fn publish_state(
             last_probe = None;
             last_locked = None;
             last_mouse_policy = None;
+            last_microphone = None;
+            last_virtual_speaker = None;
         }
         if secure_revision != Some(routes.secure_revision) {
             secure_revision = Some(routes.secure_revision);
@@ -315,6 +358,39 @@ pub(super) async fn publish_state(
                 }
             }
         };
+        let mic = microphone.borrow_and_update().clone();
+        if mic.enabled && mic.error.is_none() {
+            if last_virtual_speaker != Some(mic.speaker_active)
+                && send(
+                    false,
+                    publisher::audio_device_event(if mic.speaker_active { 25 } else { 26 }),
+                )
+                .await
+            {
+                last_virtual_speaker = Some(mic.speaker_active);
+            }
+        } else {
+            last_virtual_speaker = None;
+        }
+        let mic_state = (mic.enabled, mic.active, mic.error.clone());
+        if last_microphone.as_ref() != Some(&mic_state) {
+            let action = if mic.error.is_some() && mic.enabled {
+                Some(27)
+            } else if mic.enabled {
+                Some(if mic.active { 23 } else { 24 })
+            } else if last_microphone
+                .as_ref()
+                .is_some_and(|(enabled, _, _)| *enabled)
+            {
+                Some(24)
+            } else {
+                None
+            };
+            if action.is_none() || send(false, publisher::audio_device_event(action.unwrap())).await
+            {
+                last_microphone = Some(mic_state);
+            }
+        }
         // Native layout changes and capture restart form one screen transition.
         // Do not publish a half-restored catalog while that owner is awaiting I/O.
         let (media, catalog, requested) = {
@@ -373,8 +449,11 @@ pub(super) async fn publish_state(
             last_capture = Some(capture);
         }
         let visible = media.iter().any(|(_, s)| s.capturing && s.visible);
-        if last_visible != Some(visible) && send(false, publisher::permissions(visible)).await {
-            last_visible = Some(visible);
+        let permission = (visible, audio.allowed());
+        if last_visible != Some(permission)
+            && send(false, publisher::permissions(visible, permission.1)).await
+        {
+            last_visible = Some(permission);
         }
         if routes.control.is_some()
             && let Some(locked) = crate::features::host::capture::session_locked()

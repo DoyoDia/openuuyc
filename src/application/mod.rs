@@ -53,7 +53,7 @@ pub fn capture_agent(pipe: &str, parent: u32) -> anyhow::Result<()> {
 }
 #[cfg(windows)]
 pub use crate::platform::windows::components::{
-    Kind as ComponentKind, Operation as ComponentOperation,
+    Kind as ComponentKind, Operation as ComponentOperation, RemovalOptions,
 };
 #[cfg(windows)]
 pub fn component_operation(
@@ -61,17 +61,9 @@ pub fn component_operation(
     operation: ComponentOperation,
     allow_sas: bool,
     owner: Option<&str>,
-    remove_display: bool,
-    remove_data: bool,
+    removal: RemovalOptions,
 ) -> anyhow::Result<bool> {
-    crate::platform::windows::components::execute(
-        kind,
-        operation,
-        allow_sas,
-        owner,
-        remove_display,
-        remove_data,
-    )
+    crate::platform::windows::components::execute(kind, operation, allow_sas, owner, removal)
 }
 #[cfg(windows)]
 pub fn purge_machine_data() -> anyhow::Result<()> {

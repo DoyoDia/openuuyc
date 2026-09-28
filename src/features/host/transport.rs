@@ -285,13 +285,38 @@ impl Transport {
             .map(Self)
     }
 
+    pub(crate) fn audio_budget(&self, bitrate: u32) {
+        let mut allocations = lock(&self.0.allocations);
+        if allocations.get(&usize::MAX).map_or(0, |b| b.maximum) == bitrate {
+            return;
+        }
+        if bitrate == 0 {
+            allocations.remove(&usize::MAX);
+        } else {
+            allocations.insert(
+                usize::MAX,
+                super::parameters::Bounds {
+                    minimum: bitrate,
+                    maximum: bitrate,
+                    initial: bitrate,
+                    probe: bitrate,
+                    adaptive: false,
+                },
+            );
+        }
+        let bounds = super::allocation::total(&allocations);
+        drop(allocations);
+        if bounds.maximum > 0 {
+            lock(&self.0.controller).configure(bounds, false);
+        }
+    }
     pub(crate) fn configure(&self, bounds: super::parameters::Bounds, restart: bool) {
         let (bounds, restart) = {
             let mut streams = lock(&self.0.allocations);
             streams.insert(self.0.index, bounds);
             (
                 super::allocation::total(&streams),
-                restart && streams.len() == 1,
+                restart && streams.keys().filter(|id| **id != usize::MAX).count() == 1,
             )
         };
         lock(&self.0.controller).configure(bounds, restart);
@@ -795,7 +820,7 @@ impl Transport {
             let wire = size + self.network_overhead();
             lock(&self.0.send_rate).record(wire);
             if let Some(sequence) = sequence {
-                lock(&self.0.controller).sent(sequence, wire, pacing, burst);
+                lock(&self.0.controller).sent(sequence, wire, pacing, burst, false);
             }
             let (primary, fec) = {
                 let history = lock(&self.0.history);
@@ -1383,6 +1408,15 @@ impl Interceptor for Transport {
         writer
     }
     async fn bind_local_stream(&self, info: &StreamInfo, writer: Writer) -> Writer {
+        if info.mime_type.eq_ignore_ascii_case("audio/opus") {
+            let tcc = info.rtp_header_extensions.iter().find(|e|e.uri == "http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01")
+                .map_or(0,|e|if (1..=255).contains(&e.id) { e.id as u8 } else { 0 });
+            return Arc::new(AudioWriter {
+                parent: writer,
+                transport: self.clone(),
+                tcc,
+            });
+        }
         if let Some(stream) = self.for_stream(info) {
             return stream.bind_stream(info, writer).await;
         }
@@ -1498,5 +1532,50 @@ impl Transport {
         history.packets.clear();
         history.order.clear();
         history.bytes = 0;
+    }
+}
+
+// Audio shares the transport estimate/TWCC sequence space, but bypasses the video
+// frame pacer and RTX/FEC history. Its fixed allocation is reserved above.
+struct AudioWriter {
+    parent: Writer,
+    transport: Transport,
+    tcc: u8,
+}
+#[async_trait]
+impl RTPWriter for AudioWriter {
+    async fn write(&self, packet: &Packet, attributes: &Attributes) -> Result<usize> {
+        let shared = &self.transport.0;
+        if shared.cancel.is_cancelled()
+            || !shared.lease.requested()
+            || !shared.network.load(Ordering::Acquire)
+        {
+            return Ok(0);
+        }
+        let _egress = tokio::select! { _=shared.cancel.cancelled()=>return Err(Error::ErrIoEOF), guard=shared.egress.lock()=>guard };
+        let mut packet = packet.clone();
+        let seq = if self.tcc != 0 {
+            let seq = lock(&shared.controller).next_sequence();
+            packet.header.set_extension(
+                self.tcc,
+                Bytes::copy_from_slice(&(seq as u16).to_be_bytes()),
+            )?;
+            Some(seq)
+        } else {
+            None
+        };
+        let size = tokio::select! { _=shared.cancel.cancelled()=>return Err(Error::ErrIoEOF), result=self.parent.write(&packet,attributes)=>result? };
+        if size > 0 {
+            if let Some(seq) = seq {
+                lock(&shared.controller).sent(
+                    seq,
+                    self.transport.wire_size(size),
+                    PacedPacketInfo::default(),
+                    None,
+                    true,
+                );
+            }
+        }
+        Ok(size)
     }
 }

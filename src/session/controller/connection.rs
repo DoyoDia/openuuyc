@@ -286,6 +286,14 @@ impl ResolvedConnection {
         handle.set_persistence_error(persistence_error);
         handle.set_audio_persistence_error(audio_persistence_error);
         connection.preference_writer = store.clone().map(|store| store.bind(handle.clone()));
+        if let Some(store) = &store {
+            match store.load_microphone().await {
+                Ok(quality) => {
+                    handle.microphone().set_quality(quality)?;
+                }
+                Err(error) => handle.set_audio_persistence_error(Some(error.to_string())),
+            }
+        }
         connection.audio_preference_writer = store.map(|store| store.bind_audio(handle));
         Ok(connection)
     }

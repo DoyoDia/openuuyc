@@ -269,6 +269,18 @@ fn ensure_idle(service: &Sc) -> Result<()> {
     }
     Ok(())
 }
+pub(crate) fn running() -> Result<bool> {
+    let manager = manager(SC_MANAGER_CONNECT)?;
+    let Some(service) = service(&manager, SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS)? else {
+        return Ok(false);
+    };
+    verify_service(&service)?;
+    let mut state = SERVICE_STATUS::default();
+    unsafe {
+        QueryServiceStatus(service.0, &mut state)?;
+    }
+    Ok(state.dwCurrentState != SERVICE_STOPPED)
+}
 pub(crate) fn preflight() -> Result<()> {
     let manager = manager(SC_MANAGER_CONNECT)?;
     if let Some(service) = service(&manager, SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS)? {

@@ -15,6 +15,7 @@ use crate::features::stream_control::{
 pub(crate) struct ViewingSettingsStore {
     viewing: Arc<Entry>,
     audio: Arc<Entry>,
+    microphone: Arc<Entry>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -53,6 +54,16 @@ impl ViewingSettingsStore {
             audio: Arc::new(
                 Entry::new(&audio_service, publisher_id)
                     .map_err(|_| anyhow::anyhow!("音量设置存储不可用"))?,
+            ),
+            microphone: Arc::new(
+                Entry::new(
+                    &format!(
+                        "com.openuuyc.microphone.{:x}",
+                        Sha256::digest(user_id.as_bytes())
+                    ),
+                    publisher_id,
+                )
+                .map_err(|_| anyhow::anyhow!("麦克风设置存储不可用"))?,
             ),
         })
     }
@@ -134,38 +145,79 @@ impl ViewingSettingsStore {
         .context("音量设置保存任务中断")?
     }
 
+    pub(crate) async fn load_microphone(&self) -> Result<crate::media::audio::encoder::Quality> {
+        let entry = self.microphone.clone();
+        tokio::task::spawn_blocking(move || {
+            let bytes = match entry.get_secret() {
+                Ok(bytes) => bytes,
+                Err(Error::NoEntry) => return Ok(Default::default()),
+                Err(_) => bail!("无法读取麦克风音质设置"),
+            };
+            let quality: crate::media::audio::encoder::Quality = serde_json::from_slice(&bytes)?;
+            quality.restore()
+        })
+        .await
+        .context("麦克风设置读取任务中断")?
+    }
+    async fn save_microphone(&self, quality: crate::media::audio::encoder::Quality) -> Result<()> {
+        quality.validate()?;
+        let entry = self.microphone.clone();
+        tokio::task::spawn_blocking(move || {
+            entry
+                .set_secret(&serde_json::to_vec(&quality)?)
+                .map_err(|_| anyhow::anyhow!("无法保存麦克风音质设置"))
+        })
+        .await
+        .context("麦克风设置保存任务中断")?
+    }
     pub(crate) fn bind_audio(self, handle: StreamControlHandle) -> PreferenceWriter {
         // Subscribe after restoring startup settings, so --mute and defaults
         // do not silently overwrite saved user choices.
         let mut updates = handle.audio().preference_updates();
+        let mut microphone = handle.microphone().quality_updates();
         let stop = CancellationToken::new();
         let cancelled = stop.clone();
         let task = tokio::spawn(async move {
             loop {
-                let changed = tokio::select! {
-                    _ = cancelled.cancelled() => false,
-                    changed = updates.changed() => changed.is_ok(),
+                let mut changed = tokio::select! {
+                    _ = cancelled.cancelled() => 0u8,
+                    changed = updates.changed() => if changed.is_ok(){1}else{0},
+                    changed = microphone.changed() => if changed.is_ok(){2}else{0},
                 };
-                if changed {
-                    loop {
-                        tokio::select! {
-                            _ = cancelled.cancelled() => break,
-                            _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => break,
-                            update = updates.changed() => if update.is_err() { break; },
-                        }
-                    }
+                if changed != 0 {
+                    tokio::select! { _=cancelled.cancelled()=>{}, _=tokio::time::sleep(std::time::Duration::from_millis(250))=>{} }
                 }
-                if changed || updates.has_changed().unwrap_or(false) {
+                if updates.has_changed().unwrap_or(false) {
+                    changed |= 1;
+                }
+                if microphone.has_changed().unwrap_or(false) {
+                    changed |= 2;
+                }
+                let mut error = None;
+                if changed & 1 != 0 {
                     let settings = *updates.borrow_and_update();
                     if let Some(settings) = settings {
-                        let error = self.save_audio(settings).await.err().map(|e| e.to_string());
+                        error = self.save_audio(settings).await.err().map(|e| e.to_string());
                         if error.is_none() {
                             tracing::debug!(?settings, "saved audio settings for this device");
                         }
-                        handle.set_audio_persistence_error(error);
                     }
                 }
-                if cancelled.is_cancelled() || !changed {
+                if changed & 2 != 0 {
+                    let quality = *microphone.borrow_and_update();
+                    if let Some(quality) = quality {
+                        error = self
+                            .save_microphone(quality)
+                            .await
+                            .err()
+                            .map(|e| e.to_string())
+                            .or(error);
+                    }
+                }
+                if changed != 0 {
+                    handle.set_audio_persistence_error(error);
+                }
+                if cancelled.is_cancelled() || changed == 0 {
                     break;
                 }
             }

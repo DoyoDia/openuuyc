@@ -43,7 +43,7 @@ impl Page {
             Self::Custom => "自定义码率",
             Self::Advanced => "高级设置",
             Self::Audio => "音频输出",
-            Self::Microphone => "麦克风设备",
+            Self::Microphone => "麦克风",
             Self::Mouse => "鼠标模式",
             Self::Display => "显示设置",
         }
@@ -577,6 +577,11 @@ pub(super) fn show_stream_control_window(
     if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
         open = false;
     }
+    let menu_width = if state.page == Page::Microphone {
+        crate::ui::theme::AUDIO_MENU_WIDTH
+    } else {
+        WIDTH
+    };
     egui::Window::new("串流画质")
         .id(egui::Id::new("runtime-stream-settings-window"))
         .open(&mut open)
@@ -584,7 +589,7 @@ pub(super) fn show_stream_control_window(
         .auto_sized()
         .title_bar(false)
         .anchor(egui::Align2::RIGHT_TOP, [-114.0, 52.0])
-        .default_width(WIDTH + 24.0)
+        .default_width(menu_width + 24.0)
         .frame(
             egui::Frame::new()
                 .fill(crate::ui::theme::BG)
@@ -594,7 +599,7 @@ pub(super) fn show_stream_control_window(
         )
         .show(ctx, |ui| {
             menu_style(ui);
-            ui.set_width(WIDTH);
+            ui.set_width(menu_width);
             ui.horizontal(|ui| {
                 if state.page != Page::Quality {
                     back =
@@ -618,7 +623,7 @@ pub(super) fn show_stream_control_window(
             });
             ui.add_space(SECTION_GAP);
             ui.scope(|ui| {
-                ui.set_width(WIDTH);
+                ui.set_width(menu_width);
                 match state.page {
                     Page::Display => {
                         egui::ScrollArea::vertical()
@@ -946,7 +951,7 @@ crate::ui::controls::observe_notice(ui.ctx(), "audio-output-disconnected", "音�
                                 let input=handle.microphone().selected_input();
                                 let devices=handle.microphone().input_devices();
                                 let name=input.as_ref().map(|id|devices.devices.iter().find(|d|&d.id==id).map(|d|d.name.as_str()).unwrap_or(if devices.error.is_some() {"所选麦克风"}else{"所选设备已断开"})).unwrap_or("跟随系统默认");
-                                if menu_row(ui,"麦克风设备",name,None,true,true)
+                                if menu_row(ui,"麦克风",name,None,true,true)
                                     .on_hover_text(name).clicked() {
                                     state.page=Page::Microphone;
                                     state.local_error=handle.microphone().refresh_input_devices().err().map(|e|e.to_string());
@@ -995,16 +1000,30 @@ crate::ui::controls::observe_notice(ui.ctx(), "clipboard-error", "剪贴板同�
                     }
                     Page::Microphone => {
                         let microphone=handle.microphone();
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("音质").size(crate::ui::theme::SMALL).color(MUTED));
+                            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                                ui.label(RichText::new("kbps").size(crate::ui::theme::SMALL).color(MUTED));
+                            });
+                        });
+                        let mut quality=microphone.quality();
+                        if crate::ui::controls::audio_quality_segments(ui,&mut quality) {
+                            if let Err(error)=microphone.set_quality(quality) {state.local_error=Some(error.to_string());}
+                        }
+                        if let Some(bitrate)=microphone.target_bitrate() {
+                            if bitrate<quality.kbps*1000 {ui.label(RichText::new(format!("本次连接目标码率：{} kbps",bitrate/1000)).color(MUTED));}
+                        }
+                        ui.add_space(crate::ui::theme::MENU_GROUP_GAP);
+                        ui.label(RichText::new("输入设备").size(crate::ui::theme::SMALL).color(MUTED));
                         let selected=microphone.selected_input();
                         let inputs=microphone.input_devices();
                         ctx.request_repaint_after(std::time::Duration::from_millis(250));
-                        if menu_row(ui,"跟随系统默认","",Some(selected.is_none()),true,false).clicked() {
-                            microphone.set_input_device(None);
-                        }
-                        section_separator(ui);
                         egui::ScrollArea::vertical().id_salt("microphone-input-devices")
                             .max_height((ctx.content_rect().height()-250.0).clamp(100.0,360.0))
                             .show(ui,|ui| {
+                                if menu_row(ui,"跟随系统默认","",Some(selected.is_none()),true,false).clicked() {
+                                    microphone.set_input_device(None);
+                                }
                                 if inputs.updated.is_none() {ui.label(RichText::new("正在读取麦克风设备…").color(MUTED));}
                                 for input in &inputs.devices {
                                     if menu_row(ui,&input.name,"",Some(selected.as_ref()==Some(&input.id)),true,false)
@@ -1020,7 +1039,6 @@ crate::ui::controls::observe_notice(ui.ctx(), "clipboard-error", "剪贴板同�
                                 }
                             });
                         crate::ui::controls::observe_notice(ui.ctx(),"microphone-device-query","麦克风设备",crate::ui::controls::DialogIcon::Error,inputs.error.as_deref());
-                        ui.label(RichText::new("使用标题栏麦克风按钮开启或关闭发送").color(MUTED));
                     }
                     Page::Mouse => {
                         for (mode, label, description) in [

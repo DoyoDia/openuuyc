@@ -13,6 +13,7 @@ pub(crate) struct Update {
     pub buffer_fps: u32,
     pub control_changed: bool,
     maximum: u32,
+    feedback: Option<(u32, u32, u32)>,
 }
 
 #[derive(Clone)]
@@ -31,6 +32,7 @@ impl Controller {
                 buffer_fps: rate.fps,
                 control_changed: false,
                 maximum: rate.fps,
+                feedback: None,
             },
         }
     }
@@ -53,6 +55,7 @@ impl Controller {
                 buffer_fps: old.buffer_fps.min(rate.fps).max(1),
                 control_changed: true,
                 maximum: rate.fps,
+                feedback: None,
             });
         }
         let observed = self.frames.observed.min(rate.fps).max(1);
@@ -60,7 +63,6 @@ impl Controller {
         if self.feedback == Some(feedback) {
             return None;
         }
-        self.feedback = Some(feedback);
         let (configured, observed) = self.frames.settings(rate.fps);
         if !control_changed
             && !bitrate_changed(old.rate.target, rate.target)
@@ -68,6 +70,7 @@ impl Controller {
             && old.rate.fps.abs_diff(configured) <= 5
             && old.buffer_fps.abs_diff(observed) <= 5
         {
+            self.feedback = Some(feedback);
             return None;
         }
         Some(Update {
@@ -78,9 +81,14 @@ impl Controller {
             buffer_fps: observed,
             control_changed,
             maximum: rate.fps,
+            feedback: Some(feedback),
         })
     }
     pub fn commit(&mut self, update: Update) {
+        // A driver failure must leave the same feedback eligible for retry.
+        // Control changes invalidate the old sample so the next rate decision
+        // is evaluated against the newly committed FPS/quality settings.
+        self.feedback = update.feedback;
         self.applied = update;
     }
 }

@@ -512,44 +512,7 @@ impl NativePeer {
             sdp = remove_relay_candidates_from_sdp(&sdp);
         }
         let answer = RTCSessionDescription::answer(sdp).context("parse remote SDP answer")?;
-        let mut microphone_encoding = None;
-        for media in answer.unmarshal()?.media_descriptions {
-            if media.media_name.media != "audio"
-                || media.media_name.port.value == 0
-                || media
-                    .attributes
-                    .iter()
-                    .any(|a| matches!(a.key.as_str(), "sendonly" | "inactive"))
-            {
-                continue;
-            }
-            let opus_pt = media
-                .attributes
-                .iter()
-                .filter(|a| a.key == "rtpmap")
-                .filter_map(|a| a.value.as_deref()?.split_once(' '))
-                .find(|(_, codec)| codec.eq_ignore_ascii_case("opus/48000/2"))
-                .map(|(pt, _)| pt);
-            if let Some(pt) = opus_pt {
-                let fmtp = media
-                    .attributes
-                    .iter()
-                    .filter(|a| a.key == "fmtp")
-                    .filter_map(|a| a.value.as_deref()?.split_once(' '))
-                    .find(|(id, _)| *id == pt)
-                    .map(|(_, value)| value)
-                    .unwrap_or("");
-                let ptime = media
-                    .attributes
-                    .iter()
-                    .find(|a| a.key == "ptime")
-                    .and_then(|a| a.value.as_ref()?.parse::<u32>().ok());
-                match crate::media::microphone::Encoding::negotiated(fmtp, ptime) {
-                    Ok(config) => microphone_encoding = Some(config),
-                    Err(error) => tracing::warn!(%error,"microphone negotiation unsupported"),
-                }
-            }
-        }
+        let microphone_encoding = crate::media::audio::encoder::remote_config(&answer)?;
         // Receiver::tracks is populated only after async transport startup.
         // Register the negotiated MSIDs, not just tracks that already sent RTP.
         let mut indexes = Vec::new();

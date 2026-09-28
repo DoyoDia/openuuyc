@@ -155,7 +155,13 @@ pub(crate) fn run(name: &str, parent: u32) -> Result<()> {
             }
             ensure!(active(), "采集已撤销");
             let surface = surface.as_ref().unwrap();
-            let guard = surface.acquire(0)?;
+            let Some(guard) = surface.acquire(0)? else {
+                // Preserve the capture source and request a fresh shared
+                // surface. Never copy into a mutex we failed to acquire.
+                pending = Some(frame);
+                reply.needs_surface = true;
+                return Ok(());
+            };
             let gpu = unsafe { capture.device.GetImmediateContext()? };
             unsafe {
                 gpu.CopyResource(&surface.texture, &frame.image);

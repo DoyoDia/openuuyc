@@ -14,12 +14,14 @@ pub(crate) mod gdi;
 pub(crate) mod gpu_conversion;
 pub(crate) mod host_service;
 pub(crate) mod input;
+pub(crate) mod loopback;
 pub(crate) mod nvenc;
 pub(crate) mod preprocess;
 pub(crate) mod qsv;
 pub(crate) mod qsv_allocator;
 pub(crate) mod surface;
 pub(crate) mod transfer;
+pub(crate) mod virtual_audio;
 
 use crate::media::encoding as format;
 use crate::media::encoding::rate as encoder_rate;

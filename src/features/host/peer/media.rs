@@ -401,6 +401,10 @@ impl Worker {
                     match tokio::select! { _=send_cancel.cancelled()=>break, result=track.write(frame.format.codec, &packet)=>result }
                     {
                         Ok(0) => {
+                            // Unbound during renegotiation: the encoder has
+                            // advanced its references, but the peer missed this
+                            // frame. Resume with an IDR instead of a broken P chain.
+                            sending_keyframe.store(true, Ordering::Release);
                             complete = false;
                             break;
                         }

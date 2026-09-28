@@ -181,6 +181,14 @@ pub(super) async fn gui_worker_loop(
         }
         if let Some(command) = command {
             match command {
+                GuiCommand::RefreshHostAudioDevices { generation } => {
+                    if generation == catalog_generation
+                        && logout_task.is_none()
+                        && let Some(client) = client.as_ref().filter(|c| c.is_active())
+                    {
+                        client.host.refresh_audio_devices().await;
+                    }
+                }
                 GuiCommand::SaveHostSettings { generation } => {
                     if generation == catalog_generation
                         && logout_task.is_none()
@@ -882,7 +890,7 @@ pub(super) async fn gui_worker_loop(
                 next_assist_refresh = None;
             }
             if let Some(error) = device_sync
-                .poll(active_client, refresh_active, &events, catalog_generation)
+                .poll(active_client, &events, catalog_generation)
                 .await
             {
                 if active_client.restoration_failed().await {
