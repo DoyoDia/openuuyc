@@ -577,7 +577,7 @@ impl Screens {
             self.reports.current.store(selected, Ordering::Release);
         }
         if let Err(error) = self.maintain_headless().await {
-            tracing::warn!(%error, "headless display recovery failed");
+            tracing::warn!(error=%format!("{error:#}"), "headless display recovery failed");
             self.lease.fail(format!("显示器恢复失败：{error:#}"));
         }
         if fatal

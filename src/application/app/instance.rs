@@ -14,6 +14,10 @@ use windows::core::{BOOL, PCWSTR, w};
 
 pub struct Instance(HANDLE);
 const SHOW_SUBCLASS: usize = 0x4f554943;
+static UPDATE_EXIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub(crate) fn take_update_exit() -> bool {
+    UPDATE_EXIT.swap(false, std::sync::atomic::Ordering::AcqRel)
+}
 
 fn show_message() -> u32 {
     static MESSAGE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
@@ -98,6 +102,7 @@ unsafe extern "system" fn window_message(
         if crate::platform::windows::components::maintaining() {
             return LRESULT(2);
         }
+        UPDATE_EXIT.store(true, std::sync::atomic::Ordering::Release);
         return LRESULT(
             if crate::ui::window_manager::send(crate::ui::window_manager::Request::Exit).is_ok() {
                 1

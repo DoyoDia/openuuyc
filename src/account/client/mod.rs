@@ -22,7 +22,7 @@ impl std::fmt::Display for NoSavedSession {
 impl std::error::Error for NoSavedSession {}
 
 mod assist;
-mod wallpaper;
+mod publication;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RestorationStage {
@@ -43,7 +43,7 @@ pub struct AuthenticatedClient {
     restore_trigger: RestoreTrigger,
     restore_progress: tokio::sync::watch::Sender<RestorationStage>,
     account_name: Mutex<String>,
-    wallpaper: Mutex<wallpaper::Sync>,
+    publication: Mutex<publication::Sync>,
     features: crate::account::feature_ability::FeatureCatalog,
 }
 
@@ -93,7 +93,6 @@ impl AuthenticatedClient {
         api.set_bearer_token(Some(session.token()))?;
         let ended = CancellationToken::new();
 
-        device.watch_account(ended.clone())?;
         let restore_trigger = if owned_device.is_some()
             || crate::platform::windows::host_service::resident::is_owner()
         {
@@ -117,7 +116,7 @@ impl AuthenticatedClient {
             restore_trigger,
             restore_progress: tokio::sync::watch::channel(RestorationStage::Device).0,
             account_name,
-            wallpaper: Mutex::new(wallpaper::Sync::default()),
+            publication: Mutex::new(publication::Sync::default()),
             features: crate::account::feature_ability::FeatureCatalog::default(),
         })
     }
@@ -243,8 +242,10 @@ impl AuthenticatedClient {
             bail!("account session has ended");
         }
         *active_api = Some(api);
+        drop(active_api);
         validated.ready = true;
         self.restore_progress.send_replace(RestorationStage::Ready);
+        self.schedule_publication();
         Ok(())
     }
 
@@ -256,6 +257,16 @@ impl AuthenticatedClient {
 
     /// Finish process-owned initialization work without logging out the account.
     pub async fn close(&self) {
+        let publication = self
+            .publication
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .task
+            .take();
+        if let Some(task) = publication {
+            task.abort();
+            let _ = task.await;
+        }
         self.features.close().await;
         self.close_device_owner().await;
     }
@@ -387,7 +398,7 @@ impl AuthenticatedClient {
         let list = self
             .request(|api| async move { api.list_devices().await })
             .await?;
-        self.schedule_wallpaper(&list);
+        self.schedule_publication();
         self.schedule_feature_refresh(false);
         Ok(list)
     }

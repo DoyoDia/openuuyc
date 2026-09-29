@@ -25,6 +25,11 @@ pub(crate) async fn initialize(
                     return Err(error);
                 };
                 let code = failure.code;
+                // Registration integrity errors are not account expiration and
+                // cannot be repaired by regenerating IDs or erasing credentials.
+                if code == 1006 {
+                    return Err(error);
+                }
                 // 3B4E60 schedules the first failed startup; 3B0790 only
                 // schedules subsequent rounds for the -1 outcome.
                 if long_retries != 0 && code != -1 {

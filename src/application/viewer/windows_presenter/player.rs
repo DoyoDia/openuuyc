@@ -17,8 +17,7 @@ use crate::diagnostics::performance::PerformanceMonitor;
 use crate::features::stream_control::StreamControlHandle;
 use crate::platform::graphics::window_hwnd;
 use crate::ui::chrome::{
-    WindowMoveState, WindowResizeState, configure_dwm_window, title_bar_height_pixels,
-    title_bar_panel,
+    WindowMoveState, WindowResizeState, set_fullscreen, title_bar_height_pixels, title_bar_panel,
 };
 use anyhow::{Result, bail};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -276,8 +275,7 @@ impl ThreadedWindowsApp {
                     .fullscreen()
                     .is_none()
                     .then(|| winit::window::Fullscreen::Borderless(window.current_monitor()));
-                window.set_fullscreen(fullscreen);
-                configure_dwm_window(window);
+                set_fullscreen(window, fullscreen);
                 // A maximized window may keep the same outer size. Update
                 // the video origin even if no size-change event follows.
                 self.resize_targets(window, window.inner_size())?;

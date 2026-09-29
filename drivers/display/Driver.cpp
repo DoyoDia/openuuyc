@@ -62,10 +62,24 @@ static VirtualMonitorMode FindMode(const void* data) {
 
 bool isHDRSupported = false;
 constexpr DWORD watchdogTimeout = 3; // seconds
-DWORD watchdogCountdown = 0;
 std::thread watchdogThread;
 std::condition_variable_any watchdogWake;
 bool watchdogStopping = false;
+UINT fallbackUsers = 0;
+struct DisplayFileContext { bool fallbackPinned; ULONGLONG lastPing; };
+WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(DisplayFileContext, DisplayFileGetContext);
+
+void DisplayFileCleanup(WDFFILEOBJECT file) {
+    std::lock_guard<std::recursive_mutex> lock(monitorListOp);
+    auto* context = DisplayFileGetContext(file);
+    for (auto* monitor : monitorCtxList) {
+        if (monitor->owner == file) { monitor->owner = nullptr; }
+    }
+    if (context->fallbackPinned) {
+        context->fallbackPinned = false;
+        if (fallbackUsers) { --fallbackUsers; }
+    }
+}
 
 DWORD MaxVirtualMonitorCount = 10;
 IDDCX_BITS_PER_COMPONENT SDRBITS = IDDCX_BITS_PER_COMPONENT_8;
@@ -330,17 +344,22 @@ void RunWatchdog() {
     watchdogThread = std::thread([] {
         std::unique_lock<std::recursive_mutex> lock(monitorListOp);
         while (!watchdogWake.wait_for(lock, std::chrono::seconds(1), [] { return watchdogStopping; })) {
-            if (watchdogCountdown && !monitorCtxList.empty() && --watchdogCountdown == 0) {
-                while (!watchdogStopping && !watchdogCountdown && !monitorCtxList.empty()) {
-                    auto* ctx = monitorCtxList.front();
-                    monitorCtxList.pop_front();
+                while (!watchdogStopping && !monitorCtxList.empty()) {
+                    const auto now = GetTickCount64();
+                    auto it = std::find_if(monitorCtxList.begin(), monitorCtxList.end(),
+                        [now](const auto* ctx) {
+                            return !ctx->persistentFallback && (!ctx->owner ||
+                                now - DisplayFileGetContext(ctx->owner)->lastPing >= watchdogTimeout * 1000ull);
+                        });
+                    if (it == monitorCtxList.end()) { break; }
+                    auto* ctx = *it;
+                    monitorCtxList.erase(it);
                     freeConnectorSlots.push(ctx->connectorId);
                     auto monitor = ctx->GetMonitor();
                     lock.unlock();
                     IddCxMonitorDeparture(monitor);
                     lock.lock();
                 }
-            }
         }
     });
 }
@@ -458,6 +477,13 @@ NTSTATUS OpenUUYCDisplayDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT pDeviceInit)
 	{
 		return Status;
 	}
+
+    WDF_FILEOBJECT_CONFIG fileConfig;
+    WDF_FILEOBJECT_CONFIG_INIT(&fileConfig, WDF_NO_EVENT_CALLBACK,
+        WDF_NO_EVENT_CALLBACK, DisplayFileCleanup);
+    WDF_OBJECT_ATTRIBUTES fileAttributes;
+    WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&fileAttributes, DisplayFileContext);
+    WdfDeviceInitSetFileObjectConfig(pDeviceInit, &fileConfig, &fileAttributes);
 
 	WDF_OBJECT_ATTRIBUTES Attr;
 	WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&Attr, IndirectDeviceContextWrapper);
@@ -1410,21 +1436,19 @@ VOID OpenUUYCDisplayIoDeviceControl(
 )
 {
     std::unique_lock<std::recursive_mutex> inventory(monitorListOp);
-	// Reset watchdog
-	if (IoControlCode != IOCTL_GET_WATCHDOG) {
-		watchdogCountdown = watchdogTimeout;
+	// Only the owner of temporary displays renews their lease. Inventory queries
+    // and another connection's pings must not keep orphaned session screens alive.
+    const auto requestFile = WdfRequestGetFileObject(Request);
+	if (IoControlCode == IOCTL_DRIVER_PING || IoControlCode == IOCTL_ADD_VIRTUAL_DISPLAY) {
+        if (requestFile) { DisplayFileGetContext(requestFile)->lastPing = GetTickCount64(); }
 	}
 
 	NTSTATUS Status = STATUS_INVALID_DEVICE_REQUEST;
 	size_t bytesReturned = 0;
 
 	switch (IoControlCode) {
+	case IOCTL_ADD_FALLBACK:
 	case IOCTL_ADD_VIRTUAL_DISPLAY: {
-		if (freeConnectorSlots.empty()) {
-			Status = STATUS_TOO_MANY_NODES;
-			break;
-		}
-
 		if (InputBufferLength < sizeof(VIRTUAL_DISPLAY_ADD_PARAMS) || OutputBufferLength < sizeof(VIRTUAL_DISPLAY_ADD_OUT)) {
 			Status = STATUS_BUFFER_TOO_SMALL;
 			break;
@@ -1442,11 +1466,21 @@ VOID OpenUUYCDisplayIoDeviceControl(
 			break;
 		}
 
+
+        const bool fallback = IoControlCode == IOCTL_ADD_FALLBACK;
+        if (!requestFile || fallback != (params->MonitorGuid == FALLBACK_MONITOR_GUID)) {
+            Status = STATUS_INVALID_PARAMETER;
+            break;
+        }
 		bool guidFound = false;
 
 		for (auto it = monitorCtxList.begin(); it != monitorCtxList.end(); ++it) {
 			auto* ctx = *it;
 			if (ctx->monitorGuid == params->MonitorGuid) {
+				if (!fallback && ctx->owner != requestFile) {
+                    Status = STATUS_DEVICE_BUSY;
+                    break;
+                }
 				guidFound = true;
 				output->AdapterLuid = ctx->adapterLuid;
 				output->TargetId = ctx->targetId;
@@ -1455,10 +1489,16 @@ VOID OpenUUYCDisplayIoDeviceControl(
 			}
 		}
 
+        if (Status == STATUS_DEVICE_BUSY) { break; }
 		if (guidFound) {
 			Status = STATUS_SUCCESS;
 			break;
 		}
+
+        if (freeConnectorSlots.empty()) {
+            Status = STATUS_TOO_MANY_NODES;
+            break;
+        }
 
 		// Validate and add the virtual display
 		if (params->Width >= 2 && params->Width <= 16384 && params->Height >= 2 && params->Height <= 16384 && params->RefreshRate > 0 && params->RefreshRate <= 1000000) {
@@ -1480,6 +1520,8 @@ VOID OpenUUYCDisplayIoDeviceControl(
 				break;
 			}
 
+            pMonitorContext->persistentFallback = fallback;
+            pMonitorContext->owner = fallback ? nullptr : requestFile;
 			output->AdapterLuid = pMonitorContext->adapterLuid;
 			output->TargetId = pMonitorContext->targetId;
 			bytesReturned = sizeof(VIRTUAL_DISPLAY_ADD_OUT);
@@ -1503,6 +1545,15 @@ VOID OpenUUYCDisplayIoDeviceControl(
 		}
 
 		Status = STATUS_NOT_FOUND;
+
+        if (params->MonitorGuid == FALLBACK_MONITOR_GUID) {
+            const auto file = WdfRequestGetFileObject(Request);
+            const bool ownPin = file && DisplayFileGetContext(file)->fallbackPinned;
+            if (fallbackUsers > (ownPin ? 1u : 0u)) {
+                Status = STATUS_DEVICE_BUSY;
+                break;
+            }
+        }
 
 
 		for (auto it = monitorCtxList.begin(); it != monitorCtxList.end(); ++it) {
@@ -1535,6 +1586,40 @@ VOID OpenUUYCDisplayIoDeviceControl(
 
 		break;
 	}
+    case IOCTL_PIN_FALLBACK: {
+        UINT* value;
+        Status = WdfRequestRetrieveInputBuffer(Request, sizeof(*value), (PVOID*)&value, NULL);
+        if (!NT_SUCCESS(Status)) { break; }
+        const auto file = WdfRequestGetFileObject(Request);
+        if (!file || *value > 1) { Status = STATUS_INVALID_PARAMETER; break; }
+        auto* context = DisplayFileGetContext(file);
+        const bool pinned = *value != 0;
+        if (pinned != context->fallbackPinned) {
+            if (pinned) { ++fallbackUsers; }
+            else if (fallbackUsers) { --fallbackUsers; }
+            context->fallbackPinned = pinned;
+        }
+        break;
+    }
+    case IOCTL_GET_FALLBACK: {
+        PVIRTUAL_DISPLAY_FALLBACK_OUT output;
+        Status = WdfRequestRetrieveOutputBuffer(Request, sizeof(*output), (PVOID*)&output, NULL);
+        if (!NT_SUCCESS(Status)) { break; }
+        *output = {};
+        output->Users = fallbackUsers;
+        for (const auto* ctx : monitorCtxList) {
+            if (!ctx->persistentFallback) { continue; }
+            output->Present = 1;
+            output->AdapterLuid = ctx->adapterLuid;
+            output->TargetId = ctx->targetId;
+            output->Width = ctx->preferredMode.Width;
+            output->Height = ctx->preferredMode.Height;
+            output->RefreshRate = ctx->preferredMode.VSync;
+            break;
+        }
+        bytesReturned = sizeof(*output);
+        break;
+    }
 	case IOCTL_GET_WATCHDOG: {
 		Status = STATUS_SUCCESS;
 		PVIRTUAL_DISPLAY_GET_WATCHDOG_OUT output;
@@ -1545,7 +1630,8 @@ VOID OpenUUYCDisplayIoDeviceControl(
 		}
 
 		output->Timeout = watchdogTimeout;
-		output->Countdown = watchdogCountdown;
+        const auto elapsed = requestFile ? GetTickCount64() - DisplayFileGetContext(requestFile)->lastPing : watchdogTimeout * 1000ull;
+        output->Countdown = elapsed >= watchdogTimeout * 1000ull ? 0 : static_cast<UINT>((watchdogTimeout * 1000ull - elapsed + 999) / 1000);
 		bytesReturned = sizeof(VIRTUAL_DISPLAY_GET_WATCHDOG_OUT);
 	}
 	case IOCTL_DRIVER_PING: {

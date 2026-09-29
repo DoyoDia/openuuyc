@@ -230,6 +230,9 @@ impl AgentInternal {
     }
 
     fn uu_writable(&self, pair: &CandidatePair) -> bool {
+        if pair.send_blocked.load(Ordering::Acquire) {
+            return false;
+        }
         if CandidatePairState::from(pair.state.load(Ordering::SeqCst))
             != CandidatePairState::Succeeded
             || pair.pruned.load(Ordering::Relaxed)
@@ -248,7 +251,8 @@ impl AgentInternal {
     }
 
     fn uu_ready_to_send(&self, pair: &CandidatePair) -> bool {
-        !pair.pruned.load(Ordering::Relaxed)
+        !pair.send_blocked.load(Ordering::Acquire)
+            && !pair.pruned.load(Ordering::Relaxed)
             && (self.uu_writable(pair)
                 || self.uu_write_state(pair) == 1
                 || self.uu_presumed_writable(pair))
@@ -303,7 +307,8 @@ impl AgentInternal {
     /// whose local candidate is relay and whose remote candidate is relay or
     /// peer-reflexive. The shipped UU viewer leaves the configuration off.
     fn uu_presumed_writable(&self, pair: &CandidatePair) -> bool {
-        self.presume_writable_when_fully_relayed
+        !pair.send_blocked.load(Ordering::Acquire)
+            && self.presume_writable_when_fully_relayed
             && self.uu_write_state(pair) == 2
             && pair.local_candidate().candidate_type() == CandidateType::Relay
             && matches!(
@@ -943,6 +948,9 @@ impl ControllingSelector for AgentInternal {
 
             log::trace!("inbound STUN (SuccessResponse) from {remote} to {local}");
             if let Some(p) = self.find_pair(local, remote).await {
+                if !p.confirm_send_path(pending_request.timestamp.into_std()) {
+                    return;
+                }
                 p.state
                     .store(CandidatePairState::Succeeded as u8, Ordering::SeqCst);
                 p.binding_request_count.store(0, Ordering::SeqCst);
@@ -1061,6 +1069,9 @@ impl ControlledSelector for AgentInternal {
             log::trace!("inbound STUN (SuccessResponse) from {remote} to {local}");
 
             if let Some(p) = self.find_pair(local, remote).await {
+                if !p.confirm_send_path(pending_request.timestamp.into_std()) {
+                    return;
+                }
                 p.state
                     .store(CandidatePairState::Succeeded as u8, Ordering::SeqCst);
                 p.binding_request_count.store(0, Ordering::SeqCst);

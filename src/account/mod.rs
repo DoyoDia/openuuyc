@@ -11,3 +11,4 @@ pub(crate) mod power;
 pub(crate) mod session_restore;
 
 pub(crate) mod feature_ability;
+pub(crate) mod reporting;

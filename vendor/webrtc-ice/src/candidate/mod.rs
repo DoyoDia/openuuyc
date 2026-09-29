@@ -267,6 +267,8 @@ pub struct CandidatePair {
     /// libwebrtc Connection write state: 0 writable, 1 unreliable,
     /// 2 init, 3 timed out. This is independent of the ICE checklist state.
     pub(crate) write_state: AtomicU8,
+    pub(crate) send_blocked: AtomicBool,
+    send_failure: StdMutex<Option<(Instant, String)>>,
     pub(crate) nominated: AtomicBool,
     pub(crate) requests_sent: AtomicU64,
     pub(crate) responses_received: AtomicU64,
@@ -308,6 +310,8 @@ impl Default for CandidatePair {
             local_description: arc_swap::ArcSwapOption::empty(),
             state: AtomicU8::new(CandidatePairState::Waiting as u8),
             write_state: AtomicU8::new(2),
+            send_blocked: AtomicBool::new(false),
+            send_failure: StdMutex::new(None),
             binding_request_count: AtomicU16::new(0),
             nominated: AtomicBool::new(false),
             requests_sent: AtomicU64::new(0),
@@ -403,6 +407,8 @@ impl CandidatePair {
             local_description: arc_swap::ArcSwapOption::empty(),
             state: AtomicU8::new(CandidatePairState::Waiting as u8),
             write_state: AtomicU8::new(2),
+            send_blocked: AtomicBool::new(false),
+            send_failure: StdMutex::new(None),
             binding_request_count: AtomicU16::new(0),
             nominated: AtomicBool::new(false),
             requests_sent: AtomicU64::new(0),
@@ -584,6 +590,41 @@ impl CandidatePair {
         // expression is not the native pair priority.
         (u64::from(g.min(d)) << 32)
             | u64::from(g.max(d).wrapping_mul(2).wrapping_add(u32::from(g > d)))
+    }
+
+    pub(crate) fn block_failed_send(&self, error: &str) -> bool {
+        let mut failure = self.send_failure.lock().unwrap_or_else(|p| p.into_inner());
+        if failure.is_some() {
+            return false;
+        }
+        *failure = Some((Instant::now(), error.to_owned()));
+        self.send_blocked.store(true, Ordering::Release);
+        self.write_state.store(2, Ordering::Release);
+        true
+    }
+
+    pub(crate) fn blocked_send_reason(&self) -> Option<String> {
+        if !self.send_blocked.load(Ordering::Acquire) {
+            return None;
+        }
+        self.send_failure
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .map(|(_, error)| error.clone())
+    }
+
+    pub(crate) fn confirm_send_path(&self, request_sent: Instant) -> bool {
+        let mut failure = self.send_failure.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((failed_at, _)) = failure.as_ref() {
+            // A delayed response to a pre-failure ping must not revive the path.
+            if request_sent <= *failed_at {
+                return false;
+            }
+            *failure = None;
+            self.send_blocked.store(false, Ordering::Release);
+        }
+        true
     }
 
     pub async fn write(&self, b: &[u8]) -> Result<usize> {

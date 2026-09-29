@@ -11,6 +11,10 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Error, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum Error {
+    /// ICE is checking another path. Reliable protocols retain their own
+    /// retransmission state; this is not closure of the shared connection.
+    #[error("ICE path unavailable: {0}")]
+    ErrIcePathUnavailable(String),
     #[error("buffer: full")]
     ErrBufferFull,
     #[error("buffer: closed")]
@@ -122,6 +126,25 @@ pub enum Error {
 }
 
 impl Error {
+    pub fn is_ice_path_unavailable(&self) -> bool {
+        let mut current: &(dyn std::error::Error + 'static) = self;
+        loop {
+            if matches!(
+                current.downcast_ref::<Self>(),
+                Some(Self::ErrIcePathUnavailable(_))
+            ) {
+                return true;
+            }
+            // StdError deliberately boxes foreign transport errors (DTLS).
+            if let Some(boxed) = current.downcast_ref::<StdError>() {
+                current = boxed.0.as_ref();
+            } else if let Some(source) = current.source() {
+                current = source;
+            } else {
+                return false;
+            }
+        }
+    }
     pub fn from_std<T>(error: T) -> Self
     where
         T: std::error::Error + Send + Sync + 'static,

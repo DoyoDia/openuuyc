@@ -1,5 +1,5 @@
 //! DeviceInitializer owner, independent of any one authenticated account.
-//! Server 3D14E0/3D2BE0/3D08D0 and 3CA320; GUI owns it across QR/logouts.
+//! One serialized registration request; identity changes are explicit operations.
 use anyhow::{Context, Result, bail};
 use futures_util::{FutureExt, StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use tokio::{
@@ -9,9 +9,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use crate::account::api::{ApiFailure, DeviceInitResponse, NrdApi};
-use crate::account::auth::{
-    KeyringIdentityStore, KeyringSessionStore, NativeIdentity, SessionStore,
-};
+use crate::account::auth::{KeyringIdentityStore, NativeIdentity};
 
 #[derive(Clone)]
 pub(crate) struct DeviceHandle {
@@ -26,30 +24,22 @@ pub(crate) struct DeviceRuntime {
 }
 
 enum Command {
-    Ensure {
-        force: bool,
-        result: mpsc::UnboundedSender<InitEvent>,
-    },
-    WatchAccount(CancellationToken),
+    Ensure { force: bool, result: Completion },
     StartupRetry(tokio::sync::oneshot::Sender<std::time::Duration>),
     Controllable(bool, tokio::sync::oneshot::Sender<Result<()>>),
     Name(String, String, tokio::sync::oneshot::Sender<Result<()>>),
 }
 
-enum InitEvent {
-    IdentityReset,
-    Complete(Result<Box<NativeIdentity>>),
-}
-
-type Completion = Option<mpsc::UnboundedSender<InitEvent>>;
-type Pending = FuturesUnordered<BoxFuture<'static, (Completion, Result<DeviceInitResponse>)>>;
+type Completion = tokio::sync::oneshot::Sender<Result<NativeIdentity>>;
+type Pending = FuturesUnordered<
+    BoxFuture<'static, (Completion, Result<(DeviceInitResponse, NativeIdentity)>)>,
+>;
 
 struct Initializer {
     identity: NativeIdentity,
     published: watch::Sender<NativeIdentity>,
     identities: KeyringIdentityStore,
-    sessions: KeyringSessionStore,
-    accounts: Vec<CancellationToken>,
+    waiters: Vec<Completion>,
     initialized: bool,
     date: Option<chrono::NaiveDate>,
     errors: u8,
@@ -61,7 +51,6 @@ impl DeviceRuntime {
     pub(crate) fn start() -> Result<Self> {
         let identities = KeyringIdentityStore::new()?;
         let identity = identities.load_or_create()?;
-        let sessions = KeyringSessionStore::new()?;
         let (published, receiver) = watch::channel(identity.clone());
         let (commands, incoming) = mpsc::unbounded_channel();
         let cancel = CancellationToken::new();
@@ -69,8 +58,7 @@ impl DeviceRuntime {
             identity,
             published,
             identities,
-            sessions,
-            accounts: Vec::new(),
+            waiters: Vec::new(),
             initialized: false,
             date: None,
             errors: 0,
@@ -118,32 +106,15 @@ impl DeviceHandle {
         self.identity.borrow().clone()
     }
 
-    pub(crate) fn watch_account(&self, ended: CancellationToken) -> Result<()> {
-        self.commands
-            .send(Command::WatchAccount(ended))
-            .map_err(|_| anyhow::anyhow!("device initializer has stopped"))
-    }
-
     pub(crate) async fn ensure(&self, force: bool) -> Result<NativeIdentity> {
-        let (result, mut events) = mpsc::unbounded_channel();
+        let (result, response) = tokio::sync::oneshot::channel();
         self.commands
             .send(Command::Ensure { force, result })
             .context("device initializer has stopped")?;
-        while let Some(event) = events.recv().await {
-            match event {
-                InitEvent::IdentityReset => {
-                    // 3B49E0/3B7660 ignore intermediate result=2. It is not
-                    // success, final failure, or permission to restore old auth.
-                    tracing::warn!(
-                        "device initialization reset local client UUID; waiting for reinitialization"
-                    );
-                }
-                InitEvent::Complete(result) => return result.map(|identity| *identity),
-            }
-        }
-        bail!("device initializer stopped before completing the request")
+        response
+            .await
+            .context("device initializer stopped before completing the request")?
     }
-
     pub(crate) async fn set_controllable(&self, value: bool) -> Result<()> {
         let (result, response) = tokio::sync::oneshot::channel();
         self.commands
@@ -187,10 +158,6 @@ impl Initializer {
                 _ = cancel.cancelled() => break,
                 command = incoming.recv() => match command {
                     None => break,
-                    Some(Command::WatchAccount(ended)) => {
-                        self.accounts.retain(|account| !account.is_cancelled());
-                        self.accounts.push(ended);
-                    }
                     Some(Command::StartupRetry(reply)) => {
                         // 3CA2F0's +44 counter belongs to the device session;
                         // setting initialized only resets +40, not this counter.
@@ -227,17 +194,18 @@ impl Initializer {
                                 Ok(_) => Err(anyhow::anyhow!("后台设备响应无效")),
                                 Err(e) => Err(e),
                             };
-                            Self::finish(Some(result), value); continue;
+                            self.finish(result, value); continue;
                         }
-                        if let Err(error) = self.reload() { Self::finish(Some(result), Err(error)); continue; }
+                        if let Err(error) = self.reload() { self.finish(result, Err(error)); continue; }
+                        if !self.pending.is_empty() { self.waiters.push(result); continue; }
                         let today = chrono::Local::now().date_naive();
                         if !force && self.initialized && self.date == Some(today) {
-                            Self::finish(Some(result), Ok(self.identity.clone()));
+                            self.finish(result, Ok(self.identity.clone()));
                         } else {
                             // ensureInitialized resets immediate failures, but
                             // recursive initDevice calls below do not.
                             self.errors = 0;
-                            self.start_request(Some(result));
+                            self.start_request(result);
                         }
                     }
                 },
@@ -266,7 +234,7 @@ impl Initializer {
         // processes. An older process must not overwrite another's UUID reset.
         if !self.identities.replace_if_matches(&self.identity, &next)? {
             bail!(
-                "virtual device identity changed in another process; this initializer is no longer its owner"
+                "device identity changed in another process; this initializer is no longer its owner"
             );
         }
         self.identity = next;
@@ -280,95 +248,122 @@ impl Initializer {
             // B16B00 uses the unauthenticated device-registration builder;
             // unlike AE7290 it never calls B85C10 to attach account headers.
             let api = NrdApi::new(self.identity.client_identity()?)?;
-            Ok((api, self.identity.device_init_request()?))
+            Ok((api, self.identity.clone()))
         })();
         match request {
-            Ok((api, body)) => {
+            Ok((api, identity)) => {
                 tracing::debug!(
                     attempt = self.errors + 1,
-                    notifying = completion.is_some(),
                     "device initialization request submitted"
                 );
                 self.pending.push(
                     async move {
-                        (
-                            completion,
-                            api.init_windows_device(&body)
-                                .await
-                                .and_then(|response| response.into_data()),
-                        )
+                        let result = async {
+                            crate::account::reporting::update(|s| {
+                                s.registration = "正在读取本机信息".into()
+                            });
+                            let hardware = tokio::task::spawn_blocking(
+                                crate::platform::windows::device_profile::Hardware::read,
+                            )
+                            .await??;
+                            let body = identity.device_init_request(&hardware)?;
+                            crate::account::reporting::update(|s| {
+                                s.hardware = Some(hardware);
+                                s.reported_name = body.name.clone();
+                                s.client_id = body.client_id.clone();
+                                s.reported_controllable = body.controllable;
+                                s.registration = "正在上报设备信息".into();
+                            });
+                            Ok((api.init_windows_device(&body).await?.into_data()?, identity))
+                        }
+                        .await;
+                        (completion, result)
                     }
                     .boxed(),
                 );
             }
-            Err(error) => Self::finish(completion, Err(error)),
+            Err(error) => self.finish(completion, Err(error)),
         }
     }
 
-    fn received(&mut self, completion: Completion, response: Result<DeviceInitResponse>) {
+    fn received(
+        &mut self,
+        completion: Completion,
+        response: Result<(DeviceInitResponse, NativeIdentity)>,
+    ) {
         match response {
-            Ok(response) => {
+            Ok((response, sent)) => {
                 let result = (|| -> Result<_> {
                     let mut next = self.identity.clone();
+                    anyhow::ensure!(
+                        next.client_identity()?.client_id == sent.client_identity()?.client_id,
+                        "注册请求所属身份已改变，未应用旧响应"
+                    );
+                    let previous = next.client_identity()?.device_id;
+                    anyhow::ensure!(
+                        previous.is_empty() || previous == response.device_id,
+                        "设备资料上报返回了不同的注册身份，未覆盖现有设备"
+                    );
                     next.complete_registration(response.validated_device_id()?)?;
                     self.commit(next)?;
                     self.initialized = true;
+                    crate::account::reporting::update(|s| {
+                        s.device_id = response.device_id.clone();
+                        s.registration = "上报成功".into();
+                        s.registered_at = Some(chrono::Utc::now().timestamp());
+                    });
                     self.errors = 0; // 3CA3D0/3CA3C0.
                     Ok(self.identity.clone())
                 })();
-                Self::finish(completion, result);
+                if let Err(error) = &result {
+                    crate::account::reporting::update(|s| {
+                        s.registration = format!("上报失败：{error:#}")
+                    });
+                }
+                if result.is_ok() && !self.identity.same_registration_settings(&sent) {
+                    self.start_request(completion);
+                } else {
+                    self.finish(completion, result);
+                }
             }
             Err(error) => {
+                crate::account::reporting::update(|s| {
+                    s.registration = format!("上报失败：{error:#}")
+                });
                 let error = match error.downcast::<ApiFailure>() {
                     Ok(error) => error,
-                    Err(error) => ApiFailure {
-                        code: -1,
-                        message: format!("{error:#}"),
-                    },
+                    Err(error) => {
+                        self.initialized = false;
+                        self.finish(completion, Err(error));
+                        return;
+                    }
                 };
                 let code = error.code;
                 tracing::warn!(code, attempt = self.errors + 1, %error, "device initialization failed");
-                if self.errors >= 2 {
+                if !matches!(code, -1 | 9999) || self.errors >= 2 {
                     self.initialized = false;
                     self.errors = 0;
-                    Self::finish(completion, Err(error.into()));
+                    self.finish(completion, Err(error.into()));
                     return;
                 }
                 self.errors += 1;
-                if code == 1006 {
-                    let reset = (|| -> Result<()> {
-                        let mut next = self.identity.clone();
-                        next.reset_client_uuid();
-                        self.commit(next)?;
-                        if let Some(callback) = &completion {
-                            let _ = callback.send(InitEvent::IdentityReset);
-                        }
-                        if let Some(session) = self.sessions.load()? {
-                            self.sessions.clear_if_matches(&session)?;
-                        }
-                        for account in self.accounts.drain(..) {
-                            account.cancel();
-                        }
-                        Ok(())
-                    })();
-                    if let Err(error) = reset {
-                        Self::finish(completion, Err(error));
-                        return;
-                    }
-                    // Both native calls submit real HTTP operations. The first
-                    // has a no-op completion, not a no-op response handler.
-                    self.start_request(None);
-                }
                 self.start_request(completion);
             }
         }
     }
 
-    fn finish(completion: Completion, result: Result<NativeIdentity>) {
-        if let Some(completion) = completion {
-            let _ = completion.send(InitEvent::Complete(result.map(Box::new)));
-        } else if let Err(error) = result {
-            tracing::warn!(%error, "device background reinitialization failed");
+    fn finish(&mut self, completion: Completion, result: Result<NativeIdentity>) {
+        self.waiters.push(completion);
+        for completion in self.waiters.drain(..) {
+            let value = match &result {
+                Ok(identity) => Ok(identity.clone()),
+                Err(error) => Err(if let Some(api) = error.downcast_ref::<ApiFailure>() {
+                    api.clone().into()
+                } else {
+                    anyhow::anyhow!("{error:#}")
+                }),
+            };
+            let _ = completion.send(value);
         }
     }
 }

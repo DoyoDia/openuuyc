@@ -403,6 +403,7 @@ pub fn init(level: Option<&str>, path: Option<&Path>) -> Result<LoggingGuard> {
                 rx.recv_timeout(Duration::from_secs(1)),
                 Err(mpsc::RecvTimeoutError::Timeout)
             ) {
+                files::sync_pending(&runtime.files);
                 // Serialize read/apply so polling cannot install stale settings after a GUI save.
                 let mut state = runtime.state.lock().unwrap_or_else(|e| e.into_inner());
                 match read_settings(&runtime.config) {

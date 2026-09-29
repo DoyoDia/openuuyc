@@ -532,6 +532,14 @@ impl Association {
                         }
                         let raw = buf.as_ref();
                         if let Err(err) = net_conn.send(raw.as_ref()).await {
+                            if err.is_ice_path_unavailable() {
+                                // ICE owns path validation and switching. This
+                                // datagram was lost; SCTP's existing timers own
+                                // retransmission, not a new association/queue.
+                                buf.clear();
+                                buffer = Some(buf);
+                                continue;
+                            }
                             log::warn!("[{name2}] failed to write packets on net_conn: {err}");
                             done2.store(true, Ordering::Relaxed);
                             break 'outer;

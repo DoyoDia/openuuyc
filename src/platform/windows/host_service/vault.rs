@@ -32,15 +32,18 @@ pub(crate) fn sid(pid: u32) -> Result<String> {
         OpenProcessToken(process.0, TOKEN_QUERY, &mut token)?;
     }
     let token = Handle(token);
+    token_sid(token.0)
+}
+pub(crate) fn token_sid(token: HANDLE) -> Result<String> {
     let mut needed = 0;
     unsafe {
-        let _ = GetTokenInformation(token.0, TokenUser, None, 0, &mut needed);
+        let _ = GetTokenInformation(token, TokenUser, None, 0, &mut needed);
     }
     ensure!(needed > 0 && needed < 65536, "用户身份长度无效");
     let mut buffer = vec![0usize; (needed as usize).div_ceil(size_of::<usize>())];
     unsafe {
         GetTokenInformation(
-            token.0,
+            token,
             TokenUser,
             Some(buffer.as_mut_ptr().cast()),
             needed,

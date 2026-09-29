@@ -30,9 +30,7 @@ pub(crate) use mapping::{
 pub(crate) use performance::{
     PerformanceTrace, metric_pair, performance_frame, performance_header, performance_trace,
 };
-pub(crate) use updates::{
-    update_actions, update_countdown, update_device_row, update_prepared_notice,
-};
+pub(crate) use updates::{update_actions, update_device_row, update_prepared_notice};
 pub(crate) use viewer_caption::{ViewerCaptionIcon, viewer_caption_button};
 
 pub const HEIGHT: f32 = theme::CONTROL_HEIGHT;
@@ -759,6 +757,12 @@ pub fn primary(label: &str) -> egui::Button<'_> {
         .fill(ACCENT)
         .stroke(Stroke::NONE)
         .min_size(vec2(64.0, HEIGHT))
+}
+
+pub(crate) fn centered_button(label: &str) -> egui::Button<'_> {
+    egui::Button::new((egui::Atom::grow(), label, egui::Atom::grow()))
+        .gap(0.0)
+        .min_size(vec2(64.0, theme::CONTROL_HEIGHT))
 }
 
 /// A full button target with a vector chevron, independent of font glyphs.

@@ -283,7 +283,7 @@ impl AgentInternal {
             on_connected_rx: Mutex::new(Some(on_connected_rx)),
 
             done_tx: Mutex::new(Some(done_tx)),
-            force_candidate_contact_tx,
+            force_candidate_contact_tx: force_candidate_contact_tx.clone(),
             done_and_force_candidate_contact_rx: Mutex::new(Some((
                 done_rx,
                 force_candidate_contact_rx,
@@ -345,7 +345,11 @@ impl AgentInternal {
             pending_binding_requests: Mutex::new(vec![]),
 
             // AgentConn
-            agent_conn: Arc::new(AgentConn::new()),
+            agent_conn: Arc::new({
+                let mut conn = AgentConn::new();
+                conn.path_check = Some(force_candidate_contact_tx);
+                conn
+            }),
 
             last_consent_ping: AtomicU64::new(0),
 

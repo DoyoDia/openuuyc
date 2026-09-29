@@ -48,6 +48,11 @@ enum Commands {
         parent: u32,
     },
     #[command(hide = true)]
+    DisplayAgent {
+        #[arg(long)]
+        parent: u32,
+    },
+    #[command(hide = true)]
     InputAgent {
         #[arg(long)]
         pipe: String,
@@ -144,6 +149,7 @@ fn main() -> Result<()> {
                     | Commands::Component { .. }
                     | Commands::Service
                     | Commands::HostResident { .. }
+                    | Commands::DisplayAgent { .. }
                     | Commands::InputAgent { .. }
                     | Commands::CaptureAgent { .. }
             )
@@ -189,13 +195,23 @@ fn main() -> Result<()> {
         removal,
     } = command
     {
-        let reboot = openuuyc::application::component_operation(
+        let result = openuuyc::application::component_operation(
             component,
             operation,
             allow_sas,
             owner.as_deref(),
             removal,
-        )?;
+        );
+        let reboot = match result {
+            Ok(reboot) => reboot,
+            Err(error) => {
+                drop(_logging);
+                if let Some(code) = openuuyc::application::component_error_code(&error) {
+                    std::process::exit(code);
+                }
+                return Err(error);
+            }
+        };
         drop(_logging);
         if removal.remove_data && !reboot {
             openuuyc::application::purge_machine_data()?;
@@ -210,6 +226,7 @@ fn main() -> Result<()> {
         Commands::Component { .. } => unreachable!(),
         Commands::Service => openuuyc::application::host_service(),
         Commands::HostResident { parent } => openuuyc::application::host_resident(parent),
+        Commands::DisplayAgent { parent } => openuuyc::application::display_agent(parent),
         Commands::InputAgent { pipe, parent } => openuuyc::application::input_agent(&pipe, parent),
         Commands::CaptureAgent { pipe, parent } => {
             openuuyc::application::capture_agent(&pipe, parent)

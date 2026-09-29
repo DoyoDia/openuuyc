@@ -47,6 +47,7 @@ const CMD_FEC_DUPLICATE: u8 = 88;
 pub(crate) struct UuKcpControl {
     state: Arc<StdMutex<ControlState>>,
     control_streams: Arc<StdMutex<HashSet<u16>>>,
+    send_failure: Arc<StdMutex<Option<(Instant, String)>>>,
 }
 
 #[derive(Default)]
@@ -72,6 +73,12 @@ enum WorkerCommand {
 }
 
 impl UuKcpControl {
+    pub(crate) fn send_failure_reason(&self) -> Option<String> {
+        lock(&self.send_failure)
+            .as_ref()
+            .filter(|(at, _)| at.elapsed() < Duration::from_secs(3))
+            .map(|(_, error)| error.clone())
+    }
     /// Both roles use the negotiated CONTROL carrier. A KCP failure is returned
     /// to its owner; it must not replay the message through SCTP.
     pub(crate) async fn send_control(
@@ -126,6 +133,8 @@ impl UuKcpControl {
         state.cancel = Some(cancel);
         let shared_state = Arc::clone(&self.state);
         let control_streams = Arc::clone(&self.control_streams);
+        let send_failure = Arc::clone(&self.send_failure);
+        *lock(&send_failure) = None;
         state.task = Some(tokio::spawn(async move {
             // DcKcpTransport::Start configures the KCP object and its task,
             // without waiting for PacketTransport::writable. Do not block
@@ -150,7 +159,7 @@ impl UuKcpControl {
                     tokio::select! {
                         biased;
                         _ = &mut canceled => Ok(()),
-                        result = run_worker(Arc::clone(&endpoint), version, receiver, stream_control, control_streams) => result,
+                        result = run_worker(Arc::clone(&endpoint), version, receiver, stream_control, control_streams, send_failure) => result,
                     }
                 } else {
                     Ok(())
@@ -290,6 +299,8 @@ struct Worker {
     last_fec_network_update: Instant,
     last_remote_header: Option<RemoteHeader>,
     control_streams: Arc<StdMutex<HashSet<u16>>>,
+    send_failure: Arc<StdMutex<Option<(Instant, String)>>>,
+    last_send_warning: Option<Instant>,
 }
 
 struct WirePacket {
@@ -310,6 +321,7 @@ async fn run_worker(
     mut commands: mpsc::UnboundedReceiver<WorkerCommand>,
     stream_control: ControlReceiver,
     control_streams: Arc<StdMutex<HashSet<u16>>>,
+    send_failure: Arc<StdMutex<Option<(Instant, String)>>>,
 ) -> Result<()> {
     let output_packets = Arc::new(StdMutex::new(VecDeque::new()));
     let mut kcp = Kcp::new(
@@ -346,6 +358,8 @@ async fn run_worker(
         last_fec_network_update: now,
         last_remote_header: None,
         control_streams,
+        send_failure,
+        last_send_warning: None,
     };
     worker
         .kcp
@@ -479,9 +493,18 @@ impl Worker {
             if let Err(error) = endpoint.send(&packet.data).await {
                 // DcKcpTransport::SendPacket keeps KCP alive across temporary
                 // transport failures; its send buffer owns PUSH retransmission.
-                tracing::debug!(%error, "UU mixed-KCP datagram not sent on DTLS transport");
+                let now = Instant::now();
+                *lock(&self.send_failure) = Some((now, error.to_string()));
+                if self
+                    .last_send_warning
+                    .is_none_or(|at| now.duration_since(at) >= Duration::from_secs(1))
+                {
+                    self.last_send_warning = Some(now);
+                    tracing::debug!(%error, "UU mixed-KCP datagram not sent on DTLS transport");
+                }
                 continue;
             }
+            *lock(&self.send_failure) = None;
             if let Some(sequence) = packet.fec_original_sequence {
                 // Official SendPacket feeds the FEC worker only after the
                 // original datagram has actually been accepted by DTLS.

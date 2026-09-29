@@ -10,7 +10,7 @@ Class = Display
 ClassVer = 2.0
 Provider=%ManufacturerName%
 CatalogFile=OpenUUYCDisplay.cat
-DriverVer = 09/27/2026,1.0.0.2
+DriverVer = 09/29/2026,1.0.0.4
 
 [Manufacturer]
 %ManufacturerName%=Standard,NTamd64

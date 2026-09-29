@@ -1,13 +1,12 @@
-//! Cached local information, never the simulated hardware registered with UU.
+//! Local diagnostics use the same Windows fact collector as device registration.
 use crate::media::LocalDisplayInfo;
 use crate::media::decoder::diagnostics::{self as decoding, Event, Report, Status};
-use std::process::{Command, Stdio};
+
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use std::time::{Duration, Instant};
 
 pub(super) struct LocalDiagnostics {
     pub rows: Vec<(String, String)>,
@@ -153,63 +152,19 @@ impl LocalDiagnostics {
     }
 }
 
-// Fixed read-only system queries, bounded and hidden; no shell interpolation
-// of device/account data. Collection happens once, outside the UI thread.
-
-fn read_command(mut command: Command) -> Option<String> {
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x08000000);
-    }
-    let mut child = command.spawn().ok()?;
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) if status.success() => {
-                return child
-                    .wait_with_output()
-                    .ok()
-                    .and_then(|o| String::from_utf8(o.stdout).ok());
-            }
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-        }
-    }
-}
-
 fn hardware() -> Vec<(String, String)> {
-    let mut rows = vec![(
-        "运行平台".into(),
-        format!("{} / {}", std::env::consts::OS, std::env::consts::ARCH),
-    )];
-
-    {
-        let mut command = Command::new("powershell.exe");
-        command.args(["-NoProfile", "-NonInteractive", "-Command", "[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); $ErrorActionPreference='Stop'; $os = Get-CimInstance Win32_OperatingSystem; $cpu = Get-ItemProperty -LiteralPath 'HKLM:\\HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0'; @{os=($os.Caption + ' ' + $os.Version);cpu=$cpu.ProcessorNameString;memory=[math]::Round($os.TotalVisibleMemorySize / 1MB, 1)} | ConvertTo-Json -Compress"]);
-        if let Some(text) = read_command(command).and_then(|s| {
-            serde_json::from_str::<serde_json::Value>(s.trim_start_matches('\u{feff}')).ok()
-        }) {
-            for (key, label) in [("os", "操作系统"), ("cpu", "处理器")] {
-                if let Some(value) = text[key].as_str() {
-                    rows.push((label.into(), value.trim().into()));
-                }
-            }
-            if let Some(value) = text["memory"].as_f64() {
-                rows.push(("物理内存".into(), format!("{value:.1} GiB")));
-            }
-        } else {
-            rows.push(("硬件信息".into(), "系统查询失败或超时".into()));
+    match crate::platform::windows::device_profile::Hardware::read() {
+        Ok(hardware) => {
+            let mut rows = vec![
+                ("设备名称".into(), hardware.name),
+                ("操作系统".into(), hardware.os),
+                ("处理器".into(), hardware.cpu),
+                ("主板".into(), hardware.base_board),
+                ("物理内存".into(), format!("{} MiB", hardware.memory)),
+            ];
+            rows.extend(hardware.errors.into_iter().map(|e| ("读取提示".into(), e)));
+            rows
         }
+        Err(error) => vec![("硬件信息".into(), format!("读取失败：{error:#}"))],
     }
-
-    rows
 }

@@ -60,6 +60,21 @@ pub(crate) fn audio_device_event(action: i32) -> Vec<u8> {
     .encode_to_vec()
 }
 
+/// Official desktop ReportError(-6), Message oneof tag 12. This announces a
+/// locally confirmed installation; it is not a request to download software.
+pub(crate) fn update_started() -> Vec<u8> {
+    PbControlMessage {
+        payload: Some(PbPayload::ReportError(super::wire::PbReportError {
+            action: 0,
+            error_code: -6,
+            error_msg: String::new(),
+            type_value: 0,
+        })),
+        ..Default::default()
+    }
+    .encode_to_vec()
+}
+
 #[derive(Clone, PartialEq, prost::Message)]
 pub(crate) struct ConnectOptions {
     #[prost(int32, tag = "1")]

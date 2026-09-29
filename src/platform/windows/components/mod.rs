@@ -308,6 +308,12 @@ pub(super) fn elevate(args: &str, kind: Kind) -> Result<bool> {
     unsafe {
         GetExitCodeProcess(process.0, &mut code)?;
     }
+    if code == 170 {
+        anyhow::bail!("被控服务仍有活动的输入或画面会话，请断开连接后重试");
+    }
+    if code == 2404 {
+        return Err(super::display::install::DriverInUse.into());
+    }
     ensure!(
         code == 0 || code == 3010,
         "{}操作失败，请查看日志（退出码 {code}）",

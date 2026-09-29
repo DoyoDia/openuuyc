@@ -40,6 +40,7 @@ pub struct GuiOptions {
 }
 
 pub fn run(options: GuiOptions) -> Result<()> {
+    crate::features::host::displays::fallback::start_background();
     let (local_display, display_warning) = match detect_local_display() {
         Ok(display) => (display, None),
         Err(error) => (
@@ -491,7 +492,8 @@ impl DeviceCenterApp {
                             self.status = StatusMessage::success("登录成功，正在加载设备");
                             self.refresh_pending = true;
                         }
-                        Err(message) if method == LoginMethod::Phone => {
+                        Err(error) if method == LoginMethod::Phone => {
+                            let message = format!("{error:#}");
                             if attempt != self.phone.generation || !self.phone.submitting {
                                 continue;
                             }
@@ -499,12 +501,20 @@ impl DeviceCenterApp {
                             self.phone.status = message.clone();
                             self.phone.error = Some(message);
                         }
-                        Err(message) => {
+                        Err(error) => {
                             if attempt != self.qr_generation || !self.qr_running {
                                 continue;
                             }
                             self.qr_running = false;
-                            self.login_qr = None;
+                            let message = if error.is::<login::QrExpired>()
+                                || error
+                                    .downcast_ref::<crate::account::api::ApiFailure>()
+                                    .is_some_and(|e| e.code == 1190)
+                            {
+                                "二维码已过期，请刷新后重新扫码".into()
+                            } else {
+                                format!("{error:#}")
+                            };
                             self.login_restoring = false;
                             self.login_error = Some(message.clone());
                             self.login_status = "登录未完成".to_owned();

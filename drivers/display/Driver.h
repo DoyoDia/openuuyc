@@ -88,6 +88,8 @@ namespace Microsoft
 			LUID adapterLuid{};
 			UINT targetId = 0;
 			GUID monitorGuid{};
+            bool persistentFallback = false;
+            WDFFILEOBJECT owner = nullptr;
 
 			uint8_t* pEdidData = nullptr;
 			VirtualMonitorMode preferredMode{};

@@ -88,8 +88,14 @@ impl Screens {
     }
     pub(crate) async fn remove_virtual(&mut self, id: i32) -> Result<()> {
         let info = self.info(id)?;
-        ensure!(info.kind == 1, "目标不是本会话的扩展虚拟屏");
+        ensure!(info.kind == 1, "目标不是扩展虚拟屏");
         let identity = info.screen.identity.context("缺少显示目标身份")?;
+        // A virtual-screen wire type is not a lease on another driver's screen.
+        // Reject unsupported removal before interrupting its active capture.
+        ensure!(
+            self.displays.owns(&identity),
+            "此虚拟屏由其他会话或驱动管理，请通过创建它的程序删除"
+        );
         let before = self.running();
         self.stop(id).await?;
         if let Err(error) = self.displays.remove(identity).await {
@@ -150,7 +156,7 @@ impl Screens {
         height: u32,
     ) -> Result<i32> {
         let target = info.target.context("缺少真实显示目标")?;
-        if info.kind == 0 {
+        if !self.displays.owns(&target.identity) {
             self.displays.set_resolution(target, width, height).await?;
             self.refresh()?;
             return Ok(info.screen.id);

@@ -123,6 +123,9 @@ pub const SCREEN_TAB_MAX_WIDTH: f32 = 184.0;
 pub const CONTEXT_MENU_WIDTH: f32 = 248.0;
 pub const NAV_HEIGHT: f32 = 36.0;
 pub const SIDEBAR_WIDTH: f32 = 188.0;
+pub const AUTH_QR_SIZE: f32 = 216.0;
+pub const AUTH_COUNTRY_WIDTH: f32 = 64.0;
+pub const AUTH_CODE_ACTION_WIDTH: f32 = 128.0;
 pub const CONTROL_RADIUS: u8 = 5;
 pub const PANEL_RADIUS: u8 = 8;
 

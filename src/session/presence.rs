@@ -334,6 +334,7 @@ async fn run_remote(
         }
         match resident::request(Request::Snapshot).await {
             Ok(Reply::Snapshot(snapshot)) if snapshot.account == client.account_generation() => {
+                crate::account::reporting::replace(snapshot.publication.clone());
                 let _ = events.send(PresenceEvent::State(snapshot.online.clone()));
                 client.host.apply_remote(*snapshot).await;
             }

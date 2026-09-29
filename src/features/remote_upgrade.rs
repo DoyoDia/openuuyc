@@ -1,4 +1,5 @@
-//! User-selected update of the official software on an existing Windows target.
+//! Update notification and reconnect for an authenticated Windows target.
+//! Local OpenUUYC installation shares the official ReportError(-6) lifecycle.
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -12,9 +13,35 @@ use crate::account::feature_ability::{Feature, FeaturePolicy};
 use crate::features::stream_control::StreamControlHandle;
 use crate::ui::{controls, theme};
 
-// The official widget displays 20..0, then reconnects on the next 1s tick.
-const RECONNECT_AFTER: Duration = Duration::from_secs(21);
+// The official widget always waits 20..0. Here that duration is only a fallback
+// for an old connection that never ends (for example a cancelled installation).
+// A real remote disconnect moves directly to readiness checks and reconnect.
+const DISCONNECT_GRACE: Duration = Duration::from_secs(21);
 const PREPARED_NOTICE: Duration = Duration::from_secs(10);
+
+pub(crate) const UPDATE_PROBE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Device-list online state is a hint, not proof that a new media peer exists.
+/// Prefer an observed unavailable -> ready transition. When a fast restart's
+/// offline interval was missed, confirm readiness across two spaced snapshots.
+#[derive(Default)]
+pub(crate) struct UpdateReadiness {
+    unavailable_seen: bool,
+    ready_since: Option<Instant>,
+}
+impl UpdateReadiness {
+    pub(crate) fn observe(&mut self, ready: bool, now: Instant) -> bool {
+        if !ready {
+            self.unavailable_seen = true;
+            self.ready_since = None;
+            return false;
+        }
+        if self.unavailable_seen {
+            return true;
+        }
+        now.saturating_duration_since(*self.ready_since.get_or_insert(now)) >= UPDATE_PROBE_INTERVAL
+    }
+}
 
 #[derive(Default)]
 struct State {
@@ -113,14 +140,14 @@ impl RemoteUpgrade {
         }
     }
 
-    pub(crate) async fn wait_for_restart(&self) {
+    pub(crate) async fn wait_for_disconnect_grace(&self) {
         loop {
             let notified = self.0.changed.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
             let started = self.state().started;
             if let Some(started) = started {
-                tokio::time::sleep(RECONNECT_AFTER.saturating_sub(started.elapsed())).await;
+                tokio::time::sleep(DISCONNECT_GRACE.saturating_sub(started.elapsed())).await;
                 return;
             }
             notified.await;
@@ -293,7 +320,13 @@ fn progress_prompt(ctx: &egui::Context, started: Instant) -> bool {
             controls::dialog_header(ui, "正在更新被控端", controls::DialogIcon::Waiting, false);
             ui.label(RichText::new("连接会暂时中断，请稍候。").color(theme::MUTED));
             ui.add_space(16.0);
-            controls::update_countdown(ui, 20_u64.saturating_sub(started.elapsed().as_secs()));
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(format!(
+                    "已等待 {} 秒 · 恢复可连接后自动重连",
+                    started.elapsed().as_secs()
+                ));
+            });
             close = controls::update_actions(
                 ui,
                 None,

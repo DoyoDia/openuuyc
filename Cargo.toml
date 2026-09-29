@@ -1,6 +1,6 @@
 [package]
 name = "openuuyc"
-version = "1.0.0-alpha.6"
+version = "1.0.0-alpha.7"
 edition = "2024"
 description = "Third-party Rust client for UU Remote protocol interoperability"
 license-file = "LICENSE"
@@ -85,6 +85,9 @@ windows = { version = "0.62.2", default-features = false, features = [
     "Win32_System_IO",
     "Win32_Foundation",
     "Win32_Media_Audio",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Direct3D12",

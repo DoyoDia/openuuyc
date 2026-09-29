@@ -75,6 +75,8 @@ struct Ownership {
     dirty: bool,
     last_controlled: Option<std::time::Instant>,
     remote_action: Option<bool>,
+    updating: bool,
+    update_notice: Option<Arc<super::peer::UpdateNotice>>,
     status: Status,
 }
 
@@ -108,6 +110,8 @@ impl Default for Handle {
                 dirty: false,
                 last_controlled: None,
                 remote_action: None,
+                updating: false,
+                update_notice: None,
                 status: Status::default(),
             })),
             store: None,
@@ -120,6 +124,7 @@ impl Default for Handle {
 }
 
 fn finish_session(state: &mut Ownership) {
+    state.update_notice = None;
     if state.status.connected {
         state.last_controlled = Some(std::time::Instant::now());
     }
@@ -138,6 +143,34 @@ fn finish_session(state: &mut Ownership) {
 }
 
 impl Handle {
+    pub(crate) async fn prepare_update(&self) -> anyhow::Result<()> {
+        let notice = {
+            let mut state = lock(&self.ownership);
+            state.updating = true;
+            if state.status.connected {
+                Some(
+                    state
+                        .update_notice
+                        .clone()
+                        .ok_or_else(|| anyhow::anyhow!("更新通知尚未准备完成")),
+                )
+            } else {
+                None
+            }
+        };
+        let result = match notice {
+            Some(Ok(notice)) => notice.send().await,
+            Some(Err(error)) => Err(error),
+            None => Ok(()),
+        };
+        if result.is_err() {
+            self.cancel_update();
+        }
+        result
+    }
+    pub(crate) fn cancel_update(&self) {
+        lock(&self.ownership).updating = false;
+    }
     pub(crate) fn bind_account(&mut self, account: String) {
         self.account = account;
     }
@@ -549,6 +582,12 @@ impl Drop for SessionLease {
     }
 }
 impl Lease {
+    pub(crate) fn set_update_notice(&self, notice: Arc<super::peer::UpdateNotice>) {
+        let mut state = lock(&self.handle.ownership);
+        if self.current(&state) {
+            state.update_notice = Some(notice);
+        }
+    }
     pub(crate) fn audio_quality(&self) -> crate::media::audio::encoder::Quality {
         self.handle.audio_quality()
     }
@@ -622,6 +661,7 @@ impl Lease {
     pub(crate) fn peer_lease(&self) -> anyhow::Result<SessionLease> {
         let mut state = lock(&self.handle.ownership);
         anyhow::ensure!(self.current(&state), "本次被控许可已失效");
+        anyhow::ensure!(!state.updating, "被控端正在更新，请稍后重新连接");
         state.media = state.media.wrapping_add(1);
         finish_session(&mut state);
         state.status.session_active = true;

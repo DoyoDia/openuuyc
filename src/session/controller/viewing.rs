@@ -1,5 +1,5 @@
 //! Viewing-window attachment, reconnect ownership and cancellation.
-use super::connection::resolve_connection_with_client;
+use super::connection::{ResolvedConnection, resolve_connection_with_client};
 use super::{
     ConnectionProgressReporter, ControllerConnection, assist, await_media_startup, cancellable,
     retry_session_failure, room_released, takeover, windows,
@@ -225,38 +225,58 @@ pub(super) async fn run_viewer_connection_owner(
             target.send_replace(Some(windows::ViewerTarget {
                 device_id: resolved.target_device_id.clone(), alias: resolved.summary.alias.clone(),
             }));
+            let update_attempt = resolved.refresh_after_upgrade;
             let mut controller = match resolved.connect(Some(reporter), cancel, &mut retries).await {
                 Ok(controller) => controller,
                 Err(error) if !cancel.is_cancelled() && retry_session_failure(&error) && retries < 5 => {
                     retries += 1;
+                    resolved.refresh_after_upgrade |= update_attempt;
                     reporter(ConnectionProgress::working(4, "重建观看会话", format!("{error:#}；正在重新加入房间（{retries}/5）")));
+                    if update_attempt {
+                        cancellable(cancel,async {tokio::time::sleep(crate::features::remote_upgrade::UPDATE_PROBE_INTERVAL).await;Ok(())}).await?;
+                    }
                     continue;
                 }
                 Err(error) => return Err(error),
             };
             // F94230 resets the full-session retry budget on peer connected.
             monitor.send_replace(Some(controller.performance_monitor()));
-            retries = 0;
+            // During an update, a connected peer is not enough: retain the
+            // retry budget until media startup succeeds, otherwise repeated
+            // disconnects before the first frame could reset it indefinitely.
+            if !update_attempt { retries = 0; }
             let switcher = crate::application::viewer::device_switch::DeviceSwitcher::new(
                 Arc::clone(&resolved.client), resolved.target_device_id.clone(), switch_sender.clone(), cancel.clone());
             let session_control = controller.stream_control_handle();
             session_control.request_audio_only(resolved.profile.audio_only);
             let mut modes = session_control.audio_mode_requests();
             let mut audio_only = resolved.profile.audio_only;
-            let mut close = if audio_only {
-                if let Err(error) = cancellable(cancel, await_media_startup(controller.forwarder.session.end_waiter(), controller.start_listening())).await {
-                    return Err(controller.close_after_startup_error(error).await);
+            let startup = if audio_only {
+                cancellable(cancel, await_media_startup(controller.forwarder.session.end_waiter(), controller.start_listening())).await.map(|_| None)
+            } else {
+                present_video(&mut controller, &resolved.summary.alias, display, reporter, cancel, &viewer_sender, &switcher).await.map(Some)
+            };
+            let mut close=match startup {
+                Ok(close)=>close,
+                Err(error)=>{
+                    let error=controller.close_after_startup_error(error).await;
+                    if update_attempt && !cancel.is_cancelled() && retry_session_failure(&error) && retries<5 {
+                        retries+=1;
+                        resolved.refresh_after_upgrade=true;
+                        display=update_reconnect_display(&resolved,reporter,cancel,&viewer_sender).await?;
+                        cancellable(cancel,async {tokio::time::sleep(crate::features::remote_upgrade::UPDATE_PROBE_INTERVAL).await;Ok(())}).await?;
+                        continue;
+                    }
+                    return Err(error);
                 }
+            };
+            if audio_only {
                 reporter(ConnectionProgress::ready("仅音频连接已建立"));
                 viewer_sender.send(ViewerWindowEvent::Listening(crate::application::viewer::AudioView::new(session_control.clone(), None)))
                     .map_err(|_| anyhow!("音频窗口已关闭"))?;
-                None
-            } else {
-                match present_video(&mut controller, &resolved.summary.alias, display, reporter, cancel, &viewer_sender, &switcher).await {
-                    Ok(close) => Some(close),
-                    Err(error) => return Err(controller.close_after_startup_error(error).await),
-                }
-            };
+            }
+            if update_attempt {tracing::info!("media resumed after controlled update");}
+            retries=0;
             if !cancel.is_cancelled() && let Some(assist) = &mut resolved.assist
                 && let Err(error) = assist.remember_success(&resolved.client).await {
                 tracing::warn!(%error, "connected assistance code was not saved");
@@ -265,7 +285,7 @@ pub(super) async fn run_viewer_connection_owner(
             let upgrade = session_control.remote_upgrade();
             let upgrade_deadline = async {
                 if let Some(upgrade) = &upgrade {
-                    upgrade.wait_for_restart().await;
+                    upgrade.wait_for_disconnect_grace().await;
                 } else {
                     std::future::pending::<()>().await;
                 }
@@ -274,12 +294,10 @@ pub(super) async fn run_viewer_connection_owner(
             let alive = controller.forwarder.session.end_waiter();
             tokio::pin!(alive);
             let mut next_connection = None;
-            let mut upgrade_reconnect = false;
             let result = loop {
                 tokio::select! {
                     result = &mut alive => break result,
                     _ = &mut upgrade_deadline => {
-                        upgrade_reconnect = true;
                         break Ok(());
                     }
                     _ = cancel.cancelled() => {
@@ -382,33 +400,17 @@ pub(super) async fn run_viewer_connection_owner(
                 continue;
             }
             if upgrade.as_ref().is_some_and(|upgrade| upgrade.started()) {
-                // A transport loss during installation is expected. Wait for
-                // the official update countdown instead of ordinary retries.
-                // The service also emits room leave/2005 here. Only a preceding
-                // update-start notice permits this exception to terminal leave.
-                if !upgrade_reconnect {
-                    cancellable(cancel, async {
-                        upgrade.as_ref().unwrap().wait_for_restart().await;
-                        Ok(())
-                    }).await?;
-                }
+                // A preceding update-start notice makes loss of the OLD room
+                // expected. Once it ends, immediately check readiness instead of
+                // waiting out a UI countdown. Ordinary room leave remains final.
+                tracing::info!("old update session ended; checking target readiness immediately");
                 upgrade.as_ref().unwrap().retire();
                 resolved.preferences = Some(session_control.preferences());
                 resolved.audio_preferences = Some(session_control.audio().settings());
                 resolved.refresh_after_upgrade = true;
+                resolved.takeover = None;
                 retries = 0;
-                let (progress_tx, progress_rx) = std::sync::mpsc::channel();
-                let (display_tx, display_rx) = oneshot::channel();
-                *reporter = Arc::new(move |progress| { let _ = progress_tx.send(progress); });
-                reporter(ConnectionProgress::working(1, "更新后重新连接", format!("正在重新连接 {}", resolved.summary.alias)));
-                if let Some(background) = resolved.background.clone() { reporter(ConnectionProgress::background(background)); }
-                viewer_sender.send(ViewerWindowEvent::Reconnect {
-                    alias: resolved.summary.alias.clone(), window: None,
-                    progress: progress_rx, display: display_tx,
-                }).map_err(|_| anyhow!("更新等待窗口已关闭"))?;
-                display = cancellable(cancel, async {
-                    display_rx.await.context("更新等待窗口已关闭")
-                }).await?;
+                display = update_reconnect_display(&resolved,reporter,cancel,&viewer_sender).await?;
                 continue;
             }
             if let Some(upgrade) = &upgrade { upgrade.retire(); }
@@ -445,6 +447,39 @@ pub(super) async fn run_viewer_connection_owner(
     } else {
         result
     }
+}
+
+async fn update_reconnect_display(
+    resolved: &ResolvedConnection,
+    reporter: &mut ConnectionProgressReporter,
+    cancel: &CancellationToken,
+    sender: &std::sync::mpsc::Sender<ViewerWindowEvent>,
+) -> Result<ViewerDisplayHandle> {
+    let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+    let (display_tx, display_rx) = oneshot::channel();
+    *reporter = Arc::new(move |progress| {
+        let _ = progress_tx.send(progress);
+    });
+    reporter(ConnectionProgress::working(
+        1,
+        "等待被控端更新完成",
+        format!("正在检查 {} 的连接状态", resolved.summary.alias),
+    ));
+    if let Some(background) = resolved.background.clone() {
+        reporter(ConnectionProgress::background(background));
+    }
+    sender
+        .send(ViewerWindowEvent::Reconnect {
+            alias: resolved.summary.alias.clone(),
+            window: None,
+            progress: progress_rx,
+            display: display_tx,
+        })
+        .map_err(|_| anyhow!("更新等待窗口已关闭"))?;
+    cancellable(cancel, async {
+        display_rx.await.context("更新等待窗口已关闭")
+    })
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]

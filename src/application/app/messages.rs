@@ -126,7 +126,7 @@ pub(super) enum GuiEvent {
     SignedOut,
     AccountEnded(String),
     LoginProgress(LoginMethod, u64, u64, LoginProgress),
-    LoginFinished(LoginMethod, u64, u64, std::result::Result<(), String>),
+    LoginFinished(LoginMethod, u64, u64, anyhow::Result<()>),
     SmsCooldown(Option<Instant>),
     SmsCodeFinished {
         generation: u64,

@@ -143,6 +143,9 @@ impl Agent {
     pub fn start_resident(session: u32) -> Result<Self> {
         Self::start_role(session, "", "host-resident")
     }
+    pub fn start_display(session: u32) -> Result<Self> {
+        Self::start_role(session, "", "display-agent")
+    }
     pub fn stop_gracefully(self) {
         if let Some(stop) = &self.stop {
             unsafe {
@@ -219,7 +222,7 @@ impl Agent {
         } else {
             None
         };
-        let arguments = if role == "host-resident" {
+        let arguments = if matches!(role, "host-resident" | "display-agent") {
             String::new()
         } else {
             format!(" --pipe \"{pipe}\"")

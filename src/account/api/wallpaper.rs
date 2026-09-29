@@ -53,7 +53,7 @@ impl NrdApi {
 /// Raw bytes and the file grant only: no NRD identity, signature or user token.
 pub(crate) async fn upload_wallpaper(
     grant: WallpaperGrant,
-    image: &'static [u8],
+    image: bytes::Bytes,
 ) -> Result<UploadedWallpaper> {
     let url = reqwest::Url::parse(&grant.req_url)
         .map_err(|_| anyhow::anyhow!("invalid wallpaper upload URL"))?;
@@ -86,7 +86,7 @@ pub(crate) async fn upload_wallpaper(
     let mut response = client
         .post(url)
         .header(AUTHORIZATION, authorization)
-        .body(image)
+        .body(image.clone())
         .send()
         .await
         .map_err(|_| anyhow::anyhow!("wallpaper file upload transport failed"))?;

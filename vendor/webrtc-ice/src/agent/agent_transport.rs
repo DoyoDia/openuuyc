@@ -96,6 +96,7 @@ pub(crate) struct AgentConn {
     pub(crate) bytes_received: AtomicUsize,
     pub(crate) bytes_sent: AtomicUsize,
     pub(crate) done: AtomicBool,
+    pub(crate) path_check: Option<mpsc::Sender<bool>>,
 }
 
 impl AgentConn {
@@ -110,6 +111,7 @@ impl AgentConn {
             bytes_received: AtomicUsize::new(0),
             bytes_sent: AtomicUsize::new(0),
             done: AtomicBool::new(false),
+            path_check: None,
         }
     }
     pub(crate) fn get_selected_pair(&self) -> Option<Arc<CandidatePair>> {
@@ -142,7 +144,11 @@ impl AgentConn {
 
         let checklist = self.checklist.lock().await;
         for p in &*checklist {
-            if p.state.load(Ordering::SeqCst) != CandidatePairState::Succeeded as u8 {
+            if p.state.load(Ordering::SeqCst) != CandidatePairState::Succeeded as u8
+                || p.send_blocked.load(Ordering::Acquire)
+                || p.pruned.load(Ordering::Acquire)
+                || p.write_state.load(Ordering::Acquire) != 0
+            {
                 continue;
             }
 
@@ -223,20 +229,38 @@ impl Conn for AgentConn {
             return Err(util::Error::Other("ErrIceWriteStunMessage".into()));
         }
 
-        let result = if let Some(pair) = self.get_selected_pair() {
-            pair.write(buf).await
-        } else if let Some(pair) = self.get_best_available_candidate_pair().await {
-            pair.write(buf).await
-        } else {
-            Ok(0)
+        let pair = match self.get_selected_pair() {
+            Some(pair) => pair,
+            None => self.get_best_valid_candidate_pair().await.ok_or_else(|| {
+                util::Error::ErrIcePathUnavailable("no validated candidate pair".into())
+            })?,
         };
+        if let Some(reason) = pair.blocked_send_reason() {
+            return Err(util::Error::ErrIcePathUnavailable(reason));
+        }
+        let result = pair.write(buf).await;
 
         match result {
             Ok(n) => {
-                self.bytes_sent.fetch_add(buf.len(), Ordering::SeqCst);
+                self.bytes_sent.fetch_add(n, Ordering::SeqCst);
                 Ok(n)
             }
-            Err(err) => Err(io::Error::other(err.to_string()).into()),
+            Err(err)
+                if path_io_error(&err).is_some_and(|e| e.kind() == io::ErrorKind::WouldBlock) =>
+            {
+                Err(util::Error::ErrIcePathUnavailable(err.to_string()))
+            }
+            Err(err) if recoverable_path_error(&err) => {
+                let reason = err.to_string();
+                if pair.block_failed_send(&reason) {
+                    log::warn!("ICE selected path send failed; rechecking connectivity: {pair}, reason={reason}");
+                    if let Some(wake) = &self.path_check {
+                        let _ = wake.try_send(true);
+                    }
+                }
+                Err(util::Error::ErrIcePathUnavailable(reason))
+            }
+            Err(err) => Err(util::Error::from_std(err)),
         }
     }
 
@@ -267,4 +291,40 @@ impl Conn for AgentConn {
     fn as_any(&self) -> &(dyn std::any::Any + Send + Sync) {
         self
     }
+}
+
+fn path_io_error(error: &crate::Error) -> Option<&io::Error> {
+    match error {
+        crate::Error::Io(error) => Some(&error.0),
+        crate::Error::Util(util::Error::Io(error)) => Some(&error.0),
+        _ => None,
+    }
+}
+
+fn recoverable_path_error(error: &crate::Error) -> bool {
+    // A candidate's socket may close while a concurrent send still holds that
+    // old pair. AgentConn::done, checked before sending, owns whole-ICE closure.
+    if matches!(
+        error,
+        crate::Error::Util(
+            util::Error::ErrClosedListener
+                | util::Error::ErrUseClosedNetworkConn
+                | util::Error::ErrBufferClosed
+        )
+    ) {
+        return true;
+    }
+    path_io_error(error).is_some_and(|error| {
+        matches!(
+            error.kind(),
+            io::ErrorKind::AddrNotAvailable
+                | io::ErrorKind::NetworkUnreachable
+                | io::ErrorKind::HostUnreachable
+                | io::ErrorKind::NetworkDown
+                | io::ErrorKind::ConnectionReset
+                | io::ErrorKind::ConnectionAborted
+                | io::ErrorKind::BrokenPipe
+                | io::ErrorKind::NotConnected
+        )
+    })
 }

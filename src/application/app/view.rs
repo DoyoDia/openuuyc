@@ -283,8 +283,7 @@ fn primary(label: &str) -> egui::Button<'_> {
 }
 
 fn login_button(label: &str) -> egui::Button<'_> {
-    // Button's AtomLayout otherwise inherits the form's left alignment.
-    egui::Button::new((egui::Atom::grow(), label, egui::Atom::grow())).gap(0.0)
+    crate::ui::controls::centered_button(label)
 }
 
 fn dialog_frame() -> egui::Frame {
@@ -419,9 +418,13 @@ fn login_qr_area(
     // Reserve the same square exactly once for every state. Drawing into it
     // must not advance the cursor again (Ui::put does), nor negotiate a Frame
     // width with the wider login column.
-    let (rect, _) = ui.allocate_exact_size(vec2(216.0, 216.0), Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(
+        vec2(theme::AUTH_QR_SIZE, theme::AUTH_QR_SIZE),
+        Sense::hover(),
+    );
     if let Some(texture) = texture {
-        ui.painter().rect_filled(rect, 6.0, Color32::WHITE);
+        ui.painter()
+            .rect_filled(rect, theme::CONTROL_RADIUS, Color32::WHITE);
         ui.painter().image(
             texture.id(),
             rect.shrink(12.0),
@@ -430,9 +433,13 @@ fn login_qr_area(
         );
     } else {
         ui.painter()
-            .rect_filled(rect, 8.0, crate::ui::theme::SIDEBAR);
-        ui.painter()
-            .rect_stroke(rect, 8.0, Stroke::new(1.0, LINE), egui::StrokeKind::Inside);
+            .rect_filled(rect, theme::CONTROL_RADIUS, crate::ui::theme::SIDEBAR);
+        ui.painter().rect_stroke(
+            rect,
+            theme::CONTROL_RADIUS,
+            Stroke::new(1.0, LINE),
+            egui::StrokeKind::Inside,
+        );
         if loading {
             egui::Spinner::new().paint_at(
                 ui,
@@ -464,11 +471,16 @@ fn login_surface(
             let painter = ui.painter();
             painter.rect_filled(
                 card.translate(vec2(0.0, 8.0)),
-                14.0,
+                theme::PANEL_RADIUS,
                 Color32::from_black_alpha(28),
             );
-            painter.rect_filled(card, 14.0, crate::ui::theme::SURFACE);
-            painter.rect_stroke(card, 14.0, Stroke::new(1.0, LINE), egui::StrokeKind::Inside);
+            painter.rect_filled(card, theme::PANEL_RADIUS, crate::ui::theme::SURFACE);
+            painter.rect_stroke(
+                card,
+                theme::PANEL_RADIUS,
+                Stroke::new(1.0, LINE),
+                egui::StrokeKind::Inside,
+            );
             let title = painter.layout_no_wrap(
                 crate::APP_NAME.into(),
                 FontId::proportional(crate::ui::theme::TITLE),
@@ -533,50 +545,51 @@ fn qr_form(
     status: &str,
     error: Option<&str>,
 ) -> QrAction {
-    login_qr_area(ui, texture, running);
+    let rect = login_qr_area(ui, texture, running);
+    let mut action = QrAction::None;
+    if !running && error.is_some() {
+        ui.painter()
+            .rect_filled(rect, theme::CONTROL_RADIUS, Color32::from_black_alpha(205));
+        let button = egui::Rect::from_center_size(
+            rect.center(),
+            vec2(theme::AUTH_CODE_ACTION_WIDTH, theme::CONTROL_HEIGHT),
+        );
+        let mut overlay = ui.new_child(
+            egui::UiBuilder::new()
+                .id_salt("qr-refresh-overlay")
+                .max_rect(button)
+                .layout(egui::Layout::top_down(Align::Center)),
+        );
+        if overlay
+            .add_enabled(
+                enabled,
+                login_button("刷新二维码")
+                    .fill(BLUE)
+                    .stroke(Stroke::NONE)
+                    .min_size(button.size()),
+            )
+            .clicked()
+        {
+            action = QrAction::Start;
+        }
+    }
     ui.add_space(12.0);
+    let message = error.unwrap_or(if status.is_empty() {
+        "使用 UU 远程手机端扫码"
+    } else {
+        status
+    });
     ui.add_sized(
-        [320.0, 20.0],
+        [ui.available_width(), 20.0],
         egui::Label::new(
-            RichText::new(if error.is_some() || status.is_empty() {
-                "使用 UU 远程手机端扫码"
-            } else {
-                status
-            })
-            .size(theme::COMPACT_TEXT)
-            .color(MUTED),
+            RichText::new(message)
+                .size(theme::COMPACT_TEXT)
+                .color(if error.is_some() { AMBER } else { MUTED }),
         )
         .truncate(),
     );
-    if crate::ui::controls::observe_notice_action(
-        ui.ctx(),
-        "qr-login-error",
-        "扫码登录",
-        crate::ui::controls::DialogIcon::Error,
-        error,
-        "刷新二维码",
-    ) == Some(true)
-        && enabled
-    {
-        return QrAction::Start;
-    }
-    ui.add_space(10.0);
-    if !running && error.is_some() {
-        let clicked = ui
-            .add_enabled_ui(enabled, |ui| {
-                ui.add_sized([216.0, 40.0], login_button("刷新二维码").frame(false))
-            })
-            .inner
-            .clicked();
-        if clicked {
-            return QrAction::Start;
-        }
-    } else {
-        ui.allocate_exact_size(vec2(216.0, 40.0), Sense::hover());
-    }
-    QrAction::None
+    action
 }
-
 impl DeviceCenterApp {
     fn needs_login(&self) -> bool {
         self.devices.is_none() && self.catalog.is_none()
@@ -592,6 +605,9 @@ impl DeviceCenterApp {
             }
             return;
         }
+        // Reconcile navigation before choosing the panel margins. A removed
+        // device must not leave an empty, edge-to-edge detail page behind.
+        self.reconcile_device_details();
         let previous_page = self.center_ui.page;
         self.draw_navigation(ui);
         if self.center_ui.page != previous_page
@@ -1529,20 +1545,24 @@ fn phone_form(
 ) -> PhoneAction {
     let before = phone.contact().ok();
     let mut action = PhoneAction::default();
-    ui.allocate_ui_with_layout(vec2(320.0, 0.0), egui::Layout::top_down(Align::Min), |ui| {
+    let width = ui.available_width();
+    ui.allocate_ui_with_layout(vec2(width, 0.0), egui::Layout::top_down(Align::Min), |ui| {
         ui.spacing_mut().item_spacing = vec2(8.0, 6.0);
         ui.label(RichText::new("手机号").color(MUTED));
         ui.add_enabled_ui(!busy, |ui| {
             ui.horizontal(|ui| {
                 ui.add_sized(
-                    [64.0, theme::CONTROL_HEIGHT],
+                    [theme::AUTH_COUNTRY_WIDTH, theme::CONTROL_HEIGHT],
                     singleline_input(&mut phone.country)
                         .hint_text("+86")
                         .char_limit(6)
                         .horizontal_align(Align::Center),
                 );
                 ui.add_sized(
-                    [248.0, theme::CONTROL_HEIGHT],
+                    [
+                        width - theme::AUTH_COUNTRY_WIDTH - 8.0,
+                        theme::CONTROL_HEIGHT,
+                    ],
                     singleline_input(&mut phone.mobile)
                         .hint_text("请输入手机号")
                         .char_limit(24),
@@ -1559,7 +1579,10 @@ fn phone_form(
         ui.horizontal(|ui| {
             ui.add_enabled_ui(!busy, |ui| {
                 let response = ui.add_sized(
-                    [184.0, theme::CONTROL_HEIGHT],
+                    [
+                        width - theme::AUTH_CODE_ACTION_WIDTH - 8.0,
+                        theme::CONTROL_HEIGHT,
+                    ],
                     singleline_input(&mut phone.code)
                         .hint_text("6位短信验证码")
                         .char_limit(6),
@@ -1579,7 +1602,8 @@ fn phone_form(
             action.send = ui
                 .add_enabled(
                     !busy && remaining == 0 && phone.agreed && phone.contact().is_ok(),
-                    login_button(&label).min_size(vec2(128.0, 40.0)),
+                    login_button(&label)
+                        .min_size(vec2(theme::AUTH_CODE_ACTION_WIDTH, theme::CONTROL_HEIGHT)),
                 )
                 .clicked();
         });
@@ -1607,7 +1631,7 @@ fn phone_form(
         action.submit |= ui
             .add_enabled_ui(!busy && phone.can_submit(), |ui| {
                 ui.add_sized(
-                    [320.0, 42.0],
+                    [width, theme::CONTROL_HEIGHT],
                     login_button(if busy && !phone.sending {
                         "正在登录…"
                     } else {
@@ -1635,7 +1659,10 @@ fn phone_form(
         if can_cancel {
             ui.add_space(8.0);
             action.cancel = ui
-                .add_sized([320.0, 28.0], login_button("取消").frame(false))
+                .add_sized(
+                    [width, theme::CONTROL_HEIGHT],
+                    login_button("取消").frame(false),
+                )
                 .clicked();
         }
     });

@@ -31,6 +31,11 @@ const PACKAGE: Package = Package {
     files: FILES,
     repair: true,
 };
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "虚拟显示驱动仍有显示器。请先接通其他显示器、结束远程连接并等待兜底屏回收，再更换或卸载驱动"
+)]
+pub(crate) struct DriverInUse;
 pub(crate) fn status() -> Result<Status> {
     let mut status = PACKAGE.status()?;
     if status.ready && Driver::device_instance().is_err() {
@@ -40,13 +45,22 @@ pub(crate) fn status() -> Result<Status> {
     Ok(status)
 }
 pub(crate) fn preflight(operation: Operation) -> Result<()> {
-    if operation == Operation::Uninstall || PACKAGE.status()?.installed {
+    let current = status()?;
+    // Updating only the application/service leaves a current driver and its
+    // persistent screen intact. Occupancy matters only if we replace/remove it.
+    if operation == Operation::Install && current.ready {
+        return Ok(());
+    }
+    if operation == Operation::Uninstall || current.installed {
         drop(removal_plan()?);
     }
     Ok(())
 }
 pub(crate) fn install() -> Result<bool> {
     let _serial = super::recovery::Serial::acquire()?;
+    if status()?.ready {
+        return Ok(false);
+    }
     preflight(Operation::Install)?;
     PACKAGE.install()
 }
@@ -63,10 +77,9 @@ fn removal_plan() -> Result<Removal> {
                 .trim_start_matches(r"\\?\")
                 .trim_start_matches(r"\??\");
             let owner = path.split("#{").next().unwrap_or(path).replace('#', r"\");
-            ensure!(
-                !owner.eq_ignore_ascii_case(&instance),
-                "虚拟显示驱动仍有显示器，请先结束使用它的连接或程序"
-            );
+            if owner.eq_ignore_ascii_case(&instance) {
+                return Err(DriverInUse.into());
+            }
         }
         if Driver::device_instance().is_ok() {
             drop(Driver::open().context("虚拟显示驱动正在使用中，无法卸载")?);

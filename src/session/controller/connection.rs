@@ -32,6 +32,51 @@ pub(super) struct ResolvedConnection {
 }
 
 impl ResolvedConnection {
+    async fn wait_for_updated_target(
+        &self,
+        reporter: Option<&ConnectionProgressReporter>,
+        cancel: &CancellationToken,
+    ) -> Result<()> {
+        // Only a previously authenticated ReportError(-6) enables this wait.
+        // It polls ownership/readiness, never reissues an installation or forces
+        // a takeover. Closing the retained viewer cancels the wait immediately.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+        let operation = async {
+            let mut readiness = crate::features::remote_upgrade::UpdateReadiness::default();
+            loop {
+                let devices = self.client.list_devices().await?;
+                let device = devices
+                    .my_binded_devices
+                    .iter()
+                    .find(|d| d.device_id == self.target_device_id)
+                    .context("更新后设备已不在当前账号中")?;
+                device.validated_device_id()?;
+                anyhow::ensure!(device.platform == 1, "更新后的设备类型已变化");
+                if readiness.observe(
+                    device.is_connected() && device.controlled_support && device.controllable,
+                    std::time::Instant::now(),
+                ) {
+                    tracing::info!(
+                        "updated target advertises readiness; attempting media connection"
+                    );
+                    return Ok(());
+                }
+                report_progress(
+                    reporter,
+                    1,
+                    "等待被控端更新完成",
+                    "更新尚未完成或被控端正在恢复上线，可关闭窗口取消等待",
+                );
+                tokio::time::sleep(crate::features::remote_upgrade::UPDATE_PROBE_INTERVAL).await;
+            }
+        };
+        cancellable(cancel, async {
+            tokio::time::timeout_at(deadline, operation)
+                .await
+                .context("等待被控端更新完成超时，请稍后重新连接")?
+        })
+        .await
+    }
     pub(super) async fn connect(
         &mut self,
         reporter: Option<&ConnectionProgressReporter>,
@@ -40,6 +85,9 @@ impl ResolvedConnection {
     ) -> Result<ControllerConnection> {
         let key = shared::key(&self.controller_device_id, &self.target_device_id);
         let _gate = shared::acquire_connection(&key, cancel).await?;
+        if self.refresh_after_upgrade && self.assist.is_none() {
+            self.wait_for_updated_target(reporter, cancel).await?;
+        }
         if self.assist.is_none()
             && let Some(session) = shared::get(&key)
         {

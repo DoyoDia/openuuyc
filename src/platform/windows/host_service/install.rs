@@ -39,6 +39,14 @@ fn command() -> Result<String> {
 struct Images {
     client: String,
     host: String,
+    #[serde(default)]
+    update_notice: bool,
+}
+pub(crate) fn supports_update_notice() -> Result<bool> {
+    deployment::verify_directory(&directory()?)?;
+    let registered = images()?;
+    Ok(registered.update_notice
+        && super::process::image_hash(&deployment::image()?)? == registered.host)
 }
 fn images() -> Result<Images> {
     let path = directory()?.join("images.json");
@@ -214,6 +222,10 @@ fn stop(service: &Sc) -> Result<()> {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("被控服务仍有活动的输入或画面会话，请断开连接后重试")]
+pub(crate) struct ActiveSession;
+
 // A repair/uninstall cannot invalidate a live input or capture agent.
 fn ensure_idle(service: &Sc) -> Result<()> {
     use windows::Win32::System::Diagnostics::ToolHelp::*;
@@ -235,6 +247,7 @@ fn ensure_idle(service: &Sc) -> Result<()> {
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(0);
+    let display_agent = super::displays::maintenance_pid(state.dwProcessId)?.unwrap_or(0);
     let snapshot = super::pipe::Handle(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)? });
     let mut entry = PROCESSENTRY32W {
         dwSize: size_of::<PROCESSENTRY32W>() as u32,
@@ -247,18 +260,19 @@ fn ensure_idle(service: &Sc) -> Result<()> {
             .iter()
             .position(|c| *c == 0)
             .unwrap_or(entry.szExeFile.len());
-        ensure!(
-            entry.th32ProcessID == resident
-                || entry.th32ParentProcessID != state.dwProcessId
-                || !String::from_utf16_lossy(&entry.szExeFile[..len]).eq_ignore_ascii_case(
-                    deployment::image()?
-                        .file_name()
-                        .context("安装文件名无效")?
-                        .to_str()
-                        .context("安装文件名无效")?
-                ),
-            "被控服务仍有活动会话，请先断开"
-        );
+        if !(entry.th32ProcessID == resident
+            || entry.th32ProcessID == display_agent
+            || entry.th32ParentProcessID != state.dwProcessId
+            || !String::from_utf16_lossy(&entry.szExeFile[..len]).eq_ignore_ascii_case(
+                deployment::image()?
+                    .file_name()
+                    .context("安装文件名无效")?
+                    .to_str()
+                    .context("安装文件名无效")?,
+            ))
+        {
+            return Err(ActiveSession.into());
+        }
         result = unsafe { Process32NextW(snapshot.0, &mut entry) };
     }
     if let Err(e) = result {
@@ -322,6 +336,7 @@ pub(crate) fn install(allow_sas: bool) -> Result<bool> {
     let registered = Images {
         client: super::process::image_hash(&std::env::current_exe()?)?,
         host: super::process::image_hash(&std::env::current_exe()?)?,
+        update_notice: true,
     };
     let manager = manager(SC_MANAGER_CONNECT | SC_MANAGER_CREATE_SERVICE)?;
     let existing = service(
@@ -524,7 +539,7 @@ pub(crate) fn uninstall() -> Result<bool> {
     // One image now serves both the ordinary application and privileged roles.
     // Uninstall the service, not the running application. In particular, never
     // queue deletion of its stable path: a later reinstall could use that path.
-    for name in ["images.json", "resident.pid"] {
+    for name in ["images.json", "resident.pid", "display-agent.json"] {
         let file = directory.join(name);
         if file.exists() {
             std::fs::remove_file(file)?;

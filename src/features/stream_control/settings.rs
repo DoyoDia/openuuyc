@@ -570,6 +570,7 @@ pub(super) fn update_screen_baseline(state: &mut StreamControlState, screens: Pb
         .observe(state.screens_generation, &state.screens);
     for screen in &state.screens {
         tracing::debug!(screen_id = screen.id, name = %screen.name,
+            screen_type = screen.display.screen_type,
             primary = screen.primary, track = screen.video_track_index,
             width = screen.width, height = screen.height, "remote screen mapping");
     }

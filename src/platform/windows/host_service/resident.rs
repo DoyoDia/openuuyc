@@ -35,7 +35,10 @@ pub(crate) fn managed() -> bool {
 pub(crate) enum Request {
     Resume,
     Pause,
+    PrepareUpdate,
+    CancelUpdate,
     Snapshot,
+    RefreshPublication,
     Initialize {
         force: bool,
     },
@@ -64,6 +67,7 @@ pub(crate) enum Request {
 }
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Snapshot {
+    pub publication: crate::account::reporting::Snapshot,
     pub account: String,
     pub online: PresenceState,
     pub allowed: bool,
@@ -589,6 +593,13 @@ async fn run_account(mut incoming: Incoming, running: &impl Fn() -> bool) -> Res
             }
             if let Some((request, reply)) = command {
                 let result: Result<Reply> = match request {
+                    Request::PrepareUpdate => {
+                        if let Some(current)=&client {current.host.prepare_update().await.map(|_|Reply::Done)} else {Ok(Reply::Done)}
+                    },
+                    Request::CancelUpdate => {
+                        if let Some(current)=&client {current.host.cancel_update();}
+                        Ok(Reply::Done)
+                    },
                     Request::Initialize { force } => {
                         let handle = device.handle();
                         initializers.spawn(async move {
@@ -616,6 +627,7 @@ async fn run_account(mut incoming: Incoming, running: &impl Fn() -> bool) -> Res
                             let account = current.account_generation();
                             match request {
                                 Request::Snapshot => Ok(Reply::Snapshot(Box::new(Snapshot {
+                                    publication: crate::account::reporting::snapshot(),
                                     account,
                                     online: online.clone(),
                                     allowed: current.host.allowed(),
@@ -626,6 +638,7 @@ async fn run_account(mut incoming: Incoming, running: &impl Fn() -> bool) -> Res
                                     status: current.host.status(),
                                     capabilities: current.host.capabilities().map(|v| (*v).clone()),
                                 }))),
+                                Request::RefreshPublication => {crate::account::reporting::REFRESH.notify_one();Ok(Reply::Done)},
                                 Request::Settings {
                                     account: expected,
                                     allowed,

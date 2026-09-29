@@ -377,7 +377,7 @@ pub(super) async fn gui_worker_loop(
                             LoginMethod::Phone,
                             generation,
                             attempt,
-                            Err(error.to_string()),
+                            Err(error),
                         ));
                         continue;
                     }
@@ -469,6 +469,7 @@ pub(super) async fn gui_worker_loop(
                     }
                 }
                 GuiCommand::PrepareExit => {
+                    let update_exit = super::instance::take_update_exit();
                     let result = if crate::platform::windows::host_service::resident::managed() {
                         crate::platform::windows::host_service::resident::request(
                             crate::platform::windows::host_service::resident::Request::Pause,
@@ -476,6 +477,12 @@ pub(super) async fn gui_worker_loop(
                         .await
                         .map(|_| ())
                         .map_err(|e| format!("{e:#}"))
+                    } else if update_exit && let Some(current) = &client {
+                        current
+                            .host
+                            .prepare_update()
+                            .await
+                            .map_err(|e| format!("{e:#}"))
                     } else {
                         Ok(())
                     };
@@ -640,7 +647,7 @@ pub(super) async fn gui_worker_loop(
                 method,
                 login.generation,
                 login.attempt,
-                result.map_err(|error| format!("{error:#}")),
+                result,
             ));
         }
 

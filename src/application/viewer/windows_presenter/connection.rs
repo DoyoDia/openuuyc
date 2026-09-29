@@ -505,7 +505,7 @@ impl ConnectingWindowsRunner {
         if let Some((size, maximized, fullscreen)) = self.audio_restore_geometry.take() {
             let _ = window.request_inner_size(size);
             window.set_maximized(maximized);
-            window.set_fullscreen(fullscreen);
+            crate::ui::chrome::set_fullscreen(&window, fullscreen);
         } else if window
             .inner_size()
             .to_logical::<f64>(window.scale_factor())
@@ -692,7 +692,7 @@ impl WindowsConnectionApp {
 }
 
 fn configure_audio_window(window: &Window, compact: bool) {
-    window.set_fullscreen(None);
+    crate::ui::chrome::set_fullscreen(window, None);
     window.set_maximized(false);
     window.set_resizable(false);
     window.set_enabled_buttons(
