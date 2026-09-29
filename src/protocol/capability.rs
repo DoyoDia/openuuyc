@@ -5,6 +5,10 @@
 
 use serde::{Deserialize, Serialize};
 
+// UU SDK VideoCodec::AV1. Application CaptureSetting's use of this value is
+// enabled only for two AV1-capable peers; older peers still negotiate 1/2.
+pub(crate) const AV1_CODEC_ID: i32 = 5;
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub(crate) struct CodecCapability {
@@ -68,7 +72,19 @@ pub(crate) struct DualCapability {
 impl DualCapability {
     pub(crate) fn negotiate(local: &DeviceCapability, remote: DeviceCapability) -> Self {
         let mut rows = Vec::with_capacity(8);
-        for video_codec in [1, 2] {
+        for video_codec in [1, 2, AV1_CODEC_ID] {
+            if video_codec == AV1_CODEC_ID
+                && (!local
+                    .video_codec_capability
+                    .iter()
+                    .any(|c| c.video_codec == AV1_CODEC_ID)
+                    || !remote
+                        .video_codec_capability
+                        .iter()
+                        .any(|c| c.video_codec == AV1_CODEC_ID))
+            {
+                continue;
+            }
             for chroma_sampling in [1, 3] {
                 for bit_depth in [8, 10] {
                     let maximum = |caps: &[CodecCapability]| {
@@ -141,36 +157,40 @@ impl DualCapability {
         let minimum = if matches!(quality, 0 | 5) { 0 } else { quality };
         let h264 = self.exact(1, chroma, hdr);
         let h265 = self.exact(2, chroma, hdr);
-        for row in [h265, h264].into_iter().flatten() {
+        let av1 = self.exact(AV1_CODEC_ID, chroma, hdr);
+        for row in [av1, h265, h264].into_iter().flatten() {
             if row.valid() && row.max_frame_quality >= minimum {
                 return row;
             }
         }
-        match (
-            h265.filter(|row| row.valid()),
-            h264.filter(|row| row.valid()),
-        ) {
-            (Some(hevc), Some(avc)) => {
-                if hevc.max_frame_quality >= avc.max_frame_quality {
-                    hevc
-                } else {
-                    avc
-                }
-            }
-            (Some(row), None) | (None, Some(row)) => row,
-            (None, None) => [h265, h264]
-                .into_iter()
-                .flatten()
-                .find(|row| row.has_dimensions())
-                .unwrap_or(FrameQualityCapability {
-                    video_codec: 2,
-                    chroma_sampling: 1,
-                    bit_depth: 8,
-                    max_width: 0,
-                    max_height: 0,
-                    max_frame_quality: 0,
-                    result: -3,
-                }),
-        }
+        [av1, h265, h264]
+            .into_iter()
+            .flatten()
+            .filter(|r| r.valid())
+            .max_by_key(|r| {
+                (
+                    r.max_frame_quality,
+                    match r.video_codec {
+                        5 => 3,
+                        2 => 2,
+                        _ => 1,
+                    },
+                )
+            })
+            .or_else(|| {
+                [av1, h265, h264]
+                    .into_iter()
+                    .flatten()
+                    .find(|r| r.has_dimensions())
+            })
+            .unwrap_or(FrameQualityCapability {
+                video_codec: 2,
+                chroma_sampling: 1,
+                bit_depth: 8,
+                max_width: 0,
+                max_height: 0,
+                max_frame_quality: 0,
+                result: -3,
+            })
     }
 }

@@ -134,15 +134,7 @@ pub(crate) async fn receive_session(
                 if action.action == 7 {
                     session.stop(id).await?;
                 } else if id == -1 {
-                    session.refresh()?;
-                    let ids: Vec<_> = session
-                        .slots
-                        .iter()
-                        .filter_map(|s| s.screen.as_ref().or(s.suspended.as_ref()).map(|s| s.id))
-                        .collect();
-                    for id in ids {
-                        session.start(id).await?;
-                    }
+                    session.resume_capture().await?;
                 } else {
                     session.start(id).await?;
                 }
@@ -390,12 +382,15 @@ pub(crate) async fn receive_session(
         .slots
         .iter()
         .find_map(|s| s.screen.clone())
-        .unwrap_or_else(|| session.handshake_source());
-    let slot = &session.slots[session.active_slot(screen.id).unwrap_or(0)];
+        .or_else(|| session.handshake_source());
+    let slot = &session.slots[screen
+        .as_ref()
+        .and_then(|s| session.active_slot(s.id))
+        .unwrap_or(0)];
     super::receive(
         bytes,
         control,
-        &screen,
+        screen.as_ref(),
         &mut lock(&slot.config),
         &slot.negotiated,
     )
@@ -567,7 +562,7 @@ fn configure_media(
         )),
     }
     .encode_to_vec();
-    let result = super::receive(&bytes, false, screen, config, negotiated)?;
+    let result = super::receive(&bytes, false, Some(screen), config, negotiated)?;
     let mut errors = Vec::new();
     for bytes in result.messages {
         if let Some(PbPayload::RpcResponse(response)) =

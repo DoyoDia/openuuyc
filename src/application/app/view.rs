@@ -1145,6 +1145,7 @@ impl DeviceCenterApp {
                         .show_ui(ui, |ui| {
                             for choice in [
                                 CodecPreference::Auto,
+                                CodecPreference::Av1,
                                 CodecPreference::H265,
                                 CodecPreference::H264,
                             ] {
@@ -1247,7 +1248,7 @@ impl DeviceCenterApp {
     }
 
     fn takeover_dialog(&mut self, ctx: &egui::Context) {
-        let Some((generation, device)) = self.takeover_confirmation.take() else {
+        let Some((generation, device, audio_only)) = self.takeover_confirmation.take() else {
             return;
         };
         if generation != self.login_generation || self.logout_pending || self.mutation_pending {
@@ -1267,11 +1268,12 @@ impl DeviceCenterApp {
                         Some(device.device_id),
                         None,
                         Some(approval),
+                        audio_only,
                     );
                 }
             }
             Some(false) => {}
-            None => self.takeover_confirmation = Some((generation, device)),
+            None => self.takeover_confirmation = Some((generation, device, audio_only)),
         }
     }
 
@@ -1679,7 +1681,7 @@ impl DeviceCenterApp {
                     crate::ui::controls::DialogIcon::Warning,
                     true,
                 );
-                ui.label("当前观看将结束，本虚拟设备也会从账号中移除。");
+                ui.label("当前连接将结束，本机设备也会从账号中移除。");
                 let (accept, dismiss) = crate::ui::controls::dialog_actions(
                     ui,
                     Some(crate::ui::controls::DialogAction::new("退出登录").danger(true)),

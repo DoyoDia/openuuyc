@@ -442,7 +442,7 @@ impl Budget {
         } else {
             0.0
         };
-        (f64::from(total) * (1.0 - overhead.min(0.5))).max(30_000.0) as u32
+        (f64::from(total) * (1.0 - overhead.min(0.5))) as u32
     }
     pub fn fec_demand(&mut self, rate: f64) {
         self.demand = rate.max(0.0).min(self.bwe);

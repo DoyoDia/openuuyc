@@ -94,6 +94,11 @@ pub(in crate::application::viewer) fn run_player(
 }
 
 pub(crate) struct ConnectingWindowsRunner {
+    audio_restore_geometry: Option<(
+        winit::dpi::PhysicalSize<u32>,
+        bool,
+        Option<winit::window::Fullscreen>,
+    )>,
     pub(in crate::application::viewer) embedded: bool,
     pub(super) screens: Option<ScreenWindows>,
     pub(in crate::application::viewer) preferences: ViewerPreferences,
@@ -363,6 +368,7 @@ impl ConnectingWindowsRunner {
         embedded: bool,
     ) -> Self {
         Self {
+            audio_restore_geometry: None,
             attributes: WindowAttributes::default()
                 .with_visible(false)
                 .with_title(format!("{}{}", crate::VIEWER_TITLE_PREFIX, config.alias))
@@ -421,6 +427,19 @@ impl ConnectingWindowsRunner {
             }
             match event {
                 ViewerWindowEvent::Close => self.close_requested = true,
+                ViewerWindowEvent::Listening(audio) => {
+                    let window = self.window.as_ref().context("音频窗口已关闭")?;
+                    self.audio_restore_geometry.get_or_insert_with(|| {
+                        (
+                            window.inner_size(),
+                            window.is_maximized(),
+                            window.fullscreen(),
+                        )
+                    });
+                    configure_audio_window(window, false);
+                    self.connecting.as_mut().context("音频界面尚未准备")?.audio = Some(audio);
+                    window.request_redraw();
+                }
                 ViewerWindowEvent::Playing(session) => self.start_playing(*session)?,
                 ViewerWindowEvent::Reconnect {
                     alias,
@@ -450,6 +469,10 @@ impl ConnectingWindowsRunner {
                         .window
                         .as_ref()
                         .context("player window closed during reconnect")?;
+                    if !window.is_resizable() {
+                        restore_video_window_constraints(window);
+                        let _ = window.request_inner_size(LogicalSize::new(1280.0, 760.0));
+                    }
                     window.set_title(&format!("{}{}", crate::VIEWER_TITLE_PREFIX, self.alias));
                     let (mut app, new_display) = WindowsConnectionApp::new(
                         window,
@@ -478,6 +501,19 @@ impl ConnectingWindowsRunner {
             .window
             .take()
             .context("connection/player window is unavailable")?;
+        restore_video_window_constraints(&window);
+        if let Some((size, maximized, fullscreen)) = self.audio_restore_geometry.take() {
+            let _ = window.request_inner_size(size);
+            window.set_maximized(maximized);
+            window.set_fullscreen(fullscreen);
+        } else if window
+            .inner_size()
+            .to_logical::<f64>(window.scale_factor())
+            .width
+            < 760.0
+        {
+            let _ = window.request_inner_size(LogicalSize::new(1280.0, 760.0));
+        }
         let connecting = self
             .connecting
             .take()
@@ -508,6 +544,7 @@ impl ConnectingWindowsRunner {
 }
 
 pub(in crate::application::viewer) struct WindowsConnectionApp {
+    audio: Option<crate::application::viewer::AudioView>,
     pub(in crate::application::viewer) progress: ConnectionProgressApp,
     pub(in crate::application::viewer) presenter: UiPresenter,
     pub(in crate::application::viewer) egui_context: egui::Context,
@@ -553,6 +590,7 @@ impl WindowsConnectionApp {
         let presenter = UiPresenter::from_device(window, renderer_device, renderer_context)?;
         Ok((
             Self {
+                audio: None,
                 progress: ConnectionProgressApp::new(alias, receiver),
                 presenter,
                 egui_context,
@@ -586,17 +624,36 @@ impl WindowsConnectionApp {
     }
 
     pub(in crate::application::viewer) fn render(&mut self, window: &Window) -> Result<()> {
+        self.progress.drain();
+        if matches!(
+            self.progress.current.state,
+            crate::application::viewer::ConnectionProgressState::Failed
+        ) {
+            self.audio = None;
+        }
         let started = Instant::now();
         let input = self.egui_winit.take_egui_input(window);
         let mut resize = None;
         let output = self.egui_context.run_ui(input, |ui| {
             resize = borderless_resize(ui, window, None);
             title_bar_panel(ui, "connection-window-chrome", title_bar_height(), |ui| {
-                self.close_requested |= window_title_bar(ui, window, &self.progress.alias, None);
+                self.close_requested |=
+                    window_title_bar(ui, window, &self.progress.alias, None, self.audio.is_none());
             });
-            self.progress.draw(ui);
+            if let Some(audio) = &mut self.audio {
+                self.close_requested |= audio.show(ui);
+            } else {
+                self.progress.draw(ui);
+            }
             crate::ui::controls::show_notices(ui.ctx());
         });
+        if let Some(compact) = self
+            .audio
+            .as_mut()
+            .and_then(|audio| audio.take_layout_change())
+        {
+            configure_audio_window(window, compact);
+        }
         let (renderer_output, platform_output, viewports) = egui_directx11::split_output(output);
         let immediate = viewports
             .get(&egui::ViewportId::ROOT)
@@ -632,4 +689,31 @@ impl WindowsConnectionApp {
         }
         Ok(())
     }
+}
+
+fn configure_audio_window(window: &Window, compact: bool) {
+    window.set_fullscreen(None);
+    window.set_maximized(false);
+    window.set_resizable(false);
+    window.set_enabled_buttons(
+        winit::window::WindowButtons::CLOSE | winit::window::WindowButtons::MINIMIZE,
+    );
+    let [width, height] = if compact {
+        crate::ui::theme::AUDIO_COMPACT_SIZE
+    } else {
+        crate::ui::theme::AUDIO_WINDOW_SIZE
+    };
+    let size = LogicalSize::new(width, height);
+    // Clear the previous mode's limits before installing the new fixed size.
+    window.set_min_inner_size(None::<LogicalSize<f32>>);
+    window.set_max_inner_size(None::<LogicalSize<f32>>);
+    let _ = window.request_inner_size(size);
+    window.set_min_inner_size(Some(size));
+    window.set_max_inner_size(Some(size));
+}
+fn restore_video_window_constraints(window: &Window) {
+    window.set_max_inner_size(None::<LogicalSize<f32>>);
+    window.set_resizable(true);
+    window.set_enabled_buttons(winit::window::WindowButtons::all());
+    window.set_min_inner_size(Some(LogicalSize::new(760.0, 520.0)));
 }

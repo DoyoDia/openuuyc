@@ -174,7 +174,9 @@ impl Encoder {
                 "InitDX11",
             )?;
             let mut component = ptr::null_mut();
-            let id = wide(if format.codec == Codec::H264 {
+            let id = wide(if format.codec == Codec::Av1 {
+                b"AMFVideoEncoder_AV1\0"
+            } else if format.codec == Codec::H264 {
                 b"AMFVideoEncoderVCE_AVC\0"
             } else {
                 b"AMFVideoEncoder_HEVC\0"
@@ -206,100 +208,104 @@ impl Encoder {
             let rate = this.initial_rate(rate);
             this.rate = rate;
             this.frame_rate = super::encoder_rate::Controller::new(rate);
-            this.set_initial(b"Usage\0", b"HevcUsage\0", integer(usage))?;
-            this.set_initial(
-                b"FrameSize\0",
-                b"HevcFrameSize\0",
-                a::AMFVariantStruct {
-                    type_: 5,
-                    __bindgen_anon_1: a::AMFVariantStruct__bindgen_ty_1 {
-                        sizeValue: a::AMFSize {
-                            width: size.0 as i32,
-                            height: size.1 as i32,
+            if format.codec == Codec::Av1 {
+                this.configure_av1(size, rate)?;
+            } else {
+                this.set_initial(b"Usage\0", b"HevcUsage\0", integer(usage))?;
+                this.set_initial(
+                    b"FrameSize\0",
+                    b"HevcFrameSize\0",
+                    a::AMFVariantStruct {
+                        type_: 5,
+                        __bindgen_anon_1: a::AMFVariantStruct__bindgen_ty_1 {
+                            sizeValue: a::AMFSize {
+                                width: size.0 as i32,
+                                height: size.1 as i32,
+                            },
                         },
                     },
-                },
-            )?;
-            this.set_initial(
-                b"QualityPreset\0",
-                b"HevcQualityPreset\0",
-                integer(if format.codec == Codec::H265 { 10 } else { 1 }),
-            )?;
-            this.set_initial(
-                b"RateControlMethod\0",
-                b"HevcRateControlMethod\0",
-                integer(2),
-            )?;
-            this.set_initial(b"FrameRate\0", b"HevcFrameRate\0", frame_rate(rate.fps))?;
-            this.set_initial(
-                b"TargetBitrate\0",
-                b"HevcTargetBitrate\0",
-                integer(rate.target.into()),
-            )?;
-            this.set_initial(
-                b"PeakBitrate\0",
-                b"HevcPeakBitrate\0",
-                integer(rate.peak.max(rate.target).into()),
-            )?;
-            this.set_initial(
-                b"VBVBufferSize\0",
-                b"HevcVBVBufferSize\0",
-                integer(vbv(rate)),
-            )?;
-            this.set_initial(b"EnableVBAQ\0", b"HevcEnableVBAQ\0", boolean(true))?;
-            this.set_initial(b"EnforceHRD\0", b"HevcEnforceHRD\0", boolean(false))?;
-            this.set_initial(
-                b"HighMotionQualityBoostEnable\0",
-                b"HevcHighMotionQualityBoostEnable\0",
-                boolean(false),
-            )?;
-            this.set_initial(b"QueryTimeout\0", b"HevcQueryTimeout\0", integer(10))?;
-            if format.codec == Codec::H264 {
-                for (name, value) in [
-                    (b"BPicturesPattern\0".as_slice(), integer(0)),
-                    (b"IDRPeriod\0", integer(0)),
-                    (b"SlicesPerFrame\0", integer(1)),
-                    (b"CABACEnable\0", integer(1)),
-                    (b"DeBlockingFilter\0", boolean(true)),
-                    (b"EnableVBAQ\0", boolean(true)),
-                ] {
-                    this.set_initial(name, name, value)?;
+                )?;
+                this.set_initial(
+                    b"QualityPreset\0",
+                    b"HevcQualityPreset\0",
+                    integer(if format.codec == Codec::H265 { 10 } else { 1 }),
+                )?;
+                this.set_initial(
+                    b"RateControlMethod\0",
+                    b"HevcRateControlMethod\0",
+                    integer(2),
+                )?;
+                this.set_initial(b"FrameRate\0", b"HevcFrameRate\0", frame_rate(rate.fps))?;
+                this.set_initial(
+                    b"TargetBitrate\0",
+                    b"HevcTargetBitrate\0",
+                    integer(rate.target.into()),
+                )?;
+                this.set_initial(
+                    b"PeakBitrate\0",
+                    b"HevcPeakBitrate\0",
+                    integer(rate.peak.max(rate.target).into()),
+                )?;
+                this.set_initial(
+                    b"VBVBufferSize\0",
+                    b"HevcVBVBufferSize\0",
+                    integer(vbv(rate)),
+                )?;
+                this.set_initial(b"EnableVBAQ\0", b"HevcEnableVBAQ\0", boolean(true))?;
+                this.set_initial(b"EnforceHRD\0", b"HevcEnforceHRD\0", boolean(false))?;
+                this.set_initial(
+                    b"HighMotionQualityBoostEnable\0",
+                    b"HevcHighMotionQualityBoostEnable\0",
+                    boolean(false),
+                )?;
+                this.set_initial(b"QueryTimeout\0", b"HevcQueryTimeout\0", integer(10))?;
+                if format.codec == Codec::H264 {
+                    for (name, value) in [
+                        (b"BPicturesPattern\0".as_slice(), integer(0)),
+                        (b"IDRPeriod\0", integer(0)),
+                        (b"SlicesPerFrame\0", integer(1)),
+                        (b"CABACEnable\0", integer(1)),
+                        (b"DeBlockingFilter\0", boolean(true)),
+                        (b"EnableVBAQ\0", boolean(true)),
+                    ] {
+                        this.set_initial(name, name, value)?;
+                    }
+                } else {
+                    for (name, value) in [
+                        (b"HevcColorBitDepth\0".as_slice(), i64::from(format.depth)),
+                        (b"HevcHeaderInsertionMode\0", 2),
+                        (b"HevcOutputMode\0", 0),
+                        (b"HevcGOPSize\0", 1_000_000),
+                        (b"HevcSlicesPerFrame\0", 1),
+                    ] {
+                        this.set_initial(name, name, integer(value))?;
+                    }
                 }
-            } else {
-                for (name, value) in [
-                    (b"HevcColorBitDepth\0".as_slice(), i64::from(format.depth)),
-                    (b"HevcHeaderInsertionMode\0", 2),
-                    (b"HevcOutputMode\0", 0),
-                    (b"HevcGOPSize\0", 1_000_000),
-                    (b"HevcSlicesPerFrame\0", 1),
-                ] {
-                    this.set_initial(name, name, integer(value))?;
+                let color = format.color(None);
+                if format.codec == Codec::H265 {
+                    this.enable_multi_hw();
                 }
+                this.set_initial(
+                    b"OutColorPrimaries\0",
+                    b"HevcOutColorPrimaries\0",
+                    integer(color.primaries.into()),
+                )?;
+                this.set_initial(
+                    a::AMF_VIDEO_ENCODER_OUTPUT_TRANSFER_CHARACTERISTIC,
+                    a::AMF_VIDEO_ENCODER_HEVC_OUTPUT_TRANSFER_CHARACTERISTIC,
+                    integer(color.transfer.into()),
+                )?;
+                this.set_initial(
+                    b"OutMatrixCoeff\0",
+                    b"HevcOutMatrixCoeff\0",
+                    integer(color.matrix.into()),
+                )?;
+                this.set_initial(
+                    b"FullRangeColor\0",
+                    b"HevcNominalRange\0",
+                    boolean(color.range == 2),
+                )?;
             }
-            let color = format.color(None);
-            if format.codec == Codec::H265 {
-                this.enable_multi_hw();
-            }
-            this.set_initial(
-                b"OutColorPrimaries\0",
-                b"HevcOutColorPrimaries\0",
-                integer(color.primaries.into()),
-            )?;
-            this.set_initial(
-                a::AMF_VIDEO_ENCODER_OUTPUT_TRANSFER_CHARACTERISTIC,
-                a::AMF_VIDEO_ENCODER_HEVC_OUTPUT_TRANSFER_CHARACTERISTIC,
-                integer(color.transfer.into()),
-            )?;
-            this.set_initial(
-                b"OutMatrixCoeff\0",
-                b"HevcOutMatrixCoeff\0",
-                integer(color.matrix.into()),
-            )?;
-            this.set_initial(
-                b"FullRangeColor\0",
-                b"HevcNominalRange\0",
-                boolean(color.range == 2),
-            )?;
             let native = match (format.chroma, format.depth) {
                 (1, 8) => 1,
                 (1, 10) => 10,
@@ -336,7 +342,9 @@ impl Encoder {
                 )?;
                 let caps = Owned::<a::AMFCaps>::take(caps)?;
                 let mut value = a::AMFVariantStruct::default();
-                let name = if self.format.codec == Codec::H265 {
+                let name = if self.format.codec == Codec::Av1 {
+                    b"Av1MaxBitrate\0".as_slice()
+                } else if self.format.codec == Codec::H265 {
                     b"HevcMaxBitrate\0".as_slice()
                 } else {
                     b"MaxBitrate\0".as_slice()
@@ -383,7 +391,15 @@ impl Encoder {
         Ok(())
     }
     fn set(&self, avc: &[u8], hevc: &[u8], value: a::AMFVariantStruct) -> Result<()> {
-        let name = wide(if self.format.codec == Codec::H264 {
+        let av1;
+        let name = wide(if self.format.codec == Codec::Av1 {
+            if avc.starts_with(b"Av1") {
+                avc
+            } else {
+                av1 = [b"Av1".as_slice(), avc].concat();
+                &av1
+            }
+        } else if self.format.codec == Codec::H264 {
             avc
         } else {
             hevc
@@ -399,6 +415,68 @@ impl Encoder {
                 &String::from_utf16_lossy(&name),
             )
         }
+    }
+    fn configure_av1(&self, size: (u32, u32), rate: Rate) -> Result<()> {
+        let color = self.format.color(None);
+        for (name, value) in [
+            (b"Av1Usage\0".as_slice(), 2),
+            (b"Av1EncodingLatencyMode\0", 3),
+            (b"Av1QualityPreset\0", 100),
+            (b"Av1Profile\0", 1),
+            (
+                b"Av1OutputColorProfile\0",
+                if self.format.hdr() { 5 } else { 0 },
+            ),
+            (b"Av1ColorBitDepth\0", self.format.depth as i64),
+            (b"Av1RateControlMethod\0", 1),
+            (b"Av1TargetBitrate\0", rate.target as i64),
+            (b"Av1PeakBitrate\0", rate.peak.max(rate.target) as i64),
+            (
+                b"Av1VBVBufferSize\0",
+                i64::from(rate.target / rate.fps.max(1)),
+            ),
+            (b"Av1InitialVBVBufferFullness\0", 0),
+            (b"Av1GOPSize\0", 0),
+            (b"Av1HeaderInsertionMode\0", 2),
+            (b"Av1NumTemporalLayers\0", 1),
+            (b"Av1QueryTimeout\0", 10),
+            (b"Av1OutputColorPrimaries\0", color.primaries as i64),
+            (b"Av1OutputColorTransferChar\0", color.transfer as i64),
+            (b"Av1OutMatrixCoeff\0", color.matrix as i64),
+        ] {
+            self.set(name, name, integer(value))?;
+        }
+        for name in [
+            b"Av1EnablePreAnalysis\0".as_slice(),
+            b"Av1RateControlPreEncode\0",
+            b"Av1TileGroupObu\0",
+            b"Av1EnforceHRD\0",
+            b"Av1FillerData\0",
+        ] {
+            self.set(name, name, boolean(false))?;
+        }
+        // Older AV1 runtimes have no B-picture properties and only encode
+        // forward frames. On runtimes exposing them, keep reordering disabled.
+        for name in [
+            b"Av1MaxConsecutiveBPictures\0".as_slice(),
+            b"Av1BPicturesPattern\0",
+        ] {
+            self.set_initial(name, name, integer(0))?;
+        }
+        self.set(
+            b"Av1FrameSize\0",
+            b"Av1FrameSize\0",
+            a::AMFVariantStruct {
+                type_: 5,
+                __bindgen_anon_1: a::AMFVariantStruct__bindgen_ty_1 {
+                    sizeValue: a::AMFSize {
+                        width: size.0 as i32,
+                        height: size.1 as i32,
+                    },
+                },
+            },
+        )?;
+        self.set(b"Av1FrameRate\0", b"Av1FrameRate\0", frame_rate(rate.fps))
     }
     fn enable_multi_hw(&self) {
         let result = (|| -> Result<()> {
@@ -515,7 +593,9 @@ impl Encoder {
                 b"HevcVBVBufferSize\0",
                 integer(
                     vbv(rate)
-                        * if rate.peak.max(rate.target) < 120_000_000 {
+                        * if self.format.codec != Codec::Av1
+                            && rate.peak.max(rate.target) < 120_000_000
+                        {
                             5
                         } else {
                             1
@@ -578,6 +658,11 @@ impl Encoder {
                             (b"ForcePictureType\0", integer(2)),
                             (b"InsertSPS\0", boolean(true)),
                             (b"InsertPPS\0", boolean(true)),
+                        ]
+                    } else if self.format.codec == Codec::Av1 {
+                        vec![
+                            (b"Av1ForceFrameType\0", integer(1)),
+                            (b"Av1ForceInsertSequenceHeader\0", boolean(true)),
                         ]
                     } else {
                         vec![
@@ -671,7 +756,9 @@ impl Encoder {
                 "AMF输出码流无效"
             );
             let mut kind = a::AMFVariantStruct::default();
-            let name = wide(if self.format.codec == Codec::H264 {
+            let name = wide(if self.format.codec == Codec::Av1 {
+                b"Av1OutputFrameType\0"
+            } else if self.format.codec == Codec::H264 {
                 b"OutputDataType\0"
             } else {
                 b"HevcOutputDataType\0"

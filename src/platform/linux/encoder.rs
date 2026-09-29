@@ -5,7 +5,7 @@
 use super::capture::{Desktop, Device, Image};
 use super::cuda;
 use crate::media::encoding::software::{Encoder as SoftwareEncoder, MAXIMUM};
-use crate::media::encoding::{Backend, Capability, Codec, Format, Rate};
+use crate::media::encoding::{Backend, Capability, Codec, Format, QualityTarget, Rate};
 use anyhow::{Context, Result, bail, ensure};
 
 pub(crate) use crate::media::encoding::{Encoded, FrameTiming};
@@ -27,14 +27,14 @@ pub(crate) fn probe(
     let frame = frame.context("尚未取得所选桌面画面")?;
     let mut candidates = Vec::new();
     if crate::media::encoding::nvenc::Api::load().is_ok() {
-        for codec in [Codec::H264, Codec::H265] {
+        for codec in [Codec::H264, Codec::H265, Codec::Av1] {
             for chroma in [1, 3] {
                 let format = Format {
                     codec,
                     chroma,
                     depth: 8,
                 };
-                if Backend::Nvidia.accepts(format) {
+                if Backend::Nvidia.accepts(format) && super::nvenc::Encoder::accepts(format) {
                     candidates.push((Backend::Nvidia, format));
                 }
             }
@@ -46,6 +46,10 @@ pub(crate) fn probe(
         peak: 2_000_000,
         fps: 30,
         quality: 1,
+        quality_target: QualityTarget {
+            bitrate: 2_000_000,
+            fps: 30,
+        },
     };
     let mut result = Vec::new();
     for (backend, format) in candidates {
@@ -65,7 +69,7 @@ pub(crate) fn probe(
                     .encode(&frame.image, index * 333_333, true)?
                     .iter()
                     .find_map(|encoded| {
-                        crate::media::video_format::parse_annex_b_format(
+                        crate::media::video_format::parse_stream_format(
                             format.codec.media(),
                             &encoded.data,
                         )
@@ -74,7 +78,7 @@ pub(crate) fn probe(
                     break;
                 }
             }
-            let output = output.context("编码器未输出可验证的SPS")?;
+            let output = output.context("编码器未输出可验证的序列头")?;
             ensure!(
                 output.chroma_format_idc == format.chroma
                     && output.bit_depth_luma == format.depth
@@ -217,6 +221,10 @@ mod throughput_tests {
             peak: 20_000_000,
             fps: 60,
             quality: 4,
+            quality_target: crate::media::encoding::QualityTarget {
+                bitrate: 20_000_000,
+                fps: 60,
+            },
         };
         let mut encoder =
             super::Encoder::hardware_format(&desktop.device, size, Format::AVC, rate).unwrap();

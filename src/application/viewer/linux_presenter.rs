@@ -114,6 +114,14 @@ pub(crate) struct ConnectingWindowsRunner {
     ui_frame_interval: Duration,
     proxy: EventLoopProxy<UiEvent>,
     generation: u64,
+    /// The audio-only view, shown in place of the connection progress.
+    audio: Option<super::AudioView>,
+    /// Window geometry to restore when an audio-only session gets video.
+    audio_restore_geometry: Option<(
+        winit::dpi::PhysicalSize<u32>,
+        bool,
+        Option<winit::window::Fullscreen>,
+    )>,
 }
 
 enum Stage {
@@ -165,6 +173,8 @@ impl ConnectingWindowsRunner {
             proxy,
             embedded,
             generation: 1,
+            audio: None,
+            audio_restore_geometry: None,
         }
     }
 
@@ -283,10 +293,41 @@ impl ConnectingWindowsRunner {
                     self.exit(event_loop);
                     return;
                 }
+                ViewerWindowEvent::Listening(audio) => {
+                    let Some(window) = self.window.clone() else {
+                        return;
+                    };
+                    self.audio_restore_geometry.get_or_insert_with(|| {
+                        (
+                            window.inner_size(),
+                            window.is_maximized(),
+                            window.fullscreen(),
+                        )
+                    });
+                    configure_audio_window(&window, false);
+                    window.set_visible(true);
+                    self.audio = Some(audio);
+                    window.request_redraw();
+                }
                 ViewerWindowEvent::Playing(session) => {
                     let Some(window) = self.window.clone() else {
                         return;
                     };
+                    self.audio = None;
+                    restore_video_window_constraints(&window);
+                    if let Some((size, maximized, fullscreen)) = self.audio_restore_geometry.take()
+                    {
+                        let _ = window.request_inner_size(size);
+                        window.set_maximized(maximized);
+                        window.set_fullscreen(fullscreen);
+                    } else if window
+                        .inner_size()
+                        .to_logical::<f64>(window.scale_factor())
+                        .width
+                        < 760.0
+                    {
+                        let _ = window.request_inner_size(LogicalSize::new(1280.0, 760.0));
+                    }
                     match Player::new(*session, &window, self.proxy.clone()) {
                         Ok(player) => {
                             window.set_visible(true);
@@ -306,6 +347,13 @@ impl ConnectingWindowsRunner {
                 } => {
                     self.alias = alias.clone();
                     self.generation += 1;
+                    self.audio = None;
+                    if let Some(window) = &self.window
+                        && !window.is_resizable()
+                    {
+                        restore_video_window_constraints(window);
+                        let _ = window.request_inner_size(LogicalSize::new(1280.0, 760.0));
+                    }
                     let _ = display.send(ViewerDisplayHandle::default());
                     if let Some(shell) = self.shell.as_mut() {
                         shell.presenter.clear_video();
@@ -341,8 +389,15 @@ impl ConnectingWindowsRunner {
         let title = self.alias.clone();
         let mut close_requested = false;
         let mut placement = None;
+        if let Stage::Connecting(app) = &mut self.stage {
+            app.drain();
+            if matches!(app.current.state, super::ConnectionProgressState::Failed) {
+                self.audio = None;
+            }
+        }
         let input = shell.input.take_egui_input(&window);
         let stage = &mut self.stage;
+        let audio = &mut self.audio;
         let output = shell.context.run_ui(input, |ui| {
             let ctx = ui.ctx().clone();
             resize_regions(ui, &window, |response, direction| {
@@ -358,15 +413,23 @@ impl ConnectingWindowsRunner {
             if window.fullscreen().is_none() {
                 title_bar_panel(ui, "player-window-chrome", title_bar_height(), |ui| {
                     let bar = ui.available_rect_before_wrap();
-                    close_requested |=
-                        window_title_bar(ui, &window, &title, Some(&mut shell.move_state));
+                    close_requested |= window_title_bar(
+                        ui,
+                        &window,
+                        &title,
+                        Some(&mut shell.move_state),
+                        audio.is_none(),
+                    );
                     if let Stage::Playing(player) = stage {
                         player.title_bar_controls(ui, bar, &window);
                     }
                 });
             }
             match stage {
-                Stage::Connecting(app) => app.draw(ui),
+                Stage::Connecting(app) => match audio.as_mut() {
+                    Some(audio) => close_requested |= audio.show(ui),
+                    None => app.draw(ui),
+                },
                 Stage::Playing(player) => placement = player.draw(ui, &window),
                 Stage::Finished => {}
             }
@@ -377,6 +440,13 @@ impl ConnectingWindowsRunner {
         // staging copy inside the device -- one video frame's worth, at the
         // video's frame rate, until an allocation finally fails. The frame is
         // still taken, to keep the decoder's queue from growing instead.
+        if let Some(compact) = self
+            .audio
+            .as_mut()
+            .and_then(|audio| audio.take_layout_change())
+        {
+            configure_audio_window(&window, compact);
+        }
         let drawing = window.is_minimized() != Some(true);
         if let Stage::Playing(player) = &mut self.stage
             && let Some(frame) = player.take_frame()
@@ -675,18 +745,16 @@ impl Player {
     fn poll(&mut self) -> Result<bool> {
         self.confirm_neutral();
         self.session.ensure_running()?;
-        Ok(!mutex_lock(&self.session.frame_queue).is_empty())
+        Ok(mutex_lock(&self.session.frame_queue).is_some())
     }
 
-    /// Take the newest decoded frame, dropping anything the UI cadence skipped.
+    /// Take the newest decoded frame; the decoder already replaced any the
+    /// UI cadence skipped.
     fn take_frame(&mut self) -> Option<DecodedVideoFrame> {
-        let mut queue = mutex_lock(&self.session.frame_queue);
-        let mut frame = take_next_frame(&mut queue, &self.session.performance)?;
-        while let Some(newer) = take_next_frame(&mut queue, &self.session.performance) {
-            self.session.performance.record_dropped_present_frame();
-            frame = newer;
-        }
-        Some(frame)
+        take_next_frame(
+            &mut mutex_lock(&self.session.frame_queue),
+            &self.session.performance,
+        )
     }
 
     fn publish(&mut self, frame: &DecodedVideoFrame, transfer: Duration) {
@@ -1469,4 +1537,34 @@ fn decode_cursor(
         egui::TextureOptions::LINEAR,
     );
     Some((texture, [decoded.width(), decoded.height()], image.hotspot))
+}
+
+/// Audio-only sessions use a fixed-size window, as on Windows
+/// (`windows_presenter/connection.rs`).
+fn configure_audio_window(window: &Window, compact: bool) {
+    window.set_fullscreen(None);
+    window.set_maximized(false);
+    window.set_resizable(false);
+    window.set_enabled_buttons(
+        winit::window::WindowButtons::CLOSE | winit::window::WindowButtons::MINIMIZE,
+    );
+    let [width, height] = if compact {
+        crate::ui::theme::AUDIO_COMPACT_SIZE
+    } else {
+        crate::ui::theme::AUDIO_WINDOW_SIZE
+    };
+    let size = LogicalSize::new(width, height);
+    // Clear the previous mode's limits before installing the new fixed size.
+    window.set_min_inner_size(None::<LogicalSize<f32>>);
+    window.set_max_inner_size(None::<LogicalSize<f32>>);
+    let _ = window.request_inner_size(size);
+    window.set_min_inner_size(Some(size));
+    window.set_max_inner_size(Some(size));
+}
+
+fn restore_video_window_constraints(window: &Window) {
+    window.set_max_inner_size(None::<LogicalSize<f32>>);
+    window.set_resizable(true);
+    window.set_enabled_buttons(winit::window::WindowButtons::all());
+    window.set_min_inner_size(Some(LogicalSize::new(760.0, 520.0)));
 }

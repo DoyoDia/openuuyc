@@ -167,6 +167,14 @@ impl Session {
                     .await?;
             }
             Event::Poll => {
+                if let Some(capabilities) = self
+                    .peer
+                    .as_ref()
+                    .and_then(Peer::take_prepared_capabilities)
+                {
+                    self.capabilities = capabilities;
+                    self.send_capability(signal).await?;
+                }
                 if let Some(attempt) = self.peer.as_ref().and_then(Peer::network_change) {
                     let payload = serde_json::json!({"client_id":self.client_id,"data":{"type":"switch_network_notify","switch_network_notify":{
                         "transport_type":1,"ice_id":self.ice_id,"attempt_switch_type":attempt}}});
@@ -306,6 +314,15 @@ impl Session {
                         .cloned()
                         .context("缺少主控解码能力")?,
                 )?;
+                // OpenUUYC extension; the ordinary UU connection type stays desktop.
+                let audio_control = streamer
+                    .get("openuuyc_audio_control")
+                    .and_then(Value::as_u64)
+                    == Some(1);
+                let audio_only = streamer
+                    .get("openuuyc_audio_only")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
                 tracing::info!(client_type=options.client_type,kind=options.kind,connect_type=options.connect_type,
                     decoders=?options.decoders,formats=?remote.video_codec_capability,
                     "host incoming media capabilities");
@@ -352,26 +369,53 @@ impl Session {
                 let configuration_client = self.client.clone();
                 let task = tokio::spawn(async move {
                     let result = async {
-                        let screen = displays.prepare(options.clone()).await?;
-                        let media = lease.prepare_media(screen.clone()).await?;
-                        anyhow::ensure!(lease.requested(), "本次被控许可已失效");
-                        let capabilities = encoding_settings.select(&media.codecs)?;
-                        let prepared =
-                            desktop::Prepared::new(&options, screen, &capabilities, &remote)?;
+                        let (screen, config, negotiated, capabilities, deferred) = if audio_only {
+                            (
+                                None,
+                                crate::features::host::VideoConfig {
+                                    capturing: false,
+                                    sending: false,
+                                    ..Default::default()
+                                },
+                                Arc::new(crate::features::host::format::Negotiated::deferred()),
+                                Vec::new(),
+                                Some(crate::features::host::peer::screens::Deferred {
+                                    options: options.clone(),
+                                    remote,
+                                    encoding: encoding_settings,
+                                }),
+                            )
+                        } else {
+                            let screen = displays.prepare(options.clone()).await?;
+                            let media = lease.prepare_media(screen.clone()).await?;
+                            anyhow::ensure!(lease.requested(), "本次被控许可已失效");
+                            let capabilities = encoding_settings.select(&media.codecs)?;
+                            let prepared =
+                                desktop::Prepared::new(&options, screen, &capabilities, &remote)?;
+                            (
+                                Some(prepared.screen),
+                                prepared.config,
+                                prepared.negotiated,
+                                capabilities,
+                                None,
+                            )
+                        };
                         let mut peer = Peer::new(
-                            prepared.screen,
+                            screen,
                             owner,
                             task_cancel,
                             displays.clone(),
                             servers,
                             relay,
-                            prepared.config,
+                            config,
                             options.control_screen_reports(),
-                            prepared.negotiated,
+                            negotiated,
                             network,
                             crate::features::host::input::wire::Policy::from_client_type(
                                 options.client_type,
                             ),
+                            deferred,
+                            audio_control,
                         )
                         .await?;
                         peer.load_input_configuration(configuration_client);

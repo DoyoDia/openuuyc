@@ -223,7 +223,7 @@ impl Session {
                         .journal
                         .owned
                         .iter()
-                        .filter(|o| matches!(o.kind, 1 | 3))
+                        .filter(|o| matches!(o.kind, 1 | 3 | 4))
                         .count()
                         < 3,
                 "显示器数量已达上限"
@@ -256,7 +256,7 @@ impl Session {
         self.run(move |state, lease| {
             let index = state.owned_index(&identity)?;
             ensure!(
-                matches!(state.journal.owned[index].kind, 1 | 3),
+                matches!(state.journal.owned[index].kind, 1 | 3 | 4),
                 "不能用删除扩展屏操作退出超级屏"
             );
             ensure!(lease.requested(), "显示操作已取消");
@@ -265,6 +265,7 @@ impl Session {
             if current.targets.len() == 1
                 && current.targets[0].identity == identity
                 && !state.journal.baseline.targets.is_empty()
+                && state.journal.owned[index].kind != 4
             {
                 state.restore_layout(&state.journal.baseline, &state.journal.dpi)?;
             }
@@ -273,14 +274,63 @@ impl Session {
             if state.journal.owned[index].kind == 3 {
                 state.preferences.default_virtual = false;
             }
-            state.journal.owned.remove(index);
+            let removed = state.journal.owned.remove(index);
             // Retain the completed removal even if Windows is still publishing
             // the old active path while monitor departure is being processed.
             state.save()?;
-            state.update_preferences()?;
+            if removed.kind != 4 {
+                state.update_preferences()?;
+            }
             state.applied()
         })
         .await
+    }
+    /// Session-only hot-unplug fallback. Recheck emptiness under the display
+    /// mutation lock, and never turn this automatic action into a saved layout.
+    pub(crate) async fn create_temporary(
+        &self,
+        previous: capture::Screen,
+    ) -> Result<Option<capture::Screen>> {
+        self.run(move |state, lease| {
+            if !capture::screens()?.is_empty() {
+                return Ok(None);
+            }
+            ensure!(state.journal.owned.len() < 3, "临时显示器数量已达上限");
+            ensure!(
+                !state.journal.owned.iter().any(|s| s.kind == 4),
+                "临时显示器仍有待清理的恢复记录"
+            );
+            let size = (previous.width, previous.height);
+            validate_modes(&[size])?;
+            state
+                .create(
+                    Virtual {
+                        guid: uuid::Uuid::new_v4().to_string(),
+                        identity: None,
+                        width: size.0,
+                        height: size.1,
+                        hz: 144,
+                        dpi: 0,
+                        kind: 4,
+                        resolution_type: 1,
+                        modes: vec![size],
+                        layout: None,
+                    },
+                    lease,
+                    false,
+                )
+                .map(Some)
+        })
+        .await
+    }
+    pub(crate) fn temporary_identity(&self, screen_id: i32) -> Result<Option<String>> {
+        let state = lock(&self.state);
+        for owned in state.journal.owned.iter().filter(|o| o.kind == 4) {
+            if display::source_id(&format!("openuuyc-virtual/{}", owned.guid))? == screen_id {
+                return Ok(owned.identity.clone());
+            }
+        }
+        Ok(None)
     }
     pub(crate) async fn enter_super(
         &self,
@@ -305,8 +355,13 @@ impl Session {
                 .find(|o| o.identity.as_deref() == Some(identity.as_str()))
             {
                 owned.resolution_type = kind;
+                let temporary = owned.kind == 4;
                 state.save()?;
-                state.update_preferences()
+                if temporary {
+                    Ok(())
+                } else {
+                    state.update_preferences()
+                }
             } else {
                 state.remember_physical(&identity, Some(kind))
             }
@@ -342,6 +397,10 @@ impl Session {
             state.begin()?;
             state.intend_dpi(&target.identity, dpi)?;
             target.set_dpi(dpi, || lease.requested())?;
+            let temporary =
+                state.journal.owned.iter().any(|o| {
+                    o.kind == 4 && o.identity.as_deref() == Some(target.identity.as_str())
+                });
             if let Some(owned) = state
                 .journal
                 .owned
@@ -352,7 +411,11 @@ impl Session {
             }
             state.applied()?;
             state.remember_physical(&target.identity, None)?;
-            state.update_preferences()
+            if temporary {
+                Ok(())
+            } else {
+                state.update_preferences()
+            }
         })
         .await
     }
@@ -371,6 +434,9 @@ impl Session {
             state.cleanup()
         })
         .await?
+    }
+    pub(crate) async fn rollback_preparation(&self) -> Result<()> {
+        self.run(|state, _| state.cleanup()).await
     }
 }
 impl Drop for Session {
@@ -657,6 +723,7 @@ impl State {
     ) -> Result<capture::Screen> {
         let before = Topology::query(true)?.snapshot()?;
         let dpi = current_dpi()?;
+        let temporary = spec.kind == 4;
         let preferences = self.preferences.clone();
         let guid = spec.guid.clone();
         let result = self.create_inner(spec, lease, super_screen);
@@ -670,7 +737,9 @@ impl State {
                 remove_owned(&lock(&driver), &guid)?;
                 self.journal.owned.retain(|o| o.guid != guid);
                 self.preferences = preferences;
-                self.save_preferences()?;
+                if !temporary {
+                    self.save_preferences()?;
+                }
                 self.applied()
             })();
             if let Err(error) = recovery {
@@ -687,6 +756,16 @@ impl State {
     ) -> Result<capture::Screen> {
         let driver = self.driver()?.driver.clone();
         self.begin()?;
+        if spec.kind == 4 {
+            let available = Topology::query(false)?.targets()?;
+            // A user-unplugged target must not be re-enabled by our eventual
+            // rollback, even if it was present before earlier display edits.
+            self.journal.baseline.targets.retain(|old| {
+                available
+                    .iter()
+                    .any(|t| t.available && t.identity == old.identity)
+            });
+        }
         let before = Topology::query(true)?.snapshot()?;
         let index = self.journal.owned.len();
         self.journal.owned.push(spec.clone());
@@ -717,6 +796,16 @@ impl State {
         };
         self.journal.owned[index].identity = Some(target.identity.clone());
         self.save()?;
+        // A physical monitor may return while the IDD monitor is arriving.
+        // Preserve its current layout instead of applying the earlier empty one.
+        let mut before = if spec.kind == 4 {
+            Topology::query(true)?.snapshot()?
+        } else {
+            before
+        };
+        if spec.kind == 4 {
+            before.targets.retain(|t| t.identity != target.identity);
+        }
         let default_left = before
             .targets
             .iter()
@@ -807,7 +896,9 @@ impl State {
                 target.set_dpi(dpi, || lease.requested())?;
             }
             self.applied()?;
-            self.update_preferences()?;
+            if original.kind != 4 {
+                self.update_preferences()?;
+            }
             let mut screen = find_screen(&identity)?;
             screen.id = display::source_id(&format!("openuuyc-virtual/{}", original.guid))?;
             screen.render_adapter = self.render_adapter;
@@ -831,7 +922,9 @@ impl State {
             let screen = self.create(spec, lease, false)?;
             self.restore_recreated_layout(&before, &identity, &screen, width, height)?;
             self.applied()?;
-            self.update_preferences()?;
+            if original.kind != 4 {
+                self.update_preferences()?;
+            }
             Ok(screen)
         })();
         if result.is_err() && lease.requested() {
@@ -860,7 +953,11 @@ impl State {
                     .collect();
                 restore_dpi(&dpi)?;
                 self.applied()?;
-                self.update_preferences()
+                if original.kind == 4 {
+                    Ok(())
+                } else {
+                    self.update_preferences()
+                }
             })();
             if let Err(error) = rollback {
                 tracing::error!(%error,"virtual display resize rollback remains pending");

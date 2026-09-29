@@ -280,7 +280,11 @@ async fn run_remote(
     events: Sender<PresenceEvent>,
     cancel: CancellationToken,
 ) -> Result<()> {
+    use crate::account::auth::{KeyringSessionStore, SessionStore};
     use crate::platform::host_service::resident::{self, Reply, Request};
+    // Reuse the credential handle, not its contents: each poll must still see
+    // logout/account changes and portable/resident storage transitions.
+    let sessions = KeyringSessionStore::new()?;
     let mut tick = tokio::time::interval(Duration::from_millis(500));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     while !cancel.is_cancelled() {
@@ -288,10 +292,7 @@ async fn run_remote(
         if crate::platform::host_service::maintaining() {
             continue;
         }
-        use crate::account::auth::SessionStore;
-        let saved = crate::account::auth::KeyringSessionStore::new()?
-            .load()?
-            .map(|s| s.generation());
+        let saved = sessions.load()?.map(|s| s.generation());
         if saved.as_deref() != Some(client.account_generation().as_str()) {
             client.retire();
             break;

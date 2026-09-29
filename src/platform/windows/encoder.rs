@@ -42,7 +42,7 @@ pub(crate) fn probe(
                 }
             }
         };
-        for codec in [Codec::H264, Codec::H265] {
+        for codec in [Codec::H264, Codec::H265, Codec::Av1] {
             for chroma in [1, 3] {
                 for depth in [8, 10] {
                     let format = Format {
@@ -93,6 +93,10 @@ pub(crate) fn probe(
                 peak: 2_000_000,
                 fps: 30,
                 quality: 1,
+                quality_target: super::format::QualityTarget {
+                    bitrate: 2_000_000,
+                    fps: 30,
+                },
             };
             let mut transfer = if device != desktop.device {
                 Some(super::transfer::Transfer::new(
@@ -131,7 +135,7 @@ pub(crate) fn probe(
                 )?;
                 drop(delivery);
                 output = frames.iter().find_map(|frame| {
-                    crate::media::video_format::parse_annex_b_format(
+                    crate::media::video_format::parse_stream_format(
                         format.codec.media(),
                         &frame.data,
                     )
@@ -141,7 +145,7 @@ pub(crate) fn probe(
                 }
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
-            let output = output.context("编码器未输出可验证的SPS")?;
+            let output = output.context("编码器未输出可验证的序列头")?;
             ensure!(
                 output.chroma_format_idc == format.chroma
                     && output.bit_depth_luma == format.depth

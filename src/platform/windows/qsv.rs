@@ -27,10 +27,10 @@ fn header<T>(id: i32) -> v::mfxExtBuffer {
     }
 }
 fn codec(format: Format) -> u32 {
-    (if format.codec == Codec::H264 {
-        v::MFX_CODEC_AVC
-    } else {
-        v::MFX_CODEC_HEVC
+    (match format.codec {
+        Codec::H264 => v::MFX_CODEC_AVC,
+        Codec::H265 => v::MFX_CODEC_HEVC,
+        Codec::Av1 => v::MFX_CODEC_AV1,
     }) as u32
 }
 fn fourcc(format: Format) -> u32 {
@@ -122,6 +122,8 @@ struct Extensions {
     three: Box<v::mfxExtCodingOption3>,
     color: Box<v::mfxExtVideoSignalInfo>,
     hevc: Box<v::mfxExtHEVCParam>,
+    av1: Box<v::mfxExtAV1BitstreamParam>,
+    av1_size: Box<v::mfxExtAV1ResolutionParam>,
     pointers: Vec<*mut v::mfxExtBuffer>,
 }
 impl Clone for Extensions {
@@ -132,6 +134,8 @@ impl Clone for Extensions {
             three: self.three.clone(),
             color: self.color.clone(),
             hevc: self.hevc.clone(),
+            av1: self.av1.clone(),
+            av1_size: self.av1_size.clone(),
             pointers: Vec::new(),
         };
         for &pointer in &self.pointers {
@@ -142,6 +146,8 @@ impl Clone for Extensions {
                 &mut result.three.Header,
                 &mut result.color.Header,
                 &mut result.hevc.Header,
+                &mut result.av1.Header,
+                &mut result.av1_size.Header,
             ] {
                 if header.BufferId == id {
                     result.pointers.push(ptr::from_mut(header));
@@ -279,7 +285,9 @@ impl Extensions {
             three: Box::new(v::mfxExtCodingOption3 {
                 Header: header::<v::mfxExtCodingOption3>(v::MFX_EXTBUFF_CODING_OPTION3),
                 ScenarioInfo: 8,
-                LowDelayBRC: if format.codec == Codec::H265 {
+                LowDelayBRC: if format.codec == Codec::Av1 {
+                    16
+                } else if format.codec == Codec::H265 {
                     if low_power { 16 } else { 32 }
                 } else {
                     0
@@ -304,9 +312,28 @@ impl Extensions {
                 PicHeightInLumaSamples: size.1.div_ceil(16) as u16 * 16,
                 ..Default::default()
             }),
+            av1: Box::new(v::mfxExtAV1BitstreamParam {
+                Header: header::<v::mfxExtAV1BitstreamParam>(v::MFX_EXTBUFF_AV1_BITSTREAM_PARAM),
+                WriteIVFHeaders: 32,
+                ..Default::default()
+            }),
+            av1_size: Box::new(v::mfxExtAV1ResolutionParam {
+                Header: header::<v::mfxExtAV1ResolutionParam>(v::MFX_EXTBUFF_AV1_RESOLUTION_PARAM),
+                FrameWidth: size.0,
+                FrameHeight: size.1,
+                ..Default::default()
+            }),
             pointers: Vec::new(),
         };
-        result.pointers.push(ptr::from_mut(&mut result.one.Header));
+        if format.codec != Codec::Av1 {
+            result.pointers.push(ptr::from_mut(&mut result.one.Header));
+        }
+        if format.codec == Codec::Av1 {
+            result.pointers.push(ptr::from_mut(&mut result.av1.Header));
+            result
+                .pointers
+                .push(ptr::from_mut(&mut result.av1_size.Header));
+        }
         if version >= (1, 8) {
             result.pointers.push(ptr::from_mut(&mut result.two.Header));
         }
@@ -411,6 +438,10 @@ impl Active {
             };
             let mfx = &mut params.__bindgen_anon_1.mfx;
             mfx.CodecId = codec(format);
+            if format.codec == Codec::Av1 {
+                ensure!(version >= (2, 5), "QSV AV1需要oneVPL 2.5或更新驱动");
+                mfx.CodecProfile = v::MFX_PROFILE_AV1_MAIN as u16;
+            }
             mfx.LowPower = if format.codec == Codec::H265 { 16 } else { 0 };
             mfx.FrameInfo = v::mfxFrameInfo {
                 FourCC: fourcc(format),
@@ -715,7 +746,10 @@ impl Active {
             .map_or(timestamp, |(_, original)| original);
         Ok(vec![Encoded {
             data: self.buffer[start..end].to_vec(),
-            keyframe: stream.FrameType & v::MFX_FRAMETYPE_IDR as u16 != 0,
+            keyframe: stream.FrameType & v::MFX_FRAMETYPE_IDR as u16 != 0
+                || (self.format.codec == Codec::Av1
+                    && crate::media::av1::parameters(&self.buffer[start..end]).is_some()
+                    && stream.FrameType & v::MFX_FRAMETYPE_I as u16 != 0),
             timestamp_100ns: output_time,
             is_new: true,
             timing: None,
@@ -746,6 +780,13 @@ fn set_rate(params: &mut v::mfxVideoParam, rate: Rate) {
         let encoding = &mut mfx.__bindgen_anon_1.__bindgen_anon_1;
         encoding.__bindgen_anon_2.TargetKbps = (rate.target / 1000).div_ceil(factor).max(1) as u16;
         encoding.__bindgen_anon_3.MaxKbps = peak.div_ceil(factor) as u16;
+        if mfx.CodecId == v::MFX_CODEC_AV1 as u32 {
+            encoding.BufferSizeInKB = (rate.target / rate.fps.max(1) / 8000)
+                .div_ceil(factor)
+                .max(1)
+                .min(u16::MAX as u32) as u16;
+            encoding.__bindgen_anon_1.InitialDelayInKB = 0;
+        }
         mfx.FrameInfo.FrameRateExtN = rate.fps;
         mfx.FrameInfo.FrameRateExtD = 1;
     }
@@ -756,7 +797,8 @@ fn validate(params: &v::mfxVideoParam, size: (u32, u32), format: Format) -> Resu
         let info = mfx.FrameInfo;
         let dimensions = info.__bindgen_anon_1.__bindgen_anon_1;
         ensure!(
-            mfx.CodecId == codec(format)
+            params.AsyncDepth == 1
+                && mfx.CodecId == codec(format)
                 && info.FourCC == fourcc(format)
                 && info.ChromaFormat == u16::from(format.chroma)
                 && (info.BitDepthLuma == u16::from(format.depth)

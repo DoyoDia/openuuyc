@@ -42,7 +42,7 @@ impl Page {
             Self::Quality => "画质",
             Self::Custom => "自定义码率",
             Self::Advanced => "高级设置",
-            Self::Audio => "音频输出",
+            Self::Audio => "音频",
             Self::Microphone => "麦克风",
             Self::Mouse => "鼠标模式",
             Self::Display => "显示设置",
@@ -411,7 +411,8 @@ fn volume_bar(
         }
         ui.add_space(4.0);
         let choose_output =
-            crate::ui::controls::audio_output_button(ui, "选择输出音频设备", ROW_HEIGHT).clicked();
+            crate::ui::controls::audio_output_button(ui, "音频设置（音质与输出设备）", ROW_HEIGHT)
+                .clicked();
         let hint = if *volume > 100 {
             format!(
                 "音量 {}% · 增益 +{:.1} dB\n双击恢复 100%",
@@ -708,7 +709,7 @@ pub(super) fn show_stream_control_window(
                                 ui.add_space(crate::ui::theme::MENU_GROUP_GAP);
                                 ui.horizontal(|ui| {
                                     ui.label(
-                                        RichText::new("帧率")
+                                        RichText::new("帧率上限")
                                             .size(crate::ui::theme::TINY)
                                             .color(MUTED),
                                     )
@@ -755,6 +756,7 @@ pub(super) fn show_stream_control_window(
                                                             == choice.value(snapshot.local_display),
                                                     ),
                                                 )
+                                                .on_hover_text("帧率上限；实际帧率受双方屏幕刷新率和编解码能力限制")
                                                 .clicked()
                                                 && settings.frame_rate != choice
                                             {
@@ -853,6 +855,8 @@ pub(super) fn show_stream_control_window(
                             });
                     }
                     Page::Audio => {
+                        crate::ui::controls::remote_audio_quality(ui,handle);
+                        section_separator(ui);
                         let audio = handle.audio();
                         let selected = audio.selected_output();
                         let outputs = audio.output_devices();
@@ -882,6 +886,11 @@ crate::ui::controls::observe_notice(ui.ctx(), "audio-output-disconnected", "音�
                             .id_salt("stream-settings-advanced")
                             .max_height((ctx.content_rect().height() - 150.0).max(140.0))
                             .show(ui, |ui| {
+                                if menu_row(ui, "仅音频模式", "关闭画面", None, true, false).on_hover_text("关闭此设备会话的所有画面，继续播放声音").clicked() {
+                                    handle.request_audio_only(true);
+                                    state.open = false;
+                                }
+                                section_separator(ui);
                                 let mut relay = snapshot.network.relay_enabled;
                                 let response = ui
                                     .add_enabled_ui(snapshot.network.available, |ui| {
@@ -1203,7 +1212,7 @@ crate::ui::controls::observe_notice(ui.ctx(), "clipboard-error", "剪贴板同�
         settings = snapshot.settings;
     } else if let Some(action) = action {
         let result = match action {
-            Action::Apply if handle.frame_rate_needs_super_screen(settings) => {
+            Action::Apply if handle.frame_rate_needs_super_screen(screen_id, settings) => {
                 let (width, height, dpi) = topology_menu::local_parameters(ctx, handle, local_size);
                 topology_menu::request(
                     ctx,

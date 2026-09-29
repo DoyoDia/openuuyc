@@ -36,7 +36,9 @@ impl Format {
     fn label(self) -> String {
         format!(
             "{} · {} · {}位",
-            if self.codec == VideoCodec::H264 {
+            if self.codec == VideoCodec::Av1 {
+                "AV1"
+            } else if self.codec == VideoCodec::H264 {
                 "H.264"
             } else {
                 "H.265"
@@ -70,6 +72,37 @@ impl Format {
             };
         }
         match (self.codec, self.chroma, self.depth) {
+            (VideoCodec::Av1, 1, 8) => match size {
+                (1280, 720) => {
+                    Some(include_bytes!("fixtures/matrix/av1_8_1280x720.obu").as_slice())
+                }
+                (1920, 1080) => {
+                    Some(include_bytes!("fixtures/matrix/av1_8_1920x1080.obu").as_slice())
+                }
+                (2560, 1440) => {
+                    Some(include_bytes!("fixtures/matrix/av1_8_2560x1440.obu").as_slice())
+                }
+                (3840, 2160) => {
+                    Some(include_bytes!("fixtures/matrix/av1_8_3840x2160.obu").as_slice())
+                }
+                _ => None,
+            },
+            (VideoCodec::Av1, 1, 10) => match size {
+                (1280, 720) => {
+                    Some(include_bytes!("fixtures/matrix/av1_10_1280x720.obu").as_slice())
+                }
+                (1920, 1080) => {
+                    Some(include_bytes!("fixtures/matrix/av1_10_1920x1080.obu").as_slice())
+                }
+                (2560, 1440) => {
+                    Some(include_bytes!("fixtures/matrix/av1_10_2560x1440.obu").as_slice())
+                }
+                (3840, 2160) => {
+                    Some(include_bytes!("fixtures/matrix/av1_10_3840x2160.obu").as_slice())
+                }
+                _ => None,
+            },
+
             (VideoCodec::H264, 1, 8) => sample!("h264"),
             (VideoCodec::H264, 3, 8) => sample!("h264_444"),
             (VideoCodec::H265, 1, 8) => sample!("hevc"),
@@ -81,7 +114,7 @@ impl Format {
     }
 }
 fn formats() -> Vec<Format> {
-    [VideoCodec::H264, VideoCodec::H265]
+    [VideoCodec::H264, VideoCodec::H265, VideoCodec::Av1]
         .into_iter()
         .flat_map(|codec| {
             [1, 3].into_iter().flat_map(move |chroma| {
@@ -215,7 +248,9 @@ pub(crate) fn run(
                     return Ok(());
                 }
                 let supported = if device.is_some() {
-                    format.codec == VideoCodec::H265 || (format.chroma == 1 && format.depth == 8)
+                    format.codec == VideoCodec::H265
+                        || (format.chroma == 1
+                            && (format.depth == 8 || format.codec == VideoCodec::Av1))
                 } else {
                     format.codec == VideoCodec::H264 && format.depth == 8
                 };
@@ -299,6 +334,9 @@ pub(crate) fn run(
 /// including all its parameter sets and slices, not the whole stream as one frame.
 #[cfg(windows)]
 fn first_picture(format: Format, data: &[u8]) -> Vec<u8> {
+    if format.codec == VideoCodec::Av1 {
+        return data.to_vec();
+    }
     let mut out = Vec::new();
     let mut picture = false;
     for nal in crate::media::video_format::annex_b_units(data) {
@@ -335,8 +373,8 @@ fn decode_sample(
     cancel: Arc<AtomicBool>,
 ) -> Result<()> {
     let sample = first_picture(format, sample);
-    let signature = crate::media::video_format::parse_annex_b_format(format.codec, &sample)
-        .context("样本SPS无效")?;
+    let signature = crate::media::video_format::parse_stream_format(format.codec, &sample)
+        .context("样本序列头无效")?;
     ensure!(
         signature.chroma_format_idc == format.chroma && signature.bit_depth_luma == format.depth,
         "样本格式不匹配"
@@ -394,7 +432,25 @@ fn decode_sample(
                         frame.texture().GetDesc(&mut desc);
                     }
                     ensure!(desc.Format == expected, "GPU输出像素格式与样本不一致");
-                    check_pattern(&frame.diagnostic_pixels(&points, &cancel)?)?;
+                    let pixels = frame.diagnostic_pixels(&points, &cancel)?;
+                    if format.codec == VideoCodec::Av1 {
+                        for (i, p) in pixels.iter().enumerate() {
+                            let y = match (format.depth, i == 2) {
+                                (8, false) => 71,
+                                (8, true) => 181,
+                                (_, false) => 91,
+                                (_, true) => 117,
+                            };
+                            ensure!(
+                                p[0].abs_diff(y) <= 8
+                                    && p[1].abs_diff(128) <= 8
+                                    && p[2].abs_diff(128) <= 8,
+                                "AV1合成图案像素不符"
+                            );
+                        }
+                    } else {
+                        check_pattern(&pixels)?;
+                    }
                     let actual = (frame.width(), frame.height());
                     let _surface = writer
                         .context("缺少D3D11输出拥有者")?

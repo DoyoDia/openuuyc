@@ -214,7 +214,7 @@ impl Initializer {
                             let _ = self.reload(); let _ = reply.send(result); continue;
                         }
                         let result = self.reload().and_then(|()| {
-                            if self.identity.client_identity()?.device_id != expected_id { bail!("虚拟设备身份已改变，未覆盖新身份"); }
+                            if self.identity.client_identity()?.device_id != expected_id { bail!("本机设备身份已改变，未覆盖新身份"); }
                             let mut next = self.identity.clone(); next.set_device_name(value); self.commit(next)
                         });
                         let _ = reply.send(result);

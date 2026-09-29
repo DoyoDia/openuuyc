@@ -19,7 +19,16 @@ pub(crate) fn send(items: &[INPUT]) -> Result<()> {
     if items.is_empty() {
         return Ok(());
     }
+    let started = Instant::now();
     let n = unsafe { SendInput(items, std::mem::size_of::<INPUT>() as i32) } as usize;
+    if started.elapsed() >= Duration::from_millis(100) {
+        tracing::warn!(
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            requested = items.len(),
+            accepted = n,
+            "Windows input submission stalled"
+        );
+    }
     // Single physical transitions are submitted individually. Unicode batches have
     // an explicit caller-owned release obligation if the prefix is incomplete.
     ensure!(

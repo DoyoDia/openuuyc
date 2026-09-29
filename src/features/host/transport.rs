@@ -296,11 +296,10 @@ impl Transport {
             allocations.insert(
                 usize::MAX,
                 super::parameters::Bounds {
-                    minimum: bitrate,
+                    reservation: bitrate,
                     maximum: bitrate,
                     initial: bitrate,
                     probe: bitrate,
-                    adaptive: false,
                 },
             );
         }
@@ -321,10 +320,11 @@ impl Transport {
         };
         lock(&self.0.controller).configure(bounds, restart);
     }
-    fn allocation(&self, target: u32, extended: bool) -> u32 {
-        super::allocation::share(&lock(&self.0.allocations), self.0.index, target, extended)
+    fn allocation(&self, target: u32, view: super::allocation::View) -> u32 {
+        super::allocation::share(&lock(&self.0.allocations), self.0.index, target, view)
     }
     pub(crate) fn pause(&self) {
+        lock(&self.0.automatic).remove(self.0.index);
         let bounds = {
             let mut streams = lock(&self.0.allocations);
             if streams.remove(&self.0.index).is_none() {
@@ -360,16 +360,17 @@ impl Transport {
     }
     pub(crate) fn media_rate(&self) -> u32 {
         let target = lock(&self.0.controller).target;
-        let total = self.allocation(target, false);
+        let total = self.allocation(target, super::allocation::View::Media);
         lock(&self.0.budget).media_rate(total)
     }
-    pub(crate) fn automatic_rates(&self) -> (u32, u32, f64) {
-        let (target, lower, loss) = lock(&self.0.controller).estimates();
-        (
-            self.allocation(target, true),
-            self.allocation(lower, true),
+    pub(crate) fn automatic_rates(&self) -> super::parameters::NetworkSample {
+        let (target, lower, loss, generation) = lock(&self.0.controller).estimates();
+        super::parameters::NetworkSample {
+            probe: self.allocation(target, super::allocation::View::Probe),
+            lower: self.allocation(lower, super::allocation::View::Probe),
             loss,
-        )
+            generation,
+        }
     }
     pub(crate) fn cwnd_ratio(&self) -> f64 {
         lock(&self.0.controller).cwnd_reduce_ratio
@@ -410,17 +411,23 @@ impl Transport {
         lock(&self.0.automatic).route(pair);
     }
     pub(crate) fn remote_report(&self, loss: u8, rtt: Duration) {
+        if !self.active() || !lock(&self.0.allocations).contains_key(&self.0.index) {
+            return;
+        }
         self.rtt(rtt);
-        lock(&self.0.automatic).report(loss, rtt);
+        lock(&self.0.automatic).report(self.0.index, loss, rtt);
     }
     pub(crate) fn network_change(&self) -> Option<u8> {
-        lock(&self.0.automatic).tick(self.0.network.load(Ordering::Acquire))
+        if !self.active() {
+            return None;
+        }
+        lock(&self.0.automatic).tick(self.0.network.load(Ordering::Acquire), Instant::now())
     }
     pub(crate) fn network_attempt(&self) -> u8 {
         lock(&self.0.automatic).attempt()
     }
     pub(crate) fn quality(&self, automatic: bool, quality: i32, settings_changed: bool) {
-        lock(&self.0.automatic).quality(automatic, quality, settings_changed);
+        lock(&self.0.automatic).quality(self.0.index, automatic, quality, settings_changed);
     }
     fn overhead(&self) -> usize {
         self.network_overhead() + self.0.srtp_overhead.load(Ordering::Relaxed) as usize
@@ -451,7 +458,9 @@ impl Transport {
         lock(&self.0.history).primary.is_some()
     }
     pub(crate) fn network(&self, available: bool) {
-        self.0.network.store(available, Ordering::Release);
+        if self.0.network.swap(available, Ordering::AcqRel) != available {
+            lock(&self.0.automatic).reset_samples();
+        }
         lock(&self.0.controller).network(available);
         for stream in self.streams() {
             lock(&stream.0.budget).network(available);
@@ -460,6 +469,7 @@ impl Transport {
     }
     pub(crate) fn route_changed(&self) {
         lock(&self.0.controller).route_changed();
+        lock(&self.0.automatic).reset_samples();
         for stream in self.streams() {
             lock(&stream.0.budget).reset(true);
             lock(&stream.0.fec_blocks).clear();
@@ -482,7 +492,10 @@ impl Transport {
             let mut controller = lock(&self.0.controller);
             controller.tick(self.0.queued.load(Ordering::Relaxed) as usize);
             for stream in self.streams() {
-                let allocation = stream.allocation(controller.target, true);
+                // Probe headroom is only an observation for automatic quality.
+                // Repair budgets must use the same ordinary share as media.
+                let allocation =
+                    stream.allocation(controller.target, super::allocation::View::Media);
                 stream.0.repair_rate.store(
                     lock(&stream.0.send_rate).limit(allocation),
                     Ordering::Release,
@@ -1484,9 +1497,7 @@ impl Transport {
             }
             return writer;
         }
-        if info.mime_type.eq_ignore_ascii_case("video/h264")
-            || info.mime_type.eq_ignore_ascii_case("video/h265")
-        {
+        if super::format::Codec::from_mime(&info.mime_type).is_some() {
             lock(&self.0.history).primary = Some(info.ssrc);
             return Arc::new(MediaWriter {
                 parent: writer,
@@ -1522,6 +1533,7 @@ impl Transport {
         }
     }
     fn clear_stream(&self) {
+        lock(&self.0.automatic).remove(self.0.index);
         lock(&self.0.budget).reset(false);
         lock(&self.0.fec_blocks).clear();
         *lock(&self.0.fec) = None;

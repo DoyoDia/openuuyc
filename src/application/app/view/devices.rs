@@ -46,6 +46,7 @@ struct Entry {
 enum Action {
     Details,
     Connect,
+    Audio,
 }
 
 impl DeviceCenterApp {
@@ -60,16 +61,9 @@ impl DeviceCenterApp {
         let mut devices = Vec::new();
         if management {
             let catalog = self.catalog.as_ref()?;
-            for device in &catalog.groups.desktop_devices {
-                let group = match catalog.virtual_status(&device.device_id) {
-                    Some(false) => 0,
-                    Some(true) => 1,
-                    None => 4,
-                };
-                devices.push((device, group));
-            }
-            devices.extend(catalog.groups.mobile_devices.iter().map(|d| (d, 2)));
-            devices.extend(catalog.groups.tv_devices.iter().map(|d| (d, 3)));
+            devices.extend(catalog.groups.desktop_devices.iter().map(|d| (d, 0)));
+            devices.extend(catalog.groups.mobile_devices.iter().map(|d| (d, 1)));
+            devices.extend(catalog.groups.tv_devices.iter().map(|d| (d, 2)));
         } else {
             devices.extend(
                 all_devices(self.devices.as_ref()?)
@@ -107,11 +101,6 @@ impl DeviceCenterApp {
 
     fn device_list(&mut self, ui: &mut egui::Ui, management: bool) {
         let rows = self.device_entries(management);
-        let (pending, unresolved) = if management {
-            (0, 0)
-        } else {
-            self.watching_list_resolution()
-        };
         let index = usize::from(management);
         let count = rows.as_ref().map_or(0, Vec::len);
         let online = rows
@@ -131,7 +120,7 @@ impl DeviceCenterApp {
                 );
                 ui.label(
                     RichText::new(if management {
-                        "账号中的电脑、移动设备与观看身份"
+                        "账号中的电脑、手机、平板与电视"
                     } else {
                         "选择电脑，开始远程连接"
                     })
@@ -204,17 +193,6 @@ impl DeviceCenterApp {
             crate::ui::controls::DialogIcon::Warning,
             self.catalog_error.as_deref().filter(|_| management),
         );
-        crate::ui::controls::observe_notice(
-            ui.ctx(),
-            "unresolved-devices",
-            "设备信息不完整",
-            crate::ui::controls::DialogIcon::Warning,
-            (unresolved > 0)
-                .then(|| {
-                    format!("{unresolved} 台设备的信息未能确认，请刷新重试，也可在全部设备中查看。")
-                })
-                .as_deref(),
-        );
         let Some(mut rows) = rows else {
             self.empty_state(ui, "正在读取设备清单…", None);
             return;
@@ -257,11 +235,7 @@ impl DeviceCenterApp {
         if rows.is_empty() {
             let clear_filters = self.empty_state(
                 ui,
-                if count == 0 && pending > 0 {
-                    "正在读取设备信息…"
-                } else if count == 0 && unresolved > 0 {
-                    "设备信息暂未就绪"
-                } else if count == 0 {
+                if count == 0 {
                     "暂无设备"
                 } else {
                     "没有符合条件的设备"
@@ -277,7 +251,7 @@ impl DeviceCenterApp {
         }
         let mut picked = None;
         crate::ui::controls::page_scroll(("device-list", index)).show(ui, |ui| {
-            let groups = ["电脑", "虚拟设备", "手机 / 平板", "电视", "待识别"];
+            let groups = ["电脑", "手机 / 平板", "电视"];
             for (group, title) in groups.iter().enumerate() {
                 let entries = rows.iter().filter(|e| e.group == group).collect::<Vec<_>>();
                 if entries.is_empty() {
@@ -316,6 +290,10 @@ impl DeviceCenterApp {
                 Action::Connect => {
                     self.selected_device_id = Some(id);
                     self.start_viewer();
+                }
+                Action::Audio => {
+                    self.selected_device_id = Some(id);
+                    self.start_viewer_mode(true);
                 }
             }
         }
@@ -366,7 +344,7 @@ fn row(
         egui::Rect::from_min_size(preview.right_bottom() - vec2(29.0, 29.0), vec2(26.0, 26.0));
     ui.painter().rect_filled(icon, 5.0, BG);
     device_visuals::system_icon(ui.painter(), icon.shrink(3.0), device.platform);
-    let actions_x = rect.right() - if entry.viewing { 166.0 } else { 92.0 };
+    let actions_x = rect.right() - if entry.viewing { 210.0 } else { 92.0 };
     let status_x = if wide {
         actions_x - 120.0
     } else {
@@ -486,6 +464,21 @@ fn row(
         );
         if button.clicked() {
             action = Some(Action::Connect);
+        }
+        let audio = buttons
+            .add_enabled_ui(entry.connect_issue.is_none(), |ui| {
+                crate::ui::controls::audio_output_button(
+                    ui,
+                    "仅音频连接",
+                    crate::ui::theme::CONTROL_HEIGHT,
+                )
+            })
+            .inner;
+        if audio.clicked() {
+            action = Some(Action::Audio);
+        }
+        if let Some(issue) = &entry.connect_issue {
+            audio.on_disabled_hover_text(issue);
         }
         if let Some(issue) = &entry.connect_issue {
             button.on_disabled_hover_text(issue);

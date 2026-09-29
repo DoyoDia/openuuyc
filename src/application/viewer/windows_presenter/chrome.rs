@@ -168,7 +168,9 @@ pub(in crate::application::viewer) fn player_title_bar(
     } else {
         &stats.video_codec
     };
-    let codec = if codec_info.contains("265") || codec_info.contains("HEVC") {
+    let codec = if codec_info.contains("AV1") {
+        "AV1"
+    } else if codec_info.contains("265") || codec_info.contains("HEVC") {
         "H.265"
     } else if codec_info.contains("264") || codec_info.contains("AVC") {
         "H.264"

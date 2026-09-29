@@ -136,6 +136,30 @@ pub(super) fn parsed_packet(
     })
 }
 
+pub(super) fn depacketize_av1(
+    packet: &RtpPacket,
+    received_at: Instant,
+) -> Option<ParsedVideoPacket> {
+    let h = *packet.payload.first()?;
+    if h & 7 != 0 || h & 0x88 == 0x88 || packet.payload.len() < 2 {
+        return None;
+    }
+    let mut payload = Vec::with_capacity(packet.payload.len() + 4);
+    payload.extend_from_slice(&(packet.payload.len() as u32).to_le_bytes());
+    payload.extend_from_slice(&packet.payload);
+    let mut result = parsed_packet(
+        packet,
+        VideoCodecKind::Av1,
+        h & 0x80 == 0,
+        h & 8 != 0,
+        Vec::new(),
+        payload,
+        received_at,
+    )?;
+    result.idr = h & 8 != 0;
+    Some(result)
+}
+
 pub(super) fn parse_video_timing(payload: &[u8]) -> Option<VideoSendTiming> {
     if payload.len() != 13 {
         return None;

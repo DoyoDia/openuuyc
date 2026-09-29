@@ -7,6 +7,7 @@
 //! so no request is produced until the active remote screen's physical mode is
 //! known from `ScreenSources`.
 
+mod audio_quality;
 use crate::diagnostics::performance::PerformanceMonitor;
 pub use crate::features::network_control::NetworkControlSnapshot;
 pub use crate::features::remote_cursor::{CursorImage, RemoteCursor};
@@ -100,11 +101,11 @@ impl StreamQuality {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Auto => "自动",
-            Self::Original => "原画 30M",
-            Self::High => "超清 14M",
-            Self::Clear => "高清 8M",
+            Self::Original => "原画",
+            Self::High => "超清",
+            Self::Clear => "高清",
             Self::Custom => "自定义",
-            Self::Fast => "低码率 1M",
+            Self::Fast => "低码率",
         }
     }
 
@@ -339,6 +340,8 @@ pub struct StreamControlSnapshot {
 
 #[derive(Clone)]
 pub struct StreamControlHandle {
+    audio_mode: tokio::sync::watch::Sender<bool>,
+    audio_quality: Arc<Mutex<audio_quality::State>>,
     microphone: crate::media::microphone::Microphone,
     clipboard: crate::features::clipboard::Clipboard,
     files: Arc<crate::features::file_transfer::Transport>,
@@ -606,6 +609,8 @@ impl StreamControlHandle {
         clipboard.set_files(profile.clipboard_files);
         (
             Self {
+                audio_mode: tokio::sync::watch::channel(profile.audio_only).0,
+                audio_quality: Arc::new(Mutex::new(audio_quality::State::new(profile.audio_only))),
                 microphone: crate::media::microphone::Microphone::new(),
                 clipboard,
                 files: Arc::new(crate::features::file_transfer::Transport::default()),
@@ -749,6 +754,15 @@ impl StreamControlHandle {
 
     pub(crate) fn audio(&self) -> crate::media::audio::AudioPlayback {
         self.audio.clone()
+    }
+    pub(crate) fn request_audio_only(&self, enabled: bool) {
+        if enabled {
+            self.default_audio_quality();
+        }
+        self.audio_mode.send_replace(enabled);
+    }
+    pub(crate) fn audio_mode_requests(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.audio_mode.subscribe()
     }
 
     pub(crate) fn preferences(&self) -> StreamControlPreferences {

@@ -16,7 +16,7 @@ use webrtc::{
 pub(crate) struct VideoTrack {
     id: String,
     preferred: Codec,
-    negotiated: Arc<super::format::Negotiated>,
+    negotiated: Mutex<Arc<super::format::Negotiated>>,
     binding: Mutex<Option<TrackLocalContext>>,
 }
 impl VideoTrack {
@@ -24,7 +24,7 @@ impl VideoTrack {
         Self {
             id: format!("video_{index}"),
             preferred,
-            negotiated,
+            negotiated: Mutex::new(negotiated),
             binding: Mutex::new(None),
         }
     }
@@ -33,6 +33,13 @@ impl VideoTrack {
             .as_ref()
             .and_then(|b| b.mid())
             .map_or(0, |v| v.len())
+    }
+    pub fn configure(&self, negotiated: Arc<super::format::Negotiated>) {
+        let mut current = lock(&self.negotiated);
+        if let Some(binding) = lock(&self.binding).as_ref() {
+            negotiated.bind_codecs(binding.codec_parameters());
+        }
+        *current = negotiated;
     }
     pub async fn write(&self, codec: Codec, packet: &Packet) -> webrtc::error::Result<usize> {
         let Some(binding) = lock(&self.binding).clone() else {
@@ -77,15 +84,16 @@ impl TrackLocal for VideoTrack {
             })
             .or_else(|| {
                 context.codec_parameters().iter().find(|c| {
-                    [Codec::H265, Codec::H264].iter().any(|codec| {
-                        self.negotiated.supports_codec(*codec)
+                    [Codec::Av1, Codec::H265, Codec::H264].iter().any(|codec| {
+                        let negotiated = lock(&self.negotiated);
+                        (negotiated.choices.is_empty() || negotiated.supports_codec(*codec))
                             && c.capability.mime_type.eq_ignore_ascii_case(codec.mime())
                     })
                 })
             })
             .cloned()
             .ok_or(Error::ErrUnsupportedCodec)?;
-        self.negotiated.bind_codecs(context.codec_parameters());
+        lock(&self.negotiated).bind_codecs(context.codec_parameters());
         *lock(&self.binding) = Some(context.clone());
         Ok(selected)
     }

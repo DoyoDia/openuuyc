@@ -154,7 +154,13 @@ pub(crate) fn update_nonmodal_window_move(
         if state.start.take().is_some() {
             let _ = unsafe { ReleaseCapture() };
         }
-        window.set_maximized(!window.is_maximized());
+        if window.is_resizable()
+            && window
+                .enabled_buttons()
+                .contains(winit::window::WindowButtons::MAXIMIZE)
+        {
+            window.set_maximized(!window.is_maximized());
+        }
         return;
     }
     if response.drag_started() {

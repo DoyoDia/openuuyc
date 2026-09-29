@@ -221,6 +221,15 @@ impl Engine {
                 }
             }
         }
+        // Every input request passes here, including absolute/system mouse
+        // events and remote heartbeats. A busy broker may never become idle or
+        // receive Request::Alive; HID ownership must not depend on either.
+        if let Some(device) = &mut self.device
+            && let Err(error) = device.tick()
+        {
+            tracing::warn!(%error,"host HID lease ended; releasing old input state");
+            self.recover_hid()?;
+        }
         Ok(())
     }
     fn keyboard_report(&mut self, consumer: bool) -> Result<()> {
@@ -592,12 +601,6 @@ impl Engine {
     }
     pub fn tick(&mut self) -> Result<()> {
         self.synchronize(self.geometry.clone())?;
-        if let Some(device) = &mut self.device
-            && let Err(error) = device.tick()
-        {
-            tracing::warn!(%error,"host HID lease ended; releasing old input state");
-            self.recover_hid()?;
-        }
         if self.interruptible && !self.interrupted && !self.keys.is_empty() {
             let heartbeat = self.last_heartbeat.elapsed();
             let timeout = heartbeat > self.threshold && self.last_input <= self.last_heartbeat;
@@ -613,6 +616,9 @@ impl Engine {
         self.touch.tick()
     }
     pub fn release(&mut self) -> Result<()> {
+        if self.hid_failed {
+            return self.recover_hid();
+        }
         let mut failure = None;
         if let Err(e) = self.neutral_keys(true) {
             failure = Some(e);

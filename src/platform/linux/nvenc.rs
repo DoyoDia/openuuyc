@@ -119,6 +119,10 @@ mod tests {
             peak: 20_000_000,
             fps: 30,
             quality: 4,
+            quality_target: crate::media::encoding::QualityTarget {
+                bitrate: 20_000_000,
+                fps: 60,
+            },
         };
         let colour = crate::media::encoding::Format::AVC.color(None);
         println!("declared VUI: {colour:?}");
@@ -187,6 +191,10 @@ mod memory_tests {
             peak: 20_000_000,
             fps: 60,
             quality: 4,
+            quality_target: crate::media::encoding::QualityTarget {
+                bitrate: 20_000_000,
+                fps: 60,
+            },
         };
         let encoder =
             super::Encoder::new(&context, (w, h), crate::media::encoding::Format::AVC, rate)

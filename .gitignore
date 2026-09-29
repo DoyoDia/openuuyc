@@ -1,4 +1,5 @@
 /target/
+/temp/
 **/target/
 captures/
 /logs/

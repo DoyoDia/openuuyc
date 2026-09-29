@@ -28,6 +28,7 @@ impl Encoder {
                 peak: bitrate,
                 fps,
                 quality: 0,
+                quality_target: super::QualityTarget { bitrate, fps },
             },
             planar: vec![0; width as usize * height as usize * 3 / 2],
         })

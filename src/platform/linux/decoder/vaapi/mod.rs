@@ -49,7 +49,8 @@ impl Session {
                     extra: Some(config.extra_data.clone()),
                 })
             }
-            VideoCodec::H265 => Err(DecodeError::Unsupported),
+            // H.265 and AV1 slice parameters are not written for VA-API yet.
+            VideoCodec::H265 | VideoCodec::Av1 => Err(DecodeError::Unsupported),
         }
     }
 

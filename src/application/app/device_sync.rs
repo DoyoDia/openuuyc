@@ -1,4 +1,4 @@
-//! Account-scoped snapshots, push overlays, and deduplicated hardware reads.
+//! Account snapshots, push overlays, and user-requested device details.
 use super::*;
 use crate::account::api::{DeviceDetail, DeviceGroups};
 use crate::account::device_change::{ChangeKind, DeviceChange};
@@ -42,7 +42,6 @@ pub(super) struct DeviceSync {
     list_requested: bool,
     groups_requested: bool,
     details: VecDeque<String>,
-    explicit_details: HashSet<String>,
     unresolved: HashSet<String>,
 }
 impl Default for DeviceSync {
@@ -56,7 +55,6 @@ impl Default for DeviceSync {
             list_requested: true,
             groups_requested: true,
             details: VecDeque::new(),
-            explicit_details: HashSet::new(),
             unresolved: HashSet::new(),
         }
     }
@@ -80,23 +78,11 @@ impl DeviceSync {
     pub fn refresh(&mut self, reconnect: bool) {
         self.list_requested |= reconnect || self.list_read.is_none();
         self.groups_requested |= reconnect || self.group_read.is_none();
-        // A failed/empty hardware read cannot classify a device. Allow a user
-        // refresh to retry it, while retaining successful classifications.
-        if let Some(catalog) = &mut self.catalog {
-            catalog.details.retain(|_, detail| {
-                detail
-                    .value
-                    .as_ref()
-                    .is_ok_and(|value| !value.details.is_empty())
-            });
-        }
-        self.queue_missing();
     }
     pub fn refresh_status(&mut self) {
         self.list_requested = true;
     }
     pub fn detail(&mut self, id: String) {
-        self.explicit_details.insert(id.clone());
         if self.detail_read.as_ref().is_some_and(|r| r.id == id) {
             return;
         }
@@ -110,23 +96,6 @@ impl DeviceSync {
             .entries()
             .find(|(_, d)| d.device_id == id)
             .map(|(_, d)| (d.platform, d.version_name.clone()))
-    }
-    fn queue_missing(&mut self) {
-        if let Some(catalog) = &self.catalog {
-            // Initial desktop hardware is consumed by virtual-device detection.
-            // Other hardware is fetched only when the user opens its details.
-            for d in &catalog.groups.desktop_devices {
-                if !catalog.details.contains_key(&d.device_id)
-                    && !self.details.contains(&d.device_id)
-                    && self
-                        .detail_read
-                        .as_ref()
-                        .is_none_or(|r| r.id != d.device_id)
-                {
-                    self.details.push_back(d.device_id.clone());
-                }
-            }
-        }
     }
     fn emit(&self, events: &Sender<GuiEvent>, generation: u64, name: &str) {
         if let Some(list) = &self.list {
@@ -170,7 +139,6 @@ impl DeviceSync {
         if change.kind == ChangeKind::Removed || change.is_cloud() {
             self.unresolved.remove(&change.id);
             self.details.retain(|id| id != &change.id);
-            self.explicit_details.remove(&change.id);
             if self.detail_read.as_ref().is_some_and(|r| r.id == change.id) {
                 self.detail_read.take();
             }
@@ -181,7 +149,6 @@ impl DeviceSync {
             // Unknown membership is resolved once, not on every repeated push.
             self.refresh(true);
         }
-        self.queue_missing();
         self.emit(events, generation, name);
     }
     async fn receive(
@@ -238,7 +205,6 @@ impl DeviceSync {
                             suggested.to_owned(),
                             features.clone(),
                         ));
-                        self.queue_missing();
                         catalog_changed = true;
                     }
                 }
@@ -270,7 +236,6 @@ impl DeviceSync {
                 if let Some(catalog) = &mut self.catalog {
                     catalog.store_detail(&read.id, result.clone());
                 }
-                self.explicit_details.remove(&read.id);
                 let _ = events.send(GuiEvent::Detail(generation, read.id.clone(), result));
                 catalog_changed = true;
             }
@@ -304,7 +269,7 @@ impl DeviceSync {
             )
             .await;
         // Pending reads belong to account synchronization, not window focus.
-        // Startup, push reconciliation and hardware classification must finish
+        // Startup and push reconciliation must finish
         // while the control center is covered, minimized or in the tray.
         self.start_reads(client, events);
         failure
@@ -331,14 +296,6 @@ impl DeviceSync {
         if self.detail_read.is_none() {
             while let Some(id) = self.details.pop_front() {
                 if crate::account::api::validate_device_id(&id).is_err() {
-                    continue;
-                }
-                if !self.explicit_details.contains(&id)
-                    && self.catalog.as_ref().is_none_or(|c| {
-                        c.details.contains_key(&id)
-                            || !c.groups.entries().any(|(_, d)| d.device_id == id)
-                    })
-                {
                     continue;
                 }
                 let version = self.version(&id);

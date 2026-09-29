@@ -16,6 +16,7 @@ pub(super) async fn bind_channel(
     report_target: ReportTarget,
     input: crate::features::host::input::Receiver,
     microphone: crate::features::host::microphone::Receiver,
+    audio: crate::features::host::audio::Audio,
 ) {
     let control = channel.label() == "CONTROL_DATA_CHANNEL";
     let text = channel.label() == "TEXT_DATA_CHANNEL";
@@ -132,6 +133,7 @@ pub(super) async fn bind_channel(
         let report_target = report_target.clone();
         let input = input.clone();
         let microphone = microphone.clone();
+        let audio = audio.clone();
         Box::pin(async move {
             if cancel.is_cancelled() {
                 return;
@@ -162,6 +164,17 @@ pub(super) async fn bind_channel(
                 }
             }
             if text {
+                match audio.quality_request(&message.data) {
+                    Ok(Some(response)) => {
+                        let _ = channel.send_text_bytes(&Bytes::from(response)).await;
+                        return;
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error,"invalid audio quality request");
+                        return;
+                    }
+                    Ok(None) => {}
+                }
                 match input.receive_action(&message.data) {
                     Ok(true) => return,
                     Ok(false) => {}
@@ -211,7 +224,7 @@ pub(super) async fn bind_channel(
                 crate::features::stream_control::publisher::receive(
                     &message.data,
                     true,
-                    &handshake_source,
+                    handshake_source.as_ref(),
                     &mut lock(&handshake_config),
                     &handshake_caps,
                 )
@@ -266,7 +279,7 @@ pub(super) async fn publish_state(
     mut target: tokio::sync::watch::Receiver<ReportRoutes>,
     cancel: CancellationToken,
     kcp: crate::transport::uu_kcp::UuKcpControl,
-    initial: crate::features::host::capture::Screen,
+    initial: Option<crate::features::host::capture::Screen>,
     mut mouse_policy: tokio::sync::watch::Receiver<
         crate::features::host::input::config::MousePolicy,
     >,
@@ -285,6 +298,7 @@ pub(super) async fn publish_state(
     let mut last_mouse_policy = None;
     let mut last_microphone = None;
     let mut last_virtual_speaker = None;
+    let mut last_audio_quality = None;
     let mut revision = None;
     let mut secure_revision = None;
     let sequence = &reports.sequence;
@@ -316,10 +330,24 @@ pub(super) async fn publish_state(
             last_mouse_policy = None;
             last_microphone = None;
             last_virtual_speaker = None;
+            last_audio_quality = None;
         }
         if secure_revision != Some(routes.secure_revision) {
             secure_revision = Some(routes.secure_revision);
             last_locked = None;
+        }
+        if let Some(hello) = audio.quality_hello()
+            && last_audio_quality.as_ref() != Some(&hello)
+            && let Some(channel) = routes.text.as_ref().and_then(std::sync::Weak::upgrade)
+        {
+            let payload = Bytes::copy_from_slice(&hello);
+            let sent = tokio::select! {
+                _ = cancel.cancelled() => break,
+                result = channel.send_text_bytes(&payload) => result,
+            };
+            if sent.is_ok() {
+                last_audio_quality = Some(hello);
+            }
         }
         let send = |control: bool, bytes: Vec<u8>| {
             let channel = if control {
@@ -437,14 +465,8 @@ pub(super) async fn publish_state(
             .or_else(|| media.iter().find(|(_, s)| s.capturing));
         let capture = selected.map(|(_, s)| s.screen.id);
         if last_capture != Some(capture)
-            && send(
-                false,
-                publisher::capture_change(
-                    selected.map_or(&initial, |(_, s)| &s.screen),
-                    selected.is_some(),
-                ),
-            )
-            .await
+            && let Some(source) = selected.map(|(_, s)| &s.screen).or(initial.as_ref())
+            && send(false, publisher::capture_change(source, selected.is_some())).await
         {
             last_capture = Some(capture);
         }
@@ -466,11 +488,13 @@ pub(super) async fn publish_state(
             && let Some(encoder) = state.encoder
             && state.quality > 0
         {
-            let probe = transports[*index].automatic_rates().0;
+            let probe = transports[*index].automatic_rates().probe;
             let key = (
                 state.screen.id,
                 state.quality,
                 state.fps,
+                state.format,
+                state.budget_size,
                 state.encoder,
                 state.capture.clone(),
                 state.screen.width,
@@ -481,9 +505,10 @@ pub(super) async fn publish_state(
                 && send(
                     false,
                     publisher::quality_report(
+                        state.format,
                         state.quality,
                         probe,
-                        (state.screen.width, state.screen.height),
+                        state.budget_size,
                         state.fps,
                         encoder,
                         &state.capture,

@@ -47,7 +47,6 @@ impl RenderWorker {
         let plugins = crate::plugins::Controller::new(context.clone());
         let plugin_state = plugins.shared.clone();
         let frame_queue = Arc::clone(&session.frame_queue);
-        let decoder_wake = session.manager_wake.clone();
         let performance = session.performance.clone();
         let worker_shutdown = Arc::clone(&session.shutdown);
         let (commands, command_receiver) = std_mpsc::channel();
@@ -97,12 +96,10 @@ impl RenderWorker {
                         }
                         let dropped = {
                             let mut queue = mutex_lock(&frame_queue);
-                            let count = queue.len();
-                            queue.clear();
+                            let count = usize::from(queue.take().is_some());
                             performance.set_presentation_queue_frames(0);
                             count
                         };
-                        decoder_wake.unpark();
                         for _ in 0..dropped {
                             performance.record_dropped_present_frame();
                         }
@@ -115,9 +112,6 @@ impl RenderWorker {
                     });
                     redraw |= chain_changed;
                     let replacement = take_next_frame(&mut mutex_lock(&frame_queue), &performance);
-                    if replacement.is_some() {
-                        decoder_wake.unpark();
-                    }
                     let is_new_submission = replacement.is_some();
                     if (redraw || is_new_submission)
                         && let Some(frame) = replacement.as_ref().or(current_frame.as_ref())
@@ -191,7 +185,7 @@ impl RenderWorker {
                         }
                     }
                     redraw = false;
-                    if mutex_lock(&frame_queue).is_empty() {
+                    if mutex_lock(&frame_queue).is_none() {
                         if let Some(due) = presenter
                             .as_ref()
                             .and_then(|p| p.effects.as_ref())
@@ -215,9 +209,8 @@ impl RenderWorker {
                         context.ClearState();
                     }
                 }
-                mutex_lock(&frame_queue).clear();
+                mutex_lock(&frame_queue).take();
                 performance.set_presentation_queue_frames(0);
-                decoder_wake.unpark();
             })
             .context("create Video Render thread")?;
         let wake = thread.thread().clone();

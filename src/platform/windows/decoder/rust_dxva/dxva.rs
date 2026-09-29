@@ -16,6 +16,7 @@ use windows::{
 pub enum Codec {
     H264,
     Hevc,
+    Av1,
 }
 #[derive(Debug)]
 pub enum Failure {
@@ -48,6 +49,7 @@ fn select(
         (Codec::H264, 8, 1) => D3D11_DECODER_PROFILE_H264_VLD_NOFGT,
         (Codec::Hevc, 8, 1) => D3D11_DECODER_PROFILE_HEVC_VLD_MAIN,
         (Codec::Hevc, 10, 1) => D3D11_DECODER_PROFILE_HEVC_VLD_MAIN10,
+        (Codec::Av1, 8 | 10, 1) => GUID::from_u128(0xb8be4ccb_cf53_46ba_8d59_d6b8a6da5d2a),
         (Codec::Hevc, 8, 3) => GUID::from_u128(0x4008018f_f537_4b36_98cf_61af8a2c1a33),
         (Codec::Hevc, 10, 3) => GUID::from_u128(0x0dabeffa_4458_4602_bc03_0795659d617c),
         _ => bail!("unsupported codec/depth"),
@@ -477,6 +479,42 @@ impl Pool {
         cancel: &AtomicBool,
     ) -> Result<()> {
         ensure!(!slices.is_empty(), "empty picture");
+        self.submit_with(current, cancel, || {
+            self.submit_buffers(picture, matrix, slices, cancel)
+        })
+    }
+    pub fn submit_av1(
+        &self,
+        current: &Lease,
+        picture: &[u8],
+        tiles: &[u8],
+        bitstream: &[u8],
+        cancel: &AtomicBool,
+    ) -> Result<()> {
+        ensure!(
+            !tiles.is_empty() && !bitstream.is_empty(),
+            "empty AV1 picture"
+        );
+        self.submit_with(current, cancel, || {
+            let mut padded = bitstream.to_vec();
+            padded.resize(padded.len().div_ceil(128) * 128, 0);
+            let desc = [
+                self.commit(D3D11_VIDEO_DECODER_BUFFER_PICTURE_PARAMETERS, picture)?,
+                self.commit(D3D11_VIDEO_DECODER_BUFFER_SLICE_CONTROL, tiles)?,
+                self.commit(D3D11_VIDEO_DECODER_BUFFER_BITSTREAM, &padded)?,
+            ];
+            unsafe {
+                self.video.SubmitDecoderBuffers(&self.decoder, &desc)?;
+            }
+            Ok(())
+        })
+    }
+    fn submit_with(
+        &self,
+        current: &Lease,
+        cancel: &AtomicBool,
+        submit: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
         let sync = SyncGuard::acquire(&current.item().sync)?;
         let mut began = false;
         let mut guard = None;
@@ -512,7 +550,7 @@ impl Pool {
             }
         }
         ensure!(began, "DecoderBeginFrame busy timeout");
-        let submitted = self.submit_buffers(picture, matrix, slices, cancel);
+        let submitted = submit();
         let ended = unsafe { self.video.DecoderEndFrame(&self.decoder) };
         if self.shared {
             unsafe {

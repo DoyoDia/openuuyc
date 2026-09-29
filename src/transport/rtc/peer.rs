@@ -319,6 +319,11 @@ impl NativePeer {
     pub(crate) fn video_tracks(&self) -> VideoTrackRegistry {
         self.video_tracks.clone()
     }
+    pub(crate) fn pause_video(&self) {
+        for track in self.video_tracks.all() {
+            track.pause();
+        }
+    }
 
     pub(crate) fn spawn_viewing_task(
         &self,
@@ -773,7 +778,7 @@ impl NativePeer {
                                 || entry
                                     .capability
                                     .mime_type
-                                    .eq_ignore_ascii_case("video/HEVC")
+                                    .eq_ignore_ascii_case("video/HEVC") || entry.capability.mime_type.eq_ignore_ascii_case("video/AV1")
                         })
                         .map(|entry| {
                             (

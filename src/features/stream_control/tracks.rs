@@ -11,6 +11,66 @@ use anyhow::{Result, anyhow, bail};
 use prost::Message as _;
 
 impl StreamControlHandle {
+    pub(crate) async fn set_video_enabled(&self, enabled: bool) -> Result<()> {
+        if !enabled {
+            self.mouse.disable();
+            self.set_viewing_enabled(false);
+        }
+        if enabled {
+            self.set_viewing_enabled(true);
+            self.ensure_video_tracks_registered().await?;
+        }
+        let (complete, done) = tokio::sync::oneshot::channel();
+        {
+            let mut state = lock(&self.shared);
+            anyhow::ensure!(
+                state.pb_connected && state.text_channel_open,
+                "媒体控制通道尚未就绪"
+            );
+            let sequence = state.next_sequence;
+            state.next_sequence += 1;
+            self.outgoing
+                .send(OutgoingControlMessage {
+                    annotation_generation: None,
+                    sequence,
+                    payload: encode_envelope(
+                        sequence,
+                        PbPayload::SimpleAction(PbSimpleAction {
+                            action: if enabled { 8 } else { 7 },
+                            args: serde_json::json!({"screen_id":-1}).to_string(),
+                            params: None,
+                        }),
+                    ),
+                    protocol: protocol(&state),
+                    completion: Some(complete),
+                })
+                .map_err(|_| anyhow!("媒体连接已关闭"))?;
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(5), done)
+            .await
+            .map_err(|_| anyhow!("画面切换请求发送超时"))?
+            .map_err(|_| anyhow!("媒体连接已关闭"))?
+            .map_err(anyhow::Error::msg)?;
+        if enabled {
+            self.set_viewing_enabled(true);
+        }
+        Ok(())
+    }
+    pub(crate) async fn wait_media_control(&self) -> Result<()> {
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                {
+                    let state = lock(&self.shared);
+                    if state.pb_connected && state.text_channel_open {
+                        break;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .map_err(|_| anyhow!("媒体控制通道握手超时"))
+    }
     pub(crate) async fn stop_acquire_update(&self) -> Result<()> {
         let (complete, done) = tokio::sync::oneshot::channel();
         {
@@ -128,7 +188,10 @@ impl StreamControlHandle {
     pub(super) async fn ensure_video_tracks_registered(&self) -> Result<()> {
         {
             let mut state = lock(&self.shared);
-            ensure_business_ready(&state)?;
+            anyhow::ensure!(
+                state.pb_connected && state.text_channel_open,
+                "媒体控制通道尚未就绪"
+            );
             if state.available_video_tracks.is_empty() {
                 bail!("被控端未协商可用的视频轨道");
             }
@@ -162,7 +225,8 @@ impl StreamControlHandle {
     }
 
     pub(super) fn maybe_register_video_tracks(&self, state: &mut StreamControlState) {
-        if !state.pb_connected
+        if !state.viewing_enabled
+            || !state.pb_connected
             || !state.text_channel_open
             || state.available_video_tracks.is_empty()
             || state.available_video_tracks == state.registered_video_tracks

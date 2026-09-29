@@ -2,7 +2,7 @@ use crate::media::VideoCodec;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct VideoFormatSignature {
-    /// H.264 `profile_idc`, or HEVC `general_profile_idc`. Decides which
+    /// H.264 `profile_idc`, HEVC `general_profile_idc` or AV1 `seq_profile`. Decides which
     /// hardware profile a backend has to ask the driver for.
     pub profile_idc: u8,
     pub coded_width: u32,
@@ -16,7 +16,10 @@ pub(crate) struct VideoFormatSignature {
     pub bit_depth_chroma: u8,
 }
 
-pub(crate) fn parse_annex_b_format(codec: VideoCodec, data: &[u8]) -> Option<VideoFormatSignature> {
+pub(crate) fn parse_stream_format(codec: VideoCodec, data: &[u8]) -> Option<VideoFormatSignature> {
+    if codec == VideoCodec::Av1 {
+        return super::av1::format(data);
+    }
     annex_b_units(data)
         .into_iter()
         .find_map(|unit| match codec {

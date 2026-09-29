@@ -426,6 +426,7 @@ fn codec_label(codec: Codec) -> &'static str {
     match codec {
         Codec::H264 => "H.264",
         Codec::H265 => "H.265",
+        Codec::Av1 => "AV1",
     }
 }
 fn chroma_label(chroma: u8) -> &'static str {

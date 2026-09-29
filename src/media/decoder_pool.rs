@@ -287,7 +287,8 @@ impl DecoderPool {
                             || self.codec == VideoCodec::H265 && format.chroma_format_idc == 3)
                             && format.bit_depth_luma == format.bit_depth_chroma
                             && (format.bit_depth_luma == 8
-                                || self.codec == VideoCodec::H265 && format.bit_depth_luma == 10)
+                                || matches!(self.codec, VideoCodec::H265 | VideoCodec::Av1)
+                                    && format.bit_depth_luma == 10)
                     }
                     // The VA-API backend reads surfaces back as 8-bit NV12.
                     #[cfg(not(windows))]

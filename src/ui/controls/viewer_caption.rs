@@ -47,7 +47,22 @@ pub(crate) fn viewer_caption_button(
         crate::ui::theme::MUTED
     };
     paint_caption_icon(ui.painter(), rect, icon, color);
-    response.on_hover_text(tooltip)
+    if tooltip.is_empty() {
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(
+                egui::WidgetType::Button,
+                ui.is_enabled(),
+                match icon {
+                    ViewerCaptionIcon::Minimize => "最小化",
+                    ViewerCaptionIcon::Close => "关闭",
+                    _ => "窗口操作",
+                },
+            )
+        });
+        response
+    } else {
+        response.on_hover_text(tooltip)
+    }
 }
 
 fn paint_caption_icon(

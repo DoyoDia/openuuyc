@@ -69,15 +69,4 @@ impl Catalog {
             );
         }
     }
-    pub fn virtual_status(&self, id: &str) -> Option<bool> {
-        let detail = self.details.get(id)?.value.as_ref().ok()?;
-        (!detail.details.is_empty()).then(|| {
-            crate::account::virtual_hardware::matches(
-                detail.details.iter().map(|(k, v)| (k.as_str(), v.as_str())),
-            )
-        })
-    }
-    pub fn is_virtual(&self, id: &str) -> bool {
-        self.virtual_status(id) == Some(true)
-    }
 }

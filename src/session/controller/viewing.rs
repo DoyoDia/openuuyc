@@ -10,7 +10,7 @@ use crate::application::viewer::{
     run_connecting_viewer_window,
 };
 use crate::media::ConnectionMediaOptions;
-use anyhow::{Context as _, Result, anyhow, bail};
+use anyhow::{Context as _, Result, anyhow};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::oneshot;
@@ -237,52 +237,31 @@ pub(super) async fn run_viewer_connection_owner(
             // F94230 resets the full-session retry budget on peer connected.
             monitor.send_replace(Some(controller.performance_monitor()));
             retries = 0;
-            let prepared = {
-                let startup_session = Arc::clone(&controller.forwarder.session);
-                cancellable(cancel, await_media_startup(
-                    startup_session.ended(),
-                    controller.start_native_viewer_with_progress(
-                        &resolved.summary.alias, Some(reporter), display,
-                    ),
-                )).await
-            };
-            let (mut viewer, playback) = match prepared {
-                Ok(prepared) => prepared,
-                Err(error) => return Err(controller.close_after_startup_error(error).await),
-            };
-            // The decoder opened against the first frame's parameter sets after
-            // the RTP forwarder started; only then is presentation known.
-            let started = {
-                let startup_session = Arc::clone(&controller.forwarder.session);
-                cancellable(cancel, await_media_startup(
-                    startup_session.ended(),
-                    async {
-                        tokio::time::timeout(Duration::from_secs(30), viewer.startup())
-                            .await.context("first-frame decoder startup timeout")?
-                    },
-                )).await
-            };
-            if let Err(error) = started {
-                return Err(controller.close_after_startup_error(error).await);
-            }
-            let route = controller.peer.selected_route_details().await.unwrap_or_else(|| "安全媒体通道已建立".into());
-            reporter(ConnectionProgress::ready(format!("{route} · {} · {}", playback.codec, controller.performance_monitor().snapshot().decoder)));
-            tracing::info!(device = %resolved.summary.alias, codec = playback.codec, track = %playback.track_id, "single-window viewer entered playback");
-            let close = viewer.close_handle();
             let switcher = crate::application::viewer::device_switch::DeviceSwitcher::new(
                 Arc::clone(&resolved.client), resolved.target_device_id.clone(), switch_sender.clone(), cancel.clone());
-            viewer.set_device_switch(switcher.clone());
-            if viewer_sender.send(ViewerWindowEvent::Playing(Box::new(viewer))).is_err() {
-                let _ = controller.close().await;
-                bail!("player window closed before playback");
-            }
+            let session_control = controller.stream_control_handle();
+            session_control.request_audio_only(resolved.profile.audio_only);
+            let mut modes = session_control.audio_mode_requests();
+            let mut audio_only = resolved.profile.audio_only;
+            let mut close = if audio_only {
+                if let Err(error) = cancellable(cancel, await_media_startup(controller.forwarder.session.end_waiter(), controller.start_listening())).await {
+                    return Err(controller.close_after_startup_error(error).await);
+                }
+                reporter(ConnectionProgress::ready("仅音频连接已建立"));
+                viewer_sender.send(ViewerWindowEvent::Listening(crate::application::viewer::AudioView::new(session_control.clone(), None)))
+                    .map_err(|_| anyhow!("音频窗口已关闭"))?;
+                None
+            } else {
+                match present_video(&mut controller, &resolved.summary.alias, display, reporter, cancel, &viewer_sender, &switcher).await {
+                    Ok(close) => Some(close),
+                    Err(error) => return Err(controller.close_after_startup_error(error).await),
+                }
+            };
             if !cancel.is_cancelled() && let Some(assist) = &mut resolved.assist
                 && let Err(error) = assist.remember_success(&resolved.client).await {
                 tracing::warn!(%error, "connected assistance code was not saved");
-                reporter(ConnectionProgress::ready(format!("{route} · 验证码未保存：{error}")));
+                reporter(ConnectionProgress::ready(format!("已连接 · 验证码未保存：{error}")));
             }
-            let (stop_sender, stop_receiver) = oneshot::channel();
-            let session_control = controller.stream_control_handle();
             let upgrade = session_control.remote_upgrade();
             let upgrade_deadline = async {
                 if let Some(upgrade) = &upgrade {
@@ -292,7 +271,7 @@ pub(super) async fn run_viewer_connection_owner(
                 }
             };
             tokio::pin!(upgrade_deadline);
-            let alive = controller.keep_alive(stop_receiver);
+            let alive = controller.forwarder.session.end_waiter();
             tokio::pin!(alive);
             let mut next_connection = None;
             let mut upgrade_reconnect = false;
@@ -301,12 +280,51 @@ pub(super) async fn run_viewer_connection_owner(
                     result = &mut alive => break result,
                     _ = &mut upgrade_deadline => {
                         upgrade_reconnect = true;
-                        let _ = stop_sender.send(());
-                        break alive.await;
+                        break Ok(());
                     }
                     _ = cancel.cancelled() => {
-                        let _ = stop_sender.send(());
-                        break alive.await;
+                        break Ok(());
+                    }
+                    changed = modes.changed() => {
+                        if changed.is_err() { continue; }
+                        let wanted = *modes.borrow_and_update();
+                        if wanted == audio_only { continue; }
+                        session_control.mouse().disable();
+                        let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+                        let (display_tx, display_rx) = oneshot::channel();
+                        *reporter = Arc::new(move |progress| { let _ = progress_tx.send(progress); });
+                        reporter(ConnectionProgress::working(1, if wanted { "切换为仅音频" } else { "恢复画面" }, "正在切换媒体模式"));
+                        viewer_sender.send(ViewerWindowEvent::Reconnect {
+                            alias:resolved.summary.alias.clone(), window:None, progress:progress_rx, display:display_tx,
+                        }).map_err(|_| anyhow!("媒体窗口已关闭"))?;
+                        let mode_display = cancellable(cancel, async { display_rx.await.context("媒体窗口未完成切换") }).await?;
+                        close = None;
+                        let switched = if wanted {
+                            cancellable(cancel, await_media_startup(controller.forwarder.session.end_waiter(), controller.start_listening())).await
+                        } else {
+                            let started = cancellable(cancel, session_control.set_video_enabled(true)).await;
+                            match started {
+                                Err(error) => Err(error),
+                                Ok(()) => {
+                                    present_video(&mut controller, &resolved.summary.alias, mode_display, reporter, cancel, &viewer_sender, &switcher).await.map(|ready| { close = Some(ready); })
+                                }
+                            }
+                        };
+                        if let Err(error) = switched {
+                            if cancel.is_cancelled() { break Err(error); }
+                            let _ = session_control.set_video_enabled(false).await;
+                            audio_only = true;
+                            session_control.request_audio_only(true);
+                            viewer_sender.send(ViewerWindowEvent::Listening(crate::application::viewer::AudioView::new(session_control.clone(), Some(format!("媒体切换失败：{error:#}"))))).map_err(|_| anyhow!("媒体窗口已关闭"))?;
+                        } else {
+                            audio_only = wanted;
+                            if wanted {
+                                viewer_sender.send(ViewerWindowEvent::Listening(crate::application::viewer::AudioView::new(session_control.clone(), None)))
+                                    .map_err(|_| anyhow!("音频窗口已关闭"))?;
+                            }
+                        }
+                        resolved.profile.audio_only = audio_only;
+                        controller.profile.audio_only = audio_only;
                     }
                     Some(request) = switch_receiver.recv() => {
                         if request.from != resolved.target_device_id || request.device.device_id == resolved.target_device_id { continue; }
@@ -340,19 +358,15 @@ pub(super) async fn run_viewer_connection_owner(
                             display_rx.await.context("player did not acknowledge device switch")
                         };
                         let new_display = cancellable(cancel, replacement).await;
-                        let _ = stop_sender.send(());
-                        let stopped = alive.await;
                         let new_display = new_display?;
-                        if let Err(error) = stopped {
-                            tracing::debug!(%error, "old viewing session ended during device switch");
-                        }
                         next_connection = Some((next, new_display));
                         break Ok(());
                     }
                 }
             };
+            let result = result.and(controller.close().await);
             if cancel.is_cancelled() {
-                close.close();
+                if let Some(close) = close.as_ref() { close.close(); }
                 // Closing the HWND can race the observed server leave. Keep
                 // that reason for the main window instead of losing it here.
                 return match result {
@@ -412,7 +426,7 @@ pub(super) async fn run_viewer_connection_owner(
                         .map_err(|_| anyhow!("player window closed during reconnect"))?;
                     display = cancellable(cancel, async { display_rx.await.context("player did not acknowledge room replacement") }).await?;
                 }
-                result => { close.close(); return result; }
+                result => { if let Some(close) = close.as_ref() { close.close(); } return result; }
             }
         }
     }.await;
@@ -431,6 +445,53 @@ pub(super) async fn run_viewer_connection_owner(
     } else {
         result
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn present_video(
+    controller: &mut ControllerConnection,
+    alias: &str,
+    display: ViewerDisplayHandle,
+    reporter: &ConnectionProgressReporter,
+    cancel: &CancellationToken,
+    sender: &std::sync::mpsc::Sender<ViewerWindowEvent>,
+    switcher: &crate::application::viewer::device_switch::DeviceSwitcher,
+) -> Result<crate::application::viewer::ViewerCloseHandle> {
+    let session = Arc::clone(&controller.forwarder.session);
+    let (mut viewer, playback) = cancellable(
+        cancel,
+        await_media_startup(
+            session.ended(),
+            controller.start_native_viewer_with_progress(alias, Some(reporter), display),
+        ),
+    )
+    .await?;
+    cancellable(
+        cancel,
+        await_media_startup(session.ended(), async {
+            tokio::time::timeout(Duration::from_secs(30), viewer.startup())
+                .await
+                .context("等待视频首帧超时")?
+        }),
+    )
+    .await?;
+    let route = controller
+        .peer
+        .selected_route_details()
+        .await
+        .unwrap_or_else(|| "安全媒体通道已建立".into());
+    reporter(ConnectionProgress::ready(format!(
+        "{route} · {} · {}",
+        playback.codec,
+        controller.performance_monitor().snapshot().decoder
+    )));
+    tracing::info!(device=alias,codec=playback.codec,track=%playback.track_id,"viewer entered playback");
+    viewer.set_device_switch(switcher.clone());
+    let close = viewer.close_handle();
+    sender
+        .send(ViewerWindowEvent::Playing(Box::new(viewer)))
+        .map_err(|_| anyhow!("画面窗口已关闭"))?;
+    Ok(close)
 }
 
 pub async fn run_native_viewer_session(

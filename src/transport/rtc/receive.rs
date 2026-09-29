@@ -316,7 +316,7 @@ pub(super) async fn forward_official_video_track(
     let mut fec_receiver = rsfec_config
         .map(|config| RsFecReceiver::new(track.ssrc(), config.max_k, mutable_extensions.clone()));
     let mut flexfec_receiver = FlexFecReceiver::new(track.ssrc(), mutable_extensions.clone());
-    let mut ulpfec_receiver = UlpfecReceiver::new(track.ssrc(), mutable_extensions);
+    let mut ulpfec_receiver = UlpfecReceiver::new(track.ssrc(), mutable_extensions.clone());
     let mut pending_media = VecDeque::<PendingMediaPacket>::new();
     let mut configured_payload_type = track.payload_type();
     let mut rtcp_feedback = RtcpFeedbackBuffer::default();
@@ -332,6 +332,31 @@ pub(super) async fn forward_official_video_track(
     let mut last_keyframe_timestamp = None;
 
     loop {
+        if !*forwarding_ready.borrow() {
+            pending_media.clear();
+            receiver.reset_after_pause();
+            nack_requester = NackRequester::new();
+            fec_receiver = rsfec_config
+                .map(|c| RsFecReceiver::new(track.ssrc(), c.max_k, mutable_extensions.clone()));
+            flexfec_receiver = FlexFecReceiver::new(track.ssrc(), mutable_extensions.clone());
+            ulpfec_receiver = UlpfecReceiver::new(track.ssrc(), mutable_extensions.clone());
+            rtcp_feedback = RtcpFeedbackBuffer::default();
+            last_packet_received_at = None;
+            last_keyframe_packet_at = None;
+            last_keyframe_timestamp = None;
+            performance.set_frame_buffer_frames(0);
+            performance.set_nack_state(0, 0);
+            while !*forwarding_ready.borrow() {
+                tokio::select! {
+                    _ = stop.cancelled() => return,
+                    changed = forwarding_ready.changed() => if changed.is_err() { return; },
+                    incoming = ingress.recv() => if incoming.is_err() { return; },
+                    feedback = receiver_feedback.recv() => if feedback.is_none() { return; },
+                }
+            }
+            // Do not replay compressed frames or old decoder completions.
+            while receiver_feedback.try_recv().is_ok() {}
+        }
         performance.set_ingress_queue_packets(ingress.receiver.len());
         enum Event {
             Media(PendingMediaPacket),
@@ -345,6 +370,10 @@ pub(super) async fn forward_official_video_track(
             Event::Media(packet)
         } else {
             tokio::select! {
+                    changed = forwarding_ready.changed() => {
+                        if changed.is_err() { break; }
+                        continue;
+                    }
                     incoming = ingress.recv() => {
                         let incoming = match incoming {
                             Ok(incoming) => incoming,
@@ -623,6 +652,8 @@ pub(super) async fn forward_official_video_track(
                     };
                     let packet_codec = if mime.eq_ignore_ascii_case("video/H264") {
                         VideoCodecKind::H264
+                    } else if mime.eq_ignore_ascii_case("video/AV1") {
+                        VideoCodecKind::Av1
                     } else if mime.eq_ignore_ascii_case("video/H265")
                         || mime.eq_ignore_ascii_case("video/HEVC")
                     {
@@ -846,6 +877,7 @@ pub(super) async fn emit_official_receiver_result(
             codec: match frame.codec {
                 VideoCodecKind::H264 => VideoCodec::H264,
                 VideoCodecKind::H265 => VideoCodec::H265,
+                VideoCodecKind::Av1 => VideoCodec::Av1,
             },
         };
         let mut sinks = video_sinks.lock().await;

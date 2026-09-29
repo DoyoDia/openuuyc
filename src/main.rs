@@ -125,6 +125,9 @@ enum Commands {
         /// 静音启动，只影响本地播放
         #[arg(long)]
         mute: bool,
+        /// 仅接收远端声音，不显示或控制画面
+        #[arg(long)]
+        audio_only: bool,
         /// 码流帧率：auto、144、90、60 或 30
         #[arg(long, default_value = "auto")]
         fps: media::FrameRateChoice,
@@ -246,6 +249,7 @@ fn main() -> Result<()> {
         } => app::run(app::GuiOptions {
             background,
             media: media::ConnectionMediaOptions {
+                audio_only: false,
                 muted: false,
                 frame_rate: fps,
                 codec,
@@ -264,6 +268,7 @@ fn main() -> Result<()> {
             device,
             device_id,
             mute,
+            audio_only,
             fps,
             codec,
             hardware_decode,
@@ -273,6 +278,7 @@ fn main() -> Result<()> {
         } => tokio::runtime::Runtime::new()?.block_on(connect_device(
             device,
             media::ConnectionMediaOptions {
+                audio_only,
                 muted: mute,
                 frame_rate: fps,
                 codec,

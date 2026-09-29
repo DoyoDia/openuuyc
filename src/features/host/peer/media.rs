@@ -38,6 +38,7 @@ impl Timeline {
 pub(super) struct Worker {
     cancel: CancellationToken,
     source_missing: Arc<AtomicBool>,
+    first_frame: Arc<AtomicBool>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
     capture: Option<std::thread::JoinHandle<()>>,
 }
@@ -245,6 +246,8 @@ impl Worker {
             })?;
         let send_cancel = cancel.clone();
         let send_handle = handle.clone();
+        let first_frame = Arc::new(AtomicBool::new(false));
+        let sent_first_frame = first_frame.clone();
         let sending = tokio::spawn(async move {
             let mut payloader = H264Payloader::default();
             let sequence = timeline.sequence.clone();
@@ -294,6 +297,9 @@ impl Worker {
                         .map_err(anyhow::Error::from),
                     crate::features::host::format::Codec::H265 => {
                         crate::features::host::hevc::payloads(mtu, &frame.data)
+                    }
+                    crate::features::host::format::Codec::Av1 => {
+                        crate::media::av1::payloads(mtu, &frame.data, frame.keyframe)
                     }
                 };
                 let payloads = match payloads {
@@ -441,6 +447,7 @@ impl Worker {
                     drop(clock);
                 }
                 if complete && !send_cancel.is_cancelled() && send_handle.requested() {
+                    sent_first_frame.store(true, Ordering::Release);
                     send_handle.frame();
                 }
             }
@@ -449,6 +456,7 @@ impl Worker {
         Ok(Self {
             cancel,
             source_missing,
+            first_frame,
             tasks: vec![reports, feedback, sending],
             capture: Some(capture),
         })
@@ -464,6 +472,9 @@ impl Worker {
     }
     pub(super) fn source_missing(&self) -> bool {
         self.source_missing.load(Ordering::Acquire)
+    }
+    pub(super) fn has_frame(&self) -> bool {
+        self.first_frame.load(Ordering::Acquire) && !self.ended()
     }
     pub(super) fn ended(&self) -> bool {
         self.cancel.is_cancelled()

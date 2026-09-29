@@ -302,6 +302,7 @@ impl From<Vec<Vec<u8>>> for Received {
     }
 }
 pub(crate) fn quality_report(
+    format: crate::features::host::format::Format,
     quality: i32,
     probe: u32,
     source: (u32, u32),
@@ -314,7 +315,7 @@ pub(crate) fn quality_report(
         if quality == 6 {
             0
         } else {
-            u64::from(crate::features::host::parameters::fixed(q, 0, source, fps).maximum)
+            u64::from(crate::features::host::parameters::fixed(format, q, 0, source, fps).maximum)
         }
     };
     PbControlMessage {
@@ -449,7 +450,7 @@ pub(crate) fn input_action(
 pub(crate) fn receive(
     bytes: &[u8],
     control: bool,
-    screen: &Screen,
+    screen: Option<&Screen>,
     config: &mut VideoConfig,
     negotiated: &crate::features::host::format::Negotiated,
 ) -> Result<Received> {
@@ -496,6 +497,7 @@ pub(crate) fn receive(
             })
         }
         Some(PbPayload::SimpleAction(action)) if !control && matches!(action.action, 7 | 8) => {
+            let screen = screen.context("尚未启动画面")?;
             let args: serde_json::Value = if action.args.is_empty() {
                 serde_json::Value::Null
             } else {
@@ -531,6 +533,7 @@ pub(crate) fn receive(
                 request.payload
             {
                 let mut errors = Vec::new();
+                let screen = screen.context("尚未启动画面")?;
                 if (setting.resolution_width > 0 && setting.resolution_width as u32 != screen.width)
                     || (setting.resolution_height > 0
                         && setting.resolution_height as u32 != screen.height)
@@ -589,7 +592,7 @@ pub(crate) fn receive(
                     next.auto_quality = auto_quality(setting.auto_frame_quality);
                     next.revision = next.revision.wrapping_add(1);
                     let codec = crate::features::host::format::Codec::from_wire(setting.codec_type);
-                    let selected = if (0..=2).contains(&setting.codec_type) {
+                    let selected = if setting.codec_type == 0 || codec.is_some() {
                         negotiated.apply(
                             &mut next,
                             codec,

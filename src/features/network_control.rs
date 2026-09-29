@@ -6,6 +6,7 @@ use tokio::sync::watch;
 
 #[derive(Clone, Debug, Default)]
 pub struct NetworkControlSnapshot {
+    pub round_trip_ms: Option<f64>,
     pub relay_enabled: bool,
     pub pending: bool,
     pub available: bool,
@@ -18,6 +19,7 @@ pub struct NetworkControlSnapshot {
 struct State {
     view: NetworkControlSnapshot,
     connected: bool,
+    round_trip: Option<(Duration, Instant)>,
     forced: bool,
     has_turns: bool,
     last_request: Option<Instant>,
@@ -47,10 +49,19 @@ impl NetworkControl {
     }
 
     pub(crate) fn connected(&self, connected: bool) {
-        self.state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .connected = connected;
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.connected = connected;
+        if !connected {
+            state.round_trip = None;
+        }
+    }
+
+    /// Selected ICE candidate-pair RTT, independent of any video receiver.
+    pub(crate) fn observe_rtt(&self, delay: Option<Duration>) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.round_trip = delay
+            .filter(|_| state.connected)
+            .map(|value| (value, Instant::now()));
     }
 
     pub(crate) fn snapshot(&self) -> NetworkControlSnapshot {
@@ -72,6 +83,10 @@ impl NetworkControl {
             None
         };
         state.view.available = state.view.unavailable_reason.is_none() && !state.view.pending;
+        state.view.round_trip_ms = state
+            .round_trip
+            .filter(|(_, at)| state.connected && at.elapsed() < Duration::from_secs(3))
+            .map(|(delay, _)| delay.as_secs_f64() * 1000.0);
         state.view.clone()
     }
 

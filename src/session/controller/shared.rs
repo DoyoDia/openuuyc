@@ -136,19 +136,26 @@ impl Session {
         })
     }
     pub async fn ended(&self) -> Result<()> {
+        self.end_waiter().await
+    }
+    pub fn end_waiter(
+        &self,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'static + use<> {
         let mut rx = self.ended.clone();
-        loop {
-            if let Some(end) = rx.borrow_and_update().clone() {
-                return match end {
-                    None => Ok(()),
-                    Some(e) => Err(e
-                        .signal
-                        .map(anyhow::Error::new)
-                        .unwrap_or_else(|| anyhow!(e.message))),
-                };
-            }
-            if rx.changed().await.is_err() {
-                bail!("设备连接已结束");
+        async move {
+            loop {
+                if let Some(end) = rx.borrow_and_update().clone() {
+                    return match end {
+                        None => Ok(()),
+                        Some(e) => Err(e
+                            .signal
+                            .map(anyhow::Error::new)
+                            .unwrap_or_else(|| anyhow!(e.message))),
+                    };
+                }
+                if rx.changed().await.is_err() {
+                    bail!("设备连接已结束");
+                }
             }
         }
     }

@@ -3,6 +3,7 @@ use super::*;
 #[derive(Clone, Copy)]
 enum Glyph {
     Monitor,
+    Headphones,
     PortMapping,
     Files,
     Power,
@@ -232,6 +233,7 @@ fn paint_glyph(p: &egui::Painter, r: egui::Rect, g: Glyph, color: Color32) {
             }
         }
         Glyph::Monitor => paint_icon(p, r, Icon::Monitor, color),
+        Glyph::Headphones => crate::ui::controls::paint_headphones(p, r, color),
         Glyph::PortMapping => crate::ui::controls::paint_port_mapping_icon(p, r, color),
         Glyph::Files => crate::ui::controls::paint_file_icon(p, r, color, true),
         Glyph::Edit => paint_icon(p, r, Icon::Edit, color),
@@ -474,6 +476,7 @@ impl DeviceCenterApp {
             &device.version_name
         };
         let mut connect = false;
+        let mut audio_only = false;
         let mut edit = None;
         let mut power = None;
         let mut exit_account = false;
@@ -506,8 +509,9 @@ impl DeviceCenterApp {
             let card_h = 116.0;
             let card_y = hero_h - 24.0;
             let has_power = owned && !current && matches!(device.platform, 1 | 4);
+            let viewing = self.is_viewing_target(&id);
             let power_y = card_y + card_h + 16.0;
-            let info_y = if has_power || has_ports {
+            let info_y = if has_power || has_ports || viewing {
                 power_y + theme::CONTROL_HEIGHT + 24.0
             } else {
                 card_y + card_h + 24.0
@@ -566,7 +570,6 @@ impl DeviceCenterApp {
                 tile.shrink(tile_side * 0.16),
                 device.platform,
             );
-            let viewing = self.is_viewing_target(&id);
             let title_x = tile.right() + 24.0;
             let mut name = ui.new_child(egui::UiBuilder::new().max_rect(egui::Rect::from_min_max(
                 egui::pos2(title_x, card.top() + 16.0),
@@ -649,7 +652,7 @@ impl DeviceCenterApp {
                 crate::account::power::PowerAction::Reboot,
             ];
             let power_count = if has_power { power_actions.len() } else { 0 };
-            let action_count = power_count + 2 * usize::from(has_ports);
+            let action_count = power_count + 2 * usize::from(has_ports) + usize::from(viewing);
             let gap = 16.0;
             let button_w = (card.width() - action_count.saturating_sub(1) as f32 * gap)
                 / action_count.max(1) as f32;
@@ -741,6 +744,29 @@ impl DeviceCenterApp {
                 )
                 .on_disabled_hover_text("设备需要在线且允许连接")
                 .clicked();
+            }
+            if viewing {
+                let rect = egui::Rect::from_min_size(
+                    at(
+                        pad + (power_count + 2 * usize::from(has_ports)) as f32 * (button_w + gap),
+                        power_y,
+                    ),
+                    vec2(button_w, theme::CONTROL_HEIGHT),
+                );
+                let mut button_ui = ui.new_child(egui::UiBuilder::new().max_rect(rect));
+                let issue = self.viewer_action_issue(&device);
+                let button = detail_button(
+                    &mut button_ui,
+                    "仅音频",
+                    Glyph::Headphones,
+                    !self.mutation_pending && !self.logout_pending && issue.is_none(),
+                    rect.size(),
+                    ButtonTone::Normal,
+                );
+                audio_only = button.clicked();
+                if let Some(issue) = issue {
+                    button.on_disabled_hover_text(issue);
+                }
             }
             let left = card.left() + 12.0;
             let middle = card.center().x;
@@ -888,9 +914,9 @@ impl DeviceCenterApp {
         if files {
             self.open_file_transfer(id.clone());
         }
-        if connect {
+        if connect || audio_only {
             self.selected_device_id = Some(id);
-            self.start_viewer();
+            self.start_viewer_mode(audio_only);
         }
         if let Some(action) = edit {
             self.center_ui.edit = Some(DeviceEdit {

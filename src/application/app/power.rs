@@ -75,7 +75,6 @@ impl DeviceCenterApp {
                 .desktop_devices
                 .iter()
                 .any(|d| d.device_id == device.device_id)
-            || catalog.is_virtual(&device.device_id)
         {
             anyhow::bail!("仅支持本账号绑定的远端电脑");
         }

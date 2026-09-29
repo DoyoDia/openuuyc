@@ -3,6 +3,7 @@ pub(crate) mod dsp;
 pub(crate) mod encoder;
 pub(crate) mod neteq;
 pub(crate) mod sender;
+pub(crate) mod waveform;
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -72,6 +73,7 @@ struct Shared {
     concealed: AtomicU64,
     callbacks: AtomicU64,
     peak: AtomicU32,
+    waveform: Arc<waveform::Waveform>,
     input_level: StereoLevel,
     output_level: StereoLevel,
     preference_updates: tokio::sync::watch::Sender<Option<AudioSettings>>,
@@ -85,6 +87,7 @@ impl Shared {
     }
 
     fn clear_levels(&self) {
+        self.waveform.clear();
         self.input_level.clear();
         self.output_level.clear();
     }
@@ -170,6 +173,7 @@ impl AudioPlayback {
                 concealed: AtomicU64::new(0),
                 callbacks: AtomicU64::new(0),
                 peak: AtomicU32::new(0),
+                waveform: waveform::Waveform::new(),
                 input_level: StereoLevel::new(),
                 output_level: StereoLevel::new(),
                 preference_updates: tokio::sync::watch::channel(None).0,
@@ -210,6 +214,10 @@ impl AudioPlayback {
 
     /// Unity-gain reference at the device-channel mix, before volume/mute.
     /// This is a current display peak, not the lifetime diagnostic `peak`.
+    pub(crate) fn waveform(&self) -> waveform::Reader {
+        self.0.shared.waveform.subscribe()
+    }
+
     pub fn input_levels(&self) -> [f32; 2] {
         if self.0.shared.stopped.load(Ordering::Acquire)
             || !self.0.shared.audible.load(Ordering::Acquire)
@@ -410,6 +418,7 @@ impl Engine {
 
     fn block(&mut self, output: &mut [f32; BLOCK * 2]) -> Result<()> {
         let generation = self.shared.generation.load(Ordering::Acquire);
+        let waveform_epoch = self.shared.waveform.epoch();
         if generation != self.generation {
             self.reset(generation)?;
         }
@@ -444,6 +453,9 @@ impl Engine {
         // still consumes exactly 10 ms; no application-level PCM truncation.
         let previous = self.stats;
         self.receiver.block(output, &mut self.stats)?;
+        self.shared
+            .waveform
+            .record(output, self.blocks, waveform_epoch);
         let produced = self
             .stats
             .output_samples

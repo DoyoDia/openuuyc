@@ -46,7 +46,13 @@ pub(crate) fn update_nonmodal_window_move(
     }
     if response.double_clicked() {
         state.dragging = false;
-        window.set_maximized(!window.is_maximized());
+        if window.is_resizable()
+            && window
+                .enabled_buttons()
+                .contains(winit::window::WindowButtons::MAXIMIZE)
+        {
+            window.set_maximized(!window.is_maximized());
+        }
         return;
     }
     if response.drag_started() && !state.dragging {

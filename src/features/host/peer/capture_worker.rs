@@ -129,6 +129,9 @@ pub(super) fn capture_loop(
                     && c.capability.format.chroma == wanted.format.chroma
                     && c.capability.format.depth == wanted.format.depth
                     && (c.capability.format.codec == wanted.format.codec
+                        || (wanted.format.codec == crate::features::host::format::Codec::Av1
+                            && c.capability.format.codec
+                                == crate::features::host::format::Codec::H265)
                         || c.capability.format.codec == crate::features::host::format::Codec::H264)
                     && !(skip_cross_hevc
                         && c.capability.adapter != screen.adapter
@@ -143,6 +146,7 @@ pub(super) fn capture_loop(
                 let maximum = c.maximum_for(wanted.requested_maximum);
                 (
                     c.capability.format == wanted.format,
+                    c.capability.format.codec == crate::features::host::format::Codec::H265,
                     c.capability.backend != crate::features::host::format::Backend::Software,
                     c.fps.min(wanted.maximum_fps),
                     c.capability.adapter == screen.render_adapter.unwrap_or(screen.adapter),
@@ -170,19 +174,22 @@ pub(super) fn capture_loop(
             (screen.width, screen.height),
             wanted.maximum,
         );
+        let budget_size =
+            crate::media::geometry::fit_size(screen.width, screen.height, wanted.maximum);
         if let Some(auto) = automatic.as_mut() {
             auto.limit(maximum_quality);
-            let (probe, lower, loss) = transport.automatic_rates();
+            let sample = transport.automatic_rates();
             if wanted.sending
                 && wanted.capturing
+                && connected.load(Ordering::Acquire)
                 && auto
                     .observe(
                         Instant::now(),
+                        wanted.format,
+                        budget_size,
                         wanted.fps,
                         last_frame.is_some_and(|at| at.elapsed() < Duration::from_secs(1)),
-                        probe,
-                        lower,
-                        loss,
+                        sample,
                     )
                     .is_some()
             {
@@ -194,19 +201,30 @@ pub(super) fn capture_loop(
             // quality budget and QoS label, not only the GPU texture size.
             wanted.quality = wanted.quality.min(maximum_quality);
         }
-        transport.quality(automatic.is_some(), wanted.quality, changed);
         transport.fps(wanted.fps);
         let bounds = if automatic.is_some() {
-            crate::features::host::parameters::automatic(wanted.quality, wanted.fps, initial_auto)
+            crate::features::host::parameters::automatic(
+                wanted.format,
+                wanted.quality,
+                budget_size,
+                wanted.fps,
+                initial_auto,
+            )
         } else {
             crate::features::host::parameters::fixed(
+                wanted.format,
                 wanted.quality,
                 wanted.bitrate,
-                (screen.width, screen.height),
+                budget_size,
                 wanted.fps,
             )
         };
+        let quality_target = crate::features::host::format::QualityTarget {
+            bitrate: bounds.maximum,
+            fps: wanted.fps,
+        };
         if wanted.sending && wanted.capturing {
+            transport.quality(automatic.is_some(), wanted.quality, changed);
             transport.configure(bounds, changed);
         } else {
             transport.pause();
@@ -375,6 +393,7 @@ pub(super) fn capture_loop(
                         peak: bounds.initial.max(300_000),
                         fps: wanted.fps,
                         quality: wanted.quality,
+                        quality_target,
                     },
                 )
             } else {
@@ -412,7 +431,12 @@ pub(super) fn capture_loop(
         }
         let active_encoder = encoder.as_mut().context("缺少编码器")?;
         let peak = transport.media_rate().min(bounds.maximum);
-        let codec_minimum = (bounds.minimum / 1000).max(30) * 1000;
+        // A zero/tiny allocation is a transport pause, not an encoder failure.
+        // Do not fabricate bandwidth by clamping it back to a quality floor.
+        let codec_minimum = crate::features::host::parameters::MIN_ENCODER_RATE;
+        if peak < codec_minimum {
+            continue;
+        }
         let (media_rate, discard_frame) =
             admission.next(peak, codec_minimum, transport.cwnd_ratio());
         if discard_frame {
@@ -446,6 +470,7 @@ pub(super) fn capture_loop(
                 peak,
                 fps: wanted.fps,
                 quality: wanted.quality,
+                quality_target,
             })? {
                 keyframe.store(true, Ordering::Release);
             }
@@ -472,7 +497,7 @@ pub(super) fn capture_loop(
                 force,
             )?;
             for output in &encoded {
-                if let Some(actual) = crate::media::video_format::parse_annex_b_format(
+                if let Some(actual) = crate::media::video_format::parse_stream_format(
                     output.format.codec.media(),
                     &output.data,
                 ) {
@@ -559,6 +584,8 @@ pub(super) fn capture_loop(
                 visible: true,
                 quality: wanted.quality,
                 fps: wanted.fps,
+                format: wanted.format,
+                budget_size,
                 encoder: Some(candidate.capability.backend),
                 capture: desktop.as_ref().map_or("DXGI", |d| d.backend_name()).into(),
             };
