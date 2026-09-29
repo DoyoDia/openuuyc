@@ -7,11 +7,13 @@ use egui::{Align, Color32, FontId, RichText, Sense, Stroke, vec2};
 
 mod about;
 mod assist;
+mod assist_components;
 mod components;
 mod device_details;
 mod device_visuals;
 mod devices;
 mod diagnostics_panel;
+mod host_assist;
 mod host_settings;
 mod logs;
 mod port_mapping;
@@ -68,6 +70,10 @@ pub(super) struct CenterUi {
     legal_document: Option<about::LegalDocument>,
     logs: logs::LogUi,
     diagnostics: diagnostics_panel::ViewState,
+    host_assist_password: Option<host_assist::PasswordEditor>,
+    host_assist_settings_open: bool,
+    host_assist_show_code: bool,
+    guest_assist_open: bool,
     pub(super) shortcuts: crate::application::viewer_shortcuts::Editor,
 
     plugins: crate::plugins::Manager,
@@ -84,6 +90,11 @@ enum EditAction {
 }
 
 impl CenterUi {
+    pub(super) fn clear_host_assist(&mut self) {
+        self.host_assist_password = None;
+        self.host_assist_settings_open = false;
+        self.host_assist_show_code = false;
+    }
     pub(super) fn open_details(&mut self, id: String) {
         if self.page != Page::DeviceDetails {
             self.detail_parent = self.page;
@@ -253,29 +264,6 @@ fn paint_icon(p: &egui::Painter, rect: egui::Rect, icon: Icon, color: Color32) {
             ));
         }
     }
-}
-
-fn icon_button(ui: &mut egui::Ui, icon: Icon, hint: &str) -> egui::Response {
-    if matches!(icon, Icon::Close) {
-        return crate::ui::controls::close_button(ui, hint, 32.0);
-    }
-    let (rect, response) = ui.allocate_exact_size(vec2(32.0, 32.0), Sense::click());
-    response
-        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), hint));
-    if (response.hovered() || response.has_focus()) && ui.is_enabled() {
-        ui.painter().rect_filled(rect, 5.0, SURFACE);
-    }
-    paint_icon(
-        ui.painter(),
-        rect,
-        icon,
-        if ui.is_enabled() {
-            MUTED
-        } else {
-            crate::ui::theme::DISABLED
-        },
-    );
-    response.on_hover_text(hint)
 }
 
 fn primary(label: &str) -> egui::Button<'_> {
@@ -1040,22 +1028,80 @@ impl DeviceCenterApp {
     }
 
     fn active_view(&mut self, ui: &mut egui::Ui) {
-        let Some(session) = &self.active_session else {
+        if self.viewers.active.len() > 1 {
+            let mut close = None;
+            ui.menu_button(
+                format!("观看窗口（{}）", self.viewers.active.len()),
+                |ui| {
+                    for session in &self.viewers.active {
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(
+                                    !session.closing,
+                                    crate::ui::controls::secondary(&format!(
+                                        "{} · {}",
+                                        session.alias,
+                                        session.device_id.as_deref().unwrap_or("协助连接")
+                                    )),
+                                )
+                                .clicked()
+                            {
+                                session.handle.focus();
+                                ui.close();
+                            }
+                            if ui
+                                .add_enabled(
+                                    !session.closing,
+                                    crate::ui::controls::secondary(if session.closing {
+                                        "正在关闭"
+                                    } else {
+                                        "断开"
+                                    }),
+                                )
+                                .clicked()
+                            {
+                                close = Some(session.key.clone());
+                                ui.close();
+                            }
+                        });
+                    }
+                },
+            );
+            if let Some(key) = close {
+                if let Some(session) = self.viewers.active.iter_mut().find(|s| s.key == key) {
+                    session.handle.request_close();
+                    session.closing = true;
+                }
+            }
+            if ui
+                .add_enabled(
+                    self.viewers.active.iter().any(|s| !s.closing),
+                    crate::ui::controls::secondary("结束全部观看"),
+                )
+                .clicked()
+            {
+                self.stop_viewer();
+            }
+            return;
+        }
+        let Some(session) = self.viewers.active.first() else {
             return;
         };
+        let closing = session.closing;
+        let key = session.key.clone();
         let alias = session.alias.clone();
         // Inline in the existing right-aligned header; never add a session row
         // above the device list or assistance form.
         if ui
-            .add_enabled(
-                !self.closing_session,
-                crate::ui::controls::secondary("结束观看"),
-            )
+            .add_enabled(!closing, crate::ui::controls::secondary("结束观看"))
             .clicked()
         {
-            self.stop_viewer();
+            if let Some(session) = self.viewers.active.iter_mut().find(|s| s.key == key) {
+                session.handle.request_close();
+                session.closing = true;
+            }
         }
-        let text = if self.closing_session {
+        let text = if closing {
             format!("正在关闭  {alias}")
         } else {
             format!("观看窗口已打开  ·  {alias}")
@@ -1096,9 +1142,7 @@ impl DeviceCenterApp {
                 ui.add_space(16.0);
                 if ui
                     .add_enabled(
-                        !self.login_running
-                            && !self.logout_pending
-                            && self.active_session.is_none(),
+                        !self.login_running && !self.logout_pending && !self.has_viewers(),
                         primary("刷新"),
                     )
                     .clicked()
@@ -1210,6 +1254,9 @@ impl DeviceCenterApp {
 
     pub(super) fn draw_dialogs(&mut self, ctx: &egui::Context) {
         if self.exit_requested {
+            return;
+        }
+        if self.host_assist_dialog(ctx) {
             return;
         }
         if self.needs_login() {
@@ -1325,11 +1372,7 @@ impl DeviceCenterApp {
                         edit.alias = catalog.suggested_name.clone();
                     }
                 } else {
-                    if self.active_session.as_ref().is_some_and(|s| {
-                        s.device_id
-                            .as_ref()
-                            .is_none_or(|id| id == &edit.device.device_id)
-                    }) {
+                    if self.viewer_for_device(&edit.device.device_id).is_some() {
                         ui.colored_label(AMBER, "当前观看将结束。");
                     }
                 }
@@ -1490,9 +1533,62 @@ impl DeviceCenterApp {
     }
 
     fn login_page(&mut self, root: &mut egui::Ui) {
+        if self.center_ui.guest_assist_open {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new().fill(BG).inner_margin(32))
+                .show(root, |ui| {
+                    if ui.add(crate::ui::controls::secondary("返回登录")).clicked() {
+                        self.center_ui.guest_assist_open = false;
+                    }
+                    ui.add_space(24.0);
+                    ui.heading("远程协助");
+                    ui.label(
+                        RichText::new("无需登录，将设备 ID 和验证码分享给协助你的人。")
+                            .color(MUTED),
+                    );
+                    ui.add_space(20.0);
+                    if self.host.as_ref().is_some_and(|h| h.is_guest()) {
+                        self.host_assist_controls(ui);
+                        if let Some(host) = &self.host {
+                            let status = host.status();
+                            ui.add_space(12.0);
+                            ui.label(if status.connected {
+                                "正在接受远程协助"
+                            } else if !host.allowed() {
+                                "尚未开启远程协助"
+                            } else {
+                                &status.message
+                            });
+                            if status.connected
+                                && ui.add(crate::ui::controls::secondary("断开连接")).clicked()
+                            {
+                                host.disconnect();
+                            }
+                            if let Some(error) = status.error {
+                                ui.colored_label(AMBER, error);
+                            }
+                        }
+                    } else {
+                        ui.label("正在准备本机协助…");
+                    }
+                });
+            return;
+        }
+        egui::Panel::bottom("guest-assist-entry")
+            .frame(egui::Frame::new().fill(BG).inner_margin(16))
+            .show(root, |ui| {
+                ui.vertical_centered(|ui| {
+                    if ui
+                        .add(crate::ui::controls::secondary("无需登录 · 接受远程协助"))
+                        .clicked()
+                    {
+                        self.center_ui.guest_assist_open = true;
+                    }
+                });
+            });
         let locked = self.login_restoring
             || self.logout_pending
-            || self.active_session.is_some()
+            || self.has_viewers()
             || self.mutation_pending;
         // First restore saved credentials. Once the login page is idle,
         // request QR automatically; failures require an explicit refresh.

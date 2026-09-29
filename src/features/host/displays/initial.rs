@@ -15,7 +15,7 @@ impl Session {
     pub(crate) async fn prepare(&self, options: ConnectOptions) -> Result<capture::Screen> {
         tokio::task::spawn_blocking(recovery::recover_abandoned).await??;
         ensure!(
-            options.kind == 1 && options.connect_type == 1,
+            options.kind == 1 && matches!(options.connect_type, 1 | 2),
             "不支持的被控连接类型"
         );
         ensure!(options.virtual_modes.len() <= 64, "虚拟屏模式数量过多");

@@ -132,6 +132,13 @@ impl AuthenticatedClient {
             .expect("validated native identity")
             .device_id
     }
+    pub(crate) fn presence_key(&self) -> String {
+        self.device
+            .identity()
+            .client_identity()
+            .expect("validated native identity")
+            .client_id
+    }
     pub(crate) fn viewing_settings_store(
         &self,
         publisher_id: &str,
@@ -306,7 +313,7 @@ impl AuthenticatedClient {
         }
     }
 
-    async fn request<T, F>(&self, request: impl FnOnce(NrdApi) -> F) -> Result<T>
+    pub(crate) async fn request<T, F>(&self, request: impl FnOnce(NrdApi) -> F) -> Result<T>
     where
         F: std::future::Future<Output = Result<ApiEnvelope<T>>>,
     {
@@ -379,21 +386,6 @@ impl AuthenticatedClient {
                 }
             }))
     }
-    pub(crate) async fn host_input_configuration(
-        &self,
-    ) -> Result<crate::features::host::input::config::Configuration> {
-        let configs = self
-            .request(|api| async move {
-                api.query_configures(&[
-                    ("app_white_list".into(), String::new()),
-                    ("win_keylock_optimize".into(), String::new()),
-                ])
-                .await
-            })
-            .await?;
-        crate::features::host::input::config::Configuration::from_response(configs)
-    }
-
     pub async fn list_devices(&self) -> Result<DeviceList> {
         let list = self
             .request(|api| async move { api.list_devices().await })
@@ -628,14 +620,6 @@ impl AuthenticatedClient {
             .into());
         }
         Ok(())
-    }
-
-    pub async fn create_host_room(&self, last_controlled_interval: i64) -> Result<RoomSession> {
-        let room: RoomSession = self
-            .request(|api| async move { api.create_room(last_controlled_interval).await })
-            .await?;
-        room.validate()?;
-        Ok(room)
     }
 
     pub async fn set_controllable(&self, controllable: bool) -> Result<()> {

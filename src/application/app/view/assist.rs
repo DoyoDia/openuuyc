@@ -1,5 +1,5 @@
 use super::*;
-use crate::account::assist::{SavedDevice, SavedKind, normalize_connect_id};
+use crate::account::assist::{SavedKind, normalize_connect_id};
 use crate::application::app::assist::{DeletePrompt, FavoriteEditor};
 
 impl DeviceCenterApp {
@@ -14,32 +14,23 @@ impl DeviceCenterApp {
             }
         }
         ui.horizontal(|ui| {
-            ui.set_min_height(crate::ui::theme::CONTROL_HEIGHT);
+            ui.set_min_height(theme::CONTROL_HEIGHT);
             ui.label(
                 RichText::new(if favorites {
                     "收藏设备"
                 } else {
                     "远程协助"
                 })
-                .size(crate::ui::theme::TITLE)
+                .size(theme::TITLE)
                 .strong(),
             );
             ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                if ui
-                    .add_enabled_ui(!self.assist.loading, |ui| {
-                        if self.assist.loading {
-                            let (rect, response) =
-                                ui.allocate_exact_size(vec2(32.0, 32.0), Sense::hover());
-                            egui::Spinner::new()
-                                .size(18.0)
-                                .paint_at(ui, rect.shrink(7.0));
-                            response.on_hover_text("正在刷新记录…")
-                        } else {
-                            icon_button(ui, Icon::Refresh, "刷新记录")
-                        }
-                    })
-                    .inner
-                    .clicked()
+                if self.assist.loading {
+                    ui.add_sized(
+                        [theme::CONTROL_HEIGHT, theme::CONTROL_HEIGHT],
+                        egui::Spinner::new().size(18.0),
+                    );
+                } else if assist_components::glyph(ui, Icon::Refresh, "刷新记录", MUTED).clicked()
                 {
                     self.request_assist_refresh();
                 }
@@ -59,56 +50,239 @@ impl DeviceCenterApp {
                 self.active_view(ui);
             });
         });
+        self.assist_page_notices(ui, favorites);
         ui.add_space(18.0);
         let available = !self.assist.busy && !self.logout_pending && !self.mutation_pending;
         let mut connect = None;
-        if !favorites {
-            egui::Frame::new()
-                .fill(SURFACE)
-                .stroke(Stroke::new(1.0, LINE))
-                .corner_radius(crate::ui::theme::PANEL_RADIUS)
-                .inner_margin(20)
-                .show(ui, |ui| {
+        if favorites {
+            connect = self.assist_favorite_records(ui, available);
+        } else {
+            crate::ui::controls::page_scroll("assist-page").show(ui, |ui| {
+                self.host_assist_controls(ui);
+                ui.add_space(16.0);
+                crate::ui::controls::section_frame().show(ui, |ui| {
                     ui.set_width(ui.available_width());
-                    ui.label(RichText::new("伙伴的设备 ID").color(MUTED));
-                    ui.add_space(8.0);
-                    ui.add_enabled_ui(available && self.active_session.is_none(), |ui| {
-                        ui.horizontal(|ui| {
-                            let width = ((ui.available_width() - 120.0) * 0.5).clamp(160.0, 280.0);
-                            let input = ui.add_sized(
-                                [width, 40.0],
-                                singleline_input(&mut self.assist.connect_id)
-                                    .hint_text("输入9位设备 ID")
-                                    .char_limit(24),
+                    assist_components::header(
+                        ui,
+                        "远控伙伴设备",
+                        Some("通过伙伴的设备 ID 发起远程连接"),
+                        |_| {},
+                    );
+                    ui.separator();
+                    egui::Frame::new()
+                        .inner_margin(theme::ASSIST_CARD_MARGIN)
+                        .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.y = 8.0;
+                            let (changed, requested) = assist_components::connect_inputs(
+                                ui,
+                                &mut self.assist.connect_id,
+                                &mut self.assist.direct_code,
+                                available,
                             );
-                            if input.changed() {
+                            if changed {
                                 self.assist.connect_error = None;
-                                self.assist.direct_code.clear();
                             }
-                            let code = ui.add_sized(
-                                [width, 40.0],
-                                singleline_input(&mut self.assist.direct_code)
-                                    .hint_text("设备验证码（可选）")
-                                    .char_limit(256),
-                            );
-                            let enter = (input.has_focus() || code.has_focus())
-                                && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                            let clicked = ui
-                                .add_sized(
-                                    [104.0, 40.0],
-                                    login_button("连接").fill(BLUE).stroke(Stroke::NONE),
-                                )
-                                .clicked();
-                            if enter || clicked {
+                            if requested {
                                 connect = Some((
                                     self.assist.connect_id.clone(),
                                     self.assist.direct_code.clone(),
                                 ));
                             }
+                            ui.add_space(20.0);
+                            ui.separator();
+                            ui.add_space(8.0);
+                            if let Some(recent) = self.assist_recent_records(ui, available) {
+                                connect = Some(recent);
+                            }
                         });
-                    });
                 });
+            });
         }
+        if let Some((id, code)) = connect {
+            self.request_assist_connect(id, code);
+        }
+    }
+
+    fn assist_recent_records(
+        &mut self,
+        ui: &mut egui::Ui,
+        available: bool,
+    ) -> Option<(String, String)> {
+        let mut items = self
+            .assist
+            .lists
+            .as_ref()
+            .map(|l| l.recent.clone())
+            .unwrap_or_default();
+        items.sort_by(|a, b| {
+            b.last_connected_at
+                .cmp(&a.last_connected_at)
+                .then_with(|| a.connect_id.cmp(&b.connect_id))
+        });
+        ui.horizontal(|ui| {
+            ui.set_min_height(theme::CONTROL_HEIGHT);
+            ui.label(RichText::new("最近连接").strong());
+            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                if ui
+                    .add_enabled(
+                        available && !items.is_empty(),
+                        login_button("清空记录").frame(false),
+                    )
+                    .clicked()
+                {
+                    self.assist.delete_prompt = Some(DeletePrompt::Recent);
+                }
+            });
+        });
+        if items.is_empty() {
+            self.assist_records_empty(ui, false);
+        }
+        let mut connect = None;
+        if let Some((index, action)) = assist_components::recent_grid(ui, &items, available) {
+            let item = &items[index];
+            match action {
+                assist_components::RecentAction::Connect => {
+                    connect = Some((item.connect_id.clone(), String::new()))
+                }
+                assist_components::RecentAction::Remove => {
+                    self.assist.delete_prompt =
+                        Some(DeletePrompt::Device(SavedKind::Recent, item.clone()))
+                }
+                assist_components::RecentAction::Favorite if item.is_favorite => {
+                    self.assist.delete_prompt =
+                        Some(DeletePrompt::Device(SavedKind::Favorites, item.clone()))
+                }
+                assist_components::RecentAction::Favorite => {
+                    self.assist.favorite_editor = Some(FavoriteEditor {
+                        id: item.connect_id.clone(),
+                        remark: item.remark.clone(),
+                        editing: false,
+                        code: item.saved_code.clone(),
+                        code_changed: false,
+                    })
+                }
+            }
+        }
+        connect
+    }
+
+    fn assist_records_empty(&self, ui: &mut egui::Ui, favorites: bool) {
+        ui.label(
+            RichText::new(if self.assist.loading && self.assist.lists.is_none() {
+                "正在读取记录…"
+            } else if self.assist.lists.is_none() && self.assist.last_list_error.is_some() {
+                "记录读取失败，请刷新重试"
+            } else if favorites {
+                "暂无收藏"
+            } else {
+                "暂无最近连接"
+            })
+            .color(MUTED),
+        );
+    }
+
+    fn assist_favorite_records(
+        &mut self,
+        ui: &mut egui::Ui,
+        available: bool,
+    ) -> Option<(String, String)> {
+        let mut items = self
+            .assist
+            .lists
+            .as_ref()
+            .map(|l| l.favorites.clone())
+            .unwrap_or_default();
+        items.sort_by(|a, b| {
+            b.favorited_at
+                .cmp(&a.favorited_at)
+                .then_with(|| a.connect_id.cmp(&b.connect_id))
+        });
+        if items.is_empty() {
+            self.assist_records_empty(ui, true);
+        }
+        let mut connect = None;
+        crate::ui::controls::page_scroll("assist-favorites").show(ui, |ui| {
+            for item in &items {
+                ui.push_id(&item.publisher_device_id, |ui| {
+                    egui::Frame::new()
+                        .inner_margin(egui::Margin::symmetric(12, 10))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                let (icon, _) =
+                                    ui.allocate_exact_size(vec2(28.0, 42.0), Sense::hover());
+                                paint_icon(ui.painter(), icon, Icon::Monitor, MUTED);
+                                ui.allocate_ui_with_layout(
+                                    vec2((ui.available_width() - 188.0).max(140.0), 44.0),
+                                    egui::Layout::top_down(Align::Min),
+                                    |ui| {
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(item.title()).size(theme::BODY),
+                                            )
+                                            .truncate(),
+                                        );
+                                        ui.label(
+                                            RichText::new(assist_components::grouped_id(
+                                                &item.connect_id,
+                                            ))
+                                            .size(theme::SMALL)
+                                            .color(MUTED),
+                                        );
+                                    },
+                                );
+                                ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                                    let valid = item.validate().is_ok();
+                                    if ui
+                                        .add_enabled(
+                                            available && valid,
+                                            login_button("连接")
+                                                .min_size(vec2(78.0, theme::CONTROL_HEIGHT)),
+                                        )
+                                        .clicked()
+                                    {
+                                        connect = Some((item.connect_id.clone(), String::new()));
+                                    }
+                                    ui.add_enabled_ui(available && valid, |ui| {
+                                        if assist_components::glyph(
+                                            ui,
+                                            Icon::Close,
+                                            "取消收藏",
+                                            MUTED,
+                                        )
+                                        .clicked()
+                                        {
+                                            self.assist.delete_prompt = Some(DeletePrompt::Device(
+                                                SavedKind::Favorites,
+                                                item.clone(),
+                                            ));
+                                        }
+                                        if assist_components::glyph(
+                                            ui,
+                                            Icon::Edit,
+                                            "编辑收藏",
+                                            MUTED,
+                                        )
+                                        .clicked()
+                                        {
+                                            self.assist.favorite_editor = Some(FavoriteEditor {
+                                                id: item.connect_id.clone(),
+                                                remark: item.remark.clone(),
+                                                editing: true,
+                                                code: item.saved_code.clone(),
+                                                code_changed: false,
+                                            });
+                                        }
+                                    });
+                                });
+                            });
+                        });
+                    ui.separator();
+                });
+            }
+        });
+        connect
+    }
+    fn assist_page_notices(&mut self, ui: &mut egui::Ui, favorites: bool) {
         if let Some((_, deadline)) = &self.assist.connect_error {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -153,207 +327,6 @@ impl DeviceCenterApp {
                 );
                 self.assist.message_until = None;
             }
-        }
-        ui.add_space(22.0);
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(if favorites {
-                    "已收藏"
-                } else {
-                    "最近连接"
-                })
-                .size(crate::ui::theme::SECTION)
-                .strong(),
-            );
-            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                let has_recent = self
-                    .assist
-                    .lists
-                    .as_ref()
-                    .is_some_and(|l| !l.recent.is_empty());
-                if !favorites
-                    && ui
-                        .add_enabled(
-                            available && has_recent,
-                            login_button("清空记录").frame(false),
-                        )
-                        .clicked()
-                {
-                    self.assist.delete_prompt = Some(DeletePrompt::Recent);
-                }
-            });
-        });
-        ui.add_space(10.0);
-        let kind = if favorites {
-            SavedKind::Favorites
-        } else {
-            SavedKind::Recent
-        };
-        let mut items = self
-            .assist
-            .lists
-            .as_ref()
-            .map(|l| {
-                if favorites {
-                    l.favorites.clone()
-                } else {
-                    l.recent.clone()
-                }
-            })
-            .unwrap_or_default();
-        items.sort_by(|a, b| {
-            let time = |d: &SavedDevice| {
-                if favorites {
-                    d.favorited_at
-                } else {
-                    d.last_connected_at
-                }
-            };
-            time(b)
-                .cmp(&time(a))
-                .then_with(|| a.connect_id.cmp(&b.connect_id))
-        });
-        if items.is_empty() {
-            ui.label(
-                RichText::new(if self.assist.loading && self.assist.lists.is_none() {
-                    "正在读取记录…"
-                } else if self.assist.lists.is_none() && self.assist.last_list_error.is_some() {
-                    "记录读取失败，请点击右上角刷新重试"
-                } else if favorites {
-                    "暂无收藏"
-                } else {
-                    "暂无最近连接"
-                })
-                .color(MUTED),
-            );
-        }
-        crate::ui::controls::page_scroll(("assist-saved-list", favorites)).show(ui, |ui| {
-            for item in &items {
-                ui.push_id(&item.publisher_device_id, |ui| {
-                    egui::Frame::new()
-                        .inner_margin(egui::Margin::symmetric(12, 10))
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                let (icon, _) =
-                                    ui.allocate_exact_size(vec2(28.0, 42.0), Sense::hover());
-                                paint_icon(ui.painter(), icon, Icon::Monitor, MUTED);
-                                let text_width = (ui.available_width() - 228.0).max(140.0);
-                                ui.allocate_ui_with_layout(
-                                    vec2(text_width, 44.0),
-                                    egui::Layout::top_down(Align::Min),
-                                    |ui| {
-                                        ui.add(
-                                            egui::Label::new(
-                                                RichText::new(item.title())
-                                                    .size(crate::ui::theme::BODY),
-                                            )
-                                            .truncate(),
-                                        )
-                                        .on_hover_text(item.title());
-                                        let time = item
-                                            .last_connected_at
-                                            .filter(|&t| !favorites && t > 0)
-                                            .and_then(|t| chrono::DateTime::from_timestamp(t, 0));
-                                        let detail = if let Some(time) = time {
-                                            let time = time
-                                                .with_timezone(&chrono::Local)
-                                                .format("%m-%d %H:%M");
-                                            format!("{}  ·  {}", item.connect_id, time)
-                                        } else {
-                                            item.connect_id.clone()
-                                        };
-                                        ui.label(
-                                            RichText::new(detail)
-                                                .size(crate::ui::theme::SMALL)
-                                                .color(MUTED),
-                                        );
-                                    },
-                                );
-                                ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                                    let valid = item.validate().is_ok();
-                                    if ui
-                                        .add_enabled_ui(
-                                            available && valid && self.active_session.is_none(),
-                                            |ui| ui.add_sized([78.0, 34.0], login_button("连接")),
-                                        )
-                                        .inner
-                                        .clicked()
-                                    {
-                                        connect = Some((item.connect_id.clone(), String::new()));
-                                    }
-                                    ui.add_enabled_ui(available && valid, |ui| {
-                                        if icon_button(
-                                            ui,
-                                            Icon::Close,
-                                            if favorites {
-                                                "取消收藏"
-                                            } else {
-                                                "移除记录"
-                                            },
-                                        )
-                                        .clicked()
-                                        {
-                                            self.assist.delete_prompt =
-                                                Some(DeletePrompt::Device(kind, item.clone()));
-                                        }
-                                        if favorites
-                                            && icon_button(ui, Icon::Edit, "编辑收藏").clicked()
-                                        {
-                                            self.assist.favorite_editor = Some(FavoriteEditor {
-                                                id: item.connect_id.clone(),
-                                                remark: item.remark.clone(),
-                                                editing: true,
-                                                code: item.saved_code.clone(),
-                                                code_changed: false,
-                                            });
-                                        }
-                                        if !favorites {
-                                            let response = icon_button(
-                                                ui,
-                                                Icon::Star,
-                                                if item.is_favorite {
-                                                    "已收藏"
-                                                } else {
-                                                    "收藏"
-                                                },
-                                            );
-                                            if item.is_favorite {
-                                                paint_icon(
-                                                    ui.painter(),
-                                                    response.rect,
-                                                    Icon::Star,
-                                                    AMBER,
-                                                );
-                                            }
-                                            if response.clicked() {
-                                                if item.is_favorite {
-                                                    self.assist.delete_prompt =
-                                                        Some(DeletePrompt::Device(
-                                                            SavedKind::Favorites,
-                                                            item.clone(),
-                                                        ));
-                                                } else {
-                                                    self.assist.favorite_editor =
-                                                        Some(FavoriteEditor {
-                                                            id: item.connect_id.clone(),
-                                                            remark: item.remark.clone(),
-                                                            editing: false,
-                                                            code: item.saved_code.clone(),
-                                                            code_changed: false,
-                                                        });
-                                                }
-                                            }
-                                        }
-                                    });
-                                });
-                            });
-                        });
-                    ui.separator();
-                });
-            }
-        });
-        if let Some((id, code)) = connect {
-            self.request_assist_connect(id, code);
         }
     }
 

@@ -8,6 +8,7 @@ pub(crate) struct Status {
     pub ready: bool,
     pub connected: bool,
     pub session_active: bool,
+    pub assistance: bool,
     pub message: String,
     pub error: Option<String>,
     pub settings_error: Option<String>,
@@ -82,6 +83,7 @@ struct Ownership {
 
 #[derive(Clone)]
 pub(crate) struct Handle {
+    pub(crate) assistance: super::assist::Handle,
     desired: watch::Sender<Option<AccessRequest>>,
     ownership: Arc<Mutex<Ownership>>,
     store: Option<settings::Store>,
@@ -89,11 +91,13 @@ pub(crate) struct Handle {
     media: Arc<super::desktop::Cache>,
     scope: String,
     account: String,
+    guest: bool,
 }
 
 impl Default for Handle {
     fn default() -> Self {
         Self {
+            assistance: Default::default(),
             desired: watch::channel(None).0,
             ownership: Arc::new(Mutex::new(Ownership {
                 permission: 0,
@@ -119,6 +123,7 @@ impl Default for Handle {
             media: Arc::default(),
             scope: String::new(),
             account: String::new(),
+            guest: false,
         }
     }
 }
@@ -130,6 +135,7 @@ fn finish_session(state: &mut Ownership) {
     }
     state.status.connected = false;
     state.status.session_active = false;
+    state.status.assistance = false;
     state.status.encoder = None;
     state.status.capture = None;
     state.status.screen = None;
@@ -147,7 +153,7 @@ impl Handle {
         let notice = {
             let mut state = lock(&self.ownership);
             state.updating = true;
-            if state.status.connected {
+            if state.status.connected && !state.status.assistance {
                 Some(
                     state
                         .update_notice
@@ -195,6 +201,7 @@ impl Handle {
         state.audio_defaults = snapshot.audio_defaults;
         state.audio_quality = snapshot.audio_quality;
         state.status = snapshot.status;
+        self.assistance.replace(snapshot.assistance);
     }
     pub(crate) fn remote_failed(&self, error: String) {
         let mut state = lock(&self.ownership);
@@ -232,15 +239,27 @@ impl Handle {
         self.media.invalidate().await;
     }
     pub(crate) fn load(account: &str, device: &str) -> Self {
+        Self::load_store(account, device, settings::Store::new(account, device))
+    }
+    pub(crate) fn load_guest(device: &str) -> Self {
+        let mut handle = Self::load_store("guest", device, settings::Store::guest(device));
+        handle.guest = true;
+        handle
+    }
+    pub(crate) fn is_guest(&self) -> bool {
+        self.guest
+    }
+    fn load_store(account: &str, device: &str, store: anyhow::Result<settings::Store>) -> Self {
         use sha2::{Digest, Sha256};
         let mut handle = Self::default();
         handle.scope = format!("{:x}", Sha256::digest(format!("{account}\0{device}")));
-        let result = settings::Store::new(account, device).and_then(|store| {
+        let result = store.and_then(|store| {
             handle.store = Some(store.clone());
             store.load()
         });
         match result {
-            Ok((allowed, encoding, audio_device, audio_defaults, audio_quality)) => {
+            Ok((allowed, encoding, audio_device, audio_defaults, audio_quality, assistance)) => {
+                let _ = handle.assistance.configure(assistance);
                 handle.set_allowed(allowed);
                 let mut state = lock(&handle.ownership);
                 state.encoding = encoding;
@@ -413,10 +432,29 @@ impl Handle {
             generation: state.permission,
         }));
     }
+    pub(crate) fn set_assistance(&self, settings: super::assist::Settings) -> anyhow::Result<()> {
+        let mut state = lock(&self.ownership);
+        anyhow::ensure!(state.active, "账号会话已结束");
+        if self.assistance.configure(settings)? {
+            state.settings_revision = state.settings_revision.wrapping_add(1);
+            state.dirty = true;
+            state.status.saving = true;
+            state.status.settings_error = None;
+        }
+        Ok(())
+    }
     pub(crate) async fn persist_settings(&self) {
         let _saving = self.saving.lock().await;
         loop {
-            let (revision, allowed, encoding, audio_device, audio_defaults, audio_quality) = {
+            let (
+                revision,
+                allowed,
+                encoding,
+                audio_device,
+                audio_defaults,
+                audio_quality,
+                assistance,
+            ) = {
                 let state = lock(&self.ownership);
                 if !state.dirty {
                     return;
@@ -428,6 +466,7 @@ impl Handle {
                     state.audio_device.borrow().clone(),
                     state.audio_defaults,
                     state.audio_quality,
+                    self.assistance.settings(),
                 )
             };
             let result = if crate::platform::windows::host_service::resident::managed() {
@@ -439,6 +478,7 @@ impl Handle {
                         audio_device,
                         audio_defaults,
                         audio_quality,
+                        assistance,
                     },
                 )
                 .await
@@ -451,6 +491,7 @@ impl Handle {
                         audio_device,
                         audio_defaults,
                         audio_quality,
+                        assistance,
                     )
                 })
                 .await
@@ -488,6 +529,7 @@ impl Handle {
         }));
     }
     pub(crate) fn retire(&self) {
+        self.assistance.unavailable();
         let mut state = lock(&self.ownership);
         state.active = false;
         state.permission = state.permission.wrapping_add(1);
@@ -497,6 +539,7 @@ impl Handle {
         self.desired.send_replace(None);
     }
     pub(crate) fn room_closed(&self) {
+        self.assistance.unavailable();
         let mut state = lock(&self.ownership);
         state.permission = state.permission.wrapping_add(1);
         finish_session(&mut state);
@@ -549,6 +592,7 @@ impl Handle {
             track: 0,
             stream_generation: None,
             stop: None,
+            assistance: None,
         }
     }
     pub(crate) fn last_controlled_interval(&self) -> i64 {
@@ -566,6 +610,7 @@ pub(crate) struct Lease {
     track: usize,
     stream_generation: Option<u64>,
     stop: Option<tokio_util::sync::CancellationToken>,
+    assistance: Option<tokio_util::sync::CancellationToken>,
 }
 
 /// Unique connection owner. Callback clones only hold the checked lease.
@@ -582,6 +627,14 @@ impl Drop for SessionLease {
     }
 }
 impl Lease {
+    pub(crate) fn for_assistance(&self) -> anyhow::Result<Self> {
+        let mut lease = self.clone();
+        lease.assistance = Some(self.handle.assistance.admission()?);
+        Ok(lease)
+    }
+    pub(crate) fn is_assistance(&self) -> bool {
+        self.assistance.is_some()
+    }
     pub(crate) fn set_update_notice(&self, notice: Arc<super::peer::UpdateNotice>) {
         let mut state = lock(&self.handle.ownership);
         if self.current(&state) {
@@ -641,7 +694,12 @@ impl Lease {
             .await
     }
     fn current(&self, state: &Ownership) -> bool {
-        self.current_owner(state) && self.stop.as_ref().is_none_or(|stop| !stop.is_cancelled())
+        self.current_owner(state)
+            && self.stop.as_ref().is_none_or(|stop| !stop.is_cancelled())
+            && self
+                .assistance
+                .as_ref()
+                .is_none_or(|stop| !stop.is_cancelled())
     }
     fn current_owner(&self, state: &Ownership) -> bool {
         state.active
@@ -665,6 +723,7 @@ impl Lease {
         state.media = state.media.wrapping_add(1);
         finish_session(&mut state);
         state.status.session_active = true;
+        state.status.assistance = self.is_assistance();
         state.status.error = None;
         Ok(SessionLease(Self {
             handle: self.handle.clone(),
@@ -673,6 +732,7 @@ impl Lease {
             track: 0,
             stream_generation: None,
             stop: None,
+            assistance: self.assistance.clone(),
         }))
     }
     pub(crate) fn finish(&self) {

@@ -89,7 +89,7 @@ impl DeviceCenterApp {
             || self.phone.submitting
             || self.login_restoring
             || self.logout_pending
-            || self.active_session.is_some()
+            || self.has_viewers()
             || self.phone.remaining() > 0
         {
             return;
@@ -133,7 +133,7 @@ impl DeviceCenterApp {
             || self.phone.submitting
             || self.login_restoring
             || self.logout_pending
-            || self.active_session.is_some()
+            || self.has_viewers()
             || !self.phone.can_submit()
         {
             return;

@@ -650,7 +650,7 @@ impl SignalSession {
     pub(crate) async fn keep_alive_host(
         self,
         shutdown: oneshot::Receiver<()>,
-        client: std::sync::Arc<crate::account::client::AuthenticatedClient>,
+        client: crate::session::host_client::HostClient,
     ) -> Result<()> {
         self.keep_alive_inner(shutdown, None, None, Some(host::Session::new(client)))
             .await

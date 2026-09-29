@@ -111,11 +111,10 @@ impl DeviceCenterApp {
             self.devices
                 .as_ref()
                 .map(|list| list.current_device.device_id.as_str()),
-            self.active_session
-                .as_ref()
-                .filter(|s| s.device_id.as_deref() == Some(device.device_id.as_str()))
+            self.viewer_for_device(&device.device_id)
                 .map(|s| s.handle.info().is_some_and(|info| info.playing)),
-            self.closing_session,
+            self.viewer_for_device(&device.device_id)
+                .is_some_and(|s| s.closing),
             self.power_progress
                 .get(&device.device_id)
                 .is_some_and(|p| p.waiting),

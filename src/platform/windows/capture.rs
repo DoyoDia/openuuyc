@@ -17,6 +17,7 @@ use windows::{
 };
 
 pub(crate) use crate::media::capture::{Screen, SourceGone};
+mod inventory;
 mod recovery;
 
 /// Read the state of this process's interactive session. Unknown/failure is
@@ -77,7 +78,9 @@ fn outputs() -> Result<Vec<(IDXGIAdapter1, IDXGIOutput1, Screen)>> {
     // trust a complete DisplayConfig inventory; an unavailable query is not
     // evidence that a remote/session display should be removed.
     let active_sources = super::display::topology::Topology::query(true)
-        .and_then(|topology| topology.targets())
+        // Liveness needs source identity only. Enumerating every supported mode
+        // here stalls the capture thread on its once-per-second refresh.
+        .and_then(|topology| topology.metadata())
         .ok()
         .and_then(active_source_names);
     unsafe {
@@ -335,6 +338,7 @@ pub(crate) struct Desktop {
     backend: Backend,
     recovery: recovery::Recovery,
     refreshed: std::time::Instant,
+    inventory: Option<inventory::Refresh>,
     sampler: super::cursor_shape::Sampler,
     pub cursor: Option<super::cursor_shape::Snapshot>,
 }
@@ -349,6 +353,7 @@ impl Desktop {
                 backend: Backend::Remote(Box::new(remote)),
                 recovery: recovery::Recovery::new(false, std::time::Instant::now()),
                 refreshed: std::time::Instant::now(),
+                inventory: None,
                 sampler: Default::default(),
                 cursor: None,
             });
@@ -389,6 +394,7 @@ impl Desktop {
             backend,
             recovery,
             refreshed: std::time::Instant::now(),
+            inventory: None,
             sampler: Default::default(),
             cursor: None,
         })
@@ -445,9 +451,14 @@ impl Desktop {
             maximum,
             hdr,
         };
-        if self.refreshed.elapsed() >= std::time::Duration::from_secs(1) {
-            let current = refresh(&self.screen)?;
-            self.refreshed = std::time::Instant::now();
+        if let Some(current) = self
+            .inventory
+            .as_mut()
+            .map(inventory::Refresh::poll)
+            .transpose()?
+            .flatten()
+        {
+            let current = current?;
             // A presentation-only name change does not invalidate capture resources.
             self.screen.display_name.clone_from(&current.display_name);
             if current != self.screen {
@@ -455,6 +466,13 @@ impl Desktop {
                 replacement.generation = self.generation.wrapping_add(1);
                 *self = replacement;
             }
+        }
+        if self.refreshed.elapsed() >= std::time::Duration::from_secs(1) {
+            if self.inventory.is_none() {
+                self.inventory = Some(inventory::Refresh::new()?);
+            }
+            self.inventory.as_mut().unwrap().request(&self.screen)?;
+            self.refreshed = std::time::Instant::now();
         }
         if matches!(self.backend, Backend::Gdi(_)) && self.recovery.due(std::time::Instant::now()) {
             self.recovery.attempt(std::time::Instant::now());

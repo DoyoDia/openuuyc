@@ -330,7 +330,7 @@ impl DeviceCenterApp {
             let busy = self.diagnostics.busy();
             if crate::ui::controls::diagnostics_action(
                 ui,
-                busy || self.active_session.is_none(),
+                busy || !self.has_viewers(),
                 if busy { "停止检查" } else { "完整检查" },
             )
             .clicked()
@@ -437,8 +437,13 @@ impl DeviceCenterApp {
 
     fn diagnostic_sessions(&self, ui: &mut egui::Ui) {
         let host = self.host.as_ref().map(|host| host.status());
-        let viewing = self.active_session.as_ref().and_then(|s| s.handle.info());
-        if !host.as_ref().is_some_and(|host| host.session_active) && viewing.is_none() {
+        let viewing: Vec<_> = self
+            .viewers
+            .active
+            .iter()
+            .filter_map(|s| s.handle.info().map(|info| (s.alias.clone(), info)))
+            .collect();
+        if !host.as_ref().is_some_and(|host| host.session_active) && viewing.is_empty() {
             diagnostics_empty(ui, "暂无活动会话 · 连接后显示实际编解码信息");
             return;
         }
@@ -531,9 +536,9 @@ impl DeviceCenterApp {
                 );
             }
         }
-        if let Some(info) = viewing {
+        for (alias, info) in viewing {
             ui.add_space(theme::DIAGNOSTICS_GAP);
-            ui.strong("当前观看");
+            ui.strong(format!("当前观看 · {alias}"));
             for (label, value) in [
                 ("本机解码器", info.decoder),
                 ("接收码流", info.video_format),

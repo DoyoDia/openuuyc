@@ -1,4 +1,5 @@
 //! User-local player shortcuts. Hook reads are atomic and never perform file IO.
+mod watcher;
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -10,6 +11,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
+pub(crate) use watcher::Watcher;
 use windows::Win32::{
     Foundation::{CloseHandle, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0},
     System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject},
@@ -138,6 +140,7 @@ impl Settings {
     }
 }
 struct Cache {
+    revision: u64,
     checked: Option<Instant>,
     bytes: Option<Vec<u8>>,
     error: Option<String>,
@@ -155,6 +158,7 @@ fn runtime() -> &'static Runtime {
         capture: AtomicU64::new(0),
         typing: AtomicU64::new(0),
         cache: Mutex::new(Cache {
+            revision: 0,
             checked: None,
             bytes: None,
             error: None,
@@ -245,8 +249,8 @@ fn read(path: &std::path::Path) -> Result<Option<Vec<u8>>> {
     ensure!(bytes.len() <= 8192, "快捷键配置过大");
     Ok(Some(bytes))
 }
-pub(crate) fn refresh() {
-    {
+fn refresh() {
+    let revision = {
         let mut cache = runtime().cache.lock().unwrap_or_else(|e| e.into_inner());
         if cache
             .checked
@@ -255,9 +259,17 @@ pub(crate) fn refresh() {
             return;
         }
         cache.checked = Some(Instant::now());
-    }
+        cache.revision
+    };
     let result = path().and_then(|p| read(&p));
-    let mut cache = runtime().cache.lock().unwrap_or_else(|e| e.into_inner());
+    apply_refresh(runtime(), revision, result);
+}
+fn apply_refresh(state: &Runtime, revision: u64, result: Result<Option<Vec<u8>>>) {
+    let mut cache = state.cache.lock().unwrap_or_else(|e| e.into_inner());
+    if cache.revision != revision {
+        return;
+    }
+    cache.revision = cache.revision.wrapping_add(1);
     match result {
         Ok(bytes) => {
             if bytes == cache.bytes && cache.error.is_none() {
@@ -276,7 +288,7 @@ pub(crate) fn refresh() {
             cache.bytes = bytes;
             match parsed {
                 Ok(s) => {
-                    runtime().active.store(s.packed(), Ordering::Release);
+                    state.active.store(s.packed(), Ordering::Release);
                     cache.error = None;
                 }
                 Err(e) => cache.error = Some(e.to_string()),
@@ -334,8 +346,9 @@ fn save(expected: &Option<Vec<u8>>, settings: &Settings) -> Result<()> {
         let _ = std::fs::remove_file(&tmp);
     }
     result?;
-    runtime().active.store(settings.packed(), Ordering::Release);
     let mut cache = runtime().cache.lock().unwrap_or_else(|e| e.into_inner());
+    cache.revision = cache.revision.wrapping_add(1);
+    runtime().active.store(settings.packed(), Ordering::Release);
     cache.bytes = Some(bytes);
     cache.error = None;
     cache.checked = Some(Instant::now());
@@ -399,7 +412,6 @@ impl Editor {
     }
     fn reload(&mut self) {
         self.cancel_recording();
-        refresh();
         let cache = runtime().cache.lock().unwrap_or_else(|e| e.into_inner());
         let s = Settings::unpack(revision());
         self.draft = Some(s.clone());
@@ -408,7 +420,6 @@ impl Editor {
         self.error = cache.error.clone();
     }
     pub fn draw(&mut self, ui: &mut egui::Ui) {
-        refresh();
         if self.recording.is_none()
             && self.draft.is_some()
             && self.draft == self.baseline

@@ -9,6 +9,10 @@ use crate::session::presence::PresenceState;
 use std::time::Instant;
 
 pub(super) enum GuiCommand {
+    HostAssist {
+        generation: u64,
+        action: crate::features::host::assist::Action,
+    },
     RefreshHostAudioDevices {
         generation: u64,
     },
@@ -17,6 +21,7 @@ pub(super) enum GuiCommand {
     },
     View {
         generation: u64,
+        key: super::viewing::Key,
         alias: String,
         device_id: Option<String>,
         assist: Option<crate::account::assist::AssistRequest>,
@@ -99,6 +104,7 @@ pub(super) enum GuiEvent {
     Host(u64, crate::features::host::Handle),
     Viewer(
         u64,
+        super::viewing::Key,
         String,
         Option<String>,
         std::result::Result<crate::session::controller::windows::ViewerHandle, String>,
@@ -136,4 +142,18 @@ pub(super) enum GuiEvent {
         result: std::result::Result<(), String>,
     },
     LoggedOut(crate::account::client::LogoutOutcome),
+}
+
+impl DeviceMutation {
+    pub(super) fn close_target(&self) -> Option<&str> {
+        match self {
+            Self::Remove { id } => Some(id),
+            Self::Power { device, action }
+                if *action != crate::account::power::PowerAction::Wake =>
+            {
+                Some(&device.device_id)
+            }
+            _ => None,
+        }
+    }
 }

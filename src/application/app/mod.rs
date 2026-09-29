@@ -40,6 +40,7 @@ pub struct GuiOptions {
 }
 
 pub fn run(options: GuiOptions) -> Result<()> {
+    let _shortcuts = crate::application::viewer_shortcuts::Watcher::new()?;
     crate::features::host::displays::fallback::start_background();
     let (local_display, display_warning) = match detect_local_display() {
         Ok(display) => (display, None),
@@ -157,14 +158,13 @@ struct DeviceCenterApp {
     status: StatusMessage,
     refreshed_at: Option<Instant>,
     refresh_pending: bool,
-    active_session: Option<ViewingSession>,
-    opening_viewer: bool,
-    closing_session: bool,
+    viewers: viewing::Registry,
     exit_requested: bool,
     exit_pending: bool,
     exit_ready: bool,
     logout_confirmation: bool,
     takeover_confirmation: Option<(u64, DeviceInfo, bool)>,
+    takeover_waiting: std::collections::VecDeque<(u64, DeviceInfo, bool)>,
     logout_pending: bool,
     logout_sent: bool,
     login_generation: u64,
@@ -191,7 +191,7 @@ impl DeviceCenterApp {
             brand_texture: crate::ui::branding::load_texture(ctx),
             updates: updates::UpdateCheck::start(ctx),
             center_ui: CenterUi::default(),
-            opening_viewer: false,
+            viewers: Default::default(),
             assist: AssistUi::default(),
             worker: GuiWorker::spawn(),
             devices: None,
@@ -216,13 +216,12 @@ impl DeviceCenterApp {
             ),
             refreshed_at: None,
             refresh_pending: true,
-            active_session: None,
-            closing_session: false,
             exit_requested: false,
             exit_pending: false,
             exit_ready: false,
             logout_confirmation: false,
             takeover_confirmation: None,
+            takeover_waiting: Default::default(),
             logout_pending: false,
             logout_sent: false,
             login_generation: 0,
@@ -258,21 +257,34 @@ impl DeviceCenterApp {
                         }
                     }
                 }
-                GuiEvent::Viewer(generation, alias, device_id, result) => {
-                    self.opening_viewer = false;
-                    if generation != self.login_generation || self.logout_pending {
-                        continue;
-                    }
+                GuiEvent::Viewer(generation, key, alias, device_id, result) => {
+                    let pending = self.viewers.completed_open(&key, generation);
                     match result {
                         Ok(handle) => {
-                            self.active_session = Some(ViewingSession {
+                            let closing = generation != self.login_generation
+                                || self.logout_pending
+                                || self.exit_requested
+                                || !pending;
+                            if closing {
+                                handle.request_close();
+                            }
+                            self.viewers.active.push(viewing::Session {
+                                generation,
+                                key,
                                 device_id,
                                 alias,
                                 handle,
+                                closing,
                             });
-                            self.closing_session = false;
                         }
-                        Err(error) => self.status = StatusMessage::error(error),
+                        Err(error)
+                            if pending
+                                && generation == self.login_generation
+                                && !self.logout_pending =>
+                        {
+                            self.status = StatusMessage::error(error)
+                        }
+                        Err(_) => (),
                     }
                 }
                 GuiEvent::Startup(generation, stage) => {
@@ -526,7 +538,7 @@ impl DeviceCenterApp {
                     self.cancel_login();
                     self.phone.clear_private();
                     self.clear_catalog();
-                    if let Some(session) = &self.active_session {
+                    for session in &self.viewers.active {
                         session.handle.request_close();
                     }
                     self.devices = None;
@@ -633,22 +645,11 @@ impl DeviceCenterApp {
             self.sync_login_running();
         }
 
-        if let Some(session) = &mut self.active_session
-            && let Some(target) = session.handle.info().and_then(|info| info.target)
-        {
-            session.device_id = Some(target.device_id);
-            session.alias = target.alias;
-        }
-        let finished = self.active_session.as_ref().and_then(|session| {
-            session
-                .handle
-                .result()
-                .map(|result| (session.alias.clone(), result))
-        });
-        if let Some((alias, result)) = finished {
+        for (generation, alias, result) in self.viewers.finished() {
             tracing::info!(device = %alias, outcome = ?result, "viewing window ended");
-            self.active_session = None;
-            self.closing_session = false;
+            if generation != self.login_generation {
+                continue;
+            }
             self.status = match result {
                 Ok(crate::session::controller::windows::ViewerEnd::Closed) => {
                     StatusMessage::success(format!("{alias} 的观看窗口已关闭"))
@@ -662,7 +663,10 @@ impl DeviceCenterApp {
                     device,
                     audio_only,
                 )) => {
-                    self.takeover_confirmation = Some((self.login_generation, *device, audio_only));
+                    if !self.logout_pending && !self.exit_requested {
+                        self.takeover_waiting
+                            .push_back((generation, *device, audio_only));
+                    }
                     StatusMessage::info("等待确认接管")
                 }
                 Err(error) => StatusMessage::error(format!(
@@ -674,16 +678,35 @@ impl DeviceCenterApp {
                 self.request_assist_refresh();
             }
         }
-        if self.logout_pending && !self.logout_sent && self.active_session.is_none() {
+        if self.takeover_confirmation.is_none() && !self.logout_pending && !self.exit_requested {
+            while let Some(request) = self.takeover_waiting.pop_front() {
+                if request.0 == self.login_generation {
+                    self.takeover_confirmation = Some(request);
+                    break;
+                }
+            }
+        }
+        if self.logout_pending && !self.logout_sent && !self.has_viewers() {
             self.logout_sent = self.worker.commands.send(GuiCommand::Logout).is_ok();
             if !self.logout_sent {
                 self.logout_pending = false;
                 self.status = StatusMessage::error("设备后台服务已经停止，尚未执行账号退出");
             }
         }
-        if self.active_session.is_none()
-            && let Some(change) = self.queued_mutation.take()
+        if let Some(id) = self
+            .queued_mutation
+            .as_ref()
+            .and_then(DeviceMutation::close_target)
+            .map(str::to_owned)
         {
+            self.stop_device_viewers(&id);
+        }
+        if self
+            .queued_mutation
+            .as_ref()
+            .is_some_and(|change| !self.mutation_waits(change))
+        {
+            let change = self.queued_mutation.take().unwrap();
             self.send_mutation(change);
         }
     }
@@ -691,7 +714,7 @@ impl DeviceCenterApp {
     fn begin_login(&mut self) {
         if self.center_ui.components.busy()
             || self.logout_pending
-            || self.active_session.is_some()
+            || self.has_viewers()
             || self.mutation_pending
         {
             return;
@@ -818,7 +841,12 @@ impl DeviceCenterApp {
     }
 
     fn clear_catalog(&mut self) {
-        self.host = None;
+        self.takeover_confirmation = None;
+        self.takeover_waiting.clear();
+        if !self.host.as_ref().is_some_and(|h| h.is_guest()) {
+            self.host = None;
+        }
+        self.center_ui.clear_host_assist();
         self.center_ui.clear_wallpapers();
         self.assist = AssistUi::default();
         self.extra_details.clear();
@@ -882,22 +910,11 @@ impl DeviceCenterApp {
             return;
         }
         self.mutation_pending = true;
-        let close_target = match &change {
-            DeviceMutation::Remove { id } => Some(id),
-            DeviceMutation::Power { device, action }
-                if *action != crate::account::power::PowerAction::Wake =>
-            {
-                Some(&device.device_id)
+        if self.mutation_waits(&change) {
+            if let Some(id) = change.close_target() {
+                self.stop_device_viewers(id);
             }
-            _ => None,
-        };
-        if close_target.is_some_and(|id| {
-            self.active_session
-                .as_ref()
-                .is_some_and(|s| s.device_id.as_ref().is_none_or(|target| target == id))
-        }) {
-            self.stop_viewer();
-            self.status = StatusMessage::info("正在正常结束观看，随后执行已确认的设备操作");
+            self.status = StatusMessage::info("正在等待目标连接结束，随后执行设备操作");
             self.queued_mutation = Some(change);
         } else {
             self.send_mutation(change);
@@ -951,13 +968,11 @@ impl DeviceCenterApp {
             self.status = StatusMessage::warning(message);
             return;
         }
-        if let Some(session) = &self.active_session {
-            if session.device_id.as_ref() == Some(&device.device_id) {
+        if let Some(session) = self.viewer_for_device(&device.device_id) {
+            if !session.closing {
                 session.handle.request_audio_only(audio_only);
                 session.handle.focus();
-                return;
             }
-            self.status = StatusMessage::warning("已有观看窗口正在运行");
             return;
         }
 
@@ -979,14 +994,17 @@ impl DeviceCenterApp {
             Some("正在退出账号".into())
         } else if self.mutation_pending {
             Some("正在处理设备操作".into())
-        } else if self.opening_viewer {
-            Some("正在打开观看窗口".into())
         } else if self
-            .active_session
-            .as_ref()
-            .is_some_and(|session| session.device_id.as_deref() != Some(device.device_id.as_str()))
+            .viewers
+            .opening
+            .contains_key(&viewing::Key::Device(device.device_id.clone()))
         {
-            Some("请先关闭当前观看窗口".into())
+            Some("正在打开该设备的观看窗口".into())
+        } else if self
+            .viewer_for_device(&device.device_id)
+            .is_some_and(|s| s.closing)
+        {
+            Some("正在关闭该设备的观看窗口".into())
         } else {
             self.connection_issue(device).err()
         }
@@ -1034,7 +1052,22 @@ impl DeviceCenterApp {
         takeover: Option<crate::session::controller::takeover::Approval>,
         audio_only: bool,
     ) {
-        if self.opening_viewer {
+        let Some(key) = viewing::Key::new(device_id.as_deref(), assist_request.as_ref()) else {
+            return;
+        };
+        if let Some(session) = self.viewers.active.iter().find(|s| {
+            s.key == key
+                || device_id
+                    .as_ref()
+                    .is_some_and(|id| s.device_id.as_ref() == Some(id))
+        }) {
+            if !session.closing {
+                session.handle.request_audio_only(audio_only);
+                session.handle.focus();
+            }
+            return;
+        }
+        if !self.viewers.begin(key.clone(), self.login_generation) {
             return;
         }
         self.diagnostics.cancel_probe();
@@ -1048,12 +1081,12 @@ impl DeviceCenterApp {
                     })
             })
         });
-        self.opening_viewer = true;
         if self
             .worker
             .commands
             .send(GuiCommand::View {
                 generation: self.login_generation,
+                key: key.clone(),
                 alias,
                 device_id,
                 assist: assist_request,
@@ -1066,7 +1099,7 @@ impl DeviceCenterApp {
             })
             .is_err()
         {
-            self.opening_viewer = false;
+            self.viewers.opening.remove(&key);
             self.status = StatusMessage::error("设备后台服务已停止");
         }
     }
@@ -1084,11 +1117,22 @@ impl DeviceCenterApp {
             self.status = StatusMessage::error("后台线程已停止，无法确认被控是否退出");
         }
     }
+    fn has_viewers(&self) -> bool {
+        self.viewers.has_viewers()
+    }
+    fn viewer_for_device(&self, id: &str) -> Option<&viewing::Session> {
+        self.viewers.for_device(id)
+    }
+    fn mutation_waits(&self, change: &DeviceMutation) -> bool {
+        change
+            .close_target()
+            .is_some_and(|id| self.viewers.waits_for_device(id))
+    }
+    fn stop_device_viewers(&mut self, id: &str) {
+        self.viewers.stop_device(id);
+    }
     fn stop_viewer(&mut self) {
-        if let Some(session) = &self.active_session {
-            session.handle.request_close();
-            self.closing_session = true;
-        }
+        self.viewers.stop_all();
     }
 }
 
@@ -1117,7 +1161,6 @@ impl crate::ui::App for DeviceCenterApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui) {
-        crate::application::viewer_shortcuts::refresh();
         let ctx = ui.ctx().clone();
         self.drain_events(&ctx);
         self.tick_power();
@@ -1132,7 +1175,7 @@ impl crate::ui::App for DeviceCenterApp {
     }
 
     fn on_exit(&mut self) {
-        if let Some(session) = &self.active_session {
+        for session in &self.viewers.active {
             session.handle.request_close();
         }
         if self.logout_pending && !self.logout_sent {
@@ -1140,12 +1183,6 @@ impl crate::ui::App for DeviceCenterApp {
         }
         let _ = self.worker.commands.send(GuiCommand::Shutdown);
     }
-}
-
-struct ViewingSession {
-    device_id: Option<String>,
-    alias: String,
-    handle: crate::session::controller::windows::ViewerHandle,
 }
 
 struct StatusMessage {
@@ -1250,3 +1287,4 @@ fn qr_texture(ctx: &egui::Context, content: &str) -> Result<egui::TextureHandle>
 
 mod messages;
 mod runtime;
+mod viewing;

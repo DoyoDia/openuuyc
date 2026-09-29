@@ -20,9 +20,18 @@ struct Record {
     audio_defaults: super::audio::DefaultDevices,
     #[serde(default)]
     audio_quality: crate::media::audio::encoder::Quality,
+    #[serde(default)]
+    assistance: super::assist::Settings,
 }
 
 impl Store {
+    pub fn guest(installation: &str) -> Result<Self> {
+        uuid::Uuid::parse_str(installation).map_err(|_| anyhow::anyhow!("本机安装身份无效"))?;
+        Ok(Self(Arc::new(
+            Entry::new("com.openuuyc.host.guest", installation)
+                .map_err(|_| anyhow::anyhow!("游客协助设置存储不可用"))?,
+        )))
+    }
     pub(super) fn enroll(&self) -> Result<()> {
         self.0.enroll()
     }
@@ -45,6 +54,7 @@ impl Store {
         Option<super::audio::Device>,
         super::audio::DefaultDevices,
         crate::media::audio::encoder::Quality,
+        super::assist::Settings,
     )> {
         let bytes = match self.0.get_secret() {
             Ok(bytes) => bytes,
@@ -53,6 +63,7 @@ impl Store {
                     false,
                     Default::default(),
                     None,
+                    Default::default(),
                     Default::default(),
                     Default::default(),
                 ));
@@ -64,6 +75,7 @@ impl Store {
         ensure!(record.schema == 1, "不支持的被控设置格式");
         record.encoding.validate()?;
         let audio_quality = record.audio_quality.restore()?;
+        record.assistance.validate()?;
         if let Some(device) = &record.audio_device {
             device.validate()?;
         }
@@ -73,6 +85,7 @@ impl Store {
             record.audio_device,
             record.audio_defaults,
             audio_quality,
+            record.assistance,
         ))
     }
     pub fn save(
@@ -82,9 +95,11 @@ impl Store {
         audio_device: Option<super::audio::Device>,
         audio_defaults: super::audio::DefaultDevices,
         audio_quality: crate::media::audio::encoder::Quality,
+        assistance: super::assist::Settings,
     ) -> Result<()> {
         encoding.validate()?;
         audio_quality.validate()?;
+        assistance.validate()?;
         if let Some(device) = &audio_device {
             device.validate()?;
         }
@@ -96,6 +111,7 @@ impl Store {
                 audio_device,
                 audio_defaults,
                 audio_quality,
+                assistance,
             })?)
             .map_err(|_| anyhow::anyhow!("无法保存被控设置"))
     }

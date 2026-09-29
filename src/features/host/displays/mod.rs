@@ -100,7 +100,7 @@ impl Session {
         ensure!(remote.len() <= 256, "控制端标识无效");
         let root = store::root()?;
         let token = uuid::Uuid::new_v4().to_string();
-        let preference_path = (!remote.is_empty()).then(|| {
+        let preference_path = (!lease.is_assistance() && !remote.is_empty()).then(|| {
             root.join("preferences")
                 .join(lease.display_scope())
                 .join(format!("{:x}.json", Sha256::digest(remote)))
@@ -226,6 +226,7 @@ impl Session {
             .any(|o| o.identity.as_deref() == Some(identity))
     }
     pub(crate) async fn create(&self, resolutions: Vec<(u32, u32)>) -> Result<capture::Screen> {
+        ensure!(!self.lease.is_assistance(), "远程协助不开放添加虚拟屏");
         self.run(move |state, lease| {
             ensure!(
                 state.journal.super_baseline.is_none(),

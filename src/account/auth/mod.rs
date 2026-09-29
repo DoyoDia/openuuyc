@@ -31,6 +31,7 @@ pub(crate) fn enroll_resident() -> Result<()> {
         session.user_id(),
         &identity.client_identity()?.device_id,
     )?;
+    crate::features::host::transfer_guest_settings(&identity.client_identity()?.client_id, true)?;
     crate::features::host::displays::transfer_preferences(true)?;
     std::fs::write(vault::root()?.join("enabled"), b"OpenUUYC unattended v1\n")?;
     SecretEntry::new(SERVICE, SESSION_ACCOUNT)?.clear_portable()?;
@@ -52,6 +53,12 @@ pub(crate) fn restore_portable() -> Result<()> {
     ensure_resident_owner()?;
     let identity = KeyringIdentityStore::new()?.load_existing()?;
     let session = KeyringSessionStore::new()?.load()?;
+    if let Some(identity) = &identity {
+        crate::features::host::transfer_guest_settings(
+            &identity.client_identity()?.client_id,
+            false,
+        )?;
+    }
     if let (Some(identity), Some(session)) = (identity, session) {
         crate::features::host::restore_portable_settings(
             session.user_id(),

@@ -395,13 +395,13 @@ fn compose_wallpaper(decoded: image::DynamicImage) -> Result<Vec<u8>> {
         crop.to_rgba8()
     };
     let logo = image::load_from_memory(include_bytes!("../../../assets/icon-256.png"))?;
-    let size = (wallpaper.width() / 10).max(1);
+    let size = (wallpaper.width() * 15 / 100).max(1);
     let logo = logo
         .resize_exact(size, size, image::imageops::FilterType::Lanczos3)
         .to_rgba8();
     let position = (
-        i64::from(wallpaper.width() / 16),
-        i64::from(wallpaper.height() / 16),
+        i64::from(wallpaper.width() - size - wallpaper.width() / 10),
+        i64::from(wallpaper.height() / 8),
     );
     image::imageops::overlay(&mut wallpaper, &logo, position.0, position.1);
     let mut jpeg = Vec::new();

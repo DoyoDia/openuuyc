@@ -1,6 +1,7 @@
 //! Local controlled-device services; access policy and media sessions have separate owners.
 mod access;
 mod allocation;
+pub(crate) mod assist;
 pub(crate) mod audio;
 mod burst;
 mod congestion;
@@ -37,6 +38,14 @@ pub(crate) fn enroll_settings(account: &str, device: &str) -> anyhow::Result<()>
 }
 pub(crate) fn restore_portable_settings(account: &str, device: &str) -> anyhow::Result<()> {
     settings::Store::new(account, device)?.restore_portable()
+}
+pub(crate) fn transfer_guest_settings(device: &str, enroll: bool) -> anyhow::Result<()> {
+    let store = settings::Store::guest(device)?;
+    if enroll {
+        store.enroll()
+    } else {
+        store.restore_portable()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

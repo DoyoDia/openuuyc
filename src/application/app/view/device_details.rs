@@ -639,10 +639,7 @@ impl DeviceCenterApp {
                 );
                 let mut button_ui = ui.new_child(egui::UiBuilder::new().max_rect(rect));
                 let issue = self.viewer_action_issue(&device);
-                let own_session = self
-                    .active_session
-                    .as_ref()
-                    .is_some_and(|session| session.device_id.as_deref() == Some(id.as_str()));
+                let own_session = self.viewer_for_device(&id).is_some();
                 let button = detail_button(
                     &mut button_ui,
                     if own_session {

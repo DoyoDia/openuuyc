@@ -36,6 +36,8 @@ enum IdentityScope {
 
 type HmacSha256 = Hmac<Sha256>;
 mod assist;
+pub(crate) mod guest;
+mod host_assist;
 mod power;
 pub(crate) mod wallpaper;
 
@@ -703,6 +705,7 @@ pub struct NrdApi {
     version_name: String,
     channel: String,
     user_id: Option<String>,
+    guest_id: Option<String>,
     authorization: Option<HeaderValue>,
 }
 
@@ -715,6 +718,7 @@ impl NrdApi {
             version_name: PROTOCOL_VERSION.to_owned(),
             channel: DEFAULT_CHANNEL.to_owned(),
             user_id: None,
+            guest_id: None,
             authorization: None,
         })
     }
@@ -729,6 +733,7 @@ impl NrdApi {
             Some(user_id) => {
                 HeaderValue::from_str(user_id).context("user_id is not a valid header value")?;
                 self.user_id = Some(user_id.to_owned());
+                self.guest_id = None;
             }
             None => self.user_id = None,
         }
@@ -1038,6 +1043,7 @@ impl NrdApi {
                             && contract != LOGIN_SMS_CODE
                             && contract != LOGIN_BY_MOBILE
                             && !assist::is_write(contract)
+                            && !host_assist::is_sensitive(contract)
                             && !power::is_write(contract)
                             && contract != wallpaper::BIND,
                     }
@@ -1059,6 +1065,8 @@ impl NrdApi {
             if contract == LOGIN_SMS_CODE
                 || contract == LOGIN_BY_MOBILE
                 || assist::is_sensitive(contract)
+                || host_assist::is_sensitive(contract)
+                || guest::is_sensitive(contract)
                 || contract == wallpaper::TOKEN
                 || contract == wallpaper::BIND
             {
@@ -1147,6 +1155,11 @@ impl NrdApi {
             && let Some(user_id) = &self.user_id
         {
             pairs.push((USER_ID_HEADER.into(), user_id.clone()));
+        }
+        if scope == IdentityScope::AccountDevice
+            && let Some(guest_id) = &self.guest_id
+        {
+            pairs.push(("X-Param-Guest-ID".into(), guest_id.clone()));
         }
         pairs
     }

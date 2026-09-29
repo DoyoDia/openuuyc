@@ -8,6 +8,7 @@ use crate::{
     features::host,
     session::{
         device_session::DeviceRuntime,
+        host_client::HostClient,
         presence::{ActivePresence, PresenceEvent, PresenceState},
     },
 };
@@ -37,7 +38,13 @@ pub(crate) enum Request {
     Pause,
     PrepareUpdate,
     CancelUpdate,
-    Snapshot,
+    Snapshot {
+        ui: bool,
+    },
+    Assist {
+        account: String,
+        action: host::assist::Action,
+    },
     RefreshPublication,
     Initialize {
         force: bool,
@@ -54,6 +61,7 @@ pub(crate) enum Request {
         audio_device: Option<host::audio::Device>,
         audio_defaults: host::audio::DefaultDevices,
         audio_quality: crate::media::audio::encoder::Quality,
+        assistance: host::assist::Settings,
     },
     Disconnect {
         account: String,
@@ -67,6 +75,7 @@ pub(crate) enum Request {
 }
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Snapshot {
+    pub assistance: host::assist::Snapshot,
     pub publication: crate::account::reporting::Snapshot,
     pub account: String,
     pub online: PresenceState,
@@ -572,7 +581,7 @@ type Incoming = tokio::sync::mpsc::Receiver<(Request, tokio::sync::oneshot::Send
 async fn run_account(mut incoming: Incoming, running: &impl Fn() -> bool) -> Result<()> {
     let device = DeviceRuntime::start()?;
     let store = KeyringSessionStore::new()?;
-    let mut client: Option<Arc<AuthenticatedClient>> = None;
+    let mut client: Option<HostClient> = None;
     let mut presence: Option<ActivePresence> = None;
     let mut preparation: Option<(
         tokio_util::sync::CancellationToken,
@@ -624,9 +633,12 @@ async fn run_account(mut incoming: Incoming, running: &impl Fn() -> bool) -> Res
                     request => {
                         async {
                             let current = client.as_ref().context("后台尚未恢复账号")?;
-                            let account = current.account_generation();
+                            let account = current.generation();
                             match request {
-                                Request::Snapshot => Ok(Reply::Snapshot(Box::new(Snapshot {
+                                Request::Snapshot { ui } => {
+                                    if ui { current.host.assistance.touch_ui(); }
+                                    Ok(Reply::Snapshot(Box::new(Snapshot {
+                                    assistance: current.host.assistance.snapshot(),
                                     publication: crate::account::reporting::snapshot(),
                                     account,
                                     online: online.clone(),
@@ -637,8 +649,13 @@ async fn run_account(mut incoming: Incoming, running: &impl Fn() -> bool) -> Res
                                     audio_quality: current.host.audio_quality(),
                                     status: current.host.status(),
                                     capabilities: current.host.capabilities().map(|v| (*v).clone()),
-                                }))),
-                                Request::RefreshPublication => {crate::account::reporting::REFRESH.notify_one();Ok(Reply::Done)},
+                                })))},
+                                Request::Assist { account: expected, action } => {
+                                    ensure!(expected == account, "账号已改变");
+                                    current.host.assistance.act(action)?;
+                                    Ok(Reply::Done)
+                                },
+                                Request::RefreshPublication => {ensure!(!current.is_guest(), "请先登录");crate::account::reporting::REFRESH.notify_one();Ok(Reply::Done)},
                                 Request::Settings {
                                     account: expected,
                                     allowed,
@@ -646,6 +663,7 @@ async fn run_account(mut incoming: Incoming, running: &impl Fn() -> bool) -> Res
                                     audio_device,
                                     audio_defaults,
                                     audio_quality,
+                                    assistance,
                                 } => {
                                     ensure!(expected == account, "账号已改变");
                                     encoding.validate()?;
@@ -654,6 +672,7 @@ async fn run_account(mut incoming: Incoming, running: &impl Fn() -> bool) -> Res
                                     current.host.set_audio_device(audio_device)?;
                                     current.host.set_audio_defaults(audio_defaults)?;
                                     current.host.set_audio_quality(audio_quality)?;
+                                    current.host.set_assistance(assistance)?;
                                     current.host.set_allowed(allowed);
                                     current.host.persist_settings().await;
                                     if let Some(error) = current.host.status().settings_error {
@@ -686,9 +705,12 @@ async fn run_account(mut incoming: Incoming, running: &impl Fn() -> bool) -> Res
                 let _ = reply.send(result.unwrap_or_else(Reply::from_error));
             }
             let saved = store.load()?.map(|s| s.generation()).unwrap_or_default();
+            let desired_identity = if saved.is_empty() {
+                format!("guest:{}",device.handle().identity().client_identity()?.client_id)
+            } else { saved.clone() };
             if client
                 .as_ref()
-                .is_some_and(|c| !c.is_active() || c.account_generation() != saved)
+                .is_some_and(|c| !c.is_active() || !c.matches_saved(&saved))
             {
                 cancel_preparation(&mut preparation).await;
                 if let Some(current) = client.take() {
@@ -701,20 +723,20 @@ async fn run_account(mut incoming: Incoming, running: &impl Fn() -> bool) -> Res
                 online = PresenceState::Offline;
             }
             if client.is_none()
-                && !saved.is_empty()
-                && saved != blocked
+                && desired_identity != blocked
                 && std::time::Instant::now() >= next_start
             {
-                match AuthenticatedClient::from_saved_session_with_device(device.handle()) {
+                match if saved.is_empty() { HostClient::guest(device.handle()) } else { AuthenticatedClient::from_saved_session_with_device(device.handle()).map(|c| HostClient::from(Arc::new(c))) } {
                     Ok(c) => {
-                        let c = Arc::new(c);
+
                         let cancel = tokio_util::sync::CancellationToken::new();
                         let owner = c.host.clone();
                         let cancelled = cancel.clone();
-                        preparation = Some((
+                        if !c.is_guest() { preparation = Some((
                             cancel,
                             tokio::spawn(async move { owner.prepare_startup(cancelled).await }),
                         ));
+                        }
                         presence = Some(ActivePresence::start(c.clone()));
                         client = Some(c);
                     }
@@ -753,7 +775,7 @@ async fn run_account(mut incoming: Incoming, running: &impl Fn() -> bool) -> Res
                             matches!(e, crate::transport::signal::SignalFailure::Kicked)
                         })
                     {
-                        blocked = c.account_generation();
+                        blocked = c.generation();
                     }
                     c.host.retire();
                     c.close().await;

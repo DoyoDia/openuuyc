@@ -43,6 +43,7 @@ pub(in crate::application::viewer) fn viewer_shortcut(
 }
 
 pub(in crate::application::viewer) struct ThreadedWindowsApp {
+    _shortcuts: crate::application::viewer_shortcuts::Watcher,
     pub(in crate::application::viewer) annotation:
         crate::application::viewer::annotation::AnnotationUi,
     pub(in crate::application::viewer) modifiers: winit::keyboard::ModifiersState,
@@ -143,6 +144,7 @@ impl ThreadedWindowsApp {
             Arc::clone(&cpu_device),
         )?;
         Ok(Self {
+            _shortcuts: crate::application::viewer_shortcuts::Watcher::new()?,
             annotation: crate::application::viewer::annotation::AnnotationUi::new(
                 stream_control.clone(),
                 window_hwnd(window)?.0 as u64,
@@ -372,7 +374,6 @@ impl ThreadedWindowsApp {
     }
 
     pub(in crate::application::viewer) fn draw_ui(&mut self, window: &Window) -> Result<()> {
-        crate::application::viewer_shortcuts::refresh();
         self.egui_context
             .request_repaint_after(Duration::from_millis(500));
         if self.renderer.first_presented.load(Ordering::Acquire) {

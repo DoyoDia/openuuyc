@@ -25,7 +25,7 @@ impl Drop for PendingPeer {
     }
 }
 pub(crate) struct Session {
-    client: Arc<crate::account::client::AuthenticatedClient>,
+    client: crate::session::host_client::HostClient,
     desired: tokio::sync::watch::Receiver<Option<crate::features::host::AccessRequest>>,
     active_displays: Option<Vec<crate::protocol::capability::DisplayCapability>>,
     authorization: Option<crate::features::host::Lease>,
@@ -40,7 +40,7 @@ pub(crate) struct Session {
     active_encoder: Option<Vec<(usize, i32, (u32, u32), String)>>,
 }
 impl Session {
-    pub(crate) fn new(client: Arc<crate::account::client::AuthenticatedClient>) -> Self {
+    pub(crate) fn new(client: crate::session::host_client::HostClient) -> Self {
         Self {
             desired: client.host.subscribe(),
             client,
@@ -327,7 +327,7 @@ impl Session {
                     decoders=?options.decoders,formats=?remote.video_codec_capability,
                     "host incoming media capabilities");
                 anyhow::ensure!(
-                    options.kind == 1 && options.connect_type == 1,
+                    options.kind == 1 && matches!(options.connect_type, 1 | 2),
                     "不支持的被控连接类型"
                 );
                 anyhow::ensure!(
@@ -349,6 +349,15 @@ impl Session {
                         ..Default::default()
                     })
                     .collect();
+                anyhow::ensure!(
+                    !self.client.is_guest() || options.connect_type == 2,
+                    "游客身份仅接受远程协助"
+                );
+                let authorization = if options.connect_type == 2 {
+                    authorization.for_assistance()?
+                } else {
+                    authorization
+                };
                 self.cancel_preparation().await;
                 if let Some(peer) = self.peer.take() {
                     peer.close().await;

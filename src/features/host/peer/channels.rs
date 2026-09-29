@@ -313,9 +313,28 @@ pub(super) async fn publish_state(
             result=microphone.changed()=>{if result.is_err(){break;} false},
             _=timer.tick()=>true,
         };
-        if refresh && let Ok(mut state) = screens.try_lock() {
-            if let Err(error) = state.maintain().await {
-                tracing::debug!(%error,"host screen inventory refresh failed");
+        let inventory_revision = if refresh {
+            screens
+                .try_lock()
+                .ok()
+                .map(|state| state.inventory_revision())
+        } else {
+            None
+        };
+        if let Some(revision) = inventory_revision {
+            // Driver enumeration must not hold the screen lock or occupy a
+            // network runtime worker. At most one periodic read is in flight.
+            let result = super::screens::Inventory::collect(&cancel).await;
+            match result {
+                Ok(None) => break,
+                Ok(Some(inventory)) => {
+                    if let Ok(mut state) = screens.try_lock() {
+                        if let Err(error) = state.maintain(revision, inventory).await {
+                            tracing::debug!(%error,"host screen inventory refresh failed");
+                        }
+                    }
+                }
+                Err(error) => tracing::debug!(%error,"host screen inventory read failed"),
             }
         }
         let routes = target.borrow_and_update().clone();

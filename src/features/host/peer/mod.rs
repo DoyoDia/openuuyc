@@ -955,7 +955,7 @@ impl Peer {
     }
     pub(crate) fn load_input_configuration(
         &mut self,
-        client: Arc<crate::account::client::AuthenticatedClient>,
+        client: crate::session::host_client::HostClient,
     ) {
         let input = self.input.receiver();
         let cancel = self.cancel.clone();
