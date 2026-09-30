@@ -1,4 +1,5 @@
 //! Device-center asynchronous worker and cancellation ownership.
+mod guest;
 use super::assist::AssistResult;
 use super::messages::{DeviceMutation, GuiCommand, GuiEvent, MutationOutcome};
 use super::phone::LoginMethod;
@@ -159,6 +160,9 @@ pub(super) async fn gui_worker_loop(
     let mut host_signal: Option<ActivePresence> = None;
     let mut presence_stopped = false;
     let mut resident_mode = crate::platform::host_service::resident::managed();
+    let mut shown_assistance = None;
+    let mut guest = guest::Guest::default();
+    let mut guest_allowed = false;
 
     loop {
         let command = tokio::select! {
@@ -173,14 +177,56 @@ pub(super) async fn gui_worker_loop(
             },
             _ = tick.tick() => None,
         };
+        if let Some(host) = client
+            .as_ref()
+            .filter(|c| c.is_active())
+            .map(|c| &c.host)
+            .or_else(|| guest.client.as_ref().map(|c| &c.host))
+        {
+            host.assistance.touch_ui();
+            let pending = host.assistance.snapshot().pending.map(|p| p.id);
+            if pending.is_some() && pending != shown_assistance {
+                let _ =
+                    crate::ui::window_manager::send(crate::ui::window_manager::Request::ShowMain);
+            }
+            shown_assistance = pending;
+        } else {
+            shown_assistance = None;
+        }
         let mode = crate::platform::host_service::resident::managed();
         if mode != resident_mode {
             stop_active_signal(&mut host_signal).await;
+            guest.close().await;
             resident_mode = mode;
             presence_stopped = false;
         }
         if let Some(command) = command {
             match command {
+                GuiCommand::HostAssist { generation, action } => {
+                    if generation == catalog_generation
+                        && logout_task.is_none()
+                        && let Some(current) = client
+                            .as_ref()
+                            .map(|c| crate::session::host_client::HostClient::from(c.clone()))
+                            .or_else(|| guest.client.clone())
+                    {
+                        let result = if crate::platform::host_service::resident::managed() {
+                            crate::platform::host_service::resident::request(
+                                crate::platform::host_service::resident::Request::Assist {
+                                    account: current.generation(),
+                                    action,
+                                },
+                            )
+                            .await
+                            .map(|_| ())
+                        } else {
+                            current.host.assistance.act(action)
+                        };
+                        if let Err(error) = result {
+                            let _ = events.send(GuiEvent::Error(error.to_string()));
+                        }
+                    }
+                }
                 GuiCommand::RefreshHostAudioDevices { generation } => {
                     if generation == catalog_generation
                         && logout_task.is_none()
@@ -192,13 +238,18 @@ pub(super) async fn gui_worker_loop(
                 GuiCommand::SaveHostSettings { generation } => {
                     if generation == catalog_generation
                         && logout_task.is_none()
-                        && let Some(client) = client.as_ref().filter(|c| c.is_active())
+                        && let Some(host) = client
+                            .as_ref()
+                            .filter(|c| c.is_active())
+                            .map(|c| c.host.clone())
+                            .or_else(|| guest.client.as_ref().map(|c| c.host.clone()))
                     {
-                        client.host.persist_settings().await;
+                        host.persist_settings().await;
                     }
                 }
                 GuiCommand::View {
                     generation,
+                    key,
                     alias,
                     device_id,
                     assist,
@@ -224,7 +275,8 @@ pub(super) async fn gui_worker_loop(
                     } else {
                         Err("账号状态已改变".into())
                     };
-                    let _ = events.send(GuiEvent::Viewer(generation, alias, device_id, result));
+                    let _ =
+                        events.send(GuiEvent::Viewer(generation, key, alias, device_id, result));
                 }
                 GuiCommand::Ports {
                     generation,
@@ -377,7 +429,7 @@ pub(super) async fn gui_worker_loop(
                             LoginMethod::Phone,
                             generation,
                             attempt,
-                            Err(error.to_string()),
+                            Err(error),
                         ));
                         continue;
                     }
@@ -469,6 +521,7 @@ pub(super) async fn gui_worker_loop(
                     }
                 }
                 GuiCommand::PrepareExit => {
+                    let update_exit = super::instance::take_update_exit();
                     let result = if crate::platform::host_service::resident::managed() {
                         crate::platform::host_service::resident::request(
                             crate::platform::host_service::resident::Request::Pause,
@@ -476,6 +529,12 @@ pub(super) async fn gui_worker_loop(
                         .await
                         .map(|_| ())
                         .map_err(|e| format!("{e:#}"))
+                    } else if update_exit && let Some(current) = &client {
+                        current
+                            .host
+                            .prepare_update()
+                            .await
+                            .map_err(|e| format!("{e:#}"))
                     } else {
                         Ok(())
                     };
@@ -620,11 +679,15 @@ pub(super) async fn gui_worker_loop(
                 continue;
             }
             let result = match login.task.await {
-                Ok(Ok(prepared)) => prepared.commit().map(|_| ()),
+                Ok(Ok(prepared)) => {
+                    guest.close().await;
+                    prepared.commit().map(|_| ())
+                }
                 Ok(Err(error)) => Err(error),
                 Err(error) => Err(error.into()),
             };
             if result.is_ok() {
+                guest_allowed = false;
                 // A single accepted result closes this login epoch. Errors
                 // leave the other method alive; queued old events cannot win.
                 cancel_login_task(&mut login_task).await;
@@ -640,7 +703,7 @@ pub(super) async fn gui_worker_loop(
                 method,
                 login.generation,
                 login.attempt,
-                result.map_err(|error| format!("{error:#}")),
+                result,
             ));
         }
 
@@ -701,6 +764,7 @@ pub(super) async fn gui_worker_loop(
             let result = logout_task.take().expect("finished logout").await;
             match result {
                 Ok(outcome) => {
+                    guest_allowed = outcome.local_error.is_none();
                     let _ = events.send(GuiEvent::LoggedOut(outcome));
                 }
                 Err(error) => {
@@ -822,6 +886,7 @@ pub(super) async fn gui_worker_loop(
                         .downcast_ref::<crate::account::client::NoSavedSession>()
                         .is_some()
                     {
+                        guest_allowed = true;
                         GuiEvent::SignedOut
                     } else {
                         GuiEvent::SessionUnavailable(format!("无法打开账号会话：{error:#}"))
@@ -829,6 +894,13 @@ pub(super) async fn gui_worker_loop(
                     let _ = events.send(event);
                 }
             }
+        }
+        if client.is_none() && guest_allowed && logout_task.is_none() {
+            guest
+                .poll(device_runtime.handle(), catalog_generation, &events)
+                .await;
+        } else if guest.client.is_some() {
+            guest.close().await;
         }
         if let Some(active_client) = &client {
             if logout_task.is_some() {
@@ -936,6 +1008,7 @@ pub(super) async fn gui_worker_loop(
         let _ = task.await;
     }
     stop_active_signal(&mut host_signal).await;
+    guest.close().await;
     device_runtime.close().await;
 }
 

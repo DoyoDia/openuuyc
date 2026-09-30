@@ -2,6 +2,7 @@ use super::*;
 use std::{
     fs::{self, OpenOptions},
     io::{self, Write},
+    sync::atomic::{AtomicU64, Ordering},
     time::SystemTime,
 };
 
@@ -145,13 +146,59 @@ pub(super) fn open_directory(directory: &Path) -> Result<()> {
     Ok(())
 }
 
+// Sync outside the producer and writer locks, at most once per watcher tick.
+// Windows directory enumeration can otherwise show stale size/time until close.
+struct PendingSync {
+    file: File,
+    written: AtomicU64,
+    synced: AtomicU64,
+}
+impl PendingSync {
+    fn new(file: &File) -> io::Result<Arc<Self>> {
+        Ok(Arc::new(Self {
+            file: file.try_clone()?,
+            written: AtomicU64::new(0),
+            synced: AtomicU64::new(0),
+        }))
+    }
+    fn flush(&self) -> io::Result<()> {
+        let written = self.written.load(Ordering::Acquire);
+        if written != self.synced.load(Ordering::Acquire) {
+            self.file.sync_data()?;
+            self.synced.store(written, Ordering::Release);
+        }
+        Ok(())
+    }
+}
+pub(super) fn sync_pending(status: &Arc<Mutex<Status>>) {
+    let pending = status
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .pending
+        .clone();
+    if let Some(pending) = pending
+        && let Err(error) = pending.flush()
+    {
+        let mut state = status.lock().unwrap_or_else(|e| e.into_inner());
+        if state
+            .pending
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &pending))
+        {
+            state.error = Some(format!("日志刷新失败：{error}"));
+        }
+    }
+}
+
 #[derive(Default)]
 pub(super) struct Status {
     pub path: PathBuf,
     pub error: Option<String>,
+    pending: Option<Arc<PendingSync>>,
 }
 pub(super) struct Writer {
     file: File,
+    pending: Arc<PendingSync>,
     // A separate lease keeps logs readable in editors while they are being written.
     _lease: Option<File>,
     directory: PathBuf,
@@ -198,9 +245,15 @@ impl Writer {
         if let Some(stem) = &stem {
             save_sequence(directory, stem, sequence)?;
         }
-        status.lock().unwrap_or_else(|e| e.into_inner()).path = path;
+        let pending = PendingSync::new(&file)?;
+        {
+            let mut state = status.lock().unwrap_or_else(|e| e.into_inner());
+            state.path = path;
+            state.pending = Some(pending.clone());
+        }
         let writer = Self {
             file,
+            pending,
             _lease: lease,
             directory: directory.to_owned(),
             stem,
@@ -231,9 +284,13 @@ impl Writer {
             metadata.created().or_else(|_| metadata.modified())?,
         )
         .date_naive();
+        self.pending.flush()?;
+        self.pending = PendingSync::new(&file)?;
         self.file = file;
         self.sequence = sequence;
-        self.status.lock().unwrap_or_else(|e| e.into_inner()).path = path;
+        let mut state = self.status.lock().unwrap_or_else(|e| e.into_inner());
+        state.path = path;
+        state.pending = Some(self.pending.clone());
         Ok(())
     }
     fn write_inner(&mut self, bytes: &[u8]) -> io::Result<usize> {
@@ -260,6 +317,7 @@ impl Writer {
             }
         }
         self.file.write_all(bytes)?;
+        self.pending.written.fetch_add(1, Ordering::Release);
         self.size = self.size.saturating_add(bytes.len() as u64);
         drop(write_lock);
         if rotated {
@@ -324,6 +382,15 @@ impl Write for Writer {
     }
     fn flush(&mut self) -> io::Result<()> {
         self.file.flush()
+    }
+}
+
+impl Drop for Writer {
+    fn drop(&mut self) {
+        if let Err(error) = self.pending.flush() {
+            self.status.lock().unwrap_or_else(|e| e.into_inner()).error =
+                Some(format!("日志刷新失败：{error}"));
+        }
     }
 }
 

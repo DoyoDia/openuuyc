@@ -17,6 +17,8 @@ use windows::{
 };
 
 pub(crate) use crate::media::capture::{Screen, SourceGone};
+mod inventory;
+mod recovery;
 
 /// Read the state of this process's interactive session. Unknown/failure is
 /// not an unlocked session; callers retain their last confirmed report.
@@ -54,8 +56,33 @@ pub(crate) fn session_locked() -> Option<bool> {
     }
 }
 
+fn active_source_names(targets: Vec<super::display::topology::Target>) -> Option<Vec<String>> {
+    if targets
+        .iter()
+        .any(|t| t.active && t.available && t.source.is_empty())
+    {
+        return None;
+    }
+    Some(
+        targets
+            .into_iter()
+            .filter(|t| t.active && t.available)
+            .map(|t| t.source)
+            .collect(),
+    )
+}
+
 fn outputs() -> Result<Vec<(IDXGIAdapter1, IDXGIOutput1, Screen)>> {
     let displays = super::display::active_displays().unwrap_or_default();
+    // DXGI can retain a desktop output after the last monitor departs. Only
+    // trust a complete DisplayConfig inventory; an unavailable query is not
+    // evidence that a remote/session display should be removed.
+    let active_sources = super::display::topology::Topology::query(true)
+        // Liveness needs source identity only. Enumerating every supported mode
+        // here stalls the capture thread on its once-per-second refresh.
+        .and_then(|topology| topology.metadata())
+        .ok()
+        .and_then(active_source_names);
     unsafe {
         let factory: IDXGIFactory1 = CreateDXGIFactory1()?;
         let mut result = Vec::new();
@@ -92,6 +119,14 @@ fn outputs() -> Result<Vec<(IDXGIAdapter1, IDXGIOutput1, Screen)>> {
                     .position(|v| *v == 0)
                     .unwrap_or(desc.DeviceName.len());
                 let name = String::from_utf16_lossy(&desc.DeviceName[..length]);
+                if active_sources.as_ref().is_some_and(|sources| {
+                    !sources
+                        .iter()
+                        .any(|source| source.eq_ignore_ascii_case(&name))
+                }) {
+                    tracing::debug!(device=%name,"ignoring DXGI output without an active display target");
+                    continue;
+                }
                 let display = displays.iter().find(|d| d.name == name);
                 let display_name = display
                     .map(|d| d.friendly_name.trim().to_owned())
@@ -310,9 +345,9 @@ pub(crate) struct Desktop {
     pub generation: u64,
     pub available: bool,
     backend: Backend,
-    retry_at: std::time::Instant,
-    retries: u8,
+    recovery: recovery::Recovery,
     refreshed: std::time::Instant,
+    inventory: Option<inventory::Refresh>,
     sampler: super::cursor_shape::Sampler,
     pub cursor: Option<super::cursor_shape::Snapshot>,
 }
@@ -325,9 +360,9 @@ impl Desktop {
                 generation: 0,
                 available: true,
                 backend: Backend::Remote(Box::new(remote)),
-                retry_at: std::time::Instant::now(),
-                retries: 0,
+                recovery: recovery::Recovery::new(false, std::time::Instant::now()),
                 refreshed: std::time::Instant::now(),
+                inventory: None,
                 sampler: Default::default(),
                 cursor: None,
             });
@@ -346,7 +381,8 @@ impl Desktop {
                 Backend::Dxgi(capture)
             }
             Err(error) => {
-                tracing::debug!(%error,"desktop duplication unavailable; selecting GDI");
+                tracing::info!(device=%screen.device_name, error=%format!("{error:#}"),
+                    "desktop duplication unavailable; selecting GDI");
                 Backend::Gdi(super::gdi::Capture::new(&screen)?)
             }
         };
@@ -355,15 +391,19 @@ impl Desktop {
             Backend::Gdi(g) => g.device.clone(),
             Backend::Remote(_) => unreachable!(),
         };
+        let recovery = recovery::Recovery::new(
+            matches!(backend, Backend::Dxgi(_)),
+            std::time::Instant::now(),
+        );
         Ok(Self {
             device,
             screen,
             generation: 0,
             available: true,
             backend,
-            retry_at: std::time::Instant::now() + std::time::Duration::from_secs(10),
-            retries: 0,
+            recovery,
             refreshed: std::time::Instant::now(),
+            inventory: None,
             sampler: Default::default(),
             cursor: None,
         })
@@ -420,9 +460,14 @@ impl Desktop {
             maximum,
             hdr,
         };
-        if self.refreshed.elapsed() >= std::time::Duration::from_secs(1) {
-            let current = refresh(&self.screen)?;
-            self.refreshed = std::time::Instant::now();
+        if let Some(current) = self
+            .inventory
+            .as_mut()
+            .map(inventory::Refresh::poll)
+            .transpose()?
+            .flatten()
+        {
+            let current = current?;
             // A presentation-only name change does not invalidate capture resources.
             self.screen.display_name.clone_from(&current.display_name);
             if current != self.screen {
@@ -431,12 +476,15 @@ impl Desktop {
                 *self = replacement;
             }
         }
-        if matches!(self.backend, Backend::Gdi(_))
-            && self.retries < 5
-            && std::time::Instant::now() >= self.retry_at
-        {
-            self.retries += 1;
-            self.retry_at = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        if self.refreshed.elapsed() >= std::time::Duration::from_secs(1) {
+            if self.inventory.is_none() {
+                self.inventory = Some(inventory::Refresh::new()?);
+            }
+            self.inventory.as_mut().unwrap().request(&self.screen)?;
+            self.refreshed = std::time::Instant::now();
+        }
+        if matches!(self.backend, Backend::Gdi(_)) && self.recovery.due(std::time::Instant::now()) {
+            self.recovery.attempt(std::time::Instant::now());
             if let Ok(mut preferred) = Duplication::open(&self.screen.device_name) {
                 ensure!(
                     preferred.screen.identity == self.screen.identity
@@ -445,7 +493,8 @@ impl Desktop {
                 );
                 if let Ok(Some(frame)) = preferred.next(timeout, quality, cursor, hdr, maximum) {
                     self.replace(Backend::Dxgi(preferred));
-                    self.retries = 0;
+                    // One acquired frame does not establish lasting recovery.
+                    self.recovery.promoted(std::time::Instant::now());
                     self.available = true;
                     return Ok(Some(frame));
                 }
@@ -458,6 +507,9 @@ impl Desktop {
         };
         match frame {
             Ok(frame) => {
+                if matches!(self.backend, Backend::Dxgi(_)) {
+                    self.recovery.healthy(std::time::Instant::now());
+                }
                 self.available = true;
                 Ok(frame)
             }
@@ -487,10 +539,15 @@ impl Desktop {
                 // another duplication successfully does not prove it can acquire
                 // frames. The existing delayed probe requires a real frame before
                 // switching back, avoiding an endless ACCESS_LOST rebuild loop.
+                if self.recovery.failed(std::time::Instant::now()) {
+                    tracing::info!(
+                        "DXGI recovery was short-lived; retaining GDI until the display or input desktop changes"
+                    );
+                }
                 let replacement = Backend::Gdi(super::gdi::Capture::new(&self.screen)?);
-                tracing::debug!(error = %format!("{error:#}"), "selected capture failed; falling back to GDI");
+                tracing::info!(device=%self.screen.device_name,
+                    error = %format!("{error:#}"), "selected capture failed; falling back to GDI");
                 self.replace(replacement);
-                self.retry_at = std::time::Instant::now() + std::time::Duration::from_secs(10);
                 Ok(None)
             }
         }
@@ -500,13 +557,16 @@ impl Desktop {
 struct Duplication {
     pub device: ID3D11Device,
     context: ID3D11DeviceContext,
-    duplication: IDXGIOutputDuplication,
+    duplication: Option<IDXGIOutputDuplication>,
     frame_acquired: bool,
+    repaired_at: Option<std::time::Instant>,
+    presented_since_repair: bool,
     rotation: DXGI_MODE_ROTATION,
     pub screen: Screen,
     converter: super::preprocess::Converter,
     sdr_white: f32,
     source_hdr: Option<crate::media::video_color::HdrMetadata>,
+    color_space: Option<DXGI_COLOR_SPACE_TYPE>,
     quality: Option<super::preprocess::Request>,
     cursor: super::cursor::Cursor,
     cursor_capture: bool,
@@ -544,19 +604,8 @@ impl Duplication {
                         | DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709
                 )
             });
-            let duplication = if let Ok(output5) = output.cast::<IDXGIOutput5>() {
-                let formats = if use_float {
-                    vec![DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT]
-                } else {
-                    vec![DXGI_FORMAT_B8G8R8A8_UNORM]
-                };
-                output5.DuplicateOutput1(&device, 0, &formats).or_else(|_| {
-                    output5.DuplicateOutput1(&device, 0, &[DXGI_FORMAT_B8G8R8A8_UNORM])
-                })
-            } else {
-                output.DuplicateOutput(&device)
-            }
-            .context("无法采集当前桌面；请检查屏幕、锁屏或其他采集程序")?;
+            let color_space = advanced.as_ref().map(|d| d.ColorSpace);
+            let duplication = Self::duplicate(&output, &device, use_float)?;
             let source_hdr = advanced
                 .filter(|d| {
                     d.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020
@@ -578,13 +627,16 @@ impl Duplication {
             Ok(Self {
                 device,
                 context: context.context("未创建采集上下文")?,
-                duplication,
+                duplication: Some(duplication),
                 frame_acquired: false,
+                repaired_at: None,
+                presented_since_repair: false,
                 rotation,
                 screen,
                 converter,
                 sdr_white,
                 source_hdr,
+                color_space,
                 quality: None,
                 cursor: Default::default(),
                 cursor_capture: false,
@@ -592,8 +644,124 @@ impl Duplication {
         }
     }
 
+    fn duplicate(
+        output: &IDXGIOutput1,
+        device: &ID3D11Device,
+        use_float: bool,
+    ) -> Result<IDXGIOutputDuplication> {
+        unsafe {
+            let duplication = if let Ok(output5) = output.cast::<IDXGIOutput5>() {
+                let formats = if use_float {
+                    vec![DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT]
+                } else {
+                    vec![DXGI_FORMAT_B8G8R8A8_UNORM]
+                };
+                let modern = output5.DuplicateOutput1(device, 0, &formats);
+                let modern = if use_float {
+                    modern.or_else(|_| {
+                        output5.DuplicateOutput1(device, 0, &[DXGI_FORMAT_B8G8R8A8_UNORM])
+                    })
+                } else {
+                    modern
+                };
+                modern.or_else(|modern_error| {
+                    // Exposing IDXGIOutput5 does not guarantee DuplicateOutput1
+                    // works for this output. UU's IDD can require DuplicateOutput;
+                    // retain DXGI before considering a different capture backend.
+                    output.DuplicateOutput(device).inspect(|_| {
+                        tracing::debug!(%modern_error, "using compatible DXGI duplication interface");
+                    })
+                })
+            } else {
+                output.DuplicateOutput(device)
+            }
+            .context("无法采集当前桌面；请检查屏幕、锁屏或其他采集程序")?;
+            Ok(duplication)
+        }
+    }
+
     /// A timeout means there is no new desktop image, not a lost capture source.
     pub(crate) fn next(
+        &mut self,
+        timeout_ms: u32,
+        quality: i32,
+        cursor_capture: bool,
+        hdr: bool,
+        maximum: (u32, u32),
+    ) -> Result<Option<Frame>> {
+        let result = self.next_frame(timeout_ms, quality, cursor_capture, hdr, maximum);
+        if let Err(error) = &result
+            && error
+                .downcast_ref::<windows::core::Error>()
+                .is_some_and(|e| e.code() == DXGI_ERROR_ACCESS_LOST)
+            && self.repaired_at.is_none_or(|at| {
+                self.presented_since_repair && at.elapsed() >= std::time::Duration::from_secs(1)
+            })
+        {
+            // A display reset can invalidate only duplication. Keep the owned
+            // textures/device and encoder when the source contract is unchanged.
+            // A repair that never produces a frame, or fails again immediately,
+            // must still reach the outer bounded backend fallback.
+            self.repaired_at = Some(std::time::Instant::now());
+            self.presented_since_repair = false;
+            self.repair()?;
+            tracing::info!(device=%self.screen.device_name, "DXGI capture object restored on the existing graphics device");
+            return self.next_frame(timeout_ms, quality, cursor_capture, hdr, maximum);
+        }
+        result
+    }
+
+    fn repair(&mut self) -> Result<()> {
+        unsafe {
+            self.device.GetDeviceRemovedReason()?;
+        }
+        let before = unsafe {
+            self.duplication
+                .as_ref()
+                .context("DXGI采集对象缺失")?
+                .GetDesc()
+        };
+        self.frame_acquired = false;
+        self.duplication = None;
+        let (_, output, screen) = outputs()?
+            .into_iter()
+            .find(|(_, _, s)| s.device_name == self.screen.device_name)
+            .context("恢复期间所选屏幕已断开")?;
+        ensure!(
+            screen.identity == self.screen.identity
+                && screen.adapter == self.screen.adapter
+                && screen.width == self.screen.width
+                && screen.height == self.screen.height
+                && screen.hdr == self.screen.hdr,
+            "恢复期间采集源发生变化"
+        );
+        let color_space = output
+            .cast::<IDXGIOutput6>()
+            .ok()
+            .and_then(|output| unsafe { output.GetDesc1() }.ok())
+            .map(|desc| desc.ColorSpace);
+        ensure!(
+            color_space == self.color_space,
+            "恢复期间采集色彩空间发生变化"
+        );
+        let duplication = Self::duplicate(
+            &output,
+            &self.device,
+            before.ModeDesc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT,
+        )?;
+        let after = unsafe { duplication.GetDesc() };
+        ensure!(
+            after.ModeDesc.Width == before.ModeDesc.Width
+                && after.ModeDesc.Height == before.ModeDesc.Height
+                && after.ModeDesc.Format == before.ModeDesc.Format
+                && after.Rotation == before.Rotation,
+            "恢复期间采集格式发生变化"
+        );
+        self.duplication = Some(duplication);
+        Ok(())
+    }
+
+    fn next_frame(
         &mut self,
         timeout_ms: u32,
         quality: i32,
@@ -615,46 +783,11 @@ impl Duplication {
             // Release immediately before acquiring, as required for efficient
             // desktop duplication (IDXGIOutputDuplication::ReleaseFrame).
             self.release_frame()?;
-            match self
-                .duplication
-                .AcquireNextFrame(timeout_ms.min(50), &mut info, &mut resource)
-            {
+            let duplication = self.duplication.as_ref().context("DXGI采集对象缺失")?;
+            match duplication.AcquireNextFrame(timeout_ms.min(50), &mut info, &mut resource) {
                 Ok(()) => self.frame_acquired = true,
                 Err(error) if error.code() == DXGI_ERROR_WAIT_TIMEOUT => {
-                    // A quality change must also work on a completely static desktop.
-                    if self.quality != Some(request) || self.cursor_capture != cursor_capture {
-                        if let Some((texture, desc)) = self.converter.last_input() {
-                            let texture = self.converter.convert(
-                                &self.device,
-                                &self.context,
-                                &texture,
-                                desc,
-                                self.rotation,
-                                self.sdr_white,
-                                self.source_hdr,
-                                request,
-                                if cursor_capture {
-                                    self.cursor.render(self.screen.width, self.screen.height)
-                                } else {
-                                    None
-                                },
-                            )?;
-                            let mut output = D3D11_TEXTURE2D_DESC::default();
-                            texture.GetDesc(&mut output);
-                            self.quality = Some(request);
-                            self.cursor_capture = cursor_capture;
-                            return Ok(Some(Frame {
-                                width: output.Width,
-                                height: output.Height,
-                                image: texture,
-                                captured: std::time::Instant::now(),
-                                is_new: false,
-                                _storage: None,
-                                hdr_metadata: if hdr { self.source_hdr } else { None },
-                            }));
-                        }
-                    }
-                    return Ok(None);
+                    return self.cached_frame(request, cursor_capture, false);
                 }
                 Err(error) => return Err(error).context("桌面采集失效，需要重建所选屏幕采集"),
             }
@@ -662,8 +795,21 @@ impl Duplication {
             // surface escapes this call. Successful acquisition stays owned
             // until the next call, errors and Drop release it immediately.
             let captured = std::time::Instant::now();
+            let cursor_update = self.cursor.update(&self.device, duplication, &info);
             let result = (|| -> Result<Option<Frame>> {
-                self.cursor.update(&self.device, &self.duplication, &info)?;
+                cursor_update?;
+                // A successful acquisition can contain only a pointer update.
+                // Its desktop surface is not a newly presented image (and can
+                // be black immediately after duplication creation/recovery).
+                // Keep our last owned desktop; composite the new pointer only
+                // when the viewer requested an embedded cursor.
+                if info.LastPresentTime == 0 {
+                    return self.cached_frame(
+                        request,
+                        cursor_capture,
+                        info.LastMouseUpdateTime != 0,
+                    );
+                }
                 let texture: ID3D11Texture2D = resource.context("采集未返回纹理")?.cast()?;
                 let mut desc = D3D11_TEXTURE2D_DESC::default();
                 texture.GetDesc(&mut desc);
@@ -702,14 +848,14 @@ impl Duplication {
                 texture.GetDesc(&mut desc);
                 self.quality = Some(request);
                 self.cursor_capture = cursor_capture;
+                self.presented_since_repair = true;
                 Ok(Some(Frame {
                     width: desc.Width,
                     height: desc.Height,
                     image: texture,
                     captured,
                     _storage: None,
-                    is_new: info.LastPresentTime != 0
-                        || (cursor_capture && info.LastMouseUpdateTime != 0),
+                    is_new: true,
                     hdr_metadata: if hdr { self.source_hdr } else { None },
                 }))
             })();
@@ -720,9 +866,65 @@ impl Duplication {
         }
     }
 
+    fn cached_frame(
+        &mut self,
+        request: super::preprocess::Request,
+        cursor_capture: bool,
+        pointer_changed: bool,
+    ) -> Result<Option<Frame>> {
+        let pointer_changed = cursor_capture && pointer_changed;
+        if self.quality == Some(request)
+            && self.cursor_capture == cursor_capture
+            && !pointer_changed
+        {
+            return Ok(None);
+        }
+        // Quality/cursor changes must also work on an otherwise static desktop.
+        // Before the first real image, there is nothing safe to compose.
+        let Some((texture, desc)) = self.converter.last_input() else {
+            return Ok(None);
+        };
+        let texture = self.converter.convert(
+            &self.device,
+            &self.context,
+            &texture,
+            desc,
+            self.rotation,
+            self.sdr_white,
+            self.source_hdr,
+            request,
+            if cursor_capture {
+                self.cursor.render(self.screen.width, self.screen.height)
+            } else {
+                None
+            },
+        )?;
+        let mut output = D3D11_TEXTURE2D_DESC::default();
+        unsafe {
+            texture.GetDesc(&mut output);
+        }
+        self.quality = Some(request);
+        self.cursor_capture = cursor_capture;
+        Ok(Some(Frame {
+            width: output.Width,
+            height: output.Height,
+            image: texture,
+            captured: std::time::Instant::now(),
+            is_new: pointer_changed,
+            _storage: None,
+            hdr_metadata: if request.hdr { self.source_hdr } else { None },
+        }))
+    }
+
     fn release_frame(&mut self) -> Result<()> {
         if std::mem::take(&mut self.frame_acquired) {
-            unsafe { self.duplication.ReleaseFrame() }.context("释放采集帧失败")?;
+            unsafe {
+                self.duplication
+                    .as_ref()
+                    .context("DXGI采集对象缺失")?
+                    .ReleaseFrame()
+            }
+            .context("释放采集帧失败")?;
         }
         Ok(())
     }

@@ -17,7 +17,9 @@ use windows::{
 };
 pub(crate) type Samples = Arc<dyn Fn([f32; BLOCK * 2], Instant) + Send + Sync>;
 mod devices;
+mod stream;
 pub(crate) use devices::{Devices, Endpoint};
+pub(crate) use stream::{Capture, open};
 struct Apartment(bool, std::marker::PhantomData<std::rc::Rc<()>>);
 impl Apartment {
     fn new() -> Result<Self> {
@@ -47,7 +49,7 @@ impl Drop for Mix {
     }
 }
 
-pub(crate) struct Capture {
+struct NativeCapture {
     input_watch: devices::SessionWatch,
     render_watch: devices::SessionWatch,
     clock: IAudioClock,
@@ -67,7 +69,7 @@ pub(crate) struct Capture {
     decoded: Vec<f32>,
     _apartment: Apartment,
 }
-pub(crate) fn open(endpoint: &Endpoint, samples: Samples) -> Result<Capture> {
+fn open_native(endpoint: &Endpoint, samples: Samples) -> Result<NativeCapture> {
     let apartment = Apartment::new()?;
     unsafe {
         let endpoint = &endpoint.device;
@@ -132,7 +134,7 @@ pub(crate) fn open(endpoint: &Endpoint, samples: Samples) -> Result<Capture> {
         let render_watch = devices::SessionWatch::new(&silence)?;
         let clock = silence.GetService::<IAudioClock>()?;
         let now = Instant::now();
-        let result = Capture {
+        let result = NativeCapture {
             input_watch,
             render_watch,
             clock,
@@ -157,7 +159,7 @@ pub(crate) fn open(endpoint: &Endpoint, samples: Samples) -> Result<Capture> {
         Ok(result)
     }
 }
-impl Capture {
+impl NativeCapture {
     pub fn producing(&self) -> bool {
         self.progress.delivered
     }
@@ -279,7 +281,7 @@ impl Capture {
         Ok(())
     }
 }
-impl Drop for Capture {
+impl Drop for NativeCapture {
     fn drop(&mut self) {
         unsafe {
             let _ = self.input.Stop();

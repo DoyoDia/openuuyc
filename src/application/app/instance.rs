@@ -18,6 +18,10 @@ mod platform {
 
     pub struct Instance(HANDLE);
     const SHOW_SUBCLASS: usize = 0x4f554943;
+    static UPDATE_EXIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    pub(crate) fn take_update_exit() -> bool {
+        UPDATE_EXIT.swap(false, std::sync::atomic::Ordering::AcqRel)
+    }
 
     fn show_message() -> u32 {
         static MESSAGE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
@@ -108,6 +112,7 @@ mod platform {
             if crate::platform::windows::components::maintaining() {
                 return LRESULT(2);
             }
+            UPDATE_EXIT.store(true, std::sync::atomic::Ordering::Release);
             return LRESULT(
                 if crate::ui::window_manager::send(crate::ui::window_manager::Request::Exit).is_ok()
                 {
@@ -352,10 +357,15 @@ mod platform {
     pub(crate) fn register_window(_window: &winit::window::Window) -> Result<()> {
         Ok(())
     }
+
+    /// Only the Windows updater asks a running control center to exit.
+    pub(crate) fn take_update_exit() -> bool {
+        false
+    }
 }
 
 pub use platform::Instance;
-pub(crate) use platform::register_window;
+pub(crate) use platform::{register_window, take_update_exit};
 #[cfg(windows)]
 pub(crate) use platform::{
     reserve_after_exit, reserve_installer, reserve_maintenance, reserve_update, running_installed,

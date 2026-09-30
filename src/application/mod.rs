@@ -44,6 +44,20 @@ pub fn host_resident(parent: u32) -> anyhow::Result<()> {
     crate::platform::windows::host_service::resident::run(parent)
 }
 #[cfg(windows)]
+pub fn display_agent(parent: u32) -> anyhow::Result<()> {
+    crate::platform::windows::host_service::displays::run(parent)
+}
+#[cfg(windows)]
+pub fn component_error_code(error: &anyhow::Error) -> Option<i32> {
+    if error.is::<crate::platform::windows::host_service::install::ActiveSession>() {
+        Some(170)
+    } else if error.is::<crate::platform::windows::display::install::DriverInUse>() {
+        Some(2404)
+    } else {
+        None
+    }
+}
+#[cfg(windows)]
 pub fn input_agent(pipe: &str, parent: u32) -> anyhow::Result<()> {
     crate::features::host::input::broker::agent(pipe, parent)
 }

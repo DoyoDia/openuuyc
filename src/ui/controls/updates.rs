@@ -99,30 +99,6 @@ pub(crate) fn update_actions(
     )
 }
 
-pub(crate) fn update_countdown(ui: &mut egui::Ui, seconds: u64) {
-    egui::Frame::new()
-        .fill(theme::SURFACE)
-        .corner_radius(theme::CONTROL_RADIUS)
-        .inner_margin(egui::Margin::symmetric(14, 12))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new("自动重新连接")
-                        .color(theme::MUTED)
-                        .size(theme::COMPACT_TEXT),
-                );
-                ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(
-                        RichText::new(format!("{seconds} 秒"))
-                            .size(theme::SECTION)
-                            .strong(),
-                    );
-                });
-            });
-        });
-}
-
 pub(crate) fn update_prepared_notice(ctx: &egui::Context) -> bool {
     let mut postpone = false;
     egui::Area::new(egui::Id::new("remote-update-prepared"))

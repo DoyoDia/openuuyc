@@ -76,10 +76,7 @@ impl DeviceCenterApp {
                 .into_iter()
                 .map(|(device, group)| {
                     let id = device.device_id.as_str();
-                    let own_session = self
-                        .active_session
-                        .as_ref()
-                        .is_some_and(|s| s.device_id.as_deref() == Some(id));
+                    let own_session = self.viewer_for_device(id).is_some();
                     let connect_issue = self.viewer_action_issue(device);
                     Entry {
                         device: device.clone(),

@@ -123,6 +123,16 @@ pub const SCREEN_TAB_MAX_WIDTH: f32 = 184.0;
 pub const CONTEXT_MENU_WIDTH: f32 = 248.0;
 pub const NAV_HEIGHT: f32 = 36.0;
 pub const SIDEBAR_WIDTH: f32 = 188.0;
+pub const AUTH_QR_SIZE: f32 = 216.0;
+pub const AUTH_COUNTRY_WIDTH: f32 = 64.0;
+pub const AUTH_CODE_ACTION_WIDTH: f32 = 128.0;
+pub const ASSIST_ID_WIDTH: f32 = 216.0;
+pub const ASSIST_COLUMN_GAP: f32 = 24.0;
+pub const ASSIST_INPUT_WIDTH: f32 = 232.0;
+pub const ASSIST_SHARE_WIDTH: f32 = 112.0;
+pub const ASSIST_RECENT_SIZE: egui::Vec2 = egui::vec2(216.0, 52.0);
+pub const ASSIST_CARD_MARGIN: i8 = 20;
+pub const ASSIST_HEADER_MARGIN: egui::Margin = egui::Margin::symmetric(20, 12);
 pub const CONTROL_RADIUS: u8 = 5;
 pub const PANEL_RADIUS: u8 = 8;
 

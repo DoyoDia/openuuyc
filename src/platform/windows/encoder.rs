@@ -66,6 +66,7 @@ pub(crate) fn probe(
     let mut cached = None::<super::capture::Frame>;
     let mut cached_hdr = None;
     let mut result = Vec::new();
+    let mut last_failure = None;
     for (adapter, device, backend, format) in candidates {
         if !is_active() {
             anyhow::bail!("被控准备已取消");
@@ -166,11 +167,16 @@ pub(crate) fn probe(
                 result.push(cap)
             }
             Err(error) => {
-                tracing::debug!(?backend,?format,%error,"host encoder capability rejected")
+                tracing::debug!(?backend,?format,%error,"host encoder capability rejected");
+                last_failure = Some(format!("{error:#}"));
             }
         }
     }
-    ensure!(!result.is_empty(), "所选桌面没有可用的视频编码器");
+    ensure!(
+        !result.is_empty(),
+        "所选桌面没有可用的视频编码器：{}",
+        last_failure.as_deref().unwrap_or("没有编码候选")
+    );
     Ok(result)
 }
 

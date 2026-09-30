@@ -17,8 +17,7 @@ use crate::diagnostics::performance::PerformanceMonitor;
 use crate::features::stream_control::StreamControlHandle;
 use crate::platform::graphics::window_hwnd;
 use crate::ui::chrome::{
-    WindowMoveState, WindowResizeState, configure_dwm_window, title_bar_height_pixels,
-    title_bar_panel,
+    WindowMoveState, WindowResizeState, set_fullscreen, title_bar_height_pixels, title_bar_panel,
 };
 use anyhow::{Result, bail};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -44,6 +43,7 @@ pub(in crate::application::viewer) fn viewer_shortcut(
 }
 
 pub(in crate::application::viewer) struct ThreadedWindowsApp {
+    _shortcuts: crate::application::viewer_shortcuts::Watcher,
     pub(in crate::application::viewer) annotation:
         crate::application::viewer::annotation::AnnotationUi,
     pub(in crate::application::viewer) modifiers: winit::keyboard::ModifiersState,
@@ -144,6 +144,7 @@ impl ThreadedWindowsApp {
             Arc::clone(&cpu_device),
         )?;
         Ok(Self {
+            _shortcuts: crate::application::viewer_shortcuts::Watcher::new()?,
             annotation: crate::application::viewer::annotation::AnnotationUi::new(
                 stream_control.clone(),
                 window_hwnd(window)?.0 as u64,
@@ -276,8 +277,7 @@ impl ThreadedWindowsApp {
                     .fullscreen()
                     .is_none()
                     .then(|| winit::window::Fullscreen::Borderless(window.current_monitor()));
-                window.set_fullscreen(fullscreen);
-                configure_dwm_window(window);
+                set_fullscreen(window, fullscreen);
                 // A maximized window may keep the same outer size. Update
                 // the video origin even if no size-change event follows.
                 self.resize_targets(window, window.inner_size())?;
@@ -374,7 +374,6 @@ impl ThreadedWindowsApp {
     }
 
     pub(in crate::application::viewer) fn draw_ui(&mut self, window: &Window) -> Result<()> {
-        crate::application::viewer_shortcuts::refresh();
         self.egui_context
             .request_repaint_after(Duration::from_millis(500));
         if self.renderer.first_presented.load(Ordering::Acquire) {

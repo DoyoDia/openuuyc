@@ -28,6 +28,22 @@ pub(crate) struct Dpi {
     pub supported: Vec<u32>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum VirtualProvider {
+    Uu,
+    OpenUuyc,
+}
+
+impl VirtualProvider {
+    fn from_adapter_name(name: &str) -> Option<Self> {
+        match name {
+            "GameViewer Virtual Display Adapter" => Some(Self::Uu),
+            "OpenUUYC Virtual Display Adapter" => Some(Self::OpenUuyc),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Target {
     pub identity: String,
     pub name: String,
@@ -39,6 +55,9 @@ pub(crate) struct Target {
     pub source_id: u32,
     pub active: bool,
     pub available: bool,
+    /// Both providers use the official virtual-screen wire type. Native
+    /// operations and session cleanup still verify the actual driver/owner.
+    pub virtual_provider: Option<VirtualProvider>,
     pub modes: Vec<Mode>,
     pub dpi: Option<Dpi>,
 }
@@ -79,6 +98,25 @@ fn text(value: &[u16]) -> String {
 }
 fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(Some(0)).collect()
+}
+
+fn virtual_sources() -> Vec<(String, VirtualProvider)> {
+    // Identify only the UU/OpenUUYC adapters, not EDID model names, arbitrary
+    // "Virtual" names or other indirect-display providers.
+    let mut sources = Vec::new();
+    for index in 0.. {
+        let mut device = DISPLAY_DEVICEW {
+            cb: size_of::<DISPLAY_DEVICEW>() as u32,
+            ..Default::default()
+        };
+        if !unsafe { EnumDisplayDevicesW(None, index, &mut device, 0) }.as_bool() {
+            break;
+        }
+        if let Some(provider) = VirtualProvider::from_adapter_name(&text(&device.DeviceString)) {
+            sources.push((text(&device.DeviceName), provider));
+        }
+    }
+    sources
 }
 
 impl Topology {
@@ -183,6 +221,7 @@ impl Topology {
 
     pub(crate) fn metadata(&self) -> Result<Vec<Target>> {
         let mut targets: Vec<Target> = Vec::new();
+        let virtual_sources = virtual_sources();
         for path in &self.paths {
             let mut target = DISPLAYCONFIG_TARGET_DEVICE_NAME {
                 header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
@@ -241,6 +280,10 @@ impl Topology {
             } else {
                 String::new()
             };
+            let virtual_provider = virtual_sources
+                .iter()
+                .find(|(name, _)| name == &source)
+                .map(|(_, provider)| provider.clone());
             targets.push(Target {
                 identity,
                 name: text(&target.monitorFriendlyDeviceName),
@@ -258,6 +301,7 @@ impl Topology {
                 source_id: path.sourceInfo.id,
                 active,
                 available: path.targetInfo.targetAvailable.as_bool(),
+                virtual_provider,
             });
         }
         Ok(targets)

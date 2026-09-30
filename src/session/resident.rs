@@ -8,7 +8,16 @@ use serde::{Deserialize, Serialize};
 pub(crate) enum Request {
     Resume,
     Pause,
-    Snapshot,
+    PrepareUpdate,
+    CancelUpdate,
+    Snapshot {
+        ui: bool,
+    },
+    Assist {
+        account: String,
+        action: host::assist::Action,
+    },
+    RefreshPublication,
     Initialize {
         force: bool,
     },
@@ -24,6 +33,7 @@ pub(crate) enum Request {
         audio_device: Option<host::audio::Device>,
         audio_defaults: host::audio::DefaultDevices,
         audio_quality: crate::media::audio::encoder::Quality,
+        assistance: host::assist::Settings,
     },
     Disconnect {
         account: String,
@@ -37,6 +47,8 @@ pub(crate) enum Request {
 }
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Snapshot {
+    pub assistance: host::assist::Snapshot,
+    pub publication: crate::account::reporting::Snapshot,
     pub account: String,
     pub online: PresenceState,
     pub allowed: bool,

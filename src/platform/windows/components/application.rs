@@ -254,12 +254,19 @@ pub(crate) fn start_installed(
     let image = image()?;
     verify_directory(image.parent().context("安装路径无效")?)?;
     ensure!(image.is_file(), "安装程序缺失，请修复安装");
-    std::process::Command::new(&image)
+    let child = std::process::Command::new(&image)
         .args(arguments)
         .current_dir(image.parent().unwrap())
         .creation_flags(0x08000000)
         .spawn()
         .context("启动已安装程序失败")?;
+    // Hand off foreground permission while the launching UI is still alive.
+    // Only this child receives it; services and unrelated processes do not.
+    if let Err(error) =
+        unsafe { windows::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(child.id()) }
+    {
+        tracing::debug!(%error, "foreground launch permission unavailable");
+    }
     Ok(())
 }
 pub(crate) fn integrate_user() -> Result<()> {

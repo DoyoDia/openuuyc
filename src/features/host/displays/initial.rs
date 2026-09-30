@@ -15,7 +15,7 @@ impl Session {
     pub(crate) async fn prepare(&self, options: ConnectOptions) -> Result<capture::Screen> {
         tokio::task::spawn_blocking(recovery::recover_abandoned).await??;
         ensure!(
-            options.kind == 1 && options.connect_type == 1,
+            options.kind == 1 && matches!(options.connect_type, 1 | 2),
             "不支持的被控连接类型"
         );
         ensure!(options.virtual_modes.len() <= 64, "虚拟屏模式数量过多");
@@ -70,7 +70,19 @@ impl State {
         modes: Vec<(u32, u32)>,
         lease: &Lease,
     ) -> Result<capture::Screen> {
-        let screens = capture::screens()?;
+        if self.fallback_pin.is_none() {
+            self.fallback_pin = fallback::pin().unwrap_or_else(|error| {
+                tracing::warn!(error=%format!("{error:#}"), "optional display driver unavailable");
+                None
+            });
+        }
+        let mut screens = capture::screens()?;
+        tracing::info!(
+            screens = screens.len(),
+            forced_virtual = options.force_virtual,
+            saved_virtual = self.preferences.default_virtual,
+            "host initial display selection"
+        );
         let choice = options.params.as_ref().map_or(0, |p| p.resolution_type);
         let local = size(
             options
@@ -84,10 +96,28 @@ impl State {
             local
         }
         .unwrap_or((1920, 1080));
+        let mut automatic = None;
+        let targets = Topology::query(true)?.metadata()?;
+        if !options.force_virtual
+            && !self.preferences.default_virtual
+            && !self.preferences.super_enabled
+            && !targets.iter().any(|t| {
+                t.available && t.virtual_provider != Some(display::topology::VirtualProvider::Uu)
+            })
+        {
+            automatic = fallback::ensure(
+                self.fallback_driver()?,
+                virtual_size.0,
+                virtual_size.1,
+                &[],
+                true,
+            )?;
+            screens = capture::screens()?;
+        }
         if !options.force_virtual && self.preferences.super_enabled {
             return self.enter_super(virtual_size.0, virtual_size.1, 0, true, lease);
         }
-        if options.force_virtual || self.preferences.default_virtual || screens.is_empty() {
+        if options.force_virtual || self.preferences.default_virtual {
             validate_modes(&[virtual_size])?;
             let result = self.create(
                 Virtual {
@@ -161,7 +191,9 @@ impl State {
                 screen.render_adapter = self.render_adapter;
             }
         }
-        let selected = if options.screen_id == -1 {
+        let selected = if let Some(automatic) = automatic.as_ref() {
+            screens.iter().find(|s| s.identity == automatic.identity)
+        } else if options.screen_id == -1 {
             screens.iter().find(|s| s.primary).or(screens.first())
         } else {
             screens.iter().find(|s| s.id == options.screen_id)

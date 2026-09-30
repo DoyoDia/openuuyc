@@ -45,7 +45,7 @@ impl DeviceCenterApp {
                         if confirm.device.participant_count() > 0 {
                             ui.label(format!("设备当前有 {} 个远控参与者。", confirm.device.participant_count()));
                         }
-                        if self.active_session.as_ref().is_some_and(|s| s.device_id.as_ref().is_none_or(|id| id == &confirm.device.device_id)) {
+                        if self.viewer_for_device(&confirm.device.device_id).is_some() {
                             ui.label("本程序会先结束当前观看并释放控制按键，再发送电源请求。");
                         }
                     }

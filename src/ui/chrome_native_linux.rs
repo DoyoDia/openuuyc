@@ -5,7 +5,7 @@
 //! gesture then runs outside the application, which is why there is no cursor
 //! tracking or pointer capture here.
 use winit::dpi::PhysicalSize;
-use winit::window::{ResizeDirection, Window};
+use winit::window::{Fullscreen, ResizeDirection, Window};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct WindowMoveState {
@@ -27,6 +27,12 @@ pub(crate) fn cancel_pointer_operation(
 ) {
     moving.dragging = false;
     resizing.dragging = false;
+}
+
+/// The window manager sizes a fullscreen window itself; nothing to prepare.
+pub(crate) fn set_fullscreen(window: &Window, fullscreen: Option<Fullscreen>) {
+    window.set_fullscreen(fullscreen);
+    configure_dwm_window(window);
 }
 
 /// The desktop environment owns titlebar styling; only the icon is ours.

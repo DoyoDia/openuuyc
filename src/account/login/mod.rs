@@ -19,6 +19,15 @@ const STATUS_SCANNED: i32 = 2;
 const STATUS_CANCELED: i32 = 3;
 const STATUS_CONFIRMED: i32 = 4;
 
+#[derive(Debug)]
+pub(crate) struct QrExpired;
+impl std::fmt::Display for QrExpired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("二维码已过期")
+    }
+}
+impl std::error::Error for QrExpired {}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LoginOutcome {
     Restored,
@@ -173,7 +182,7 @@ where
     let mut announced_status = None;
     loop {
         if Instant::now() >= deadline {
-            bail!("QR login timed out; run the login command again");
+            return Err(QrExpired.into());
         }
         let response = match api.get_login_qr_status(&state).await {
             Ok(response) => response,

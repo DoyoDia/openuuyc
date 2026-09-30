@@ -14,9 +14,11 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
-use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, WM_ERASEBKGND, WM_NCDESTROY};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetClientRect, WM_ERASEBKGND, WM_NCCALCSIZE, WM_NCDESTROY,
+};
 use winit::dpi::{PhysicalPosition, PhysicalSize};
-use winit::window::{ResizeDirection, Window};
+use winit::window::{Fullscreen, ResizeDirection, Window};
 
 const BACKDROP_SUBCLASS: usize = 0x4f555542;
 
@@ -29,8 +31,19 @@ pub(crate) fn cancel_pointer_operation(
     }
 }
 
+pub(crate) fn set_fullscreen(window: &Window, fullscreen: Option<Fullscreen>) {
+    // Publish the target before winit synchronously changes styles/bounds.
+    // Its undecorated WM_NCCALCSIZE path otherwise clamps an IsZoomed HWND
+    // to rcWork even when the requested bounds cover the complete monitor.
+    if let Err(error) = prepare_window_background(window, fullscreen.is_some()) {
+        tracing::warn!(%error, "prepare fullscreen client area");
+    }
+    window.set_fullscreen(fullscreen);
+    configure_dwm_window(window);
+}
+
 pub(crate) fn configure_dwm_window(window: &Window) {
-    if let Err(error) = prepare_window_background(window) {
+    if let Err(error) = prepare_window_background(window, window.fullscreen().is_some()) {
         tracing::warn!(%error, "prepare window background");
     }
     let Ok(hwnd) = window_hwnd(window) else {
@@ -71,14 +84,14 @@ pub(crate) fn configure_dwm_window(window: &Window) {
     }
 }
 
-fn prepare_window_background(window: &Window) -> Result<()> {
+fn prepare_window_background(window: &Window, fullscreen: bool) -> Result<()> {
     anyhow::ensure!(
         unsafe {
             SetWindowSubclass(
                 window_hwnd(window)?,
                 Some(backdrop_proc),
                 BACKDROP_SUBCLASS,
-                0,
+                usize::from(fullscreen),
             )
             .as_bool()
         },
@@ -99,10 +112,15 @@ unsafe extern "system" fn backdrop_proc(
     wparam: WPARAM,
     lparam: LPARAM,
     id: usize,
-    _data: usize,
+    data: usize,
 ) -> LRESULT {
     unsafe {
         match message {
+            WM_NCCALCSIZE if data != 0 && wparam.0 != 0 => {
+                // Keep the proposed full window rectangle as the client area.
+                // Normal maximization still delegates to winit's rcWork logic.
+                return LRESULT(0);
+            }
             WM_ERASEBKGND => {
                 paint_backdrop(hwnd, HDC(wparam.0 as _));
                 return LRESULT(1);

@@ -97,6 +97,8 @@ impl ReportRoutes {
     }
 }
 type ReportTarget = tokio::sync::watch::Sender<ReportRoutes>;
+mod upgrade;
+pub(crate) use upgrade::UpdateNotice;
 
 impl Peer {
     pub(crate) async fn new(
@@ -547,6 +549,7 @@ impl Peer {
             control_screens,
             ..Default::default()
         });
+        handle.set_update_notice(UpdateNotice::new(report_target.clone(), cancel.clone()));
         let cursor = tokio::spawn(cursor::run(
             reports.clone(),
             report_receiver.clone(),
@@ -952,7 +955,7 @@ impl Peer {
     }
     pub(crate) fn load_input_configuration(
         &mut self,
-        client: Arc<crate::account::client::AuthenticatedClient>,
+        client: crate::session::host_client::HostClient,
     ) {
         let input = self.input.receiver();
         let cancel = self.cancel.clone();

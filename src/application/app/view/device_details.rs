@@ -331,28 +331,51 @@ fn paint_glyph(p: &egui::Painter, r: egui::Rect, g: Glyph, color: Color32) {
 }
 
 impl DeviceCenterApp {
-    pub(super) fn device_details_page(&mut self, ui: &mut egui::Ui) {
+    pub(super) fn reconcile_device_details(&mut self) {
+        if self.center_ui.page != Page::DeviceDetails {
+            return;
+        }
         let Some(id) = self.center_ui.detail_id.clone() else {
             self.center_ui.close_details();
             return;
         };
-        let device = self
-            .devices
+        if self.detail_device(&id).is_none() {
+            self.extra_details.remove(&id);
+            if self.detail_pending.as_deref() == Some(&id) {
+                self.detail_pending = None;
+            }
+            self.center_ui.close_details();
+        }
+    }
+
+    fn detail_device(&self, id: &str) -> Option<&DeviceInfo> {
+        self.devices
             .as_ref()
-            .and_then(|l| {
-                all_devices(l)
+            .and_then(|list| {
+                all_devices(list)
                     .find(|(_, d)| d.device_id == id)
                     .map(|(_, d)| d)
             })
             .or_else(|| {
-                self.catalog.as_ref().and_then(|c| {
-                    c.groups
+                self.catalog.as_ref().and_then(|catalog| {
+                    catalog
+                        .groups
                         .entries()
                         .find(|(_, d)| d.device_id == id)
                         .map(|(_, d)| d)
                 })
             })
-            .cloned();
+    }
+
+    pub(super) fn device_details_page(&mut self, ui: &mut egui::Ui) {
+        let Some(id) = self.center_ui.detail_id.clone() else {
+            self.center_ui.close_details();
+            return;
+        };
+        let Some(device) = self.detail_device(&id).cloned() else {
+            self.center_ui.close_details();
+            return;
+        };
         let viewport = ui.available_size();
         // Insert behind the toolbar now, then position the backdrop after the
         // scroll area resolves its offset. It shares one image with the header.
@@ -423,10 +446,6 @@ impl DeviceCenterApp {
                 self.detail_pending = None;
             }
         }
-        let Some(device) = device else {
-            ui.label("该设备已不在当前清单中，请返回列表刷新。");
-            return;
-        };
         let current = self
             .catalog
             .as_ref()
@@ -620,10 +639,7 @@ impl DeviceCenterApp {
                 );
                 let mut button_ui = ui.new_child(egui::UiBuilder::new().max_rect(rect));
                 let issue = self.viewer_action_issue(&device);
-                let own_session = self
-                    .active_session
-                    .as_ref()
-                    .is_some_and(|session| session.device_id.as_deref() == Some(id.as_str()));
+                let own_session = self.viewer_for_device(&id).is_some();
                 let button = detail_button(
                     &mut button_ui,
                     if own_session {

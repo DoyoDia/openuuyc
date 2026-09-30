@@ -154,10 +154,6 @@ impl DeviceCenterApp {
             return;
         }
         self.assist.connect_error = None;
-        if self.active_session.is_some() {
-            self.assist.fail("请先关闭当前观看窗口");
-            return;
-        }
         match normalize_connect_id(&value) {
             Ok(id) => {
                 self.assist.connect_id = id.clone();
@@ -174,6 +170,18 @@ impl DeviceCenterApp {
                             .find(|d| d.connect_id == id)
                     })
                     .map(|d| d.publisher_device_id.clone());
+                if let Some(session) = self.viewers.active.iter().find(|s| {
+                    s.key == super::viewing::Key::Assistance(id.clone())
+                        || publisher_id
+                            .as_ref()
+                            .is_some_and(|p| s.device_id.as_ref() == Some(p))
+                }) {
+                    if !session.closing {
+                        session.handle.request_audio_only(false);
+                        session.handle.focus();
+                    }
+                    return;
+                }
                 self.request_assist_operation(AssistOperation::QueryMode {
                     id,
                     code,
@@ -265,7 +273,7 @@ impl DeviceCenterApp {
         }
     }
     pub(super) fn launch_assist(&mut self, pending: PendingAssist, code: String) {
-        if self.active_session.is_some() || self.logout_pending || self.mutation_pending {
+        if self.logout_pending || self.mutation_pending {
             return;
         }
         let mut request = match AssistRequest::new(&pending.id, code) {

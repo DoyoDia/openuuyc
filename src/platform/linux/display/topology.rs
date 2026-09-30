@@ -26,6 +26,16 @@ pub(crate) struct Dpi {
     pub recommended: u32,
     pub supported: Vec<u32>,
 }
+/// Which virtual-display driver owns a target. X11 has neither the UU nor the
+/// OpenUUYC virtual adapter, so Linux targets never carry one; shared code
+/// only compares against the variants.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum VirtualProvider {
+    Uu,
+    OpenUuyc,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Target {
     pub identity: String,
@@ -38,6 +48,7 @@ pub(crate) struct Target {
     pub source_id: u32,
     pub active: bool,
     pub available: bool,
+    pub virtual_provider: Option<VirtualProvider>,
     pub modes: Vec<Mode>,
     /// X11 has no per-output scale; desktops that scale do it for the whole
     /// session, so no output offers a DPI choice.
@@ -229,6 +240,11 @@ impl Topology {
         }
         Ok(result)
     }
+    /// The targets without the Windows split between cheap metadata and the
+    /// mode list: RandR reports modes with the outputs at no extra cost.
+    pub(crate) fn metadata(&self) -> Result<Vec<Target>> {
+        self.targets()
+    }
     pub(crate) fn targets(&self) -> Result<Vec<Target>> {
         Ok(self
             .visible()
@@ -269,6 +285,7 @@ impl Topology {
                     source_id: output.info.crtc,
                     active: active.is_some(),
                     available: output.connected(),
+                    virtual_provider: None,
                     modes,
                     dpi: None,
                 }

@@ -30,9 +30,7 @@ pub(crate) use mapping::{
 pub(crate) use performance::{
     PerformanceTrace, metric_pair, performance_frame, performance_header, performance_trace,
 };
-pub(crate) use updates::{
-    update_actions, update_countdown, update_device_row, update_prepared_notice,
-};
+pub(crate) use updates::{update_actions, update_device_row, update_prepared_notice};
 pub(crate) use viewer_caption::{ViewerCaptionIcon, viewer_caption_button};
 
 pub const HEIGHT: f32 = theme::CONTROL_HEIGHT;
@@ -761,6 +759,65 @@ pub fn primary(label: &str) -> egui::Button<'_> {
         .min_size(vec2(64.0, HEIGHT))
 }
 
+pub(crate) fn centered_button(label: &str) -> egui::Button<'_> {
+    egui::Button::new((egui::Atom::grow(), label, egui::Atom::grow()))
+        .gap(0.0)
+        .min_size(vec2(64.0, theme::CONTROL_HEIGHT))
+}
+
+pub(crate) fn section_frame() -> egui::Frame {
+    egui::Frame::new()
+        .fill(SURFACE)
+        .stroke(Stroke::new(1.0, LINE))
+        .corner_radius(theme::PANEL_RADIUS)
+}
+
+pub(crate) fn visibility_button(ui: &mut egui::Ui, visible: &mut bool) -> egui::Response {
+    let (_, response) = icon_button_area(ui, HEIGHT);
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Button,
+            ui.is_enabled(),
+            if *visible {
+                "隐藏验证码"
+            } else {
+                "显示验证码"
+            },
+        )
+    });
+    if response.clicked() {
+        *visible = !*visible;
+    }
+    let center = response.rect.center();
+    let color = if !ui.is_enabled() {
+        theme::DISABLED
+    } else if response.hovered() || response.has_focus() {
+        TEXT
+    } else {
+        MUTED
+    };
+    let stroke = Stroke::new(theme::ICON_STROKE, color);
+    let points = [
+        (-9., 0.),
+        (-5., -5.),
+        (0., -6.),
+        (5., -5.),
+        (9., 0.),
+        (5., 5.),
+        (0., 6.),
+        (-5., 5.),
+    ]
+    .map(|(x, y)| center + vec2(x, y))
+    .to_vec();
+    ui.painter().add(egui::Shape::closed_line(points, stroke));
+    ui.painter().circle_stroke(center, 2.5, stroke);
+    if !*visible {
+        ui.painter()
+            .line_segment([center + vec2(-8., 8.), center + vec2(8., -8.)], stroke);
+    }
+    response
+}
+
 /// A full button target with a vector chevron, independent of font glyphs.
 pub fn back_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
     let text =
@@ -827,13 +884,15 @@ pub(crate) fn edit_button(ui: &mut egui::Ui, hint: &str, size: f32) -> egui::Res
     response.on_hover_text(hint)
 }
 
-fn icon_button_area(ui: &mut egui::Ui, size: f32) -> (egui::Rect, egui::Response) {
+pub(crate) fn icon_button_area(ui: &mut egui::Ui, size: f32) -> (egui::Rect, egui::Response) {
     let (rect, response) = ui.allocate_exact_size(vec2(size, size), egui::Sense::click());
     let visuals = ui.style().interact(&response);
-    if response.hovered() || response.is_pointer_button_down_on() || response.has_focus() {
+    if ui.is_enabled()
+        && (response.hovered() || response.is_pointer_button_down_on() || response.has_focus())
+    {
         ui.painter().rect(
             rect,
-            5.0,
+            theme::CONTROL_RADIUS,
             visuals.weak_bg_fill,
             if response.has_focus() {
                 visuals.bg_stroke
@@ -843,7 +902,35 @@ fn icon_button_area(ui: &mut egui::Ui, size: f32) -> (egui::Rect, egui::Response
             egui::StrokeKind::Inside,
         );
     }
-    (rect, response)
+    (
+        rect,
+        response.on_hover_cursor(egui::CursorIcon::PointingHand),
+    )
+}
+
+/// An unobtrusive button with the same hover/pressed states as icon controls.
+pub(crate) fn value_button(
+    ui: &mut egui::Ui,
+    size: egui::Vec2,
+    label: impl Into<egui::WidgetText>,
+) -> egui::Response {
+    ui.scope(|ui| {
+        ui.spacing_mut().button_padding = vec2(0.0, 0.0);
+        let disabled = &mut ui.visuals_mut().widgets.noninteractive;
+        disabled.weak_bg_fill = Color32::TRANSPARENT;
+        disabled.bg_fill = Color32::TRANSPARENT;
+        disabled.bg_stroke = Stroke::NONE;
+        let inactive = &mut ui.visuals_mut().widgets.inactive;
+        inactive.weak_bg_fill = Color32::TRANSPARENT;
+        inactive.bg_fill = Color32::TRANSPARENT;
+        inactive.bg_stroke = Stroke::NONE;
+        ui.add_sized(
+            size,
+            egui::Button::new((label.into(), egui::Atom::grow())).gap(0.0),
+        )
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+    })
+    .inner
 }
 
 pub fn close_button(ui: &mut egui::Ui, hint: &str, size: f32) -> egui::Response {

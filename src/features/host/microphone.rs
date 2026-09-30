@@ -1,8 +1,9 @@
 //! Authorized remote microphone -> shared NetEq implementation -> virtual input.
+mod routing;
 use super::{Lease, lock};
 use crate::{
     media::audio::neteq,
-    platform::virtual_audio::{Bridge, Routing, State},
+    platform::virtual_audio::{Bridge, State},
 };
 use anyhow::{Context, Result, ensure};
 use bytes::Bytes;
@@ -59,6 +60,7 @@ struct Command {
 struct Shared {
     lease: Lease,
     routing_error: Mutex<Option<String>>,
+    routing_changed: AtomicBool,
     cancel: CancellationToken,
     connected: Arc<AtomicBool>,
     enabled: AtomicBool,
@@ -87,6 +89,7 @@ impl Session {
     ) -> Result<Self> {
         let shared = Arc::new(Shared {
             routing_error: Mutex::new(None),
+            routing_changed: AtomicBool::new(false),
             lease,
             cancel,
             connected,
@@ -329,28 +332,15 @@ fn run(shared: Arc<Shared>, commands: mpsc::Receiver<Command>) {
         })
         .ok();
     let mut device = None::<(Bridge, Playout)>;
-    let mut defaults = Routing::default();
-    let mut last_defaults = None;
-    let mut defaults_retry_at = Instant::now();
+    let routing = routing::Worker::new(shared.clone())
+        .map_err(|error| {
+            *lock(&shared.routing_error) = Some(error.to_string());
+            shared.routing_changed.store(true, Ordering::Release);
+        })
+        .ok();
     let mut retry_at = Instant::now();
     while !shared.cancel.is_cancelled() {
-        let selected = shared.lease.audio_defaults();
-        if shared.permitted() && Instant::now() >= defaults_retry_at {
-            let result = if last_defaults != Some(selected) {
-                defaults.apply(selected.speakers(), selected.microphone())
-            } else {
-                defaults.maintain()
-            };
-            match result {
-                Ok(()) => {
-                    last_defaults = Some(selected);
-                    *lock(&shared.routing_error) = None;
-                }
-                Err(error) => {
-                    defaults_retry_at = Instant::now() + Duration::from_secs(1);
-                    *lock(&shared.routing_error) = Some(format!("默认音频设备调整失败：{error:#}"));
-                }
-            }
+        if shared.routing_changed.swap(false, Ordering::AcqRel) {
             let status = shared.status.borrow().clone();
             shared.publish(
                 status.enabled,
@@ -444,10 +434,6 @@ fn run(shared: Arc<Shared>, commands: mpsc::Receiver<Command>) {
                 }
             }
         }
-        if !shared.permitted() {
-            defaults = Routing::default();
-            last_defaults = None;
-        }
         if !shared.permitted() || !shared.retained.load(Ordering::Acquire) {
             if device.take().is_some() {
                 shared.flush();
@@ -497,7 +483,7 @@ fn run(shared: Arc<Shared>, commands: mpsc::Receiver<Command>) {
         }
     }
     drop(device);
-    drop(defaults);
+    drop(routing);
     shared.flush();
     shared.publish(false, false, false, None, 0);
     while let Ok(command) = commands.try_recv() {

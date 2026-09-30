@@ -23,6 +23,30 @@ use webrtc::{
 
 pub(crate) const TRACK_COUNT: usize = 5;
 
+pub(super) struct Inventory {
+    targets: Vec<Target>,
+    screens: Vec<capture::Screen>,
+}
+impl Inventory {
+    pub fn read() -> Result<Self> {
+        Ok(Self {
+            targets: Topology::query(false)?.targets()?,
+            screens: capture::screens()?,
+        })
+    }
+    pub async fn collect(cancel: &CancellationToken) -> Result<Option<Self>> {
+        if cancel.is_cancelled() {
+            return Ok(None);
+        }
+        let mut task = tokio::task::spawn_blocking(Self::read);
+        tokio::select! {
+            biased;
+            _=cancel.cancelled()=>{let _=task.await;Ok(None)},
+            result=&mut task=>result.context("显示器库存读取任务中断").and_then(|r|r).map(Some),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ScreenInfo {
     pub screen: capture::Screen,
@@ -68,6 +92,7 @@ pub(crate) struct Slot {
     awaiting_source: bool,
 }
 pub(crate) struct Screens {
+    inventory_revision: u64,
     pub displays: Arc<crate::features::host::displays::Session>,
     pub slots: Vec<Slot>,
     pub registered: Vec<usize>,
@@ -256,6 +281,7 @@ impl Screens {
             });
         }
         let mut state = Self {
+            inventory_revision: 0,
             displays,
             slots,
             registered: vec![0],
@@ -279,9 +305,15 @@ impl Screens {
         Ok(state)
     }
     pub(crate) fn refresh(&mut self) -> Result<()> {
-        let targets = Topology::query(false)?.targets()?;
+        self.apply_inventory(Inventory::read()?)
+    }
+    pub(super) fn inventory_revision(&self) -> u64 {
+        self.inventory_revision
+    }
+    fn apply_inventory(&mut self, inventory: Inventory) -> Result<()> {
+        let Inventory { targets, screens } = inventory;
         let mut catalog = Vec::new();
-        for mut screen in capture::screens()? {
+        for mut screen in screens {
             let mut target = targets
                 .iter()
                 .find(|target| {
@@ -307,6 +339,7 @@ impl Screens {
                 resolution_type,
             });
         }
+        self.inventory_revision = self.inventory_revision.wrapping_add(1);
         let mut old = lock(&self.reports.catalog);
         if *old != catalog {
             *old = catalog;
@@ -527,8 +560,13 @@ impl Screens {
         }
         Ok(())
     }
-    pub(crate) async fn maintain(&mut self) -> Result<()> {
-        self.refresh()?;
+    pub(super) async fn maintain(&mut self, revision: u64, inventory: Inventory) -> Result<()> {
+        // A user-requested layout operation may have completed during the read.
+        // Its newer catalog wins over the late periodic result.
+        if revision != self.inventory_revision {
+            return Ok(());
+        }
+        self.apply_inventory(inventory)?;
         let selected = self.reports.current.load(Ordering::Acquire);
         let mut fatal = false;
         for index in 0..self.slots.len() {
@@ -577,7 +615,7 @@ impl Screens {
             self.reports.current.store(selected, Ordering::Release);
         }
         if let Err(error) = self.maintain_headless().await {
-            tracing::warn!(%error, "headless display recovery failed");
+            tracing::warn!(error=%format!("{error:#}"), "headless display recovery failed");
             self.lease.fail(format!("显示器恢复失败：{error:#}"));
         }
         if fatal

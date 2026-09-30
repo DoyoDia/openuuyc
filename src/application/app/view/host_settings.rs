@@ -1,7 +1,7 @@
 use super::*;
 
 impl DeviceCenterApp {
-    fn save_host_settings(&mut self) {
+    pub(super) fn save_host_settings(&mut self) {
         if self
             .worker
             .commands
@@ -25,7 +25,7 @@ impl DeviceCenterApp {
         form_row(
             ui,
             "允许被控",
-            "允许同一账号的其他设备连接本机",
+            "允许授权设备连接本机，远程协助需单独开启",
             |ui| {
                 if ui
                     .add_enabled_ui(host.is_some(), |ui| {

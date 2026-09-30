@@ -16,6 +16,16 @@ pub(crate) fn maintaining() -> bool {
     false
 }
 
+pub(crate) mod install {
+    use super::*;
+
+    /// No service is ever installed, so the portable client does its own
+    /// background upkeep.
+    pub(crate) fn running() -> Result<bool> {
+        Ok(false)
+    }
+}
+
 pub(crate) mod vault {
     use super::*;
 
@@ -60,6 +70,9 @@ pub(crate) mod resident {
         false
     }
     pub(crate) async fn request(_request: Request) -> Result<Reply> {
+        bail!(NO_SERVICE)
+    }
+    pub(crate) fn call(_request: Request) -> Result<Reply> {
         bail!(NO_SERVICE)
     }
 }

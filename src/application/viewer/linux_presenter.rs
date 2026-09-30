@@ -23,8 +23,8 @@ use crate::media::decoder::RenderSurface;
 use crate::platform::graphics::VideoPlacement;
 use crate::ui::chrome::{
     WindowMoveState, WindowResizeState, cancel_pointer_operation, configure_dwm_window,
-    resize_regions, title_bar_height, title_bar_panel, update_nonmodal_window_resize,
-    window_title_bar,
+    resize_regions, set_fullscreen, title_bar_height, title_bar_panel,
+    update_nonmodal_window_resize, window_title_bar,
 };
 use crate::ui::gfx::{UiPresenter, UiTimingAudit, split_output};
 use crate::ui::window_manager::{Event as UiEvent, Repaint as UiRepaintEvent};
@@ -319,7 +319,7 @@ impl ConnectingWindowsRunner {
                     {
                         let _ = window.request_inner_size(size);
                         window.set_maximized(maximized);
-                        window.set_fullscreen(fullscreen);
+                        set_fullscreen(&window, fullscreen);
                     } else if window
                         .inner_size()
                         .to_logical::<f64>(window.scale_factor())
@@ -653,6 +653,8 @@ impl ApplicationHandler<UiEvent> for ConnectingWindowsRunner {
 
 /// The playing half of the window: video, input forwarding and the menus.
 struct Player {
+    /// Reloads shortcut settings changed in the control center while playing.
+    _shortcuts: crate::application::viewer_shortcuts::Watcher,
     session: NativeViewerSession,
     /// Keeps the decoder publishing frames and nudges the event loop; held for
     /// its lifetime, which is what registers this window with the session.
@@ -706,6 +708,7 @@ impl Player {
         let owner = u64::from(window.id());
         let wake = FrameWakeBridge::install(&session, proxy, window.id())?;
         Ok(Self {
+            _shortcuts: crate::application::viewer_shortcuts::Watcher::new()?,
             session,
             wake,
             owner,
@@ -1469,9 +1472,9 @@ impl Drop for FrameWakeBridge {
 
 fn toggle_fullscreen(window: &Arc<Window>) {
     if window.fullscreen().is_some() {
-        window.set_fullscreen(None);
+        set_fullscreen(window, None);
     } else {
-        window.set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
+        set_fullscreen(window, Some(winit::window::Fullscreen::Borderless(None)));
     }
 }
 
@@ -1542,7 +1545,7 @@ fn decode_cursor(
 /// Audio-only sessions use a fixed-size window, as on Windows
 /// (`windows_presenter/connection.rs`).
 fn configure_audio_window(window: &Window, compact: bool) {
-    window.set_fullscreen(None);
+    set_fullscreen(window, None);
     window.set_maximized(false);
     window.set_resizable(false);
     window.set_enabled_buttons(

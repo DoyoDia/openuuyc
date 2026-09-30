@@ -6,6 +6,7 @@ use crate::ui::controls::{diagnostics_empty, diagnostics_row, diagnostics_table}
 enum Tab {
     #[default]
     Device,
+    Publication,
     Encoding,
     // The decode check exercises DXVA11 adapters.
     #[cfg(windows)]
@@ -17,6 +18,8 @@ pub(super) struct ViewState {
     tab: Tab,
     encoder: Option<(u64, Backend)>,
     decoder: usize,
+    publication_refresh: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
+    publication_error: Option<String>,
 }
 
 impl DeviceCenterApp {
@@ -34,6 +37,7 @@ impl DeviceCenterApp {
             ui.horizontal(|ui| {
                 for (tab, label) in [
                     (Tab::Device, "设备概览"),
+                    (Tab::Publication, "设备上报"),
                     (Tab::Encoding, "编码能力"),
                     #[cfg(windows)]
                     (Tab::Decoding, "解码检查"),
@@ -56,6 +60,7 @@ impl DeviceCenterApp {
                     ui.set_min_height(theme::DIAGNOSTICS_BODY_MIN_HEIGHT);
                     match tab {
                         Tab::Device => self.diagnostic_device(ui),
+                        Tab::Publication => self.diagnostic_publication(ui),
                         Tab::Encoding => self.diagnostic_encoding(ui),
                         #[cfg(windows)]
                         Tab::Decoding => self.diagnostic_decoding(ui),
@@ -80,6 +85,143 @@ impl DeviceCenterApp {
         }
         for value in &self.diagnostics.graphics {
             diagnostics_row(ui, "渲染设备", value);
+        }
+    }
+
+    fn diagnostic_publication(&mut self, ui: &mut egui::Ui) {
+        use crate::account::reporting;
+        let state = &mut self.center_ui.diagnostics;
+        if let Some(rx) = &state.publication_refresh {
+            match rx.try_recv() {
+                Ok(result) => {
+                    state.publication_error = result.err();
+                    state.publication_refresh = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    state.publication_error = Some("刷新任务中断".into());
+                    state.publication_refresh = None;
+                }
+                Err(_) => {}
+            }
+        }
+        ui.horizontal(|ui| {
+            ui.label("本机注册资料与壁纸发布状态");
+            if ui
+                .add_enabled(
+                    state.publication_refresh.is_none(),
+                    egui::Button::new("重新读取并上报"),
+                )
+                .clicked()
+            {
+                let (tx, rx) = std::sync::mpsc::channel();
+                state.publication_refresh = Some(rx);
+                state.publication_error = None;
+                let context = ui.ctx().clone();
+                std::thread::spawn(move || {
+                    use crate::platform::host_service::resident;
+                    let result = if resident::managed() {
+                        resident::call(resident::Request::RefreshPublication).map(|_| ())
+                    } else {
+                        reporting::REFRESH.notify_one();
+                        Ok(())
+                    };
+                    let _ = tx.send(result.map_err(|e| format!("{e:#}")));
+                    context.request_repaint();
+                });
+            }
+        });
+        if let Some(error) = &state.publication_error {
+            ui.colored_label(theme::RED, error);
+        }
+        ui.add_space(theme::DIAGNOSTICS_GAP);
+        let snapshot = reporting::snapshot();
+        let value = |s: &str| {
+            if s.is_empty() {
+                "未读取".to_owned()
+            } else {
+                s.to_owned()
+            }
+        };
+        let time = |stamp: Option<i64>| {
+            stamp
+                .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
+                .map(|t| {
+                    t.with_timezone(&chrono::Local)
+                        .format("%Y-%m-%d %H:%M:%S")
+                        .to_string()
+                })
+                .unwrap_or_else(|| "尚未确认".into())
+        };
+        diagnostics_row(ui, "注册设备", &value(&snapshot.device_id));
+        diagnostics_row(ui, "客户端标识", &value(&snapshot.client_id));
+        diagnostics_row(ui, "硬件上报", &value(&snapshot.registration));
+        diagnostics_row(ui, "上报时间", &time(snapshot.registered_at));
+        diagnostics_row(ui, "上报名称", &value(&snapshot.reported_name));
+        diagnostics_row(
+            ui,
+            "被控许可",
+            if snapshot.reported_controllable {
+                "允许"
+            } else {
+                "关闭"
+            },
+        );
+        if let Some(hardware) = snapshot.hardware {
+            diagnostics_row(ui, "系统 UUID", &hardware.system_uuid);
+            diagnostics_row(ui, "Windows 标识", &hardware.machine_guid);
+            for (label, text) in [
+                ("系统设备名", hardware.name),
+                ("操作系统", hardware.os),
+                ("主板", hardware.base_board),
+                ("处理器", hardware.cpu),
+                ("显卡", hardware.video.join(" / ")),
+                ("网卡地址", hardware.mac),
+                ("活动显示器", hardware.screen),
+            ] {
+                diagnostics_row(
+                    ui,
+                    label,
+                    &if text.is_empty() {
+                        "系统未提供".into()
+                    } else {
+                        text
+                    },
+                );
+            }
+            diagnostics_row(
+                ui,
+                "物理内存",
+                &if hardware.memory > 0 {
+                    format!("{} MiB", hardware.memory)
+                } else {
+                    "系统未提供".into()
+                },
+            );
+            for error in hardware.errors {
+                ui.colored_label(theme::AMBER, error);
+            }
+        }
+        ui.separator();
+        diagnostics_row(ui, "服务端回读", &value(&snapshot.readback));
+        diagnostics_row(ui, "回读时间", &time(snapshot.readback_at));
+        for (label, text) in &snapshot.server_details {
+            diagnostics_row(ui, label, text);
+        }
+        ui.separator();
+        diagnostics_row(ui, "壁纸状态", &value(&snapshot.wallpaper));
+        diagnostics_row(ui, "图片来源", &value(&snapshot.wallpaper_file));
+        diagnostics_row(ui, "确认时间", &time(snapshot.wallpaper_at));
+        if !snapshot.wallpaper_url.is_empty() {
+            if let Some(texture) = self.center_ui.wallpapers.texture(
+                ui.ctx(),
+                &snapshot.device_id,
+                &snapshot.wallpaper_url,
+            ) {
+                let width = ui.available_width().min(640.0);
+                ui.add(
+                    egui::Image::new(&texture).fit_to_exact_size(vec2(width, width * 9.0 / 16.0)),
+                );
+            }
         }
     }
 
@@ -193,7 +335,7 @@ impl DeviceCenterApp {
             let busy = self.diagnostics.busy();
             if crate::ui::controls::diagnostics_action(
                 ui,
-                busy || self.active_session.is_none(),
+                busy || !self.has_viewers(),
                 if busy { "停止检查" } else { "完整检查" },
             )
             .clicked()
@@ -299,13 +441,14 @@ impl DeviceCenterApp {
     }
 
     fn diagnostic_sessions(&self, ui: &mut egui::Ui) {
-        let host = self
-            .host
-            .as_ref()
-            .map(|host| host.status())
-            .filter(|host| host.session_active);
-        let viewing = self.active_session.as_ref().and_then(|s| s.handle.info());
-        if host.is_none() && viewing.is_none() {
+        let host = self.host.as_ref().map(|host| host.status());
+        let viewing: Vec<_> = self
+            .viewers
+            .active
+            .iter()
+            .filter_map(|s| s.handle.info().map(|info| (s.alias.clone(), info)))
+            .collect();
+        if !host.as_ref().is_some_and(|host| host.session_active) && viewing.is_empty() {
             diagnostics_empty(ui, "暂无活动会话 · 连接后显示实际编解码信息");
             return;
         }
@@ -398,9 +541,9 @@ impl DeviceCenterApp {
                 );
             }
         }
-        if let Some(info) = viewing {
+        for (alias, info) in viewing {
             ui.add_space(theme::DIAGNOSTICS_GAP);
-            ui.strong("当前观看");
+            ui.strong(format!("当前观看 · {alias}"));
             for (label, value) in [
                 ("本机解码器", info.decoder),
                 ("接收码流", info.video_format),

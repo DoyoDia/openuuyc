@@ -406,7 +406,10 @@ pub(super) async fn send_remote_input(
                     if kcp.is_negotiated(){kcp.send_input(channel.id(),event.event.encode(),Arc::new(move||state.is_current(&guarded)),release).await}
                     else {kcp.send_control(&channel,event.event.encode()).await}
                 }) => result
-                .map_err(|_| anyhow::anyhow!("鼠标输入发送超时"))
+                .map_err(|_| match kcp.send_failure_reason() {
+                    Some(reason) => anyhow::anyhow!("鼠标输入发送超时：{reason}"),
+                    None => anyhow::anyhow!("鼠标输入发送超时"),
+                })
                 .and_then(|result| result.map(|_| ())),
         };
         if let Err(error) = &result

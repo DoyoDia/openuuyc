@@ -5,6 +5,7 @@ pub(crate) mod capture;
 pub(crate) mod cuda;
 pub(crate) mod cursor_shape;
 pub(crate) mod decoder;
+pub(crate) mod device_profile;
 pub(crate) mod display;
 pub(crate) mod display_hdr;
 pub(crate) mod encoder;

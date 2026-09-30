@@ -7,6 +7,7 @@ use egui::{Align, Color32, FontId, RichText, Sense, Stroke, vec2};
 
 mod about;
 mod assist;
+mod assist_components;
 // Installing the service and drivers is part of the Windows setup.
 #[cfg(windows)]
 mod components;
@@ -14,6 +15,7 @@ mod device_details;
 mod device_visuals;
 mod devices;
 mod diagnostics_panel;
+mod host_assist;
 mod host_settings;
 mod logs;
 mod port_mapping;
@@ -71,6 +73,10 @@ pub(super) struct CenterUi {
     legal_document: Option<about::LegalDocument>,
     logs: logs::LogUi,
     diagnostics: diagnostics_panel::ViewState,
+    host_assist_password: Option<host_assist::PasswordEditor>,
+    host_assist_settings_open: bool,
+    host_assist_show_code: bool,
+    guest_assist_open: bool,
     pub(super) shortcuts: crate::application::viewer_shortcuts::Editor,
 
     plugins: crate::plugins::Manager,
@@ -87,6 +93,11 @@ enum EditAction {
 }
 
 impl CenterUi {
+    pub(super) fn clear_host_assist(&mut self) {
+        self.host_assist_password = None;
+        self.host_assist_settings_open = false;
+        self.host_assist_show_code = false;
+    }
     pub(super) fn open_details(&mut self, id: String) {
         if self.page != Page::DeviceDetails {
             self.detail_parent = self.page;
@@ -258,36 +269,12 @@ fn paint_icon(p: &egui::Painter, rect: egui::Rect, icon: Icon, color: Color32) {
     }
 }
 
-fn icon_button(ui: &mut egui::Ui, icon: Icon, hint: &str) -> egui::Response {
-    if matches!(icon, Icon::Close) {
-        return crate::ui::controls::close_button(ui, hint, 32.0);
-    }
-    let (rect, response) = ui.allocate_exact_size(vec2(32.0, 32.0), Sense::click());
-    response
-        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), hint));
-    if (response.hovered() || response.has_focus()) && ui.is_enabled() {
-        ui.painter().rect_filled(rect, 5.0, SURFACE);
-    }
-    paint_icon(
-        ui.painter(),
-        rect,
-        icon,
-        if ui.is_enabled() {
-            MUTED
-        } else {
-            crate::ui::theme::DISABLED
-        },
-    );
-    response.on_hover_text(hint)
-}
-
 fn primary(label: &str) -> egui::Button<'_> {
     crate::ui::controls::primary(label).min_size(vec2(84.0, crate::ui::controls::HEIGHT))
 }
 
 fn login_button(label: &str) -> egui::Button<'_> {
-    // Button's AtomLayout otherwise inherits the form's left alignment.
-    egui::Button::new((egui::Atom::grow(), label, egui::Atom::grow())).gap(0.0)
+    crate::ui::controls::centered_button(label)
 }
 
 fn dialog_frame() -> egui::Frame {
@@ -422,9 +409,13 @@ fn login_qr_area(
     // Reserve the same square exactly once for every state. Drawing into it
     // must not advance the cursor again (Ui::put does), nor negotiate a Frame
     // width with the wider login column.
-    let (rect, _) = ui.allocate_exact_size(vec2(216.0, 216.0), Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(
+        vec2(theme::AUTH_QR_SIZE, theme::AUTH_QR_SIZE),
+        Sense::hover(),
+    );
     if let Some(texture) = texture {
-        ui.painter().rect_filled(rect, 6.0, Color32::WHITE);
+        ui.painter()
+            .rect_filled(rect, theme::CONTROL_RADIUS, Color32::WHITE);
         ui.painter().image(
             texture.id(),
             rect.shrink(12.0),
@@ -433,9 +424,13 @@ fn login_qr_area(
         );
     } else {
         ui.painter()
-            .rect_filled(rect, 8.0, crate::ui::theme::SIDEBAR);
-        ui.painter()
-            .rect_stroke(rect, 8.0, Stroke::new(1.0, LINE), egui::StrokeKind::Inside);
+            .rect_filled(rect, theme::CONTROL_RADIUS, crate::ui::theme::SIDEBAR);
+        ui.painter().rect_stroke(
+            rect,
+            theme::CONTROL_RADIUS,
+            Stroke::new(1.0, LINE),
+            egui::StrokeKind::Inside,
+        );
         if loading {
             egui::Spinner::new().paint_at(
                 ui,
@@ -467,11 +462,16 @@ fn login_surface(
             let painter = ui.painter();
             painter.rect_filled(
                 card.translate(vec2(0.0, 8.0)),
-                14.0,
+                theme::PANEL_RADIUS,
                 Color32::from_black_alpha(28),
             );
-            painter.rect_filled(card, 14.0, crate::ui::theme::SURFACE);
-            painter.rect_stroke(card, 14.0, Stroke::new(1.0, LINE), egui::StrokeKind::Inside);
+            painter.rect_filled(card, theme::PANEL_RADIUS, crate::ui::theme::SURFACE);
+            painter.rect_stroke(
+                card,
+                theme::PANEL_RADIUS,
+                Stroke::new(1.0, LINE),
+                egui::StrokeKind::Inside,
+            );
             let title = painter.layout_no_wrap(
                 crate::APP_NAME.into(),
                 FontId::proportional(crate::ui::theme::TITLE),
@@ -536,50 +536,51 @@ fn qr_form(
     status: &str,
     error: Option<&str>,
 ) -> QrAction {
-    login_qr_area(ui, texture, running);
+    let rect = login_qr_area(ui, texture, running);
+    let mut action = QrAction::None;
+    if !running && error.is_some() {
+        ui.painter()
+            .rect_filled(rect, theme::CONTROL_RADIUS, Color32::from_black_alpha(205));
+        let button = egui::Rect::from_center_size(
+            rect.center(),
+            vec2(theme::AUTH_CODE_ACTION_WIDTH, theme::CONTROL_HEIGHT),
+        );
+        let mut overlay = ui.new_child(
+            egui::UiBuilder::new()
+                .id_salt("qr-refresh-overlay")
+                .max_rect(button)
+                .layout(egui::Layout::top_down(Align::Center)),
+        );
+        if overlay
+            .add_enabled(
+                enabled,
+                login_button("刷新二维码")
+                    .fill(BLUE)
+                    .stroke(Stroke::NONE)
+                    .min_size(button.size()),
+            )
+            .clicked()
+        {
+            action = QrAction::Start;
+        }
+    }
     ui.add_space(12.0);
+    let message = error.unwrap_or(if status.is_empty() {
+        "使用 UU 远程手机端扫码"
+    } else {
+        status
+    });
     ui.add_sized(
-        [320.0, 20.0],
+        [ui.available_width(), 20.0],
         egui::Label::new(
-            RichText::new(if error.is_some() || status.is_empty() {
-                "使用 UU 远程手机端扫码"
-            } else {
-                status
-            })
-            .size(theme::COMPACT_TEXT)
-            .color(MUTED),
+            RichText::new(message)
+                .size(theme::COMPACT_TEXT)
+                .color(if error.is_some() { AMBER } else { MUTED }),
         )
         .truncate(),
     );
-    if crate::ui::controls::observe_notice_action(
-        ui.ctx(),
-        "qr-login-error",
-        "扫码登录",
-        crate::ui::controls::DialogIcon::Error,
-        error,
-        "刷新二维码",
-    ) == Some(true)
-        && enabled
-    {
-        return QrAction::Start;
-    }
-    ui.add_space(10.0);
-    if !running && error.is_some() {
-        let clicked = ui
-            .add_enabled_ui(enabled, |ui| {
-                ui.add_sized([216.0, 40.0], login_button("刷新二维码").frame(false))
-            })
-            .inner
-            .clicked();
-        if clicked {
-            return QrAction::Start;
-        }
-    } else {
-        ui.allocate_exact_size(vec2(216.0, 40.0), Sense::hover());
-    }
-    QrAction::None
+    action
 }
-
 impl DeviceCenterApp {
     fn needs_login(&self) -> bool {
         self.devices.is_none() && self.catalog.is_none()
@@ -595,6 +596,9 @@ impl DeviceCenterApp {
             }
             return;
         }
+        // Reconcile navigation before choosing the panel margins. A removed
+        // device must not leave an empty, edge-to-edge detail page behind.
+        self.reconcile_device_details();
         let previous_page = self.center_ui.page;
         self.draw_navigation(ui);
         if self.center_ui.page != previous_page
@@ -1030,22 +1034,80 @@ impl DeviceCenterApp {
     }
 
     fn active_view(&mut self, ui: &mut egui::Ui) {
-        let Some(session) = &self.active_session else {
+        if self.viewers.active.len() > 1 {
+            let mut close = None;
+            ui.menu_button(
+                format!("观看窗口（{}）", self.viewers.active.len()),
+                |ui| {
+                    for session in &self.viewers.active {
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(
+                                    !session.closing,
+                                    crate::ui::controls::secondary(&format!(
+                                        "{} · {}",
+                                        session.alias,
+                                        session.device_id.as_deref().unwrap_or("协助连接")
+                                    )),
+                                )
+                                .clicked()
+                            {
+                                session.handle.focus();
+                                ui.close();
+                            }
+                            if ui
+                                .add_enabled(
+                                    !session.closing,
+                                    crate::ui::controls::secondary(if session.closing {
+                                        "正在关闭"
+                                    } else {
+                                        "断开"
+                                    }),
+                                )
+                                .clicked()
+                            {
+                                close = Some(session.key.clone());
+                                ui.close();
+                            }
+                        });
+                    }
+                },
+            );
+            if let Some(key) = close {
+                if let Some(session) = self.viewers.active.iter_mut().find(|s| s.key == key) {
+                    session.handle.request_close();
+                    session.closing = true;
+                }
+            }
+            if ui
+                .add_enabled(
+                    self.viewers.active.iter().any(|s| !s.closing),
+                    crate::ui::controls::secondary("结束全部观看"),
+                )
+                .clicked()
+            {
+                self.stop_viewer();
+            }
+            return;
+        }
+        let Some(session) = self.viewers.active.first() else {
             return;
         };
+        let closing = session.closing;
+        let key = session.key.clone();
         let alias = session.alias.clone();
         // Inline in the existing right-aligned header; never add a session row
         // above the device list or assistance form.
         if ui
-            .add_enabled(
-                !self.closing_session,
-                crate::ui::controls::secondary("结束观看"),
-            )
+            .add_enabled(!closing, crate::ui::controls::secondary("结束观看"))
             .clicked()
         {
-            self.stop_viewer();
+            if let Some(session) = self.viewers.active.iter_mut().find(|s| s.key == key) {
+                session.handle.request_close();
+                session.closing = true;
+            }
         }
-        let text = if self.closing_session {
+        let text = if closing {
             format!("正在关闭  {alias}")
         } else {
             format!("观看窗口已打开  ·  {alias}")
@@ -1086,9 +1148,7 @@ impl DeviceCenterApp {
                 ui.add_space(16.0);
                 if ui
                     .add_enabled(
-                        !self.login_running
-                            && !self.logout_pending
-                            && self.active_session.is_none(),
+                        !self.login_running && !self.logout_pending && !self.has_viewers(),
                         primary("刷新"),
                     )
                     .clicked()
@@ -1221,6 +1281,9 @@ impl DeviceCenterApp {
         if self.exit_requested {
             return;
         }
+        if self.host_assist_dialog(ctx) {
+            return;
+        }
         if self.needs_login() {
             self.logout_confirmation = false;
             self.takeover_confirmation = None;
@@ -1334,11 +1397,7 @@ impl DeviceCenterApp {
                         edit.alias = catalog.suggested_name.clone();
                     }
                 } else {
-                    if self.active_session.as_ref().is_some_and(|s| {
-                        s.device_id
-                            .as_ref()
-                            .is_none_or(|id| id == &edit.device.device_id)
-                    }) {
+                    if self.viewer_for_device(&edit.device.device_id).is_some() {
                         ui.colored_label(AMBER, "当前观看将结束。");
                     }
                 }
@@ -1499,9 +1558,62 @@ impl DeviceCenterApp {
     }
 
     fn login_page(&mut self, root: &mut egui::Ui) {
+        if self.center_ui.guest_assist_open {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new().fill(BG).inner_margin(32))
+                .show(root, |ui| {
+                    if ui.add(crate::ui::controls::secondary("返回登录")).clicked() {
+                        self.center_ui.guest_assist_open = false;
+                    }
+                    ui.add_space(24.0);
+                    ui.heading("远程协助");
+                    ui.label(
+                        RichText::new("无需登录，将设备 ID 和验证码分享给协助你的人。")
+                            .color(MUTED),
+                    );
+                    ui.add_space(20.0);
+                    if self.host.as_ref().is_some_and(|h| h.is_guest()) {
+                        self.host_assist_controls(ui);
+                        if let Some(host) = &self.host {
+                            let status = host.status();
+                            ui.add_space(12.0);
+                            ui.label(if status.connected {
+                                "正在接受远程协助"
+                            } else if !host.allowed() {
+                                "尚未开启远程协助"
+                            } else {
+                                &status.message
+                            });
+                            if status.connected
+                                && ui.add(crate::ui::controls::secondary("断开连接")).clicked()
+                            {
+                                host.disconnect();
+                            }
+                            if let Some(error) = status.error {
+                                ui.colored_label(AMBER, error);
+                            }
+                        }
+                    } else {
+                        ui.label("正在准备本机协助…");
+                    }
+                });
+            return;
+        }
+        egui::Panel::bottom("guest-assist-entry")
+            .frame(egui::Frame::new().fill(BG).inner_margin(16))
+            .show(root, |ui| {
+                ui.vertical_centered(|ui| {
+                    if ui
+                        .add(crate::ui::controls::secondary("无需登录 · 接受远程协助"))
+                        .clicked()
+                    {
+                        self.center_ui.guest_assist_open = true;
+                    }
+                });
+            });
         let locked = self.login_restoring
             || self.logout_pending
-            || self.active_session.is_some()
+            || self.has_viewers()
             || self.mutation_pending;
         // First restore saved credentials. Once the login page is idle,
         // request QR automatically; failures require an explicit refresh.
@@ -1554,20 +1666,24 @@ fn phone_form(
 ) -> PhoneAction {
     let before = phone.contact().ok();
     let mut action = PhoneAction::default();
-    ui.allocate_ui_with_layout(vec2(320.0, 0.0), egui::Layout::top_down(Align::Min), |ui| {
+    let width = ui.available_width();
+    ui.allocate_ui_with_layout(vec2(width, 0.0), egui::Layout::top_down(Align::Min), |ui| {
         ui.spacing_mut().item_spacing = vec2(8.0, 6.0);
         ui.label(RichText::new("手机号").color(MUTED));
         ui.add_enabled_ui(!busy, |ui| {
             ui.horizontal(|ui| {
                 ui.add_sized(
-                    [64.0, theme::CONTROL_HEIGHT],
+                    [theme::AUTH_COUNTRY_WIDTH, theme::CONTROL_HEIGHT],
                     singleline_input(&mut phone.country)
                         .hint_text("+86")
                         .char_limit(6)
                         .horizontal_align(Align::Center),
                 );
                 ui.add_sized(
-                    [248.0, theme::CONTROL_HEIGHT],
+                    [
+                        width - theme::AUTH_COUNTRY_WIDTH - 8.0,
+                        theme::CONTROL_HEIGHT,
+                    ],
                     singleline_input(&mut phone.mobile)
                         .hint_text("请输入手机号")
                         .char_limit(24),
@@ -1584,7 +1700,10 @@ fn phone_form(
         ui.horizontal(|ui| {
             ui.add_enabled_ui(!busy, |ui| {
                 let response = ui.add_sized(
-                    [184.0, theme::CONTROL_HEIGHT],
+                    [
+                        width - theme::AUTH_CODE_ACTION_WIDTH - 8.0,
+                        theme::CONTROL_HEIGHT,
+                    ],
                     singleline_input(&mut phone.code)
                         .hint_text("6位短信验证码")
                         .char_limit(6),
@@ -1604,7 +1723,8 @@ fn phone_form(
             action.send = ui
                 .add_enabled(
                     !busy && remaining == 0 && phone.agreed && phone.contact().is_ok(),
-                    login_button(&label).min_size(vec2(128.0, 40.0)),
+                    login_button(&label)
+                        .min_size(vec2(theme::AUTH_CODE_ACTION_WIDTH, theme::CONTROL_HEIGHT)),
                 )
                 .clicked();
         });
@@ -1632,7 +1752,7 @@ fn phone_form(
         action.submit |= ui
             .add_enabled_ui(!busy && phone.can_submit(), |ui| {
                 ui.add_sized(
-                    [320.0, 42.0],
+                    [width, theme::CONTROL_HEIGHT],
                     login_button(if busy && !phone.sending {
                         "正在登录…"
                     } else {
@@ -1660,7 +1780,10 @@ fn phone_form(
         if can_cancel {
             ui.add_space(8.0);
             action.cancel = ui
-                .add_sized([320.0, 28.0], login_button("取消").frame(false))
+                .add_sized(
+                    [width, theme::CONTROL_HEIGHT],
+                    login_button("取消").frame(false),
+                )
                 .clicked();
         }
     });

@@ -13,7 +13,7 @@ mod native;
 
 pub(crate) use native::{
     WindowMoveState, WindowResizeState, cancel_pointer_operation, configure_dwm_window,
-    update_nonmodal_window_move, update_nonmodal_window_resize,
+    set_fullscreen, update_nonmodal_window_move, update_nonmodal_window_resize,
 };
 
 fn title_bar_frame() -> egui::Frame {
@@ -195,7 +195,7 @@ fn window_buttons_impl(ui: &mut egui::Ui, window: &Window, tooltips: bool) -> bo
         );
         if maximize.clicked() {
             if window.fullscreen().is_some() {
-                window.set_fullscreen(None);
+                set_fullscreen(window, None);
             } else {
                 if window.is_resizable()
                     && window

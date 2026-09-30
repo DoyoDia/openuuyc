@@ -21,10 +21,7 @@ pub(crate) fn route_gui() -> Result<bool> {
     {
         deployment::start_installed(std::env::args_os().skip(1))?;
     } else {
-        let choice = run(false)?;
-        if choice {
-            deployment::start_installed(std::env::args_os().skip(1))?;
-        }
+        run(false)?;
     }
     Ok(true)
 }
@@ -118,7 +115,7 @@ fn cleanup_helpers() {
         }
     }
 }
-fn run(uninstall: bool) -> Result<bool> {
+fn run(uninstall: bool) -> Result<()> {
     let _installer = super::instance::reserve_installer()?;
     let _instance = if uninstall {
         Some(super::instance::reserve_maintenance()?)
@@ -128,8 +125,6 @@ fn run(uninstall: bool) -> Result<bool> {
     if uninstall && deployment::active_directory()?.exists() {
         deployment::verify_directory(&deployment::active_directory()?)?;
     }
-    let launch = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let output = launch.clone();
     let installed_version = deployment::installed_version().ok();
     crate::ui::run(
         crate::ui::WindowConfig {
@@ -152,12 +147,11 @@ fn run(uninstall: bool) -> Result<bool> {
                 pending: None,
                 error: None,
                 finished: false,
-                launch: output,
                 installed_version,
             })
         }),
     )?;
-    Ok(launch.load(std::sync::atomic::Ordering::Acquire))
+    Ok(())
 }
 struct Maintenance {
     uninstall: bool,
@@ -166,7 +160,6 @@ struct Maintenance {
     error: Option<String>,
     finished: bool,
     installed_version: Option<String>,
-    launch: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 impl crate::ui::App for Maintenance {
     fn uses_tray(&self) -> bool {
@@ -183,10 +176,8 @@ impl crate::ui::App for Maintenance {
                     match result {
                         Ok(false) => {
                             self.finished = true;
-                            self.launch
-                                .store(!self.uninstall, std::sync::atomic::Ordering::Release);
                             if !self.uninstall {
-                                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                                self.open_installed(ui.ctx());
                             }
                         }
                         Ok(true) => self.error = Some("需要重启Windows后完成操作".into()),
@@ -253,9 +244,7 @@ impl crate::ui::App for Maintenance {
                                 ui.label(egui::RichText::new("删除登录信息、设置、插件、缓存和日志，下次使用需重新登录。").color(theme::AMBER));
                             }
                         } else if ui.link("打开已安装版本").clicked() {
-                            self.launch
-                                .store(true, std::sync::atomic::Ordering::Release);
-                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                            self.open_installed(ui.ctx());
                         }
                     });
                 }
@@ -316,6 +305,18 @@ impl crate::ui::App for Maintenance {
 }
 
 impl Maintenance {
+    fn open_installed(&mut self, ctx: &egui::Context) {
+        // Start before destroying the foreground installer, otherwise Windows
+        // restores another app first and the replacement opens behind it.
+        match deployment::start_installed(std::env::args_os().skip(1)) {
+            Ok(()) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            Err(error) => {
+                self.finished = false;
+                self.error = Some(format!("打开已安装版本失败：{error:#}"));
+            }
+        }
+    }
+
     fn start(&mut self, ctx: egui::Context) {
         let (tx, rx) = mpsc::channel();
         self.pending = Some(rx);
@@ -341,7 +342,15 @@ fn update_running() -> Result<bool> {
     let mut had_window = running.is_some();
     let background = host_service::resident::managed() && host_service::install::running()?;
     let resume = background && !host_service::resident::paused()?;
+    let mut notified = false;
     let result = (|| -> Result<bool> {
+        // Announce before the old GUI's normal exit path pauses the resident.
+        // The protected deployment receipt distinguishes pre-notification builds
+        // without sending an unknown IPC request to an older running service.
+        if resume && host_service::install::supports_update_notice()? {
+            host_service::resident::call(host_service::resident::Request::PrepareUpdate)?;
+            notified = true;
+        }
         if let Some(running) = running {
             running.close()?;
         }
@@ -368,6 +377,9 @@ fn update_running() -> Result<bool> {
     })();
     drop(gate);
     if let Err(error) = result {
+        if notified {
+            let _ = host_service::resident::call(host_service::resident::Request::CancelUpdate);
+        }
         let restored = if had_window {
             deployment::start_installed(std::iter::empty::<std::ffi::OsString>())
         } else if resume {

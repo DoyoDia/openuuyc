@@ -69,6 +69,9 @@ struct DesktopWindow {
     tray: Option<super::tray::Tray>,
     exiting: bool,
     show_after_present: bool,
+    /// Read only on Windows; see its use after the first present.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    focus_after_present: bool,
     window_move: super::chrome::WindowMoveState,
     window_resize: super::chrome::WindowResizeState,
     min_inner_size: Option<egui::Vec2>,
@@ -195,6 +198,7 @@ impl Runner {
             },
             exiting: false,
             show_after_present: self.config.viewport.visible.unwrap_or(true),
+            focus_after_present: self.config.viewport.active.unwrap_or(true),
             window_move: Default::default(),
             window_resize: Default::default(),
             min_inner_size,
@@ -355,6 +359,21 @@ impl DesktopWindow {
             if presented && self.show_after_present {
                 self.show_after_present = false;
                 self.window.set_visible(true);
+                // X11 and Wayland window managers apply their own focus
+                // policy to a newly mapped window.
+                #[cfg(windows)]
+                if std::mem::take(&mut self.focus_after_present) {
+                    // Respect Windows foreground permission. winit's Windows
+                    // focus_window() synthesizes Alt input; activation here
+                    // needs only the permission granted by our launcher.
+                    if let Ok(hwnd) = super::gfx::window_hwnd(&self.window) {
+                        let activated = unsafe {
+                            windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd)
+                        }
+                        .as_bool();
+                        tracing::debug!(activated, "initial window foreground activation");
+                    }
+                }
             }
         } else if !self.close_requested {
             // QR/font updates must survive a minimized window and upload on restore.

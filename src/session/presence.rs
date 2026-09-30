@@ -3,8 +3,8 @@
 //!
 //! The same authenticated room now also owns configured local controlled-device access.
 
+use super::host_client::HostClient;
 use crate::account::api::ApiFailure;
-use crate::account::client::AuthenticatedClient;
 use crate::account::device_change::{ChangeKind, DeviceChange};
 use crate::transport::signal::{
     SignalFailure, SignalPushHandler, SignalRole, SignalSession, SocketState,
@@ -42,7 +42,8 @@ pub(crate) struct ActivePresence {
 }
 
 impl ActivePresence {
-    pub(crate) fn start(client: Arc<AuthenticatedClient>) -> Self {
+    pub(crate) fn start(client: impl Into<HostClient>) -> Self {
+        let client = client.into();
         let cancel = CancellationToken::new();
         let task_cancel = cancel.clone();
         let (events, receiver) = mpsc::channel();
@@ -50,9 +51,9 @@ impl ActivePresence {
             let ended = client.ended();
             let run = async {
                 if crate::platform::host_service::resident::managed() {
-                    run_remote(Arc::clone(&client), events.clone(), task_cancel.clone()).await
+                    run_remote(client.clone(), events.clone(), task_cancel.clone()).await
                 } else {
-                    run_presence(Arc::clone(&client), events.clone(), task_cancel.clone()).await
+                    run_presence(client.clone(), events.clone(), task_cancel.clone()).await
                 }
             };
             tokio::pin!(run);
@@ -85,7 +86,7 @@ impl ActivePresence {
 }
 
 async fn run_presence(
-    client: Arc<AuthenticatedClient>,
+    client: HostClient,
     events: Sender<PresenceEvent>,
     task_cancel: CancellationToken,
 ) -> Result<()> {
@@ -94,18 +95,25 @@ async fn run_presence(
     // normal close; two account owners must never kick each other off the server.
     let _owner = loop {
         if let Some(reservation) =
-            crate::platform::host_service::reserve_presence(&client.device_id())?
+            crate::platform::host_service::reserve_presence(&client.presence_key())?
         {
             break reservation;
         }
         tokio::select! { _ = task_cancel.cancelled() => return Ok(()), _ = tokio::time::sleep(Duration::from_millis(100)) => () }
     };
+    let _assistance = crate::features::host::assist::Running::start(client.clone());
     let mut policy = HostRoomRetry::default();
     let mut initial_requests = 0;
     let mut backoff = false;
     loop {
         if task_cancel.is_cancelled() {
             return Ok(());
+        }
+        if client.is_guest() {
+            let mut desired = client.host.subscribe();
+            while !client.host.requested() {
+                tokio::select! { _ = task_cancel.cancelled() => return Ok(()), result = desired.changed() => { result?; } }
+            }
         }
         let _ = events.send(PresenceEvent::State(if backoff {
             PresenceState::Reconnecting
@@ -147,11 +155,17 @@ async fn run_presence(
             }
         };
         let room_cancel = task_cancel.child_token();
-        let push_client = Arc::clone(&client);
+        let push_client = client.clone();
         let push_cancel = room_cancel.clone();
         let push_events = events.clone();
         let observer: SignalPushHandler = Arc::new(move |push| {
             if push_cancel.is_cancelled() || !push_client.is_active() {
+                return;
+            }
+            if push_client.host.assistance.push(push) {
+                return;
+            }
+            if push_client.is_guest() {
                 return;
             }
             let change = match DeviceChange::parse(push) {
@@ -276,7 +290,7 @@ impl HostRoomRetry {
 }
 
 async fn run_remote(
-    client: Arc<AuthenticatedClient>,
+    client: HostClient,
     events: Sender<PresenceEvent>,
     cancel: CancellationToken,
 ) -> Result<()> {
@@ -293,26 +307,31 @@ async fn run_remote(
             continue;
         }
         let saved = sessions.load()?.map(|s| s.generation());
-        if saved.as_deref() != Some(client.account_generation().as_str()) {
+        if !client.matches_saved(saved.as_deref().unwrap_or_default()) {
             client.retire();
             break;
         }
         if let Some(retry) = client.host.take_remote_action() {
             let action = if retry {
                 Request::Retry {
-                    account: client.account_generation(),
+                    account: client.generation(),
                 }
             } else {
                 Request::Disconnect {
-                    account: client.account_generation(),
+                    account: client.generation(),
                 }
             };
             if let Err(e) = resident::request(action).await {
                 let _ = events.send(PresenceEvent::Warning(format!("后台操作失败：{e:#}")));
             }
         }
-        match resident::request(Request::Snapshot).await {
-            Ok(Reply::Snapshot(snapshot)) if snapshot.account == client.account_generation() => {
+        match resident::request(Request::Snapshot {
+            ui: client.host.assistance.ui_present(),
+        })
+        .await
+        {
+            Ok(Reply::Snapshot(snapshot)) if snapshot.account == client.generation() => {
+                crate::account::reporting::replace(snapshot.publication.clone());
                 let _ = events.send(PresenceEvent::State(snapshot.online.clone()));
                 client.host.apply_remote(*snapshot).await;
             }

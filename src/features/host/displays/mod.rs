@@ -1,5 +1,6 @@
 //! Session-owned display mutations. Native work is serialized and keeps its
 //! recovery intent alive even if the awaiting RPC or connection is cancelled.
+pub(crate) mod fallback;
 mod initial;
 pub(crate) mod recovery;
 mod store;
@@ -80,6 +81,7 @@ struct State {
     has_saved_preferences: bool,
     preference_path: Option<PathBuf>,
     driver: Option<Heartbeat>,
+    fallback_pin: Option<Driver>,
     render_adapter: Option<u64>,
     dirty: bool,
     restoring: bool,
@@ -98,7 +100,7 @@ impl Session {
         ensure!(remote.len() <= 256, "控制端标识无效");
         let root = store::root()?;
         let token = uuid::Uuid::new_v4().to_string();
-        let preference_path = (!remote.is_empty()).then(|| {
+        let preference_path = (!lease.is_assistance() && !remote.is_empty()).then(|| {
             root.join("preferences")
                 .join(lease.display_scope())
                 .join(format!("{:x}.json", Sha256::digest(remote)))
@@ -110,6 +112,7 @@ impl Session {
             .flatten();
         let has_saved_preferences = preferences.is_some();
         let preferences = preferences.unwrap_or_default();
+        fallback::start_background();
         Ok(Arc::new(Self {
             lease,
             closed: Arc::new(AtomicBool::new(false)),
@@ -134,6 +137,7 @@ impl Session {
                 has_saved_preferences,
                 preference_path,
                 driver: None,
+                fallback_pin: None,
                 render_adapter: None,
                 dirty: false,
                 restoring: false,
@@ -182,7 +186,11 @@ impl Session {
             .find(|o| o.identity.as_ref() == screen.identity.as_ref() && o.identity.is_some())
         else {
             return Ok((
-                0,
+                i32::from(
+                    target
+                        .as_ref()
+                        .is_some_and(|t| t.virtual_provider.is_some()),
+                ),
                 state
                     .preferences
                     .physical
@@ -210,7 +218,15 @@ impl Session {
         }
         Ok((if owned.kind == 2 { 2 } else { 1 }, owned.resolution_type))
     }
+    pub(crate) fn owns(&self, identity: &str) -> bool {
+        lock(&self.state)
+            .journal
+            .owned
+            .iter()
+            .any(|o| o.identity.as_deref() == Some(identity))
+    }
     pub(crate) async fn create(&self, resolutions: Vec<(u32, u32)>) -> Result<capture::Screen> {
+        ensure!(!self.lease.is_assistance(), "远程协助不开放添加虚拟屏");
         self.run(move |state, lease| {
             ensure!(
                 state.journal.super_baseline.is_none(),
@@ -223,7 +239,7 @@ impl Session {
                         .journal
                         .owned
                         .iter()
-                        .filter(|o| matches!(o.kind, 1 | 3 | 4))
+                        .filter(|o| matches!(o.kind, 1 | 3))
                         .count()
                         < 3,
                 "显示器数量已达上限"
@@ -256,7 +272,7 @@ impl Session {
         self.run(move |state, lease| {
             let index = state.owned_index(&identity)?;
             ensure!(
-                matches!(state.journal.owned[index].kind, 1 | 3 | 4),
+                matches!(state.journal.owned[index].kind, 1 | 3),
                 "不能用删除扩展屏操作退出超级屏"
             );
             ensure!(lease.requested(), "显示操作已取消");
@@ -265,7 +281,6 @@ impl Session {
             if current.targets.len() == 1
                 && current.targets[0].identity == identity
                 && !state.journal.baseline.targets.is_empty()
-                && state.journal.owned[index].kind != 4
             {
                 state.restore_layout(&state.journal.baseline, &state.journal.dpi)?;
             }
@@ -274,63 +289,80 @@ impl Session {
             if state.journal.owned[index].kind == 3 {
                 state.preferences.default_virtual = false;
             }
-            let removed = state.journal.owned.remove(index);
+            state.journal.owned.remove(index);
             // Retain the completed removal even if Windows is still publishing
             // the old active path while monitor departure is being processed.
             state.save()?;
-            if removed.kind != 4 {
-                state.update_preferences()?;
-            }
+            state.update_preferences()?;
             state.applied()
         })
         .await
     }
-    /// Session-only hot-unplug fallback. Recheck emptiness under the display
-    /// mutation lock, and never turn this automatic action into a saved layout.
-    pub(crate) async fn create_temporary(
+    /// The singleton fallback is owned by the machine, never journal.owned.
+    pub(crate) async fn ensure_fallback(
         &self,
         previous: capture::Screen,
     ) -> Result<Option<capture::Screen>> {
         self.run(move |state, lease| {
-            if !capture::screens()?.is_empty() {
+            if state.journal.super_baseline.is_some() || !state.journal.owned.is_empty() {
                 return Ok(None);
             }
-            ensure!(state.journal.owned.len() < 3, "临时显示器数量已达上限");
-            ensure!(
-                !state.journal.owned.iter().any(|s| s.kind == 4),
-                "临时显示器仍有待清理的恢复记录"
-            );
-            let size = (previous.width, previous.height);
-            validate_modes(&[size])?;
-            state
-                .create(
-                    Virtual {
-                        guid: uuid::Uuid::new_v4().to_string(),
-                        identity: None,
-                        width: size.0,
-                        height: size.1,
-                        hz: 144,
-                        dpi: 0,
-                        kind: 4,
-                        resolution_type: 1,
-                        modes: vec![size],
-                        layout: None,
-                    },
-                    lease,
-                    false,
-                )
-                .map(Some)
+            ensure!(lease.requested(), "显示操作已取消");
+            fallback::ensure(
+                state.fallback_driver()?,
+                previous.width,
+                previous.height,
+                &[],
+                true,
+            )
         })
         .await
     }
-    pub(crate) fn temporary_identity(&self, screen_id: i32) -> Result<Option<String>> {
-        let state = lock(&self.state);
-        for owned in state.journal.owned.iter().filter(|o| o.kind == 4) {
-            if display::source_id(&format!("openuuyc-virtual/{}", owned.guid))? == screen_id {
-                return Ok(owned.identity.clone());
-            }
+    pub(crate) fn fallback_screen(&self) -> Result<Option<capture::Screen>> {
+        let mut state = lock(&self.state);
+        if state
+            .fallback_pin
+            .as_ref()
+            .is_some_and(|d| d.fallback_state().is_err())
+        {
+            // A driver/device restart invalidates old handles. Re-open and pin
+            // the new generation before resuming its machine-owned monitor.
+            state.fallback_pin.take();
+            state.fallback_pin = fallback::pin()?;
         }
-        Ok(None)
+        match &state.fallback_pin {
+            Some(driver) => fallback::screen(driver),
+            None => Ok(None),
+        }
+    }
+    pub(crate) fn allows_fallback_retirement(&self) -> bool {
+        let state = lock(&self.state);
+        state.journal.owned.is_empty() && state.journal.super_baseline.is_none()
+    }
+    pub(crate) async fn retire_fallback(&self, replacement: String) -> Result<bool> {
+        self.run(move |state, _| {
+            if !state.journal.owned.is_empty() || state.journal.super_baseline.is_some() {
+                return Ok(false);
+            }
+            let retiring = fallback::screen(state.fallback_driver()?)?.and_then(|s| s.identity);
+            let removed = fallback::retire(state.fallback_driver()?, Some(&replacement))?;
+            if removed {
+                // A session that changed modes must not later restore the
+                // fallback baseline after it has been deliberately retired.
+                let available = Topology::query(false)?.metadata()?;
+                state.journal.baseline.targets.retain(|old| {
+                    retiring.as_deref() != Some(old.identity.as_str())
+                        && available
+                            .iter()
+                            .any(|t| t.available && t.identity == old.identity)
+                });
+                if state.dirty {
+                    state.save()?;
+                }
+            }
+            Ok(removed)
+        })
+        .await
     }
     pub(crate) async fn enter_super(
         &self,
@@ -355,13 +387,8 @@ impl Session {
                 .find(|o| o.identity.as_deref() == Some(identity.as_str()))
             {
                 owned.resolution_type = kind;
-                let temporary = owned.kind == 4;
                 state.save()?;
-                if temporary {
-                    Ok(())
-                } else {
-                    state.update_preferences()
-                }
+                state.update_preferences()
             } else {
                 state.remember_physical(&identity, Some(kind))
             }
@@ -397,10 +424,6 @@ impl Session {
             state.begin()?;
             state.intend_dpi(&target.identity, dpi)?;
             target.set_dpi(dpi, || lease.requested())?;
-            let temporary =
-                state.journal.owned.iter().any(|o| {
-                    o.kind == 4 && o.identity.as_deref() == Some(target.identity.as_str())
-                });
             if let Some(owned) = state
                 .journal
                 .owned
@@ -411,11 +434,7 @@ impl Session {
             }
             state.applied()?;
             state.remember_physical(&target.identity, None)?;
-            if temporary {
-                Ok(())
-            } else {
-                state.update_preferences()
-            }
+            state.update_preferences()
         })
         .await
     }
@@ -431,7 +450,9 @@ impl Session {
                 state.journal.retired = true;
                 state.save()?;
             }
-            state.cleanup()
+            state.cleanup()?;
+            state.fallback_pin.take();
+            Ok(())
         })
         .await?
     }
@@ -457,6 +478,7 @@ impl Drop for Session {
                 if let Err(error) = state.cleanup() {
                     tracing::error!(%error,"display recovery remains pending");
                 }
+                state.fallback_pin.take();
                 Ok(())
             });
     }
@@ -504,6 +526,21 @@ fn restore_dpi(values: &[(String, u32)]) -> Result<()> {
 }
 
 impl State {
+    fn fallback_driver(&mut self) -> Result<&Driver> {
+        if self
+            .fallback_pin
+            .as_ref()
+            .is_some_and(|d| d.fallback_state().is_err())
+        {
+            self.fallback_pin.take();
+        }
+        if self.fallback_pin.is_none() {
+            self.fallback_pin = fallback::pin()?;
+        }
+        self.fallback_pin
+            .as_ref()
+            .context("常驻无屏显示需要安装或更新虚拟显示驱动")
+    }
     fn enter_super(
         &mut self,
         width: u32,
@@ -693,6 +730,15 @@ impl State {
                 ensure!(
                     owner != instance
                         || self
+                            .fallback_pin
+                            .as_ref()
+                            .map(|d| d.fallback())
+                            .transpose()?
+                            .flatten()
+                            .is_some_and(
+                                |o| o.adapter == target.adapter && o.target == target.target
+                            )
+                        || self
                             .journal
                             .owned
                             .iter()
@@ -702,7 +748,14 @@ impl State {
             }
             self.driver = Some(Heartbeat::open()?);
             if let Some(adapter) = capture::encoding_adapters()?.first() {
-                lock(&self.driver.as_ref().unwrap().driver).render_adapter(adapter.luid)?;
+                // Reasserting the render adapter can disturb a live fallback.
+                // All displays on our adapter already share its selected GPU.
+                if !targets.iter().any(|t| {
+                    t.available
+                        && t.virtual_provider == Some(display::topology::VirtualProvider::OpenUuyc)
+                }) {
+                    lock(&self.driver.as_ref().unwrap().driver).render_adapter(adapter.luid)?;
+                }
                 self.render_adapter = Some(adapter.luid);
             }
         }
@@ -723,7 +776,6 @@ impl State {
     ) -> Result<capture::Screen> {
         let before = Topology::query(true)?.snapshot()?;
         let dpi = current_dpi()?;
-        let temporary = spec.kind == 4;
         let preferences = self.preferences.clone();
         let guid = spec.guid.clone();
         let result = self.create_inner(spec, lease, super_screen);
@@ -737,9 +789,7 @@ impl State {
                 remove_owned(&lock(&driver), &guid)?;
                 self.journal.owned.retain(|o| o.guid != guid);
                 self.preferences = preferences;
-                if !temporary {
-                    self.save_preferences()?;
-                }
+                self.save_preferences()?;
                 self.applied()
             })();
             if let Err(error) = recovery {
@@ -756,17 +806,6 @@ impl State {
     ) -> Result<capture::Screen> {
         let driver = self.driver()?.driver.clone();
         self.begin()?;
-        if spec.kind == 4 {
-            let available = Topology::query(false)?.targets()?;
-            // A user-unplugged target must not be re-enabled by our eventual
-            // rollback, even if it was present before earlier display edits.
-            self.journal.baseline.targets.retain(|old| {
-                available
-                    .iter()
-                    .any(|t| t.available && t.identity == old.identity)
-            });
-        }
-        let before = Topology::query(true)?.snapshot()?;
         let index = self.journal.owned.len();
         self.journal.owned.push(spec.clone());
         self.save()?;
@@ -798,14 +837,8 @@ impl State {
         self.save()?;
         // A physical monitor may return while the IDD monitor is arriving.
         // Preserve its current layout instead of applying the earlier empty one.
-        let mut before = if spec.kind == 4 {
-            Topology::query(true)?.snapshot()?
-        } else {
-            before
-        };
-        if spec.kind == 4 {
-            before.targets.retain(|t| t.identity != target.identity);
-        }
+        let mut before = Topology::query(true)?.snapshot()?;
+        before.targets.retain(|t| t.identity != target.identity);
         let default_left = before
             .targets
             .iter()
@@ -896,9 +929,7 @@ impl State {
                 target.set_dpi(dpi, || lease.requested())?;
             }
             self.applied()?;
-            if original.kind != 4 {
-                self.update_preferences()?;
-            }
+            self.update_preferences()?;
             let mut screen = find_screen(&identity)?;
             screen.id = display::source_id(&format!("openuuyc-virtual/{}", original.guid))?;
             screen.render_adapter = self.render_adapter;
@@ -922,9 +953,7 @@ impl State {
             let screen = self.create(spec, lease, false)?;
             self.restore_recreated_layout(&before, &identity, &screen, width, height)?;
             self.applied()?;
-            if original.kind != 4 {
-                self.update_preferences()?;
-            }
+            self.update_preferences()?;
             Ok(screen)
         })();
         if result.is_err() && lease.requested() {
@@ -953,11 +982,7 @@ impl State {
                     .collect();
                 restore_dpi(&dpi)?;
                 self.applied()?;
-                if original.kind == 4 {
-                    Ok(())
-                } else {
-                    self.update_preferences()
-                }
+                self.update_preferences()
             })();
             if let Err(error) = rollback {
                 tracing::error!(%error,"virtual display resize rollback remains pending");
@@ -1023,6 +1048,17 @@ impl State {
             return Ok(());
         }
         self.restore_layout(&self.journal.baseline, &self.journal.dpi)?;
+        if !self.journal.owned.is_empty() && self.fallback_pin.is_some() {
+            let leaving: Vec<_> = self
+                .journal
+                .owned
+                .iter()
+                .filter_map(|o| o.identity.clone())
+                .collect();
+            // A manual/super screen may be the last output after the physical
+            // monitor was unplugged. Establish the persistent replacement first.
+            fallback::ensure(self.fallback_driver()?, 1920, 1080, &leaving, false)?;
+        }
         if !self.journal.owned.is_empty() {
             let driver = self.driver()?.driver.clone();
             for owned in &self.journal.owned {

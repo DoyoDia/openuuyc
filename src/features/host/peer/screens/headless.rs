@@ -1,4 +1,5 @@
-//! Session-owned hot-unplug fallback. Native mutations remain in displays::Session.
+//! Capture handoff for the machine-owned headless display. The connection may
+//! retire it only after a replacement produces frames; disconnect leaves it alive.
 use super::*;
 use std::time::{Duration, Instant};
 
@@ -10,16 +11,18 @@ pub(super) fn same_source(a: &capture::Screen, b: &capture::Screen) -> bool {
 pub(super) struct State {
     empty_since: Option<Instant>,
     attempted: bool,
+    unused_returning: Option<(String, Instant)>,
     pub(super) recovery: Option<Recovery>,
 }
 pub(super) struct Recovery {
     slot: usize,
     original: capture::Screen,
-    temporary: i32,
+    fallback: i32,
     automatic: bool,
     returning: Option<Instant>,
     retry_at: Instant,
     probe: Option<Probe>,
+    replacement_since: Option<(String, Instant)>,
 }
 struct Probe {
     cancel: CancellationToken,
@@ -78,7 +81,7 @@ impl State {
     pub(super) fn knows_screen(&self, id: i32) -> bool {
         self.recovery
             .as_ref()
-            .is_some_and(|r| id == r.original.id || id == r.temporary)
+            .is_some_and(|r| id == r.original.id || id == r.fallback)
     }
     pub(super) fn owns_slot(&self, slot: usize) -> bool {
         self.recovery.as_ref().is_some_and(|r| r.slot == slot)
@@ -86,7 +89,7 @@ impl State {
     pub(super) fn choose(&mut self, id: i32) {
         if let Some(r) = &mut self.recovery {
             // Controllers can echo our newly published fallback selection.
-            if id != r.temporary && !(r.returning.is_some() && id == r.original.id) {
+            if id != r.fallback && !(r.returning.is_some() && id == r.original.id) {
                 r.automatic = false;
                 r.returning = None;
                 if let Some(probe) = &r.probe {
@@ -97,7 +100,7 @@ impl State {
     }
     pub(super) fn stop(&mut self, id: i32) {
         if let Some(r) = &mut self.recovery {
-            if id == -1 || id == r.temporary || (r.returning.is_some() && id == r.original.id) {
+            if id == -1 || id == r.fallback || (r.returning.is_some() && id == r.original.id) {
                 r.automatic = false;
                 r.returning = None;
                 if let Some(probe) = &r.probe {
@@ -137,6 +140,69 @@ impl Screens {
     }
     pub(super) async fn maintain_headless(&mut self) -> Result<()> {
         if self.headless.recovery.is_none() {
+            if let Some(fallback) = self.displays.fallback_screen()? {
+                if let Some(slot) = self.active_slot(fallback.id) {
+                    self.headless.recovery = Some(Recovery {
+                        slot,
+                        original: fallback.clone(),
+                        fallback: fallback.id,
+                        automatic: true,
+                        returning: None,
+                        retry_at: Instant::now(),
+                        probe: None,
+                        replacement_since: None,
+                    });
+                } else if self.displays.allows_fallback_retirement() {
+                    // A retained screen may already be unused at reconnect, or
+                    // video was paused before the first topology maintenance.
+                    let idle = self
+                        .slots
+                        .iter()
+                        .all(|s| s.worker.is_none() && !s.awaiting_source);
+                    let replacement = lock(&self.reports.catalog)
+                        .iter()
+                        .find(|i| {
+                            i.screen.id != fallback.id
+                                && i.target.as_ref().is_some_and(|t| {
+                                    t.active
+                                    && t.available
+                                    && t.virtual_provider
+                                        != Some(
+                                            crate::platform::display::topology::VirtualProvider::Uu,
+                                        )
+                                })
+                                && (idle
+                                    || self.slots.iter().enumerate().any(|(n, s)| {
+                                        self.delivered(n)
+                                            && s.screen
+                                                .as_ref()
+                                                .is_some_and(|s| same_source(s, &i.screen))
+                                    }))
+                        })
+                        .and_then(|i| i.screen.identity.clone());
+                    if let Some(identity) = replacement {
+                        let now = Instant::now();
+                        let (id, since) = self
+                            .headless
+                            .unused_returning
+                            .get_or_insert((identity.clone(), now));
+                        if *id != identity {
+                            *id = identity.clone();
+                            *since = now;
+                        }
+                        if now.duration_since(*since) >= Duration::from_secs(2)
+                            && self.displays.retire_fallback(identity).await?
+                        {
+                            self.headless.unused_returning = None;
+                            self.refresh()?;
+                        }
+                    } else {
+                        self.headless.unused_returning = None;
+                    }
+                }
+            }
+        }
+        if self.headless.recovery.is_none() {
             if lock(&self.reports.catalog).is_empty() && !self.headless.attempted {
                 self.headless.empty_since.get_or_insert_with(Instant::now);
                 // Confirm the empty topology before publishing ScreenSources.
@@ -144,10 +210,13 @@ impl Screens {
                 tokio::select! { _ = self.cancel.cancelled() => return Ok(()), _ = tokio::time::sleep(Duration::from_millis(200)) => {} }
                 self.refresh()?;
             }
-            if !self
-                .headless
-                .should_create(lock(&self.reports.catalog).is_empty(), Instant::now())
-            {
+            let only_official = lock(&self.reports.catalog).iter().all(|info| {
+                info.target.as_ref().is_some_and(|t| {
+                    t.virtual_provider
+                        == Some(crate::platform::display::topology::VirtualProvider::Uu)
+                })
+            });
+            if !self.headless.should_create(only_official, Instant::now()) {
                 return Ok(());
             }
             let current = self.reports.current.load(Ordering::Acquire);
@@ -155,21 +224,24 @@ impl Screens {
                 .slots
                 .iter()
                 .enumerate()
-                .filter(|(index, slot)| self.registered.contains(index) && slot.awaiting_source)
-                .filter_map(|(index, slot)| slot.suspended.clone().map(|s| (index, s)))
+                .filter(|(index, _)| self.registered.contains(index))
+                .filter_map(|(index, slot)| {
+                    slot.suspended
+                        .clone()
+                        .or_else(|| slot.screen.clone())
+                        .map(|s| (index, s))
+                })
                 .min_by_key(|(_, s)| s.id != current);
             let Some((index, original)) = candidate else {
                 return Ok(());
             };
             self.lease
-                .update(true, true, "显示器已断开，正在准备临时虚拟屏…");
-            let Some(temporary) = self
+                .update(true, true, "没有可用普通显示器，正在准备常驻虚拟屏…");
+            let Some(fallback) = self
                 .displays
-                .create_temporary(original.clone())
+                .ensure_fallback(original.clone())
                 .await
-                .context(
-                    "没有可用显示器，临时虚拟屏无法创建；请检查虚拟显示驱动或重新连接显示器",
-                )?
+                .context("无屏兜底无法建立；请检查虚拟显示驱动或重新连接显示器")?
             else {
                 return Ok(());
             };
@@ -178,20 +250,21 @@ impl Screens {
             self.headless.recovery = Some(Recovery {
                 slot: index,
                 original,
-                temporary: temporary.id,
+                fallback: fallback.id,
                 automatic: true,
                 returning: None,
                 retry_at: Instant::now(),
                 probe: None,
+                replacement_since: None,
             });
             self.refresh()?;
             let config = *lock(&self.slots[index].config);
-            self.start_at(index, temporary, config).await?;
+            self.start_at(index, fallback, config).await?;
             return Ok(());
         }
 
         // Temporarily take the state so transitions may borrow the screen pool.
-        // Always put it back on error; the display journal remains the final owner.
+        // Always put it back on error; the driver keeps the fallback alive.
         let mut recovery = self.headless.recovery.take().unwrap();
         let result = self.advance_headless(&mut recovery, Instant::now()).await;
         match result {
@@ -210,12 +283,55 @@ impl Screens {
         }
     }
     async fn advance_headless(&mut self, r: &mut Recovery, now: Instant) -> Result<bool> {
-        let temporary = self.info(r.temporary).ok().map(|i| i.screen);
-        let original = self
-            .info(r.original.id)
-            .ok()
-            .map(|i| i.screen)
-            .filter(|screen| same_source(screen, &r.original));
+        if !self.displays.allows_fallback_retirement() || self.before_super.is_some() {
+            if let Some(probe) = &mut r.probe {
+                probe.close().await;
+            }
+            r.probe = None;
+            r.returning = None;
+            return Ok(false);
+        }
+        let fallback = self.info(r.fallback).ok().map(|i| i.screen);
+        let original = lock(&self.reports.catalog)
+            .iter()
+            .filter(|i| {
+                i.screen.id != r.fallback
+                    && i.target.as_ref().is_some_and(|t| {
+                        t.active
+                            && t.available
+                            && t.virtual_provider
+                                != Some(crate::platform::display::topology::VirtualProvider::Uu)
+                    })
+            })
+            .min_by_key(|i| (i.screen.identity != r.original.identity, !i.screen.primary))
+            .map(|i| i.screen.clone());
+        if let Some(original) = &original {
+            let identity = original.identity.clone().context("替代显示器缺少身份")?;
+            if r.replacement_since
+                .as_ref()
+                .is_none_or(|(id, _)| id != &identity)
+            {
+                r.replacement_since = Some((identity, now));
+                r.retry_at = now + Duration::from_secs(2);
+            }
+        } else {
+            r.replacement_since = None;
+        }
+        if r.returning.is_none() && r.probe.is_none() {
+            if let Some(original) = &original {
+                r.original = original.clone();
+            }
+        }
+        if original.is_some()
+            && now >= r.retry_at
+            && self
+                .slots
+                .iter()
+                .all(|s| s.worker.is_none() && !s.awaiting_source)
+        {
+            // Audio-only / paused video has no capture to migrate or probe.
+            return self.remove_fallback(r.fallback).await;
+        }
         if !r.automatic {
             if let Some(probe) = &mut r.probe {
                 probe.close().await;
@@ -227,14 +343,24 @@ impl Screens {
             }
             // Do not destroy a manually retained/paused fallback screen. A new
             // selection must actually deliver a frame before automatic cleanup.
-            if self.active_slot(r.temporary).is_none()
+            if self.active_slot(r.fallback).is_none()
                 && self
                     .slots
                     .iter()
                     .enumerate()
                     .any(|(i, _)| self.delivered(i))
             {
-                return self.remove_temporary(r.temporary).await.map(|_| true);
+                return self.remove_fallback(r.fallback).await;
+            }
+            return Ok(false);
+        }
+        if fallback.is_none() && original.is_none() && r.returning.is_none() && now >= r.retry_at {
+            r.retry_at = now + Duration::from_secs(10);
+            if let Some(screen) = self.displays.ensure_fallback(r.original.clone()).await? {
+                r.fallback = screen.id;
+                self.refresh()?;
+                let config = *lock(&self.slots[r.slot].config);
+                self.start_at(r.slot, screen, config).await?;
             }
             return Ok(false);
         }
@@ -250,9 +376,11 @@ impl Screens {
                     .is_some_and(|s| same_source(s, &r.original))
                 && self.delivered(r.slot)
             {
-                self.remove_temporary(r.temporary).await?;
-                tracing::info!("original display resumed; temporary display removed");
-                return Ok(true);
+                if self.remove_fallback(r.fallback).await? {
+                    tracing::info!("replacement display resumed; persistent fallback retired");
+                    return Ok(true);
+                }
+                return Ok(false);
             }
             let ended = self.slots[r.slot]
                 .worker
@@ -265,9 +393,9 @@ impl Screens {
             {
                 r.returning = None;
                 r.retry_at = now + Duration::from_secs(10);
-                if let Some(temporary) = temporary {
+                if let Some(fallback) = fallback {
                     let config = *lock(&self.slots[r.slot].config);
-                    self.start_at(r.slot, temporary, config).await?;
+                    self.start_at(r.slot, fallback, config).await?;
                 }
             }
             return Ok(false);
@@ -296,12 +424,12 @@ impl Screens {
         }
         // Keep fallback playback healthy while a returning physical display is
         // still failing its preflight. A present-but-unusable original must not
-        // starve recovery of the usable temporary capture.
+        // starve recovery of the usable fallback capture.
         if self.slots[r.slot].worker.is_none() && now >= r.retry_at {
-            if let Some(temporary) = temporary {
+            if let Some(fallback) = fallback {
                 r.retry_at = now + Duration::from_secs(10);
                 let config = *lock(&self.slots[r.slot].config);
-                self.start_at(r.slot, temporary, config).await?;
+                self.start_at(r.slot, fallback, config).await?;
                 return Ok(false);
             }
         }
@@ -316,9 +444,41 @@ impl Screens {
         }
         Ok(false)
     }
-    async fn remove_temporary(&mut self, id: i32) -> Result<()> {
-        if let Some(identity) = self.displays.temporary_identity(id)? {
-            self.displays.remove(identity).await?;
+    async fn remove_fallback(&mut self, id: i32) -> Result<bool> {
+        let replacement = self
+            .slots
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| self.delivered(*i))
+            .filter_map(|(_, slot)| slot.screen.as_ref())
+            .filter(|s| s.id != id)
+            .find_map(|s| s.identity.clone());
+        let replacement = replacement.or_else(|| {
+            if self
+                .slots
+                .iter()
+                .any(|s| s.worker.is_some() || s.awaiting_source)
+            {
+                return None;
+            }
+            lock(&self.reports.catalog)
+                .iter()
+                .find(|i| {
+                    i.screen.id != id
+                        && i.target.as_ref().is_some_and(|t| {
+                            t.active
+                                && t.available
+                                && t.virtual_provider
+                                    != Some(crate::platform::display::topology::VirtualProvider::Uu)
+                        })
+                })
+                .and_then(|i| i.screen.identity.clone())
+        });
+        let Some(replacement) = replacement else {
+            return Ok(false);
+        };
+        if !self.displays.retire_fallback(replacement).await? {
+            return Ok(false);
         }
         for slot in &mut self.slots {
             if slot.suspended.as_ref().is_some_and(|s| s.id == id) {
@@ -326,6 +486,7 @@ impl Screens {
                 slot.awaiting_source = false;
             }
         }
-        self.refresh()
+        self.refresh()?;
+        Ok(true)
     }
 }

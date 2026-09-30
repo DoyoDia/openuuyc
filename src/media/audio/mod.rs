@@ -55,7 +55,13 @@ struct Packet {
     generation: u64,
 }
 
+enum Audit {
+    Rejected(u16),
+    Statistics(neteq::Statistics),
+}
+
 struct Shared {
+    audit: ArrayQueue<(u64, Audit)>,
     packets: ArrayQueue<Packet>,
     settings: AtomicU32,
     generation: AtomicU64,
@@ -156,6 +162,7 @@ impl AudioPlayback {
     pub fn new() -> Self {
         Self(Arc::new(Owner {
             shared: Arc::new(Shared {
+                audit: ArrayQueue::new(32),
                 packets: ArrayQueue::new(200),
                 settings: AtomicU32::new(100),
                 generation: AtomicU64::new(0),
@@ -441,7 +448,10 @@ impl Engine {
             {
                 self.started = true;
             } else {
-                tracing::debug!(sequence = packet.sequence, "NetEq rejected an audio packet");
+                let _ = self
+                    .shared
+                    .audit
+                    .push((generation, Audit::Rejected(packet.sequence)));
             }
         }
         if !self.started {
@@ -478,16 +488,12 @@ impl Engine {
             .fetch_max(peak.to_bits(), Ordering::Relaxed);
         self.blocks += 1;
         if self.blocks.is_multiple_of(500) {
-            tracing::debug!(
-                buffer_ms = self.stats.buffer_ms,
-                target_ms = self.stats.target_ms,
-                concealed_samples = self.stats.concealed_samples,
-                inserted_samples = self.stats.inserted_samples,
-                removed_samples = self.stats.removed_samples,
-                discarded_packets = self.stats.discarded_packets,
-                "native NetEq playout"
-            );
+            let _ = self
+                .shared
+                .audit
+                .push((generation, Audit::Statistics(self.stats)));
         }
+
         Ok(())
     }
 }
@@ -667,6 +673,26 @@ fn output_worker(shared: Arc<Shared>) {
     let mut failures = 0;
     let mut next_check = Instant::now();
     while !shared.stopped.load(Ordering::Acquire) {
+        while let Some((generation, event)) = shared.audit.pop() {
+            if generation != shared.generation.load(Ordering::Acquire) {
+                continue;
+            }
+            match event {
+                Audit::Rejected(sequence) => {
+                    tracing::debug!(sequence, "NetEq rejected an audio packet")
+                }
+                Audit::Statistics(stats) => tracing::debug!(
+                    buffer_ms = stats.buffer_ms,
+                    target_ms = stats.target_ms,
+                    concealed_samples = stats.concealed_samples,
+                    inserted_samples = stats.inserted_samples,
+                    removed_samples = stats.removed_samples,
+                    discarded_packets = stats.discarded_packets,
+                    "native NetEq playout"
+                ),
+            }
+        }
+
         let retry = shared.retry.swap(false, Ordering::AcqRel);
         let refresh = shared.refresh_devices.swap(false, Ordering::AcqRel);
         let generation = shared.generation.load(Ordering::Acquire);
