@@ -3,9 +3,14 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use anyhow::{Result, bail};
+use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
+pub(crate) mod polling;
+
 const MAX_EVENTS: usize = 512;
+const MOTION_INTERVAL: Duration = Duration::from_millis(1);
+const MOTION_JITTER: Duration = Duration::from_micros(100);
 pub(crate) const BUTTONS: [u32; 5] = [1, 2, 16, 32, 64];
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -57,6 +62,18 @@ pub(crate) enum InputEvent {
 }
 
 impl InputEvent {
+    fn movement(&self) -> bool {
+        matches!(
+            self,
+            Self::Absolute { .. } | Self::Relative { .. } | Self::Correction { .. }
+        )
+    }
+    fn input_boundary(&self) -> bool {
+        matches!(
+            self,
+            Self::Button { .. } | Self::Key { .. } | Self::Wheel { .. } | Self::AssistButton { .. }
+        )
+    }
     pub fn send_timeout(&self) -> std::time::Duration {
         match self {
             Self::Correction { expires, .. }
@@ -157,6 +174,7 @@ struct State {
     activation_generation: u64,
     waiting_for_neutral: bool,
     keyboard_platform: i32,
+    accept_host_input: bool,
     queue: VecDeque<InputEvent>,
     in_flight: bool,
     in_flight_assist: Option<u64>,
@@ -164,6 +182,10 @@ struct State {
     cancellation: tokio_util::sync::CancellationToken,
     error: Option<String>,
     recovering: bool,
+    throttle: bool,
+    next_motion_at: Option<Instant>,
+    deadline_timer: Option<crate::platform::deadline::Timer>,
+    polling_warning: Option<polling::Warning>,
     listeners: Vec<Weak<dyn Fn() + Send + Sync>>,
 }
 
@@ -175,6 +197,58 @@ pub(crate) struct RemoteInput {
 }
 
 impl RemoteInput {
+    pub(crate) fn set_host_input_allowed(&self, allowed: bool) {
+        self.lock().accept_host_input = allowed;
+    }
+
+    pub(crate) fn accepts_host_input(&self) -> bool {
+        self.lock().accept_host_input
+    }
+
+    pub fn set_throttle(&self, enabled: bool) -> Result<()> {
+        let mut s = self.lock();
+        if s.throttle == enabled {
+            return Ok(());
+        }
+        let timer = if enabled {
+            Some(crate::platform::deadline::Timer::new(self.wake.clone())?)
+        } else {
+            None
+        };
+        let retired = std::mem::replace(&mut s.deadline_timer, timer);
+        s.throttle = enabled;
+        s.next_motion_at = None;
+        if enabled {
+            s.polling_warning = None;
+        }
+        // Keep pending motion and button order when changing the user's policy.
+        drop(s);
+        // Joining a retiring callback must never hold the input queue lock.
+        drop(retired);
+        self.wake.notify_one();
+        self.repaint();
+        Ok(())
+    }
+
+    pub fn warn_high_polling(&self, hz: u32) {
+        let mut s = self.lock();
+        if s.throttle || !s.ready || s.stopping || s.mode == MouseMode::View {
+            return;
+        }
+        s.polling_warning = Some(polling::Warning {
+            hz,
+            until: Instant::now() + Duration::from_secs(10),
+        });
+        drop(s);
+        self.repaint();
+    }
+
+    pub fn polling_warning(&self) -> Option<polling::Warning> {
+        let s = self.lock();
+        s.polling_warning
+            .filter(|w| !s.throttle && s.mode != MouseMode::View && Instant::now() < w.until)
+    }
+
     pub fn set_keyboard_platform(&self, platform: i32) {
         self.lock().keyboard_platform = platform;
     }
@@ -430,6 +504,10 @@ impl RemoteInput {
     }
 
     fn advance_epoch(s: &mut State) {
+        s.next_motion_at = None;
+        if let Some(timer) = &mut s.deadline_timer {
+            timer.disarm();
+        }
         s.epoch = s.epoch.wrapping_add(1);
         s.cancellation.cancel();
         s.cancellation = tokio_util::sync::CancellationToken::new();
@@ -662,11 +740,44 @@ impl RemoteInput {
             let wake = self.wake.notified();
             tokio::pin!(wake);
             wake.as_mut().enable();
+            let deadline;
             {
                 let mut s = self.lock();
-                if let Some(event) = s.queue.pop_front() {
-                    if !Self::pending_current(&s, &event) {
-                        continue;
+                if s.queue
+                    .front()
+                    .is_some_and(|event| !Self::pending_current(&s, event))
+                {
+                    s.queue.pop_front();
+                    continue;
+                }
+                let now = Instant::now();
+                deadline = Self::motion_deadline(&s, now);
+                if let Some(timer) = &mut s.deadline_timer {
+                    if let Some(deadline) = deadline {
+                        if let Err(error) = timer.arm(deadline) {
+                            Self::release_locked(&mut s);
+                            s.mode = MouseMode::View;
+                            s.error = Some(format!("鼠标节流计时失败，控制已停止：{error:#}"));
+                            drop(s);
+                            self.wake.notify_one();
+                            self.repaint();
+                            continue;
+                        }
+                    } else {
+                        timer.disarm();
+                    }
+                }
+                if deadline.is_none()
+                    && let Some(event) = s.queue.pop_front()
+                {
+                    if s.throttle && event.movement() {
+                        // Retain the cadence across small scheduling/send delays.
+                        // Skip missed slots rather than accumulating catch-up work.
+                        let slot = s
+                            .next_motion_at
+                            .filter(|at| *at + MOTION_INTERVAL > now)
+                            .unwrap_or(now);
+                        s.next_motion_at = Some(slot + MOTION_INTERVAL);
                     }
                     s.in_flight = true;
                     s.in_flight_motion = matches!(
@@ -702,8 +813,37 @@ impl RemoteInput {
                     };
                 }
             }
+            // Physical input, cancellation and the one-shot native timer all
+            // use the same wakeup. No periodic work while the queue is empty.
             wake.await;
         }
+    }
+
+    fn motion_deadline(s: &State, now: Instant) -> Option<Instant> {
+        if !s.throttle || !s.queue.front().is_some_and(InputEvent::movement) {
+            return None;
+        }
+        s.next_motion_at.and_then(|at| {
+            // Send the position before a click/key/wheel early, never reorder
+            // the edge ahead of its position. At most one slot can be borrowed;
+            // advancing the same virtual clock automatically repays it.
+            let at = if s.queue.get(1).is_some_and(InputEvent::input_boundary) {
+                at.checked_sub(MOTION_INTERVAL).unwrap_or(now)
+            } else {
+                // Accept a physical move near the tick instead of making a
+                // native 1000-Hz source wait for tiny scheduling differences.
+                // This allowance uses the same clock; it does not accumulate.
+                if matches!(
+                    s.queue.front(),
+                    Some(InputEvent::Absolute { .. } | InputEvent::Relative { .. })
+                ) && at.saturating_duration_since(now) <= MOTION_JITTER
+                {
+                    return None;
+                }
+                at
+            };
+            (at > now).then_some(at)
+        })
     }
 
     fn pending_current(s: &State, event: &InputEvent) -> bool {

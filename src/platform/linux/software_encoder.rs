@@ -227,10 +227,7 @@ mod tests {
                 };
                 println!("{format:?} {name}: {actual:?}, BT.601 limited {expected:?}");
                 assert!(
-                    actual
-                        .iter()
-                        .zip(expected)
-                        .all(|(a, e)| a.abs_diff(e) <= 4),
+                    actual.iter().zip(expected).all(|(a, e)| a.abs_diff(e) <= 4),
                     "{format:?} {name} is not BT.601 limited"
                 );
             }

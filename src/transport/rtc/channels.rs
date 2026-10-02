@@ -407,15 +407,27 @@ pub(super) async fn send_remote_input(
                     else {kcp.send_control(&channel,event.event.encode()).await}
                 }) => result
                 .map_err(|_| match kcp.send_failure_reason() {
-                    Some(reason) => anyhow::anyhow!("鼠标输入发送超时：{reason}"),
-                    None => anyhow::anyhow!("鼠标输入发送超时"),
+                    Some(reason) => anyhow::anyhow!("键鼠输入发送超时：{reason}"),
+                    None => anyhow::anyhow!("键鼠输入发送超时"),
                 })
                 .and_then(|result| result.map(|_| ())),
         };
         if let Err(error) = &result
             && mouse.is_current(&event)
         {
-            tracing::warn!(target: "openuuyc::transport::rtc::input", %error, "mouse input transport failed");
+            use crate::features::remote_input::InputEvent;
+            let kind = match event.event {
+                InputEvent::Key { .. } => "keyboard",
+                InputEvent::Button { .. } | InputEvent::AssistButton { .. } => "button",
+                InputEvent::Relative { .. }
+                | InputEvent::Absolute { .. }
+                | InputEvent::Correction { .. } => "movement",
+                InputEvent::Wheel { .. } => "wheel",
+                InputEvent::Heartbeat => "keyboard_heartbeat",
+            };
+            tracing::warn!(target: "openuuyc::transport::rtc::input", %error, input_kind=kind,
+                carrier=if kcp.is_negotiated(){"mixed_kcp"}else{"sctp"},
+                worker_stage=kcp.worker_stage(), "remote input transport failed");
         }
         if !keyboard_submission_seen
             && result.is_ok()

@@ -1,6 +1,6 @@
 [package]
 name = "openuuyc"
-version = "1.0.0-alpha.9"
+version = "1.0.0-alpha.10"
 edition = "2024"
 description = "Third-party Rust client for UU Remote protocol interoperability"
 license-file = "LICENSE"
@@ -80,6 +80,11 @@ openuuyc-amf-sys = { path = "vendor/amf-sys" }
 openuuyc-vpl-sys = { path = "vendor/vpl-sys" }
 egui-directx11 = { path = "vendor/egui-directx11" }
 windows = { version = "0.62.2", default-features = false, features = [
+    "Foundation",
+    "Data_Xml_Dom",
+    "UI_Notifications",
+    "Win32_System_WinRT",
+    "Win32_System_Variant",
     "Win32_Devices_Display",
     "Win32_Devices_DeviceAndDriverInstallation",
     "Win32_System_IO",
@@ -149,6 +154,9 @@ x11rb = { version = "0.13", features = ["randr", "shm", "xfixes", "xtest"] }
 # zbus must stay on async-io: its tokio feature is global, and makes the
 # blocking Secret Service calls of the keyring panic inside our runtime.
 ksni = { version = "0.3.6", default-features = false, features = ["blocking", "async-io"] }
+# Desktop notifications (org.freedesktop.Notifications), the counterpart of
+# Windows toasts; the same async-io zbus as above.
+zbus = { version = "5.19", default-features = false, features = ["async-io", "blocking-api"] }
 # Host capture through the XDG ScreenCast portal (Wayland, and X11 on request).
 ashpd = { version = "0.13.13", default-features = false, features = ["async-io", "screencast"] }
 pollster = "0.4"

@@ -4,6 +4,7 @@
 pub(crate) mod capture;
 pub(crate) mod cuda;
 pub(crate) mod cursor_shape;
+pub(crate) mod deadline;
 pub(crate) mod decoder;
 pub(crate) mod device_profile;
 pub(crate) mod display;
@@ -13,6 +14,7 @@ pub(crate) mod graphics;
 pub(crate) mod host_service;
 pub(crate) mod input;
 pub(crate) mod loopback;
+pub(crate) mod notifications;
 pub(crate) mod nvenc;
 mod software_encoder;
 pub(crate) mod surface;

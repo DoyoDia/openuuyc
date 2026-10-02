@@ -39,33 +39,26 @@ pub(crate) fn send(items: &[INPUT]) -> Result<()> {
     Ok(())
 }
 pub(crate) fn key_input(key: u16, down: bool) -> INPUT {
-    unsafe {
-        let thread = GetWindowThreadProcessId(GetForegroundWindow(), None);
-        let scan = MapVirtualKeyExW(
-            u32::from(key),
-            MAPVK_VK_TO_VSC_EX,
-            Some(GetKeyboardLayout(thread)),
-        );
-        let mut flags = if down {
-            KEYBD_EVENT_FLAGS(0)
-        } else {
-            KEYEVENTF_KEYUP
-        };
-        if scan & 0xff00 == 0xe000 {
-            flags |= KEYEVENTF_EXTENDEDKEY;
-        }
-        INPUT {
-            r#type: INPUT_KEYBOARD,
-            Anonymous: INPUT_0 {
-                ki: KEYBDINPUT {
-                    wVk: VIRTUAL_KEY(key),
-                    wScan: scan as u16 & 0xff,
-                    dwFlags: flags,
-                    time: 0,
-                    dwExtraInfo: INPUT_MARKER,
-                },
+    let scan = super::keyboard::scan_code(key);
+    let mut flags = if down {
+        KEYBD_EVENT_FLAGS(0)
+    } else {
+        KEYEVENTF_KEYUP
+    };
+    if scan & 0xff00 == 0xe000 {
+        flags |= KEYEVENTF_EXTENDEDKEY;
+    }
+    INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VIRTUAL_KEY(key),
+                wScan: scan & 0xff,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: INPUT_MARKER,
             },
-        }
+        },
     }
 }
 pub(crate) fn keyboard(key: u16, down: bool) -> Result<()> {

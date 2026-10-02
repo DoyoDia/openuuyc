@@ -25,6 +25,7 @@ pub(crate) fn open(
         config: crate::ui::WindowConfig {
             viewport,
             centered: true,
+            notification: false,
         },
         factory: Box::new(move |ctx, _| {
             theme::configure(ctx);

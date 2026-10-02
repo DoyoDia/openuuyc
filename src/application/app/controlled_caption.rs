@@ -12,7 +12,7 @@ impl DeviceCenterApp {
     }
 }
 
-fn caption(
+pub(super) fn caption(
     status: &crate::features::host::Status,
     devices: Option<&crate::account::api::DeviceList>,
     catalog: Option<&super::catalog::Catalog>,
@@ -103,7 +103,7 @@ fn clean_name(name: &str) -> String {
         .to_owned()
 }
 
-fn duration(seconds: u64) -> String {
+pub(super) fn duration(seconds: u64) -> String {
     if seconds >= 3600 {
         format!(
             "{}:{:02}:{:02}",

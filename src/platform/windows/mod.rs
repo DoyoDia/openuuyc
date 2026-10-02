@@ -16,6 +16,7 @@ pub(crate) mod gpu_conversion;
 pub(crate) mod host_service;
 pub(crate) mod input;
 pub(crate) mod loopback;
+pub(crate) mod notifications;
 pub(crate) mod nvenc;
 pub(crate) mod preprocess;
 pub(crate) mod qsv;

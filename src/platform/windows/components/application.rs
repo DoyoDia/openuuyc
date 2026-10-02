@@ -287,10 +287,12 @@ pub(crate) fn request_uninstall(removal: super::RemovalOptions) -> Result<bool> 
             crate::account::auth::restore_portable()?;
         }
     }
+    let notification_image = image()?;
     let args = format!("component application uninstall{}", removal.arguments());
     let reboot = super::elevate(&args, super::Kind::Application)?;
     startup::set(false)?;
     integration::shortcuts(false)?;
+    crate::platform::windows::notifications::unregister(&notification_image)?;
     if removal.remove_data && !reboot {
         data::user()?;
     }

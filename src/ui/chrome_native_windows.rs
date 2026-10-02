@@ -9,13 +9,14 @@ use windows::Win32::Graphics::Dwm::{
     DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DWMWCP_ROUNDSMALL, DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{
-    DC_BRUSH, FillRect, GetDC, GetStockObject, HBRUSH, HDC, ReleaseDC, SetDCBrushColor,
+    DC_BRUSH, FillRect, GetDC, GetMonitorInfoW, GetStockObject, HBRUSH, HDC,
+    MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint, ReleaseDC, SetDCBrushColor,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetClientRect, WM_ERASEBKGND, WM_NCCALCSIZE, WM_NCDESTROY,
+    GetClientRect, WM_ERASEBKGND, WM_MOVING, WM_NCCALCSIZE, WM_NCDESTROY,
 };
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::window::{Fullscreen, ResizeDirection, Window};
@@ -116,6 +117,19 @@ unsafe extern "system" fn backdrop_proc(
 ) -> LRESULT {
     unsafe {
         match message {
+            WM_MOVING if data == 0 && lparam.0 != 0 => {
+                let mut cursor = POINT::default();
+                if GetCursorPos(&raw mut cursor).is_ok() {
+                    let rect = &mut *(lparam.0 as *mut RECT);
+                    let position =
+                        constrain_drag_position(PhysicalPosition::new(rect.left, rect.top), cursor);
+                    rect.bottom = rect
+                        .bottom
+                        .saturating_add(position.y.saturating_sub(rect.top));
+                    rect.top = position.y;
+                    return LRESULT(1);
+                }
+            }
             WM_NCCALCSIZE if data != 0 && wparam.0 != 0 => {
                 // Keep the proposed full window rectangle as the client area.
                 // Normal maximization still delegates to winit's rcWork logic.
@@ -156,6 +170,24 @@ unsafe fn paint_backdrop(hwnd: HWND, dc: HDC) {
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct WindowMoveState {
     start: Option<(POINT, PhysicalPosition<i32>)>,
+}
+
+pub(crate) fn constrain_drag_position(
+    position: PhysicalPosition<i32>,
+    cursor: POINT,
+) -> PhysicalPosition<i32> {
+    // Follow the pointer's destination monitor, including monitors above the
+    // primary display. Work-area coordinates also account for a top taskbar.
+    let monitor = unsafe { MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST) };
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if unsafe { GetMonitorInfoW(monitor, &raw mut info) }.as_bool() {
+        PhysicalPosition::new(position.x, position.y.max(info.rcWork.top))
+    } else {
+        position
+    }
 }
 
 pub(crate) fn update_nonmodal_window_move(
@@ -201,9 +233,12 @@ pub(crate) fn update_nonmodal_window_move(
         let mut cursor = POINT::default();
         if unsafe { GetCursorPos(&raw mut cursor) }.is_ok() {
             let started = Instant::now();
-            window.set_outer_position(PhysicalPosition::new(
-                origin.x.saturating_add(cursor.x - start_cursor.x),
-                origin.y.saturating_add(cursor.y - start_cursor.y),
+            window.set_outer_position(constrain_drag_position(
+                PhysicalPosition::new(
+                    origin.x.saturating_add(cursor.x - start_cursor.x),
+                    origin.y.saturating_add(cursor.y - start_cursor.y),
+                ),
+                cursor,
             ));
             let elapsed = started.elapsed();
             if elapsed >= Duration::from_millis(50) {

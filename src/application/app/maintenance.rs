@@ -138,6 +138,7 @@ fn run(uninstall: bool) -> Result<()> {
                 .with_inner_size(crate::ui::theme::MAINTENANCE_WINDOW_SIZE)
                 .with_resizable(false),
             centered: true,
+            notification: false,
         },
         Box::new(move |ctx, _| {
             super::view::configure_visuals(ctx);

@@ -79,6 +79,7 @@ struct DesktopWindow {
     last_frame: Option<Instant>,
     interval: Duration,
     window: Arc<Window>,
+    notification: bool,
 }
 
 impl Drop for DesktopWindow {
@@ -109,7 +110,11 @@ impl Runner {
         // WindowConfig sizes describe page content; the shared caption occupies
         // client space now, so preserve the page's requested and minimum size.
         let mut viewport_builder = self.config.viewport.clone();
-        let caption_height = super::chrome::title_bar_height();
+        let caption_height = if self.config.notification {
+            0.0
+        } else {
+            super::chrome::title_bar_height()
+        };
         if let Some(size) = &mut viewport_builder.inner_size {
             size.y += caption_height;
         }
@@ -127,6 +132,9 @@ impl Runner {
         )?);
         super::chrome::configure_dwm_window(&window);
         super::branding::set_taskbar_icon(&window);
+        if self.config.notification {
+            crate::platform::notifications::place(&window, true)?;
+        }
         if self.config.centered
             && let Some(monitor) = window.current_monitor()
         {
@@ -206,6 +214,7 @@ impl Runner {
             last_frame: None,
             interval: Duration::from_secs_f64(1000.0 / f64::from(refresh)),
             window,
+            notification: self.config.notification,
         });
         let state = self.state.as_mut().expect("created desktop state");
         state.render()?;
@@ -268,7 +277,7 @@ impl DesktopWindow {
                     None,
                 );
             });
-            if self.window.fullscreen().is_none() {
+            if !self.notification && self.window.fullscreen().is_none() {
                 let alert = self.app.0.title_bar_alert();
                 super::chrome::title_bar_panel_alert(
                     ui,
@@ -424,6 +433,9 @@ impl ApplicationHandler<Event> for Runner {
             }
             WindowEvent::Resized(size) => {
                 state.schedule(Instant::now());
+                if state.notification {
+                    let _ = crate::platform::notifications::place(&state.window, false);
+                }
                 state.presenter.resize(size)
             }
             WindowEvent::RedrawRequested => state.render(),
@@ -610,7 +622,9 @@ impl ApplicationHandler<Event> for Windows {
                 factory,
             }) => {
                 if self.windows.contains_key(&key) {
-                    self.focus(&key);
+                    if !config.notification {
+                        self.focus(&key);
+                    }
                     return;
                 }
                 let mut window = Runner {

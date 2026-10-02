@@ -588,12 +588,12 @@ impl ApplicationHandler<UiEvent> for ConnectingWindowsRunner {
     fn device_event(
         &mut self,
         _event_loop: &ActiveEventLoop,
-        _device: DeviceId,
+        device: DeviceId,
         event: DeviceEvent,
     ) {
         // Raw motion is the only pointer source once the pointer is locked.
         if let Stage::Playing(player) = &mut self.stage
-            && player.on_device_event(&event)
+            && player.on_device_event(device, &event)
         {
             self.schedule(Instant::now());
         }
@@ -691,6 +691,9 @@ struct Player {
     focused: bool,
     /// Sub-pixel motion carried between raw events.
     motion_remainder: [f64; 2],
+    /// Report rate per physical mouse, for the high polling-rate notice.
+    polling: crate::features::remote_input::polling::Monitor,
+    polling_origin: Instant,
     /// Throttles the pointer diagnostics, which stay off unless
     /// `openuuyc::viewer::input` is enabled at debug.
     diagnostics_at: [Option<Instant>; 2],
@@ -731,6 +734,8 @@ impl Player {
             pointer_locked: false,
             focused: true,
             motion_remainder: [0.0, 0.0],
+            polling: Default::default(),
+            polling_origin: Instant::now(),
             diagnostics_at: [None; 2],
             hidden_since: None,
         })
@@ -861,6 +866,13 @@ impl Player {
                 &self.session.performance,
                 &snapshot,
                 "linux-player",
+            );
+        }
+        if self.focused && !self.stream_control_ui.open {
+            super::polling_warning::show(
+                ui.ctx(),
+                self.session.stream_control.mouse(),
+                ui.available_rect_before_wrap(),
             );
         }
         self.update_pointer_lock(window);
@@ -1079,18 +1091,35 @@ impl Player {
     }
 
     /// Raw pointer motion, used while the remote drives its own cursor.
-    fn on_device_event(&mut self, event: &DeviceEvent) -> bool {
+    fn on_device_event(&mut self, device: DeviceId, event: &DeviceEvent) -> bool {
+        if let DeviceEvent::Removed = event {
+            self.polling.interrupt();
+            self.polling.remove(device_key(device));
+            return false;
+        }
         let DeviceEvent::MouseMotion { delta } = event else {
             return false;
         };
-        {
-            let input = self.input();
-            if !input.relative_mode()
-                || input.mode() == MouseMode::View
-                || input.waiting_for_neutral()
+        let input = self.input();
+        if input.mode() == MouseMode::View || input.waiting_for_neutral() {
+            return false;
+        }
+        let relative = input.relative_mode();
+        // Like the Windows viewer, rate every physical report while in
+        // control, relative or not, per device.
+        if self.focused && (delta.0 != 0.0 || delta.1 != 0.0) {
+            // winit gives no event timestamp; arrival time stands in for the
+            // message time Windows reports.
+            let message_ms = self.polling_origin.elapsed().as_millis() as u32;
+            if let Some(hz) = self
+                .polling
+                .observe(device_key(device), message_ms, Instant::now())
             {
-                return false;
+                self.input().warn_high_polling(hz);
             }
+        }
+        if !relative {
+            return false;
         }
         // Whole pixels go out now; the fraction waits for the next event so slow
         // movement is not rounded away.
@@ -1160,6 +1189,8 @@ impl Player {
     fn on_focus_changed(&mut self, window: &Arc<Window>, focused: bool) {
         self.focused = focused;
         if !focused {
+            // Reports resume from a fresh window after focus returns.
+            self.polling.interrupt();
             self.release_pointer(window);
             // A key released while another window has focus never reaches us.
             self.release_keys();
@@ -1570,4 +1601,12 @@ fn restore_video_window_constraints(window: &Window) {
     window.set_resizable(true);
     window.set_enabled_buttons(winit::window::WindowButtons::all());
     window.set_min_inner_size(Some(LogicalSize::new(760.0, 520.0)));
+}
+
+/// A nonzero key for a winit input device, for the per-device rate monitor.
+fn device_key(device: DeviceId) -> usize {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    device.hash(&mut hasher);
+    (hasher.finish() as usize).max(1)
 }

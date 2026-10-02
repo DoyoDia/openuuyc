@@ -100,6 +100,10 @@ pub(super) enum MutationOutcome {
 }
 
 pub(super) enum GuiEvent {
+    HostAssistFailed {
+        generation: u64,
+        error: String,
+    },
     ExitReady(std::result::Result<(), String>),
     Host(u64, crate::features::host::Handle),
     Viewer(

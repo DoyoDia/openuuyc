@@ -220,6 +220,7 @@ pub(super) async fn run_viewer_connection_owner(
         let mut display = cancellable(cancel, async { display_receiver.await.context("player display was not created") }).await?;
         let (switch_sender, mut switch_receiver) = tokio::sync::mpsc::channel::<crate::application::viewer::device_switch::SwitchRequest>(1);
         let mut retries = 0;
+        let mut update_started = None;
         loop {
             monitor.send_replace(None);
             target.send_replace(Some(windows::ViewerTarget {
@@ -248,6 +249,10 @@ pub(super) async fn run_viewer_connection_owner(
             let switcher = crate::application::viewer::device_switch::DeviceSwitcher::new(
                 Arc::clone(&resolved.client), resolved.target_device_id.clone(), switch_sender.clone(), cancel.clone());
             let session_control = controller.stream_control_handle();
+            // Marked host input is valid when controlling another device from
+            // this desktop. Keep it out of an actual local loopback session.
+            session_control.mouse().set_host_input_allowed(
+                resolved.target_device_id != resolved.client.device_id());
             session_control.request_audio_only(resolved.profile.audio_only);
             let mut modes = session_control.audio_mode_requests();
             let mut audio_only = resolved.profile.audio_only;
@@ -263,7 +268,7 @@ pub(super) async fn run_viewer_connection_owner(
                     if update_attempt && !cancel.is_cancelled() && retry_session_failure(&error) && retries<5 {
                         retries+=1;
                         resolved.refresh_after_upgrade=true;
-                        display=update_reconnect_display(&resolved,reporter,cancel,&viewer_sender).await?;
+                        display=update_reconnect_display(&resolved,reporter,cancel,&viewer_sender,update_started.context("更新等待状态已丢失")?).await?;
                         cancellable(cancel,async {tokio::time::sleep(crate::features::remote_upgrade::UPDATE_PROBE_INTERVAL).await;Ok(())}).await?;
                         continue;
                     }
@@ -275,7 +280,7 @@ pub(super) async fn run_viewer_connection_owner(
                 viewer_sender.send(ViewerWindowEvent::Listening(crate::application::viewer::AudioView::new(session_control.clone(), None)))
                     .map_err(|_| anyhow!("音频窗口已关闭"))?;
             }
-            if update_attempt {tracing::info!("media resumed after controlled update");}
+            if update_attempt {tracing::info!("media resumed after controlled update");update_started=None;}
             retries=0;
             if !cancel.is_cancelled() && let Some(assist) = &mut resolved.assist
                 && let Err(error) = assist.remember_success(&resolved.client).await {
@@ -399,7 +404,8 @@ pub(super) async fn run_viewer_connection_owner(
                 retries = 0;
                 continue;
             }
-            if upgrade.as_ref().is_some_and(|upgrade| upgrade.started()) {
+            if let Some(started) = upgrade.as_ref().and_then(|upgrade| upgrade.started_at()) {
+                update_started = Some(started);
                 // A preceding update-start notice makes loss of the OLD room
                 // expected. Once it ends, immediately check readiness instead of
                 // waiting out a UI countdown. Ordinary room leave remains final.
@@ -410,7 +416,7 @@ pub(super) async fn run_viewer_connection_owner(
                 resolved.refresh_after_upgrade = true;
                 resolved.takeover = None;
                 retries = 0;
-                display = update_reconnect_display(&resolved,reporter,cancel,&viewer_sender).await?;
+                display = update_reconnect_display(&resolved,reporter,cancel,&viewer_sender,started).await?;
                 continue;
             }
             if let Some(upgrade) = &upgrade { upgrade.retire(); }
@@ -454,17 +460,14 @@ async fn update_reconnect_display(
     reporter: &mut ConnectionProgressReporter,
     cancel: &CancellationToken,
     sender: &std::sync::mpsc::Sender<ViewerWindowEvent>,
+    update_started: std::time::Instant,
 ) -> Result<ViewerDisplayHandle> {
     let (progress_tx, progress_rx) = std::sync::mpsc::channel();
     let (display_tx, display_rx) = oneshot::channel();
     *reporter = Arc::new(move |progress| {
         let _ = progress_tx.send(progress);
     });
-    reporter(ConnectionProgress::working(
-        1,
-        "等待被控端更新完成",
-        format!("正在检查 {} 的连接状态", resolved.summary.alias),
-    ));
+    reporter(ConnectionProgress::updating(update_started));
     if let Some(background) = resolved.background.clone() {
         reporter(ConnectionProgress::background(background));
     }

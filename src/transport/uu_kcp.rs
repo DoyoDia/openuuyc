@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{self, Write};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -35,6 +36,7 @@ const RECOVERY_INFO_INTERVAL: Duration = Duration::from_millis(500);
 const FEC_NETWORK_UPDATE_INTERVAL: Duration = Duration::from_millis(1_000);
 const BINARY_MESSAGE: u16 = 1;
 const CONTROL_SEND_WINDOW: u16 = 256;
+const CONTROL_RECEIVE_WINDOW: u16 = 256;
 
 const CMD_PUSH: u8 = 81;
 const CMD_ACK: u8 = 82;
@@ -48,6 +50,17 @@ pub(crate) struct UuKcpControl {
     state: Arc<StdMutex<ControlState>>,
     control_streams: Arc<StdMutex<HashSet<u16>>>,
     send_failure: Arc<StdMutex<Option<(Instant, String)>>>,
+    progress: Arc<AtomicU8>,
+}
+
+#[repr(u8)]
+enum Progress {
+    Inactive,
+    Idle,
+    Window,
+    Processing,
+    Writing,
+    Delivering,
 }
 
 #[derive(Default)]
@@ -73,6 +86,16 @@ enum WorkerCommand {
 }
 
 impl UuKcpControl {
+    pub(crate) fn worker_stage(&self) -> &'static str {
+        match self.progress.load(Ordering::Relaxed) {
+            1 => "idle",
+            2 => "waiting_for_kcp_window",
+            3 => "processing_kcp",
+            4 => "writing_dtls",
+            5 => "delivering_peer_control",
+            _ => "inactive",
+        }
+    }
     pub(crate) fn send_failure_reason(&self) -> Option<String> {
         lock(&self.send_failure)
             .as_ref()
@@ -134,6 +157,7 @@ impl UuKcpControl {
         let shared_state = Arc::clone(&self.state);
         let control_streams = Arc::clone(&self.control_streams);
         let send_failure = Arc::clone(&self.send_failure);
+        let progress = Arc::clone(&self.progress);
         *lock(&send_failure) = None;
         state.task = Some(tokio::spawn(async move {
             // DcKcpTransport::Start configures the KCP object and its task,
@@ -159,7 +183,7 @@ impl UuKcpControl {
                     tokio::select! {
                         biased;
                         _ = &mut canceled => Ok(()),
-                        result = run_worker(Arc::clone(&endpoint), version, receiver, stream_control, control_streams, send_failure) => result,
+                        result = run_worker(Arc::clone(&endpoint), version, receiver, stream_control, control_streams, send_failure, progress.clone()) => result,
                     }
                 } else {
                     Ok(())
@@ -174,6 +198,7 @@ impl UuKcpControl {
             if state.generation == generation {
                 // Worker failure does not renegotiate the wire protocol.
                 state.sender = None;
+                progress.store(Progress::Inactive as u8, Ordering::Relaxed);
             }
             drop(state);
             if let Err(error) = result {
@@ -301,6 +326,8 @@ struct Worker {
     control_streams: Arc<StdMutex<HashSet<u16>>>,
     send_failure: Arc<StdMutex<Option<(Instant, String)>>>,
     last_send_warning: Option<Instant>,
+    progress: Arc<AtomicU8>,
+    last_peer_input: Option<Instant>,
 }
 
 struct WirePacket {
@@ -322,6 +349,7 @@ async fn run_worker(
     stream_control: ControlReceiver,
     control_streams: Arc<StdMutex<HashSet<u16>>>,
     send_failure: Arc<StdMutex<Option<(Instant, String)>>>,
+    progress: Arc<AtomicU8>,
 ) -> Result<()> {
     let output_packets = Arc::new(StdMutex::new(VecDeque::new()));
     let mut kcp = Kcp::new(
@@ -332,7 +360,7 @@ async fn run_worker(
     );
     kcp.set_mtu(KCP_STANDARD_MTU)
         .context("configure UU mixed-KCP MTU")?;
-    kcp.set_wndsize(CONTROL_SEND_WINDOW, 256);
+    kcp.set_wndsize(CONTROL_SEND_WINDOW, CONTROL_RECEIVE_WINDOW);
     // UU configures nodelay(1, 5, 2, 1). The local KCP fork preserves its
     // two-millisecond lower clamp instead of upstream KCP's ten milliseconds.
     kcp.set_nodelay(true, 5, 2, true);
@@ -360,6 +388,8 @@ async fn run_worker(
         control_streams,
         send_failure,
         last_send_warning: None,
+        progress,
+        last_peer_input: None,
     };
     worker
         .kcp
@@ -371,7 +401,7 @@ async fn run_worker(
         conversation = KCP_CONVERSATION,
         wire_mtu = KCP_WIRE_MTU,
         send_window = CONTROL_SEND_WINDOW,
-        receive_window = 256,
+        receive_window = CONTROL_RECEIVE_WINDOW,
         "UU mixed-KCP control transport started"
     );
 
@@ -379,7 +409,12 @@ async fn run_worker(
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut receive_buffer = vec![0_u8; 65_536];
     let mut pending = None;
+    let mut pending_since = Instant::now();
+    let mut wait_reported = false;
     loop {
+        worker
+            .progress
+            .store(Progress::Idle as u8, Ordering::Relaxed);
         if let Some(WorkerCommand::Send {
             stream_id,
             payload,
@@ -399,6 +434,19 @@ async fn run_worker(
                 && !release
                 && worker.kcp.wait_snd() >= usize::from(CONTROL_SEND_WINDOW)
             {
+                worker
+                    .progress
+                    .store(Progress::Window as u8, Ordering::Relaxed);
+                if !wait_reported && pending_since.elapsed() >= Duration::from_millis(250) {
+                    tracing::warn!(
+                        stream_id, waiting_ms = pending_since.elapsed().as_millis() as u64,
+                        outstanding = worker.kcp.wait_snd(), remote_window = worker.kcp.rmt_wnd(),
+                        kcp_srtt_ms = worker.kcp.rx_srtt(),
+                        last_peer_input_ms = ?worker.last_peer_input.map(|at| at.elapsed().as_millis() as u64),
+                        "input blocked waiting for mixed-KCP send window"
+                    );
+                    wait_reported = true;
+                }
                 pending = Some(WorkerCommand::Send {
                     stream_id,
                     payload,
@@ -407,6 +455,9 @@ async fn run_worker(
                     result,
                 });
             } else {
+                worker
+                    .progress
+                    .store(Progress::Processing as u8, Ordering::Relaxed);
                 let outcome = match worker.send_message(stream_id, &payload) {
                     Ok(bytes) => worker.flush_output(&endpoint).await.map(|()| bytes),
                     Err(error) => Err(error),
@@ -418,15 +469,19 @@ async fn run_worker(
             command = commands.recv(), if pending.is_none() => {
                 let Some(command) = command else { break; };
                 pending = Some(command);
+                pending_since = Instant::now();
+                wait_reported = false;
             }
             received = endpoint.recv(&mut receive_buffer) => {
                 let size = received.context("receive UU mixed-KCP datagram")?;
+                worker.progress.store(Progress::Processing as u8, Ordering::Relaxed);
                 if let Err(error) = worker.receive_datagram(&receive_buffer[..size], &stream_control) {
                     tracing::warn!(%error, bytes = size, "discarding invalid UU mixed-KCP datagram");
                 }
                 worker.flush_output(&endpoint).await?;
             }
             _ = tick.tick() => {
+                worker.progress.store(Progress::Processing as u8, Ordering::Relaxed);
                 worker.on_tick()?;
                 worker.flush_output(&endpoint).await?;
             }
@@ -490,7 +545,12 @@ impl Worker {
                 wire = %hex_prefix(&packet.data, 96),
                 "sending UU mixed-KCP datagram"
             );
-            if let Err(error) = endpoint.send(&packet.data).await {
+            self.progress
+                .store(Progress::Writing as u8, Ordering::Relaxed);
+            let sent = endpoint.send(&packet.data).await;
+            self.progress
+                .store(Progress::Processing as u8, Ordering::Relaxed);
+            if let Err(error) = sent {
                 // DcKcpTransport::SendPacket keeps KCP alive across temporary
                 // transport failures; its send buffer owns PUSH retransmission.
                 let now = Instant::now();
@@ -675,21 +735,14 @@ impl Worker {
             ),
             "unsupported UU mixed-KCP command {wire_command}"
         );
-        if matches!(wire_command, CMD_PUSH | CMD_RESEND_PUSH | CMD_FEC_DUPLICATE) {
-            if !recovered_by_fec {
-                self.last_remote_header = Some(RemoteHeader {
-                    window: read_u16(wire, 10)?,
-                    timestamp: read_u32(wire, 12)?,
-                    una: read_u32(wire, 20)?,
-                });
-            }
-        }
-
         let mut standard = wire[4..].to_vec();
         if matches!(wire_command, CMD_RESEND_PUSH | CMD_FEC_DUPLICATE) {
             standard[4] = CMD_PUSH;
         }
         if recovered_by_fec || wire_command == CMD_FEC_DUPLICATE {
+            // Repairs contain normalized (zeroed) flow-control metadata. Restore
+            // from the real peer header BEFORE input; CMD88 must never overwrite
+            // that cache with its own zeros and close an otherwise open window.
             let header = self.last_remote_header.unwrap_or(RemoteHeader {
                 window: 256,
                 timestamp: self.now_ms(),
@@ -700,9 +753,27 @@ impl Worker {
             standard[16..20].copy_from_slice(&header.una.to_le_bytes());
         }
         let accepted = self.kcp.accepted_segments();
+        let receive_next = self.kcp.receive_next();
         self.kcp
             .input(&standard)
             .context("input UU mixed-KCP segment")?;
+        // Official input remembers headers only for eligible PUSH/retransmits.
+        // A rejected/out-of-window packet or a synthesized repair is not a new
+        // peer advertisement, even if its payload is a duplicate.
+        if !recovered_by_fec
+            && matches!(wire_command, CMD_PUSH | CMD_RESEND_PUSH)
+            && (read_u32(wire, 16)?.wrapping_sub(receive_next) as i32)
+                < i32::from(CONTROL_RECEIVE_WINDOW)
+        {
+            self.last_remote_header = Some(RemoteHeader {
+                window: read_u16(wire, 10)?,
+                timestamp: read_u32(wire, 12)?,
+                una: read_u32(wire, 20)?,
+            });
+        }
+        if !recovered_by_fec {
+            self.last_peer_input = Some(Instant::now());
+        }
         if self.kcp.accepted_segments() != accepted {
             self.recovery
                 .record_received(read_u32(wire, 16)?, wire_command, recovered_by_fec);
@@ -739,7 +810,12 @@ impl Worker {
                 );
                 continue;
             }
-            if let Err(error) = stream_control(stream_id, &message) {
+            self.progress
+                .store(Progress::Delivering as u8, Ordering::Relaxed);
+            let delivered = stream_control(stream_id, &message);
+            self.progress
+                .store(Progress::Processing as u8, Ordering::Relaxed);
+            if let Err(error) = delivered {
                 // F91D10 discards an invalid application message, without
                 // interrupting delivery of subsequent transport messages.
                 tracing::warn!(%error, stream_id, bytes = message.len(), "invalid UU CONTROL protobuf from mixed-KCP");

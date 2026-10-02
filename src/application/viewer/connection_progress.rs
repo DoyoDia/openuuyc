@@ -167,6 +167,20 @@ impl ConnectionProgressApp {
         if let Some(texture) = &texture {
             controls::connection_wallpaper(ui, texture, self.details_open);
         }
+        if let Some(started) = self.update_started {
+            // Keep one update presentation across readiness probes, room join,
+            // decoder startup and the final wait for the first presented frame.
+            // Player drops this backdrop only when presentation actually starts.
+            if texture.is_none() {
+                ui.painter()
+                    .rect_filled(ui.available_rect_before_wrap(), 0., theme::BG);
+            }
+            if crate::features::remote_upgrade::progress_prompt(&ctx, started) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            ctx.request_repaint_after(Duration::from_millis(200));
+            return;
+        }
         if !failed {
             ctx.request_repaint_after(Duration::from_millis(33));
         }

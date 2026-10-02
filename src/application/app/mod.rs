@@ -25,6 +25,7 @@ mod controlled_caption;
 pub(crate) mod device_status;
 mod device_sync;
 mod diagnostics;
+pub(crate) mod notifications;
 
 pub mod instance;
 #[cfg(windows)]
@@ -68,6 +69,7 @@ pub fn run(options: GuiOptions) -> Result<()> {
         crate::ui::WindowConfig {
             viewport,
             centered: true,
+            notification: false,
         },
         Box::new(move |ctx, graphics| {
             configure_visuals(ctx);
@@ -79,6 +81,13 @@ pub fn run(options: GuiOptions) -> Result<()> {
             Box::new(app)
         }),
     )
+}
+/// A Windows toast button relaunches the program with its protocol URI; Linux
+/// desktop notifications report their actions to the running process.
+#[cfg(windows)]
+pub fn notification_activation(uri: &str) -> Result<()> {
+    notifications::Action::parse(uri)?;
+    instance::deliver_notification(uri)
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -157,6 +166,7 @@ struct DeviceCenterApp {
     media: ConnectionMediaOptions,
     presence: PresenceState,
     host: Option<crate::features::host::Handle>,
+    notifications: notifications::Center,
     status: StatusMessage,
     refreshed_at: Option<Instant>,
     refresh_pending: bool,
@@ -212,6 +222,7 @@ impl DeviceCenterApp {
             media,
             presence: PresenceState::Connecting,
             host: None,
+            notifications: notifications::Center::new(ctx),
             status: display_warning.map_or_else(
                 || StatusMessage::info("正在读取设备并建立本机在线状态"),
                 StatusMessage::warning,
@@ -407,6 +418,11 @@ impl DeviceCenterApp {
                     self.login_restore_error(&message);
                     self.refresh_pending = false;
                     self.status = StatusMessage::error(message);
+                }
+                GuiEvent::HostAssistFailed { generation, error } => {
+                    if generation == self.login_generation {
+                        self.notifications.report(error);
+                    }
                 }
                 GuiEvent::SessionUnavailable(message) => {
                     self.clear_catalog();
@@ -1175,6 +1191,7 @@ impl crate::ui::App for DeviceCenterApp {
     fn ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         self.drain_events(&ctx);
+        self.tick_notifications();
         self.tick_power();
         self.draw_center(ui);
         self.draw_dialogs(&ctx);

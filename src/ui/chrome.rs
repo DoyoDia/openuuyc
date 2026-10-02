@@ -15,6 +15,10 @@ pub(crate) use native::{
     WindowMoveState, WindowResizeState, cancel_pointer_operation, configure_dwm_window,
     set_fullscreen, update_nonmodal_window_move, update_nonmodal_window_resize,
 };
+// Windows positions borderless windows itself and keeps them below the work
+// area's top; X11 and Wayland window managers do that on their own.
+#[cfg(windows)]
+pub(crate) use native::constrain_drag_position;
 
 pub(crate) struct TitleBarAlert {
     pub source: String,

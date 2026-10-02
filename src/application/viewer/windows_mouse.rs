@@ -4,12 +4,16 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use windows::Win32::Foundation::{HWND, POINT};
 use windows::Win32::Graphics::Gdi::{ClientToScreen, ScreenToClient};
+use windows::Win32::System::SystemInformation::GetTickCount64;
 use windows::Win32::UI::Input::{
     GetRawInputData, HRAWINPUT, RAWINPUT, RAWINPUTHEADER, RAWMOUSE, RID_HEADER, RID_INPUT,
     RIM_TYPEMOUSE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetCursorPos, GetForegroundWindow, MSG, PostMessageW, WM_INPUT, WM_INPUT_DEVICE_CHANGE, WM_NULL,
+    GetCursorPos, GetForegroundWindow, MSG, PostMessageW, WM_INPUT, WM_INPUT_DEVICE_CHANGE,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP,
+    WM_MOUSEMOVE, WM_NULL, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_XBUTTONDBLCLK,
+    WM_XBUTTONDOWN, WM_XBUTTONUP,
 };
 use winit::event_loop::ActiveEventLoop;
 use winit::window::{Cursor, CursorGrabMode, CursorIcon, CustomCursor, Window};
@@ -30,6 +34,21 @@ struct Target {
     output: [u32; 2],
     top: u32,
     resize_edges: bool,
+    raw_since: u64,
+}
+
+fn raw_belongs_to_activation(
+    message_time: u32,
+    activated_at: u64,
+    now: u64,
+    input_code: usize,
+) -> bool {
+    // WM_INPUT's code describes the foreground state when the input happened,
+    // not when we finally dispatch it. MSG.time uses the wrapping tick clock.
+    let age = (now as u32).wrapping_sub(message_time) as i32;
+    // Unwrap recent queued input relative to now, not to a potentially weeks-old
+    // activation. Clock quantization may put a fresh message just ahead of now.
+    input_code & 0xff == 0 && now.saturating_sub(age.max(0) as u64) >= activated_at
 }
 
 impl Target {
@@ -95,7 +114,11 @@ impl Target {
 }
 
 #[derive(Default)]
-pub(super) struct RawRouter(Mutex<Option<Target>>);
+pub(super) struct RawRouter(
+    Mutex<Option<Target>>,
+    Mutex<crate::features::remote_input::polling::Monitor>,
+    std::sync::atomic::AtomicBool,
+);
 
 pub(super) fn router() -> &'static Arc<RawRouter> {
     static ROUTER: OnceLock<Arc<RawRouter>> = OnceLock::new();
@@ -154,9 +177,6 @@ impl RawRouter {
         point.x >= rect.left && point.x < rect.right && point.y >= rect.top && point.y < rect.bottom
     }
     fn wheel(&self, owner: u64, delta: winit::event::MouseScrollDelta) {
-        if crate::platform::windows::input::system::own_message() {
-            return;
-        }
         let Some(target) = self.0.lock().unwrap_or_else(|p| p.into_inner()).clone() else {
             return;
         };
@@ -169,6 +189,9 @@ impl RawRouter {
             return;
         };
         let input = target.control.mouse();
+        if crate::platform::windows::input::system::own_message() && !input.accepts_host_input() {
+            return;
+        }
         if input.mode() == MouseMode::View || input.waiting_for_neutral() {
             return;
         }
@@ -188,15 +211,25 @@ impl RawRouter {
         input.wheel(owner, y, false);
     }
 
-    fn install(&self, target: Target) {
-        let previous = self
-            .0
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .replace(target.clone());
+    fn install(&self, mut target: Target) {
+        let previous = {
+            let mut slot = self.0.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(previous) = slot.as_ref().filter(|p| {
+                p.hwnd == target.hwnd
+                    && p.track == target.track
+                    && p.control.mouse().same_session(target.control.mouse())
+            }) {
+                target.raw_since = previous.raw_since;
+            } else {
+                target.raw_since = unsafe { GetTickCount64() };
+                self.2.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+            slot.replace(target.clone())
+        };
         if let Some(previous) = previous
             && previous.hwnd != target.hwnd
         {
+            self.1.lock().unwrap_or_else(|p| p.into_inner()).interrupt();
             previous.control.mouse().pause_owner(previous.owner());
         }
     }
@@ -214,6 +247,7 @@ impl RawRouter {
             }
         };
         if let Some(target) = old {
+            self.1.lock().unwrap_or_else(|p| p.into_inner()).interrupt();
             target.control.mouse().pause_owner(owner);
         }
     }
@@ -225,14 +259,46 @@ impl RawRouter {
             return false;
         }
         let msg = unsafe { &*pointer.cast::<MSG>() };
+        if msg.message == WM_MOUSEMOVE || host_button_flags(msg).is_some() {
+            self.host_message(msg);
+            return false;
+        }
         if msg.message != WM_INPUT && msg.message != WM_INPUT_DEVICE_CHANGE {
             return false;
         }
         let Some(target) = self.0.lock().unwrap_or_else(|p| p.into_inner()).clone() else {
             return false;
         };
-        if !target.focused() || msg.message == WM_INPUT_DEVICE_CHANGE {
+        if !target.focused() {
+            // A message can observe loss of foreground before winit delivers
+            // Focused(false). Retire the native target too, so regaining focus
+            // cannot reuse the previous activation's timestamp boundary.
+            self.clear(target.owner());
+            return false;
+        }
+        if msg.message == WM_INPUT_DEVICE_CHANGE {
+            let mut monitor = self.1.lock().unwrap_or_else(|p| p.into_inner());
+            monitor.interrupt();
+            monitor.remove(msg.lParam.0 as usize);
+            drop(monitor);
             target.control.mouse().pause_owner(target.owner());
+            return false;
+        }
+        if !raw_belongs_to_activation(
+            msg.time,
+            target.raw_since,
+            unsafe { GetTickCount64() },
+            msg.wParam.0,
+        ) {
+            if !self.2.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::debug!(
+                    background_input = msg.wParam.0 & 0xff != 0,
+                    age_ms = (unsafe { GetTickCount64() } as u32).wrapping_sub(msg.time),
+                    "discarded raw mouse report from before input activation"
+                );
+            }
+            // Preserve winit/DefWindowProc cleanup; never route old button edges
+            // or pointer movement into the newly active remote-input owner.
             return false;
         }
         let handle = HRAWINPUT(msg.lParam.0 as _);
@@ -272,13 +338,19 @@ impl RawRouter {
             return false;
         }
         let mouse = unsafe { raw.data.mouse };
-        if mouse.ulExtraInformation as usize
-            == crate::platform::windows::input::system::INPUT_MARKER
-        {
+        let host_input = mouse.ulExtraInformation as usize
+            == crate::platform::windows::input::system::INPUT_MARKER;
+        let input = target.control.mouse();
+        if host_input && (!input.accepts_host_input() || !input.relative_mode()) {
             return false;
         }
-        let flags = unsafe { mouse.Anonymous.Anonymous.usButtonFlags };
-        let input = target.control.mouse();
+        // Host-injected button edges have a single owner: the window-message
+        // route below. Raw motion remains authoritative in relative mode.
+        let flags = if host_input {
+            0
+        } else {
+            unsafe { mouse.Anonymous.Anonymous.usButtonFlags }
+        };
         let mode = input.mode();
         if mode == MouseMode::View {
             return false;
@@ -298,6 +370,20 @@ impl RawRouter {
             target.position(msg.pt, held)
         };
         let accepted = relative || position.is_some();
+        if !host_input
+            && accepted
+            && mouse.usFlags.0 & 1 == 0
+            && (mouse.lLastX != 0 || mouse.lLastY != 0)
+        {
+            let warning = self.1.lock().unwrap_or_else(|p| p.into_inner()).observe(
+                raw.header.hDevice.0 as usize,
+                msg.time,
+                std::time::Instant::now(),
+            );
+            if let Some(hz) = warning {
+                input.warn_high_polling(hz);
+            }
+        }
         if !relative {
             if let Some((screen, x, y)) = position {
                 input.absolute(target.owner(), screen, x, y);
@@ -327,6 +413,79 @@ impl RawRouter {
         // wheel source, as in the official window-event route.
         false
     }
+
+    fn host_message(&self, msg: &MSG) {
+        if !crate::platform::windows::input::system::own_message() {
+            return;
+        }
+        let Some(target) = self.0.lock().unwrap_or_else(|p| p.into_inner()).clone() else {
+            return;
+        };
+        let input = target.control.mouse();
+        if !target.focused()
+            || !input.accepts_host_input()
+            || !raw_belongs_to_activation(
+                msg.time,
+                target.raw_since,
+                unsafe { GetTickCount64() },
+                0,
+            )
+            || input.mode() == MouseMode::View
+        {
+            return;
+        }
+        let flags = host_button_flags(msg).unwrap_or(0);
+        if super::windows_keyboard::observe_mouse_buttons(target.owner(), flags)
+            || input.waiting_for_neutral()
+        {
+            return;
+        }
+        let relative = input.relative_mode();
+        let position = if relative {
+            None
+        } else {
+            target.position(msg.pt, input.owner_holds_buttons(target.owner()))
+        };
+        if let Some((screen, x, y)) = position {
+            input.absolute(target.owner(), screen, x, y);
+        }
+        for (button, down) in button_edges(flags) {
+            let key = match button {
+                1 => 1,
+                2 => 2,
+                16 => 4,
+                32 => 5,
+                64 => 6,
+                _ => 0,
+            };
+            if key != 0 {
+                crate::plugins::hotkeys::key_event(target.owner(), key, down);
+            }
+            if !down || relative || position.is_some() {
+                input.button(target.owner(), button, down);
+            }
+        }
+    }
+}
+
+fn host_button_flags(msg: &MSG) -> Option<u16> {
+    Some(match msg.message {
+        WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => 1,
+        WM_LBUTTONUP => 2,
+        WM_RBUTTONDOWN | WM_RBUTTONDBLCLK => 4,
+        WM_RBUTTONUP => 8,
+        WM_MBUTTONDOWN | WM_MBUTTONDBLCLK => 16,
+        WM_MBUTTONUP => 32,
+        WM_XBUTTONDOWN | WM_XBUTTONDBLCLK | WM_XBUTTONUP => {
+            let shift = match (msg.wParam.0 >> 16) & 0xffff {
+                1 => 6,
+                2 => 8,
+                _ => return None,
+            };
+            (if msg.message == WM_XBUTTONUP { 2 } else { 1 }) << shift
+        }
+        _ => return None,
+    })
 }
 
 fn wheel_units(delta: winit::event::MouseScrollDelta) -> Option<[i32; 2]> {
@@ -515,6 +674,7 @@ impl WindowMouse {
             output: [size.width, size.height],
             top: title_bar_height_pixels(window),
             resize_edges: !window.is_maximized() && window.fullscreen().is_none(),
+            raw_since: 0,
         };
         if relative && let Some((width, height, rotation)) = frame_size {
             let (width, height) = if matches!(rotation, 90 | 270) {

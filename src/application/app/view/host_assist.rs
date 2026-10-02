@@ -289,57 +289,10 @@ impl DeviceCenterApp {
         }
     }
     pub(super) fn host_assist_dialog(&mut self, ctx: &egui::Context) -> bool {
-        let Some(host) = &self.host else {
-            return false;
-        };
-        let Some(pending) = host.assistance.snapshot().pending else {
-            if self.assist_password_dialog(ctx) {
-                return true;
-            }
-            return self.assist_settings_dialog(ctx);
-        };
-        let remaining = pending
-            .expires_at
-            .saturating_sub(chrono::Utc::now().timestamp())
-            .max(0);
-        let mut answer = None;
-        let modal = egui::Modal::new(egui::Id::new(("host-assist-confirm", &pending.id)))
-            .frame(dialog_frame())
-            .show(ctx, |ui| {
-                ui.set_width(theme::MESSAGE_DIALOG_WIDTH);
-                if crate::ui::controls::dialog_header(
-                    ui,
-                    "远程协助请求",
-                    crate::ui::controls::DialogIcon::Info,
-                    true,
-                ) {
-                    answer = Some(false);
-                }
-                ui.label(format!("“{}”请求连接并控制这台电脑。", pending.name));
-                ui.label("允许后，对方可以查看画面并控制键盘和鼠标。");
-                ui.label(RichText::new(format!("剩余 {remaining} 秒")).color(MUTED));
-                let (allow, reject) = crate::ui::controls::dialog_actions(
-                    ui,
-                    Some(crate::ui::controls::DialogAction::new("允许连接").enabled(remaining > 0)),
-                    Some("拒绝"),
-                );
-                if allow {
-                    answer = Some(true);
-                } else if reject {
-                    answer = Some(false);
-                }
-            });
-        if modal.should_close() && answer.is_none() {
-            answer = Some(false);
+        if self.assist_password_dialog(ctx) {
+            return true;
         }
-        if let Some(allow) = answer {
-            self.host_assist_action(Action::Answer {
-                id: pending.id,
-                allow,
-            });
-        }
-        ctx.request_repaint_after(Duration::from_millis(250));
-        true
+        self.assist_settings_dialog(ctx)
     }
 
     fn assist_password_dialog(&mut self, ctx: &egui::Context) -> bool {

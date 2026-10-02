@@ -35,6 +35,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    #[cfg(windows)]
+    #[command(hide = true)]
+    Notification { uri: String },
     /// 打开卸载窗口，选择是否保留驱动和本机数据
     #[cfg(windows)]
     Uninstall {
@@ -161,6 +164,10 @@ fn main() -> Result<()> {
         transport: media::TransportChoice::Auto,
     });
 
+    #[cfg(windows)]
+    if let Commands::Notification { uri } = &command {
+        return app::notification_activation(uri);
+    }
     if matches!(command, Commands::Gui { .. }) && openuuyc::application::route_installed_gui()? {
         return Ok(());
     }
@@ -240,6 +247,10 @@ fn main() -> Result<()> {
         }
         Commands::DisplayRecovery { token } => openuuyc::application::display_recovery(&token),
         Commands::PluginVideoHost => openuuyc::plugins::video::host(),
+        #[cfg(windows)]
+        Commands::Notification { .. } => {
+            unreachable!("notification activation is handled before application startup")
+        }
 
         Commands::PluginHost { manifest } => openuuyc::plugins::host(&manifest),
         Commands::Gui {
@@ -305,7 +316,8 @@ fn internal_role(command: &Commands) -> bool {
         | Commands::PluginVideoHost
         | Commands::DisplayRecovery { .. } => true,
         #[cfg(windows)]
-        Commands::Component { .. }
+        Commands::Notification { .. }
+        | Commands::Component { .. }
         | Commands::Service
         | Commands::HostResident { .. }
         | Commands::DisplayAgent { .. }
