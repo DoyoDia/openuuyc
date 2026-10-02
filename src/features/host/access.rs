@@ -5,6 +5,8 @@ use tokio::sync::watch;
 
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Status {
+    #[serde(default)]
+    pub connection: Option<ConnectionInfo>,
     pub ready: bool,
     pub connected: bool,
     pub session_active: bool,
@@ -24,6 +26,14 @@ pub(crate) struct Status {
     pub screen: Option<capture::Screen>,
     pub video: Option<ActiveEncoding>,
     pub streams: std::collections::BTreeMap<usize, StreamStatus>,
+}
+
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ConnectionInfo {
+    pub device_id: String,
+    pub client_id: String,
+    pub elapsed_seconds: Option<u64>,
+    pub observation_lost: bool,
 }
 
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -75,6 +85,7 @@ struct Ownership {
     active: bool,
     dirty: bool,
     last_controlled: Option<std::time::Instant>,
+    connected_since: Option<std::time::Instant>,
     remote_action: Option<bool>,
     updating: bool,
     update_notice: Option<Arc<super::peer::UpdateNotice>>,
@@ -113,6 +124,7 @@ impl Default for Handle {
                 active: true,
                 dirty: false,
                 last_controlled: None,
+                connected_since: None,
                 remote_action: None,
                 updating: false,
                 update_notice: None,
@@ -129,6 +141,8 @@ impl Default for Handle {
 }
 
 fn finish_session(state: &mut Ownership) {
+    state.connected_since = None;
+    state.status.connection = None;
     state.update_notice = None;
     if state.status.connected {
         state.last_controlled = Some(std::time::Instant::now());
@@ -193,6 +207,11 @@ impl Handle {
             return;
         }
         if state.dirty {
+            // Pending local preferences must not freeze the observed live session.
+            let mut status = snapshot.status;
+            status.saving = state.status.saving;
+            status.settings_error = state.status.settings_error.clone();
+            state.status = status;
             return;
         }
         state.allowed = snapshot.allowed;
@@ -205,7 +224,15 @@ impl Handle {
     }
     pub(crate) fn remote_failed(&self, error: String) {
         let mut state = lock(&self.ownership);
+        let observed = state.status.connection.clone();
         finish_session(&mut state);
+        // Losing the IPC observer is not evidence that remote access ended.
+        state.status.connection = observed
+            .filter(|c| c.elapsed_seconds.is_some())
+            .map(|mut c| {
+                c.observation_lost = true;
+                c
+            });
         state.status.ready = false;
         state.status.error = Some(error);
         state.status.message = "后台连接中断".into();
@@ -571,12 +598,20 @@ impl Handle {
         self.desired.subscribe()
     }
     pub(crate) fn status(&self) -> Status {
-        lock(&self.ownership).status.clone()
+        let state = lock(&self.ownership);
+        let mut status = state.status.clone();
+        if let (Some(connection), Some(since)) = (&mut status.connection, state.connected_since) {
+            connection.elapsed_seconds = Some(since.elapsed().as_secs());
+        }
+        status
     }
     pub(crate) fn update(&self, ready: bool, connected: bool, message: impl Into<String>) {
         Self::update_locked(&mut lock(&self.ownership), ready, connected, message.into());
     }
     fn update_locked(state: &mut Ownership, ready: bool, connected: bool, message: String) {
+        if connected && state.status.connection.is_some() && state.connected_since.is_none() {
+            state.connected_since = Some(std::time::Instant::now());
+        }
         if connected || state.status.connected {
             state.last_controlled = Some(std::time::Instant::now());
         }
@@ -627,6 +662,19 @@ impl Drop for SessionLease {
     }
 }
 impl Lease {
+    pub(crate) fn controller(&self, device_id: &str, client_id: &str) {
+        self.modify(|state| {
+            state.status.connection = Some(ConnectionInfo {
+                device_id: if crate::account::api::validate_device_id(device_id).is_ok() {
+                    device_id.to_owned()
+                } else {
+                    String::new()
+                },
+                client_id: client_id.to_owned(),
+                ..Default::default()
+            });
+        });
+    }
     pub(crate) fn for_assistance(&self) -> anyhow::Result<Self> {
         let mut lease = self.clone();
         lease.assistance = Some(self.handle.assistance.admission()?);

@@ -487,6 +487,7 @@ impl Transport {
         let mut interval = tokio::time::interval(Duration::from_millis(25));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut report_at = Instant::now();
+        let mut reported_bytes = BTreeMap::<usize, [u64; 3]>::new();
         while self.active() {
             tokio::select! { _=self.0.cancel.cancelled()=>break, _=interval.tick()=>{} }
             let mut controller = lock(&self.0.controller);
@@ -512,6 +513,31 @@ impl Transport {
                 );
             }
             if report_at.elapsed() >= Duration::from_secs(5) {
+                let span = report_at.elapsed().as_secs_f64();
+                for stream in self.streams() {
+                    let allocation =
+                        stream.allocation(controller.target, super::allocation::View::Media);
+                    let budget = lock(&stream.0.budget);
+                    let totals = budget.sent_totals();
+                    let rates = reported_bytes
+                        .insert(stream.0.index, totals)
+                        .filter(|previous| totals.iter().zip(previous).all(|(a, b)| a >= b))
+                        .map(|previous| {
+                            std::array::from_fn::<_, 3, _>(|i| {
+                                ((totals[i] - previous[i]) as f64 * 8.0 / span).round() as u64
+                            })
+                        });
+                    tracing::info!(
+                        stream = stream.0.index,
+                        allocation_bps = allocation,
+                        encoder_allocation_bps = budget.media_rate(allocation),
+                        sample_ms = (span * 1000.0).round() as u64,
+                        media_wire_bps = rates.map(|r| r[0]),
+                        rtx_wire_bps = rates.map(|r| r[1]),
+                        fec_wire_bps = rates.map(|r| r[2]),
+                        "host measured media egress"
+                    );
+                }
                 tracing::info!(
                     feedbacks = controller.feedback_count,
                     target_bps = controller.target,
@@ -519,6 +545,9 @@ impl Transport {
                     loss = controller.loss,
                     delay_overuse = controller.delay_overuse(),
                     link_pressure = controller.link_pressure(),
+                    rtt_ms = controller.rtt.ms(),
+                    cwnd_reduce_ratio = controller.cwnd_reduce_ratio,
+                    bounded_target_bps = controller.estimates().1,
                     burst_bytes = controller.burst_bytes(),
                     queued_bytes = self.0.queued.load(Ordering::Relaxed),
                     media_packets = self.0.counts[0].load(Ordering::Relaxed),

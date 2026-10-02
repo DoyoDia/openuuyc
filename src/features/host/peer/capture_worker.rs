@@ -21,6 +21,7 @@ pub(super) fn capture_loop(
     mut screen: capture::Screen,
     handle: Lease,
     cancel: CancellationToken,
+    encode_cancel: Arc<AtomicBool>,
     connected: Arc<AtomicBool>,
     config: Arc<Mutex<VideoConfig>>,
     keyframe: Arc<AtomicBool>,
@@ -53,7 +54,7 @@ pub(super) fn capture_loop(
 
     while !cancel.is_cancelled() && handle.requested() {
         let mut wanted = *lock(&config);
-        if !negotiated.permits_codec(wanted.format.codec) {
+        if !negotiated.permits_format(wanted.format) {
             let previous = wanted.revision;
             let chroma = wanted.format.chroma;
             let hdr = wanted.format.hdr();
@@ -125,7 +126,7 @@ pub(super) fn capture_loop(
             .choices
             .iter()
             .filter(|c| {
-                negotiated.permits_codec(c.capability.format.codec)
+                negotiated.permits_format(c.capability.format)
                     && c.capability.format.chroma == wanted.format.chroma
                     && c.capability.format.depth == wanted.format.depth
                     && (c.capability.format.codec == wanted.format.codec
@@ -397,12 +398,17 @@ pub(super) fn capture_loop(
                     },
                 )
             } else {
-                encoder::Encoder::software(
+                encoder::Encoder::software_format(
                     &device,
-                    size.0,
-                    size.1,
-                    wanted.fps,
-                    bounds.initial.max(300_000),
+                    size,
+                    wanted.format,
+                    crate::features::host::format::Rate {
+                        target: bounds.initial.max(300_000),
+                        peak: bounds.initial.max(300_000),
+                        fps: wanted.fps,
+                        quality: wanted.quality,
+                        quality_target,
+                    },
                 )
             };
             encoder = match created {
@@ -491,12 +497,13 @@ pub(super) fn capture_loop(
             while frame_metadata.len() > 2048 {
                 frame_metadata.pop_first();
             }
-            let encoded = active_encoder.encode(
+            let encoded = active_encoder.encode_cancellable(
                 delivery
                     .as_ref()
                     .map_or(&frame.texture, |d| &d.frame.texture),
                 timestamp,
                 force,
+                &encode_cancel,
             )?;
             for output in &encoded {
                 if let Some(actual) = crate::media::video_format::parse_stream_format(
@@ -514,6 +521,9 @@ pub(super) fn capture_loop(
             }
             Ok((encoded, force, Instant::now()))
         })();
+        if cancel.is_cancelled() || !handle.requested() {
+            break;
+        }
         let (encoded, force, encode_finished) = match encoded {
             Ok(encoded) => {
                 encode_errors = 0;

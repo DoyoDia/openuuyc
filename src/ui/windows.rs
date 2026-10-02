@@ -266,17 +266,20 @@ impl DesktopWindow {
                 );
             });
             if self.window.fullscreen().is_none() {
-                super::chrome::title_bar_panel(
+                let alert = self.app.0.title_bar_alert();
+                super::chrome::title_bar_panel_alert(
                     ui,
                     "desktop-window-chrome",
                     super::chrome::title_bar_height(),
+                    alert.is_some(),
                     |ui| {
-                        if super::chrome::window_title_bar(
+                        if super::chrome::window_title_bar_alert(
                             ui,
                             &self.window,
                             &self.window.title(),
                             Some(&mut self.window_move),
                             true,
+                            alert.as_ref(),
                         ) {
                             self.exiting = false;
                             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);

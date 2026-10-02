@@ -383,7 +383,7 @@ impl Router {
         for control in self.windows.values() {
             let state = control.snapshot();
             if state.mouse_mode != MouseMode::View || state.mouse_pending {
-                let _ = control.set_mouse_mode(MouseMode::View);
+                let _ = control.suspend_mouse_control();
             }
             control.mouse().reconcile_keyboard_releases();
         }

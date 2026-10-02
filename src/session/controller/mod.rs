@@ -58,7 +58,7 @@ pub struct ControllerConnection {
     forwarder: shared::ForwarderLease,
     profile: ConnectionMediaProfile,
     preference_writer: Option<crate::features::viewing_settings::PreferenceWriter>,
-    audio_preference_writer: Option<crate::features::viewing_settings::PreferenceWriter>,
+    local_preference_writer: Option<crate::features::viewing_settings::PreferenceWriter>,
 }
 
 pub struct ConnectionSummary {
@@ -226,7 +226,7 @@ impl ControllerConnection {
             forwarder: session.lease(viewing)?,
             profile,
             preference_writer: None,
-            audio_preference_writer: None,
+            local_preference_writer: None,
         })
     }
     async fn activate_viewing(&self) -> Result<()> {
@@ -746,7 +746,7 @@ impl ControllerConnection {
         if let Some(writer) = &mut self.preference_writer {
             writer.finish().await;
         }
-        if let Some(writer) = &mut self.audio_preference_writer {
+        if let Some(writer) = &mut self.local_preference_writer {
             writer.finish().await;
         }
         let closed = self.close().await;
@@ -777,7 +777,7 @@ impl ControllerConnection {
         if let Some(writer) = &mut self.preference_writer {
             writer.finish().await;
         }
-        if let Some(writer) = &mut self.audio_preference_writer {
+        if let Some(writer) = &mut self.local_preference_writer {
             writer.finish().await;
         }
         result

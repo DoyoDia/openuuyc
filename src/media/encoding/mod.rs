@@ -52,15 +52,21 @@ pub(crate) struct Format {
     pub depth: u8,
 }
 impl Format {
+    pub(crate) fn software(self) -> openuuyc_codec::Format {
+        openuuyc_codec::Format {
+            codec: self.codec.media(),
+            chroma: self.chroma,
+            depth: self.depth,
+        }
+    }
+
     pub const AVC: Self = Self {
         codec: Codec::H264,
         chroma: 1,
         depth: 8,
     };
     pub fn valid(self) -> bool {
-        matches!(self.chroma, 1 | 3)
-            && matches!(self.depth, 8 | 10)
-            && (self.codec != Codec::Av1 || self.chroma == 1)
+        matches!(self.chroma, 1 | 3) && matches!(self.depth, 8 | 10)
     }
     pub fn hdr(self) -> bool {
         self.depth == 10
@@ -117,7 +123,7 @@ impl Backend {
             Self::Nvidia => "NVIDIA NVENC",
             Self::Amd => "AMD AMF",
             Self::Intel => "INTEL QSV",
-            Self::Software => "OpenUUYC H264",
+            Self::Software => "OpenUUYC Rust",
         }
     }
     // ReportQosStats carries a classification, not sender_para_info's name.
@@ -131,13 +137,22 @@ impl Backend {
         if !format.valid() {
             return false;
         }
+        // NVENC and AMF expose Main profile in the current APIs. oneVPL has
+        // High profile, but only a successful Query/Init and real output probe
+        // can establish support on the selected Intel device.
+        if format.codec == Codec::Av1
+            && format.chroma == 3
+            && matches!(self, Self::Nvidia | Self::Amd)
+        {
+            return false;
+        }
         match self {
             // T C4C300 rejects Y410, and the current AVC configuration has no
             // 10-bit producer. A generic D3D converter is not encoder support.
             Self::Nvidia => {
                 !(format.depth == 10 && (format.chroma == 3 || format.codec == Codec::H264))
             }
-            Self::Software => format == Format::AVC,
+            Self::Software => format.software().can_encode(),
             Self::Amd | Self::Intel => true,
         }
     }
@@ -191,4 +206,3 @@ pub(crate) struct FrameTiming {
 }
 
 pub(crate) mod rate;
-pub(crate) mod software;

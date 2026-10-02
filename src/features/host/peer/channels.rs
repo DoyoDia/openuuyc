@@ -220,7 +220,12 @@ pub(super) async fn bind_channel(
                 tag = message.data.first().copied(),
                 "host business message received"
             );
-            let responses = if control {
+            // Route only the verified setting RPC through the same screen owner
+            // as TEXT. CONTROL's remaining messages keep their original scope.
+            let screen_setting = control
+                && crate::features::stream_control::publisher::is_capture_setting(&message.data)
+                    .unwrap_or(false);
+            let responses = if control && !screen_setting {
                 crate::features::stream_control::publisher::receive(
                     &message.data,
                     true,
@@ -247,7 +252,11 @@ pub(super) async fn bind_channel(
                             if cancel.is_cancelled() {
                                 break;
                             }
-                            let result = send_business(&channel, control, &kcp, response).await;
+                            let result = if screen_setting {
+                                send_setting_response(&report_target, response).await
+                            } else {
+                                send_business(&channel, control, &kcp, response).await
+                            };
                             if let Err(error) = result {
                                 tracing::warn!(%error,control,"host business response failed");
                             }
@@ -258,6 +267,19 @@ pub(super) async fn bind_channel(
             }
         })
     }));
+}
+
+/// S 46D0F0 -> 471950 -> ControlledConnectionContext[10] -> wrapper[13]:
+/// CaptureSetting RPC replies use TEXT even when iOS submits them on CONTROL.
+pub(super) async fn send_setting_response(target: &ReportTarget, bytes: Vec<u8>) -> Result<usize> {
+    let channel = target
+        .borrow()
+        .text
+        .as_ref()
+        .and_then(std::sync::Weak::upgrade)
+        .ok_or_else(|| anyhow::anyhow!("画面设置回执通道尚未就绪"))?;
+    // Do not cancel a reliable SCTP message midway through fragment enqueue.
+    Ok(channel.send_text_bytes(&Bytes::from(bytes)).await?)
 }
 
 pub(super) async fn send_business(

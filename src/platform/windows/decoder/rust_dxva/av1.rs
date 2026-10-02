@@ -5,7 +5,7 @@ use super::{
 };
 use anyhow::{Context, Result, ensure};
 use bytemuck::Zeroable;
-use cros_codecs::codec::av1::parser::*;
+use openuuyc_codec::syntax::av1::syntax::*;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -52,14 +52,8 @@ impl Av1 {
         let mut controls = Vec::new();
         let mut bitstream = Vec::new();
         for unit in crate::media::av1::units(data)? {
-            let action = self.parser.read_obu(unit).map_err(anyhow::Error::msg)?;
-            let ObuAction::Process(obu) = action else {
-                continue;
-            };
-            ensure!(
-                obu.header.spatial_id == 0 && obu.header.temporal_id == 0,
-                "layered AV1 unsupported"
-            );
+            let unit = unit?.bytes;
+            let obu = self.parser.read_obu(unit).map_err(anyhow::Error::msg)?;
             let parsed = self.parser.parse_obu(obu).map_err(anyhow::Error::msg)?;
             let group = match parsed {
                 ParsedObu::SequenceHeader(_) => {
@@ -128,13 +122,19 @@ impl Av1 {
             .context("missing AV1 sequence")?
             .clone();
         ensure!(
-            s.seq_profile == Profile::Profile0
-                && !s.color_config.mono_chrome
-                && s.color_config.subsampling_x
-                && s.color_config.subsampling_y
+            !s.color_config.mono_chrome
                 && matches!(s.bit_depth, BitDepth::Depth8 | BitDepth::Depth10),
             Failure::Unsupported
         );
+        let chroma = match (
+            s.seq_profile,
+            s.color_config.subsampling_x,
+            s.color_config.subsampling_y,
+        ) {
+            (Profile::Profile0, true, true) => 1,
+            (Profile::Profile1, false, false) => 3,
+            _ => anyhow::bail!(Failure::Unsupported),
+        };
         let key = h.frame_type == FrameType::KeyFrame;
         ensure!(!self.fresh || key, "waiting for AV1 keyframe");
         if key {
@@ -147,11 +147,9 @@ impl Av1 {
             width > 0 && height > 0 && width <= 16384 && height <= 16384,
             "invalid AV1 geometry"
         );
-        if self
-            .pool
-            .as_ref()
-            .is_none_or(|p| p.width != width || p.height != height || p.depth != depth)
-        {
+        if self.pool.as_ref().is_none_or(|p| {
+            p.width != width || p.height != height || p.depth != depth || p.chroma != chroma
+        }) {
             ensure!(key, "AV1 resolution change requires keyframe");
             self.pool = Some(Pool::new(
                 self.device.clone(),
@@ -159,7 +157,7 @@ impl Av1 {
                 width,
                 height,
                 depth,
-                1,
+                chroma,
                 9,
             )?);
         }
@@ -267,8 +265,12 @@ fn params(
         | u32::from(h.use_ref_frame_mvs) << 24
         | u32::from(s.enable_ref_frame_mvs) << 25
         | 1 << 26;
-    p.format =
-        h.frame_type as u8 | u8::from(h.show_frame) << 2 | u8::from(h.showable_frame) << 3 | 0x30;
+    p.format = h.frame_type as u8
+        | u8::from(h.show_frame) << 2
+        | u8::from(h.showable_frame) << 3
+        | u8::from(s.color_config.subsampling_x) << 4
+        | u8::from(s.color_config.subsampling_y) << 5
+        | u8::from(s.color_config.mono_chrome) << 6;
     p.primary = h.primary_ref_frame as u8;
     p.order = h.order_hint as u8;
     p.order_bits = s.order_hint_bits.max(0) as u8;

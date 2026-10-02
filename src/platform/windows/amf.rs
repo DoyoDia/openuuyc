@@ -175,7 +175,7 @@ impl Encoder {
             )?;
             let mut component = ptr::null_mut();
             let id = wide(if format.codec == Codec::Av1 {
-                b"AMFVideoEncoder_AV1\0"
+                b"AMFVideoEncoderHW_AV1\0"
             } else if format.codec == Codec::H264 {
                 b"AMFVideoEncoderVCE_AVC\0"
             } else {

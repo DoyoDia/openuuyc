@@ -28,6 +28,21 @@ service access require separate assessment.
 
 2. Video decoding and platform adaptation
 
+AV1 global-motion validation:
+crates/codec/kernels/av1/src/bitstream/syntax/warp.rs adapts dav1d warpmv.c shear validation
+and reciprocal constants at 9a275d0c9296f2c0ded9d0dd28f99cf22dea2572.
+BSD-2-Clause; see crates/codec/kernels/av1/licenses/COPYING.dav1d.
+
+AV1 streaming software encoder:
+crates/codec/kernels/av1/src/encoder derives from rav1e 31435de9d76fddd38f6dcc31d4014574cebb2092,
+retaining its Rust coding algorithms and SIMD assembly with original notices.
+The local integration adds immediate-output streaming, live rate changes and
+cooperative cancellation; film grain, scene lookahead, temporal-importance
+analysis and two-pass processing are removed.
+Copyright (c) The rav1e contributors. BSD-2-Clause and AOM patent grant;
+see crates/codec/kernels/av1/licenses/COPYING.rav1e and crates/codec/kernels/av1/licenses/PATENTS.rav1e.
+Source: https://github.com/xiph/rav1e
+
 Windows NVENC hardware encoder ABI bindings:
 vendor/nvenc-sys/ retains the NVENC-only Windows bindings, GUIDs, version
 constants and original layout tests from nvidia-video-codec-sdk 0.4.0 (MIT).
@@ -45,7 +60,7 @@ Source: https://github.com/kixelated/goog_cc
 
 FFmpeg-derived Rust decoding and DXVA parameter implementations:
 LGPL-2.1-or-later.
-Principal locations: crates/h264-core/ and
+Principal locations: crates/codec/kernels/h264/ and
 src/platform/windows/decoder/rust_dxva/.
 Retained original author attributions include Michael Niedermayer, Loren
 Merritt, Daniel Kang, Laurent Aimar, and Hendrik Leppkes. File-specific
@@ -54,7 +69,7 @@ optimizations, parameter mapping, and other covered modifications do not
 become subject to the project's reserved-rights terms instead.
 Reference: FFmpeg 8.0.3, https://ffmpeg.org/releases/ffmpeg-8.0.3.tar.xz
 License texts: src/media/decoder/COPYING.FFmpeg and
-crates/h264-core/COPYING.LGPLv2.1.
+crates/codec/kernels/h264/COPYING.LGPLv2.1.
 
 Platform adaptation derived from mediaway-decoder 0.1.8:
 MIT OR Apache-2.0.
@@ -67,7 +82,7 @@ active media types and decoder ownership now belong to OpenUUYC.
 Selected AVC/HEVC syntax, reference metadata and transform primitives are
 adapted from oxideav-h264 0.1.8 and oxideav-h265 0.0.10 (MIT),
 Copyright (c) 2026 Karpelès Lab Inc. The retained portions are in
-crates/h264-core/src/syntax and crates/h265-syntax/src. These packages are
+crates/codec/kernels/h264/src/syntax and crates/codec/kernels/hevc/src. These packages are
 no longer runtime Cargo dependencies; unused codec/extension implementations
 were not imported. Original MIT texts are retained as COPYING.OxideAV in
 both crates. Their license does not replace the LGPL applicable to
@@ -168,7 +183,7 @@ original project material or covered by the goog_cc/NVENC binding licenses.
 
 Rust H.264 desktop encoder
 
-The realtime encoder in crates/h264-core shares the existing LGPL-2.1-or-later
+The realtime encoder in crates/codec/kernels/h264 shares the existing LGPL-2.1-or-later
 FFmpeg-derived interpolation, prediction, deblocking and CAVLC tables with the
 decoder. Selected forward/inverse transform primitives retain the MIT attribution
 from oxideav-h264 0.1.8 in the local syntax module. Frame decisions, motion search, rate control and
@@ -204,8 +219,25 @@ effects are included.
 
 AV1 syntax parsing
 
-The cros-codecs 0.0.6 AV1 parser is used without its Linux/VAAPI/V4L2 backends.
-Copyright The ChromiumOS Authors. BSD-3-Clause; see licenses/cros-codecs.txt.
+The local syntax module in crates/codec/kernels/av1/src/bitstream adapts the AV1 parser from
+cros-codecs 0.0.6 (commit 7a4211c57ac2e791412f40df2c22fd2cf81104f6).
+Container probing, owned OBU copies, unused operating-point selection and
+Linux/VAAPI/V4L2 backends are not part of this implementation. Its bit reader
+uses local bounded primitives, with local tile-boundary and syntax fixes.
+There is no cros-codecs runtime dependency.
+Copyright The ChromiumOS Authors. BSD-3-Clause;
+see crates/codec/kernels/av1/licenses/COPYING.ChromiumOS.
 Source: https://github.com/chromeos/cros-codecs
 The D3D11 AV1 parameter mapping references FFmpeg's dxva2_av1.c and remains
 covered by the existing LGPL-2.1-or-later notice and COPYING.FFmpeg.
+
+AV1 mature decoder source baseline:
+crates/codec/kernels/av1/src/decoder contains the Rust and assembly decoder sources from rav1d
+revision d3d1cd67059f47803919be8276650e5870c9fd02, including the dav1d-derived
+SIMD kernels and original notices. BSD-2-Clause; see crates/codec/kernels/av1/licenses/COPYING.rav1d.
+Source: https://github.com/memorysafety/rav1d
+The Rust convenience API in src/rust_api.rs derives from dav1d-rs at
+94b1deaa1e25bf29c77bb5cc8a08ddaf7663eede, Copyright (c) 2018 Luca Barbato,
+MIT; its complete license text is retained at the top of that source file.
+The local Rust source and SIMD assembly are used by the AV1 software playback
+backend. No C decoder implementation is compiled into it.

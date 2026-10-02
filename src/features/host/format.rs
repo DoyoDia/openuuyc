@@ -37,7 +37,7 @@ impl Negotiated {
                 &Default::default(),
                 Default::default(),
             ),
-            codecs: AtomicU8::new(7),
+            codecs: AtomicU8::new(15),
             encoder_true_color: false,
         }
     }
@@ -45,7 +45,7 @@ impl Negotiated {
         Self {
             choices: self.choices.clone(),
             dual: self.dual.clone(),
-            codecs: AtomicU8::new(7),
+            codecs: AtomicU8::new(15),
             encoder_true_color: self.encoder_true_color,
         }
     }
@@ -119,7 +119,9 @@ impl Negotiated {
                         ),
                         fps: decoder.maximum_fps().min(
                             if capability.backend == Backend::Software {
-                                crate::media::encoding::software::MAX_FPS
+                                openuuyc_codec::encoder::maximum_fps(
+                                    capability.format.codec.media(),
+                                )
                             } else {
                                 144
                             },
@@ -136,7 +138,7 @@ impl Negotiated {
         Ok(Self {
             choices,
             dual,
-            codecs: AtomicU8::new(7),
+            codecs: AtomicU8::new(15),
             // S543170 computes this from local encoder caps before intersection.
             encoder_true_color: local.iter().any(|c| c.format.chroma == 3),
         })
@@ -152,7 +154,13 @@ impl Negotiated {
             bits | match Codec::from_mime(&codec.capability.mime_type) {
                 Some(Codec::H264) => 1,
                 Some(Codec::H265) => 2,
-                Some(Codec::Av1) => 4,
+                Some(Codec::Av1) => {
+                    match crate::media::av1::rtp_profile(&codec.capability.sdp_fmtp_line) {
+                        Some(0) => 4,
+                        Some(1 | 2) => 12,
+                        _ => 0,
+                    }
+                }
                 None => 0,
             }
         });
@@ -163,9 +171,16 @@ impl Negotiated {
             & match codec {
                 Codec::H264 => 1,
                 Codec::H265 => 2,
-                Codec::Av1 => 4,
+                Codec::Av1 => 12,
             }
             != 0
+    }
+    pub fn permits_format(&self, format: Format) -> bool {
+        if format.codec == Codec::Av1 {
+            self.codecs.load(Ordering::Acquire) & if format.chroma == 3 { 8 } else { 4 } != 0
+        } else {
+            self.permits_codec(format.codec)
+        }
     }
     pub fn maximum_quality(&self, format: Format, source: (u32, u32), maximum: (u32, u32)) -> i32 {
         let json_limit = self
@@ -191,14 +206,18 @@ impl Negotiated {
     ) -> anyhow::Result<()> {
         let mut dual = self.dual.clone();
         dual.frame_quality_capability.retain(|row| {
-            Codec::from_wire(row.video_codec)
-                .is_some_and(|c| self.permits_codec(c) && codec.is_none_or(|wanted| wanted == c))
-                && self.choices.iter().any(|choice| {
-                    choice.capability.format.codec.wire() == row.video_codec
-                        && choice.capability.format.chroma == row.chroma_sampling
-                        && choice.capability.format.depth == row.bit_depth
-                        && choice.fps >= 30
-                })
+            Codec::from_wire(row.video_codec).is_some_and(|c| {
+                self.permits_format(Format {
+                    codec: c,
+                    chroma: row.chroma_sampling,
+                    depth: row.bit_depth,
+                }) && codec.is_none_or(|wanted| wanted == c)
+            }) && self.choices.iter().any(|choice| {
+                choice.capability.format.codec.wire() == row.video_codec
+                    && choice.capability.format.chroma == row.chroma_sampling
+                    && choice.capability.format.depth == row.bit_depth
+                    && choice.fps >= 30
+            })
         });
         let quality = match config.quality {
             5 => 0,
@@ -238,12 +257,12 @@ impl Negotiated {
                     .max_by_key(|c| {
                         let maximum = c.maximum_for(config.requested_maximum);
                         (
-                            maximum.0.max(maximum.1),
                             c.capability.backend != Backend::Software,
+                            maximum.0.max(maximum.1),
                         )
                     })
                 {
-                    selected = Some((choice, fps));
+                    selected = Some((choice, fps, (row.max_width as u32, row.max_height as u32)));
                     break;
                 }
                 fps = match fps {
@@ -257,10 +276,11 @@ impl Negotiated {
                 break;
             }
         }
-        let (choice, fps) =
+        let (choice, fps, row_maximum) =
             selected.ok_or_else(|| anyhow::anyhow!("请求的画面格式没有共同能力"))?;
         config.format = choice.capability.format;
-        config.maximum = choice.maximum_for(config.requested_maximum);
+        let maximum = choice.maximum_for(config.requested_maximum);
+        config.maximum = (maximum.0.min(row_maximum.0), maximum.1.min(row_maximum.1));
         config.maximum_fps = fps;
         config.fps = fps.min(config.fps_limit);
         config.maximum_quality = self.maximum_quality(config.format, source, config.maximum);

@@ -62,8 +62,11 @@ impl EncodingSettings {
     pub fn validate(self) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.mode != EncoderMode::Software
-                || matches!(self.codec, EncoderCodec::Automatic | EncoderCodec::H264),
-            "软件编码仅支持 H.264，请选择自动或 H.264"
+                || matches!(
+                    self.codec,
+                    EncoderCodec::Automatic | EncoderCodec::H264 | EncoderCodec::Av1
+                ),
+            "软件编码支持 H.264 和 AV1，请选择自动、H.264 或 AV1"
         );
         Ok(())
     }

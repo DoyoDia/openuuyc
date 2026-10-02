@@ -110,9 +110,15 @@ pub(crate) struct Engine {
     foreground: Option<u32>,
     mouse_policy: super::config::MousePolicy,
     game_simulation: Option<bool>,
+    privileged: bool,
 }
 impl Engine {
-    pub fn new(hardware: bool, policy: super::wire::Policy, origin: u32) -> Result<Self> {
+    pub fn new(
+        hardware: bool,
+        policy: super::wire::Policy,
+        origin: u32,
+        privileged: bool,
+    ) -> Result<Self> {
         let now = Instant::now();
         Ok(Self {
             device: None,
@@ -145,12 +151,13 @@ impl Engine {
             foreground: None,
             mouse_policy: Default::default(),
             game_simulation: None,
+            privileged,
         })
     }
     pub fn backend(&self) -> &'static str {
         if self.device.is_some() {
             "OpenUUYC HID"
-        } else if self.origin != std::process::id() {
+        } else if self.privileged {
             "Windows · 系统服务"
         } else {
             "Windows · 当前用户"

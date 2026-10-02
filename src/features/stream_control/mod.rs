@@ -47,6 +47,7 @@ pub(crate) mod annotation;
 mod display_settings;
 mod display_topology;
 mod microphone;
+mod preferences;
 pub(crate) mod publisher;
 
 const VIDEO_QUALITY_FAST: i32 = 1;
@@ -201,6 +202,7 @@ pub(crate) struct StreamControlPreferences {
     pub(crate) custom_bitrate_limit: Option<u32>,
     audio: Option<crate::media::audio::AudioSettings>,
     auto_frame_quality: i32,
+    device: Option<crate::features::viewing_settings::DevicePreferences>,
 }
 
 impl StreamControlPreferences {
@@ -242,6 +244,7 @@ impl StreamControlPreferences {
         settings.custom_bitrate_mbps = normalize_custom_bitrate(settings.custom_bitrate_mbps);
         Self {
             settings,
+            device: None,
             custom_bitrate_limit: None,
             audio: None,
             auto_frame_quality: if settings.quality == StreamQuality::Auto {
@@ -423,7 +426,12 @@ struct StreamControlState {
     custom_bitrate_limit: u32,
     features: Option<crate::account::feature_ability::FeaturePolicy>,
     remote_notice: Option<(Instant, &'static str)>,
-    preferred_mouse_mode: MouseMode,
+    device_preferences: crate::features::viewing_settings::DevicePreferences,
+    device_preferences_loaded: bool,
+    device_preference_updates:
+        tokio::sync::watch::Sender<Option<crate::features::viewing_settings::DevicePreferences>>,
+    device_persistence_error: Option<String>,
+    restore_input_pending: bool,
     remote_cursor: crate::features::remote_cursor::RemoteCursorState,
     peer_mouse_relative: Option<bool>,
     cursor_sync_needed: bool,
@@ -497,7 +505,11 @@ impl StreamControlHandle {
             annotation: Default::default(),
             custom_bitrate_limit: MAX_CUSTOM_BITRATE_MBPS,
             features: None,
-            preferred_mouse_mode: MouseMode::Smart,
+            device_preferences: Default::default(),
+            device_preferences_loaded: false,
+            device_preference_updates: tokio::sync::watch::channel(None).0,
+            device_persistence_error: None,
+            restore_input_pending: false,
             remote_notice: None,
             remote_cursor: cursor.clone(),
             peer_mouse_relative: None,
@@ -564,6 +576,7 @@ impl StreamControlHandle {
             last_notice: None,
             preference_updates: tokio::sync::watch::channel(None).0,
             confirmed_preferences: StreamControlPreferences {
+                device: None,
                 custom_bitrate_limit: None,
                 settings: StreamControlSettings {
                     true_color: false,
@@ -668,7 +681,7 @@ impl StreamControlHandle {
                 .map(|cap| cap.select(3, state.settings.hdr, 0))
                 .filter(|cap| cap.result == 0)
                 .and_then(|cap| quality_from_capability(cap.max_frame_quality)),
-            mouse_preference: state.preferred_mouse_mode,
+            mouse_preference: state.device_preferences.mouse_mode,
             mouse_mode: state.mouse.mode(),
             mouse_pending: state.mouse.waiting_for_neutral(),
             mouse_error: state.mouse.error(),
@@ -727,7 +740,8 @@ impl StreamControlHandle {
             persistence_error: state
                 .persistence_error
                 .clone()
-                .or_else(|| state.audio_persistence_error.clone()),
+                .or_else(|| state.audio_persistence_error.clone())
+                .or_else(|| state.device_persistence_error.clone()),
             network,
         }
     }
@@ -748,6 +762,7 @@ impl StreamControlHandle {
     pub(crate) fn preferences(&self) -> StreamControlPreferences {
         let state = lock(&self.shared);
         StreamControlPreferences {
+            device: Some(state.device_preferences),
             settings: state.confirmed_preferences.settings,
             custom_bitrate_limit: (state.custom_bitrate_limit < MAX_CUSTOM_BITRATE_MBPS)
                 .then_some(state.custom_bitrate_limit),
@@ -832,6 +847,7 @@ impl StreamControlHandle {
             .push_back(PendingCapturePreferences {
                 sequence,
                 preferences: StreamControlPreferences {
+                    device: None,
                     custom_bitrate_limit: (state.custom_bitrate_limit < MAX_CUSTOM_BITRATE_MBPS)
                         .then_some(state.custom_bitrate_limit),
                     settings: state.settings,

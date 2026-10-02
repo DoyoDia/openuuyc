@@ -8,6 +8,19 @@ use anyhow::Context as _;
 mod displays;
 pub(crate) use displays::{receive_session, screen_states};
 
+/// CaptureSetting has the same RPC contract on TEXT and CONTROL. Current iOS
+/// sends it on CONTROL (including mixed KCP); channel choice is not permission
+/// to execute any of the other TEXT-only operations.
+pub(crate) fn is_capture_setting(bytes: &[u8]) -> Result<bool> {
+    let Some(PbPayload::RpcRequest(bytes)) = PbControlMessage::decode(bytes)?.payload else {
+        return Ok(false);
+    };
+    Ok(matches!(
+        PbRpcRequest::decode(bytes.as_slice())?.payload,
+        Some(PbRpcRequestPayload::CaptureSetting(_))
+    ))
+}
+
 pub(crate) struct MicrophonePolicy {
     pub enabled: bool,
     sequence: i64,

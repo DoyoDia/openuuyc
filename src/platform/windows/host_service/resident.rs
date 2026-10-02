@@ -40,6 +40,8 @@ pub(crate) enum Request {
     CancelUpdate,
     Snapshot {
         ui: bool,
+        #[serde(default)]
+        device_cursor: Option<crate::account::device_change::relay::Cursor>,
     },
     Assist {
         account: String,
@@ -75,6 +77,8 @@ pub(crate) enum Request {
 }
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Snapshot {
+    #[serde(default)]
+    pub device_changes: Option<crate::account::device_change::relay::Batch>,
     pub assistance: host::assist::Snapshot,
     pub publication: crate::account::reporting::Snapshot,
     pub account: String,
@@ -589,6 +593,7 @@ async fn run_account(mut incoming: Incoming, running: &impl Fn() -> bool) -> Res
     )> = None;
     let mut initializers = tokio::task::JoinSet::new();
     let mut online = PresenceState::Offline;
+    let mut device_changes = crate::account::device_change::relay::Relay::new();
     let mut blocked = String::new();
     let mut next_start = std::time::Instant::now();
     let mut tick = tokio::time::interval(Duration::from_millis(200));
@@ -635,9 +640,10 @@ async fn run_account(mut incoming: Incoming, running: &impl Fn() -> bool) -> Res
                             let current = client.as_ref().context("后台尚未恢复账号")?;
                             let account = current.generation();
                             match request {
-                                Request::Snapshot { ui } => {
+                                Request::Snapshot { ui, device_cursor } => {
                                     if ui { current.host.assistance.touch_ui(); }
                                     Ok(Reply::Snapshot(Box::new(Snapshot {
+                                    device_changes: Some(device_changes.read(device_cursor.as_ref())),
                                     assistance: current.host.assistance.snapshot(),
                                     publication: crate::account::reporting::snapshot(),
                                     account,
@@ -737,6 +743,7 @@ async fn run_account(mut incoming: Incoming, running: &impl Fn() -> bool) -> Res
                             tokio::spawn(async move { owner.prepare_startup(cancelled).await }),
                         ));
                         }
+                        device_changes.reset();
                         presence = Some(ActivePresence::start(c.clone()));
                         client = Some(c);
                     }
@@ -749,7 +756,14 @@ async fn run_account(mut incoming: Incoming, running: &impl Fn() -> bool) -> Res
             if let Some(p) = &presence {
                 while let Ok(event) = p.events.try_recv() {
                     match event {
-                        PresenceEvent::State(state) => online = state,
+                        PresenceEvent::State(state) => {
+                            if matches!(state, PresenceState::Online)
+                                && !matches!(online, PresenceState::Online) {
+                                device_changes.reset();
+                            }
+                            online = state;
+                        },
+                        PresenceEvent::DeviceChanged(change) => device_changes.push(change),
                         PresenceEvent::Warning(error) => {
                             tracing::warn!(%error, "unattended presence")
                         }

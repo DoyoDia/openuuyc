@@ -79,6 +79,13 @@ impl DeviceSync {
         self.list_requested |= reconnect || self.list_read.is_none();
         self.groups_requested |= reconnect || self.group_read.is_none();
     }
+    pub fn resynchronize(&mut self) {
+        // An HTTP read from before an event gap must not overwrite the new
+        // baseline. Dropping Read cancels its task and discards its overlays.
+        self.list_read.take();
+        self.group_read.take();
+        self.refresh(true);
+    }
     pub fn refresh_status(&mut self) {
         self.list_requested = true;
     }

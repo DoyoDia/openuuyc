@@ -227,8 +227,22 @@ impl Peer {
                 "profile=0;level-idx=17;tier=0",
                 "apt=104",
             ),
+            (
+                super::format::Codec::Av1,
+                "video/AV1",
+                106,
+                "profile=1;level-idx=17;tier=0",
+                "apt=106",
+            ),
         ] {
-            if screen.is_none() || negotiated.supports_codec(kind) {
+            if screen.is_none()
+                || (negotiated.supports_codec(kind)
+                    && (pt != 106
+                        || negotiated.choices.iter().any(|c| {
+                            c.capability.format.codec == super::format::Codec::Av1
+                                && c.capability.format.chroma == 3
+                        })))
+            {
                 media.register_codec(
                     RTCRtpCodecParameters {
                         capability: RTCRtpCodecCapability {
@@ -569,7 +583,11 @@ impl Peer {
             audio.clone(),
             microphone.receiver().status(),
         ));
-        let (control_tx, mut control_rx) = mpsc::unbounded_channel::<(u16, u64, Vec<u8>)>();
+        enum ControlWork {
+            Response(Vec<u8>),
+            CaptureSetting(Vec<u8>),
+        }
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel::<(u16, u64, ControlWork)>();
         let control_screen = screen.clone();
         let control_config = config.clone();
         let control_stop = cancel.clone();
@@ -587,6 +605,19 @@ impl Peer {
                 if control_input.receive(stream_id, bytes)? {
                     return Ok(());
                 }
+                if crate::features::stream_control::publisher::is_capture_setting(bytes)? {
+                    // KCP delivery is synchronous. Reuse the response worker to
+                    // serialize display/settings work without blocking ACK/input
+                    // delivery or spawning an unordered task for each request.
+                    control_tx
+                        .send((
+                            stream_id,
+                            generation,
+                            ControlWork::CaptureSetting(bytes.to_vec()),
+                        ))
+                        .context("host CONTROL setting queue closed")?;
+                    return Ok(());
+                }
                 let responses = crate::features::stream_control::publisher::receive(
                     bytes,
                     true,
@@ -597,7 +628,7 @@ impl Peer {
                 control_target.send_if_modified(|routes| routes.received(&responses));
                 for response in responses.messages {
                     control_tx
-                        .send((stream_id, generation, response))
+                        .send((stream_id, generation, ControlWork::Response(response)))
                         .context("host CONTROL response queue closed")?;
                 }
                 Ok(())
@@ -605,18 +636,56 @@ impl Peer {
         let control_kcp = kcp.clone();
         let control_stop = cancel.clone();
         let response_input = input.receiver();
+        let control_screens = screens.clone();
+        let control_target = report_target.clone();
         let control_responses = tokio::spawn(async move {
             loop {
                 let item = tokio::select! { _=control_stop.cancelled()=>break, item=control_rx.recv()=>item };
-                let Some((id, generation, bytes)) = item else {
+                let Some((id, generation, work)) = item else {
                     break;
                 };
                 if !response_input.ready(id, generation).await {
                     continue;
                 }
-                let result = tokio::select! { _=control_stop.cancelled()=>break, result=control_kcp.send(id, bytes)=>result };
-                if let Err(error) = result {
-                    tracing::warn!(%error,"host KCP CONTROL response failed");
+                let (messages, setting_response) = match work {
+                    ControlWork::Response(bytes) => (vec![bytes], false),
+                    ControlWork::CaptureSetting(bytes) => {
+                        let mut state = tokio::select! {
+                            _ = control_stop.cancelled() => break,
+                            state = control_screens.lock() => state,
+                        };
+                        if response_input.generation(id) != Some(generation) {
+                            continue;
+                        }
+                        match crate::features::stream_control::publisher::receive_session(
+                            &mut state, &bytes, false,
+                        )
+                        .await
+                        {
+                            Ok(responses) => {
+                                control_target
+                                    .send_if_modified(|routes| routes.received(&responses));
+                                (responses.messages, true)
+                            }
+                            Err(error) => {
+                                tracing::warn!(%error, "host KCP capture setting failed");
+                                continue;
+                            }
+                        }
+                    }
+                };
+                for bytes in messages {
+                    if !response_input.ready(id, generation).await || control_stop.is_cancelled() {
+                        break;
+                    }
+                    let result = if setting_response {
+                        channels::send_setting_response(&control_target, bytes).await
+                    } else {
+                        tokio::select! { _=control_stop.cancelled()=>break, result=control_kcp.send(id, bytes)=>result }
+                    };
+                    if let Err(error) = result {
+                        tracing::warn!(%error,"host KCP CONTROL response failed");
+                    }
                 }
             }
         });

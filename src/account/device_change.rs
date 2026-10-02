@@ -3,14 +3,16 @@
 use crate::account::api::{DeviceGroups, DeviceInfo, DeviceList};
 use anyhow::{Result, bail};
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) mod relay;
+
+#[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum ChangeKind {
     Bound,
     Changed,
     Removed,
 }
 
-#[derive(Clone, Default, serde::Deserialize)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 struct Fields {
     alias: Option<String>,
@@ -25,7 +27,7 @@ struct Fields {
     participants_info: Option<Vec<serde_json::Value>>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct DeviceChange {
     pub id: String,
     pub kind: ChangeKind,

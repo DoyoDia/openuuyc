@@ -218,22 +218,4 @@ fn max_frame_rate_level(refresh_hz: u32) -> u32 {
         .unwrap_or(144)
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum VideoCodec {
-    H264,
-    H265,
-    Av1,
-}
-
-impl std::str::FromStr for VideoCodec {
-    type Err = anyhow::Error;
-
-    fn from_str(value: &str) -> Result<Self> {
-        match value.to_ascii_lowercase().as_str() {
-            "h264" | "avc" => Ok(Self::H264),
-            "h265" | "hevc" => Ok(Self::H265),
-            "av1" => Ok(Self::Av1),
-            _ => bail!("unsupported video codec: {value}"),
-        }
-    }
-}
+pub use openuuyc_codec::Codec as VideoCodec;

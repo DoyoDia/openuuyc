@@ -1,4 +1,4 @@
-//! Rust D3D11 decoding for Windows 4:2:0 / HEVC 4:4:4 hardware playback.
+//! Rust D3D11 decoding for Windows 4:2:0 / HEVC and AV1 4:4:4 playback.
 //! Hardware preparation never calls the native video bridge.
 mod av1;
 mod av1_params;

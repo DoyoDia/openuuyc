@@ -8,7 +8,7 @@ use tokio::sync::Notify;
 const MAX_EVENTS: usize = 512;
 pub(crate) const BUTTONS: [u32; 5] = [1, 2, 16, 32, 64];
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MouseMode {
     #[default]
     View,

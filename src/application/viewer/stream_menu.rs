@@ -912,7 +912,7 @@ crate::ui::controls::observe_notice(ui.ctx(), "audio-output-disconnected", "音�
                                     view.performance_mode != super::PerformancePanelMode::Hidden;
                                 if switch_row(ui, "性能监控", &mut monitoring)
                                     .on_hover_text(format!(
-                                        "仅当前播放窗口；切换快捷键：{}",
+                                        "为此设备保存，同一设备的播放窗口共用；切换快捷键：{}",
                                         crate::application::viewer_shortcuts::label(
                                             crate::application::viewer_shortcuts::Action::Performance
                                         )
@@ -954,7 +954,7 @@ crate::ui::controls::observe_notice(ui.ctx(), "audio-output-disconnected", "音�
                                     state.page = Page::Mouse;
                                 }
                                 switch_row(ui, "拦截本机快捷键", &mut view.intercept_shortcuts)
-                                    .on_hover_text("仅当前播放窗口。开启后，控制时优先将按键交给远端；关闭后允许本机快捷键响应。播放器自身快捷键始终保留。");
+                                    .on_hover_text("为此设备保存，同一设备的播放窗口共用。开启后，控制时优先将按键交给远端；关闭后允许本机快捷键响应。播放器自身快捷键始终保留。");
                                 let clipboard = handle.clipboard();
                                 let mic=handle.microphone().snapshot();
                                 let input=handle.microphone().selected_input();
@@ -977,15 +977,19 @@ crate::ui::controls::observe_notice(ui.ctx(), "audio-output-disconnected", "音�
                                 crate::ui::controls::observe_notice(ui.ctx(),"microphone-error","麦克风",crate::ui::controls::DialogIcon::Error,mic.error.as_deref());
                                 let clip = clipboard.snapshot();
                                 let mut enabled = clip.enabled;
-                                if switch_row(ui, "剪贴板同步", &mut enabled).changed() {
-                                    if let Err(error) = clipboard.set_enabled(enabled) {
+                                if switch_row(ui, "剪贴板同步", &mut enabled)
+                                    .on_hover_text("为此设备记住开关；键鼠控制就绪且对端允许时同步，不保存剪贴板内容")
+                                    .changed() {
+                                    if let Err(error) = handle.set_clipboard_enabled(enabled) {
                                         state.local_error = Some(error.to_string());
                                     }
                                 }
                                 if enabled {
                                     let mut files = clip.files;
-                                    if switch_row(ui, "文件复制", &mut files).changed() {
-                                        clipboard.set_files(files);
+                                    if switch_row(ui, "文件复制", &mut files)
+                                        .on_hover_text("为此设备记住文件复制开关")
+                                        .changed() {
+                                        handle.set_clipboard_files(files);
                                     }
                                     crate::ui::controls::progress_notice(ui.ctx(),"clipboard-wait","剪贴板同步",(!clip.active && snapshot.mouse_mode != MouseMode::View).then_some("等待剪贴板通道就绪"));
 crate::ui::controls::observe_notice(ui.ctx(), "clipboard-error", "剪贴板同步失败", crate::ui::controls::DialogIcon::Error, clip.error.as_deref());

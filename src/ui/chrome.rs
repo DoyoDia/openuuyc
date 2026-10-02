@@ -22,6 +22,11 @@ use winit::window::{Fullscreen, ResizeDirection, Window};
 
 const BACKDROP_SUBCLASS: usize = 0x4f555542;
 
+pub(crate) struct TitleBarAlert {
+    pub source: String,
+    pub duration: String,
+}
+
 pub(crate) fn cancel_pointer_operation(
     moving: &mut WindowMoveState,
     resizing: &mut WindowResizeState,
@@ -51,6 +56,16 @@ pub(crate) fn title_bar_panel<R>(
     height: f32,
     contents: impl FnOnce(&mut egui::Ui) -> R,
 ) -> egui::InnerResponse<R> {
+    title_bar_panel_alert(ui, id, height, false, contents)
+}
+
+pub(crate) fn title_bar_panel_alert<R>(
+    ui: &mut egui::Ui,
+    id: &'static str,
+    height: f32,
+    alert: bool,
+    contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::InnerResponse<R> {
     let clip = ui.clip_rect();
     let bottom = ui.available_rect_before_wrap().top() + height;
     // The native video child starts exactly at this boundary. Frame-edge
@@ -60,7 +75,16 @@ pub(crate) fn title_bar_panel<R>(
         egui::pos2(clip.right(), bottom),
     )));
     let result = egui::Panel::top(id)
-        .frame(title_bar_frame())
+        .frame(if alert {
+            title_bar_frame()
+                .fill(crate::ui::theme::CONTROLLED_TITLE_BG)
+                .stroke(egui::Stroke::new(
+                    crate::ui::theme::WINDOW_TITLE_STROKE,
+                    crate::ui::theme::CONTROLLED_TITLE_LINE,
+                ))
+        } else {
+            title_bar_frame()
+        })
         .exact_size(height)
         .show(ui, contents);
     ui.set_clip_rect(clip);
@@ -73,6 +97,17 @@ pub(crate) fn window_title_bar(
     alias: &str,
     move_state: Option<&mut WindowMoveState>,
     tooltips: bool,
+) -> bool {
+    window_title_bar_alert(ui, window, alias, move_state, tooltips, None)
+}
+
+pub(crate) fn window_title_bar_alert(
+    ui: &mut egui::Ui,
+    window: &Window,
+    alias: &str,
+    move_state: Option<&mut WindowMoveState>,
+    tooltips: bool,
+    alert: Option<&TitleBarAlert>,
 ) -> bool {
     ui.set_min_height(crate::ui::theme::WINDOW_TITLE_CONTENT_HEIGHT);
     let rect = egui::Rect::from_min_size(
@@ -98,12 +133,25 @@ pub(crate) fn window_title_bar(
     } else if handle_title_drag(window, &drag) {
         let _ = window.drag_window();
     }
+    let brand_rect = if alert.is_some() {
+        egui::Rect::from_min_max(
+            caption_rect.min,
+            egui::pos2(
+                (caption_rect.left()
+                    + crate::ui::theme::CONTROLLED_TITLE_BRAND_MAX.min(rect.width() * 0.25))
+                .min(caption_rect.right()),
+                caption_rect.bottom(),
+            ),
+        )
+    } else {
+        caption_rect
+    };
     let mut caption = ui.new_child(
         egui::UiBuilder::new()
-            .max_rect(caption_rect)
+            .max_rect(brand_rect)
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
-    caption.set_clip_rect(caption_rect);
+    caption.set_clip_rect(brand_rect);
     paint_brand_logo(&mut caption);
     caption.add(
         egui::Label::new(
@@ -113,6 +161,17 @@ pub(crate) fn window_title_bar(
         )
         .truncate(),
     );
+    if let Some(alert) = alert {
+        let margin = crate::ui::theme::WINDOW_TITLE_MARGIN;
+        let centered = rect.translate(egui::vec2(
+            (f32::from(margin.right) - f32::from(margin.left)) * 0.5,
+            0.0,
+        ));
+        let inset = (brand_rect.right() - centered.left())
+            .max(centered.right() - controls_rect.left())
+            + crate::ui::theme::CONTROLLED_TITLE_GAP;
+        paint_title_alert(ui, alert, centered.shrink2(egui::vec2(inset, 0.0)));
+    }
     let mut controls = ui.new_child(
         egui::UiBuilder::new()
             .max_rect(controls_rect.shrink2(egui::vec2(4.0, 0.0)))
@@ -122,6 +181,35 @@ pub(crate) fn window_title_bar(
     let close = window_buttons_impl(&mut controls, window, tooltips);
     ui.allocate_rect(rect, egui::Sense::hover());
     close
+}
+
+pub(crate) fn paint_title_alert(ui: &egui::Ui, alert: &TitleBarAlert, rect: egui::Rect) {
+    if rect.width() <= 0.0 {
+        return;
+    }
+    let color = crate::ui::theme::CONTROLLED_TITLE_TEXT;
+    let font = egui::FontId::proportional(crate::ui::theme::COMPACT_TEXT);
+    let suffix =
+        ui.painter()
+            .layout_no_wrap(format!("  ·  {}", alert.duration), font.clone(), color);
+    let width = (rect.width() - suffix.size().x).max(0.0);
+    let mut job = egui::text::LayoutJob::simple(alert.source.clone(), font, color, width);
+    job.wrap.max_rows = 1;
+    job.wrap.break_anywhere = true;
+    let source = ui.painter().layout_job(job);
+    let total = source.size().x + suffix.size().x;
+    let x = rect.center().x - total / 2.0;
+    let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
+    painter.galley(
+        egui::pos2(x, rect.center().y - source.size().y / 2.0),
+        source.clone(),
+        color,
+    );
+    painter.galley(
+        egui::pos2(x + source.size().x, rect.center().y - suffix.size().y / 2.0),
+        suffix,
+        color,
+    );
 }
 
 fn title_regions(rect: egui::Rect, maximize: bool) -> (egui::Rect, egui::Rect) {

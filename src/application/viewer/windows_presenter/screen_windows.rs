@@ -237,7 +237,6 @@ pub(super) struct ScreenWindows {
     sessions: HashMap<i32, Arc<NativeViewerSession>>,
     factory: ScreenPlayback,
     shutdown: Arc<AtomicBool>,
-    preferences: ViewerPreferences,
     proxy: EventLoopProxy<UiEvent>,
     generation: u64,
     next_refresh: Instant,
@@ -261,7 +260,6 @@ impl ScreenWindows {
         window: Window,
         mut session: NativeViewerSession,
         connecting: WindowsConnectionApp,
-        preferences: ViewerPreferences,
         proxy: EventLoopProxy<UiEvent>,
         generation: u64,
     ) -> Result<Self> {
@@ -272,12 +270,7 @@ impl ScreenWindows {
         let screen_id = session.screen_id();
         let session = Arc::new(session);
         factory.register(Arc::clone(&session));
-        let app = ThreadedWindowsApp::from_session(
-            &window,
-            Arc::clone(&session),
-            connecting,
-            preferences,
-        )?;
+        let app = ThreadedWindowsApp::from_session(&window, Arc::clone(&session), connecting)?;
         let catalog = factory.screens();
         let tabs = catalog.iter().map(|screen| screen.id).collect();
         let slot = ScreenWindow {
@@ -297,7 +290,6 @@ impl ScreenWindows {
             sessions: HashMap::from([(session.track_index, session)]),
             factory,
             shutdown,
-            preferences,
             proxy,
             generation,
             next_refresh: Instant::now(),
@@ -308,17 +300,6 @@ impl ScreenWindows {
         };
         group.sync_bars();
         Ok(group)
-    }
-
-    pub fn viewer_preferences(&self, preferred: Option<WindowId>) -> ViewerPreferences {
-        preferred
-            .and_then(|id| self.windows.get(&id))
-            .or_else(|| self.windows.values().next())
-            .and_then(|slot| slot.app.as_ref())
-            .map_or(self.preferences, |app| ViewerPreferences {
-                performance_mode: app.performance_mode,
-                intercept_shortcuts: app.intercept_shortcuts,
-            })
     }
 
     pub fn take_window(&mut self, preferred: Option<WindowId>) -> Option<Window> {
@@ -887,7 +868,6 @@ impl ScreenWindows {
                                 &slot.window,
                                 Arc::clone(&session),
                                 pending.connecting.take().expect("screen UI"),
-                                self.preferences,
                             )
                             .map(|app| {
                                 slot.app = Some(app);

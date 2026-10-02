@@ -21,10 +21,24 @@ use tokio_util::sync::CancellationToken;
 
 pub(crate) use engine::{Geometry, Screen};
 
+// Drain only already queued movement. No batching timer, no summed relative
+// deltas, and no reordering across a key/button/contact boundary.
+const MAX_BATCH: usize = 16;
+
+fn motion(event: &wire::Event) -> bool {
+    matches!(
+        event,
+        wire::Event::Absolute { .. }
+            | wire::Event::Relative { .. }
+            | wire::Event::RelativeScaled { .. }
+    )
+}
+
 struct Envelope {
     generation: u64,
     event: wire::Event,
     geometry: Geometry,
+    queued_at: std::time::Instant,
 }
 impl Envelope {
     fn coalesce(&mut self, next: &Self) -> bool {
@@ -58,8 +72,26 @@ struct Gate {
     generation: u64,
     faulted: bool,
     pending: VecDeque<Envelope>,
+    executing: Option<(std::time::Instant, usize)>,
+    last_execution: Duration,
 }
 impl Gate {
+    fn batch(&mut self, first: Envelope) -> (u64, Geometry, Vec<wire::Event>) {
+        let mut events = Vec::with_capacity(MAX_BATCH);
+        let moving = motion(&first.event);
+        events.push(first.event);
+        while moving
+            && events.len() < MAX_BATCH
+            && self.pending.front().is_some_and(|next| {
+                next.generation == first.generation
+                    && next.geometry == first.geometry
+                    && motion(&next.event)
+            })
+        {
+            events.push(self.pending.pop_front().unwrap().event);
+        }
+        (first.generation, first.geometry, events)
+    }
     // Called only after the previous generation's holds have been released.
     fn resume(&mut self, generation: u64) {
         if self.generation == generation && self.stream.is_some() {
@@ -241,6 +273,7 @@ impl Receiver {
             generation: gate.generation,
             event,
             geometry: (self.shared.geometry)(),
+            queued_at: std::time::Instant::now(),
         };
         if gate
             .pending
@@ -254,8 +287,19 @@ impl Receiver {
             // generation, release all owned holds, then accept only fresh input.
             gate.faulted = true;
             gate.generation = gate.generation.wrapping_add(1);
+            tracing::warn!(
+                oldest_ms = gate
+                    .pending
+                    .front()
+                    .map(|item| item.queued_at.elapsed().as_millis() as u64),
+                executing_ms = gate
+                    .executing
+                    .map(|(when, _)| when.elapsed().as_millis() as u64),
+                executing_events = gate.executing.map(|(_, count)| count),
+                last_execution_us = gate.last_execution.as_micros() as u64,
+                "host input queue saturated; discarding generation and releasing holds"
+            );
             gate.pending.clear();
-            tracing::warn!("host input queue saturated; discarding generation and releasing holds");
             self.shared
                 .lease
                 .input_status(None, Some("输入暂时阻塞，正在释放并恢复".into()));
@@ -288,8 +332,8 @@ fn run(shared: Arc<Shared>, rx: mpsc::Receiver<()>) {
                 gate.stream.map(|_| gate.binding),
             )
         };
-        // A transport outage or failed service invalidates queued input, but must
-        // not replenish the bounded recovery budget for this channel binding.
+        // Retry delay is bounded, not the number of recoveries during a viewing
+        // session. The lease/channel still owns and cancels all recovery work.
         if binding != current_binding {
             binding = current_binding;
             attempts = 0;
@@ -310,8 +354,7 @@ fn run(shared: Arc<Shared>, rx: mpsc::Receiver<()>) {
                 // Do not reopen the gate until outstanding holds were discharged.
                 if engine.as_ref().is_some_and(|engine| !engine.healthy()) {
                     engine.take();
-                    prepare_at = std::time::Instant::now()
-                        + Duration::from_secs(1u64 << attempts.saturating_sub(1));
+                    prepare_at = std::time::Instant::now() + recovery_delay(attempts);
                 }
                 std::thread::sleep(Duration::from_millis(100));
                 continue;
@@ -325,8 +368,8 @@ fn run(shared: Arc<Shared>, rx: mpsc::Receiver<()>) {
             }
         }
         if let Some(current) = current {
-            if engine.is_none() && attempts < 5 && std::time::Instant::now() >= prepare_at {
-                attempts += 1;
+            if engine.is_none() && std::time::Instant::now() >= prepare_at {
+                attempts = attempts.saturating_add(1).min(5);
                 match Backend::new(shared.policy, require_service, || shared.permitted()) {
                     Ok(mut value) => {
                         require_service |= value.service();
@@ -344,8 +387,8 @@ fn run(shared: Arc<Shared>, rx: mpsc::Receiver<()>) {
                         }
                     }
                     Err(error) => {
-                        prepare_at =
-                            std::time::Instant::now() + Duration::from_secs(1u64 << (attempts - 1));
+                        prepare_at = std::time::Instant::now() + recovery_delay(attempts);
+                        tracing::warn!(attempts, %error, "host input backend preparation failed");
                         shared.lease.input_status(None, Some(error.to_string()));
                         let mut gate = lock(&shared.gate);
                         if shared.permitted() {
@@ -397,9 +440,10 @@ fn run(shared: Arc<Shared>, rx: mpsc::Receiver<()>) {
             }
         }
         if let Some(item) = item {
-            if generation != Some(item.generation)
+            let (item_generation, geometry, events) = lock(&shared.gate).batch(item);
+            if generation != Some(item_generation)
                 || !shared.permitted()
-                || item.geometry != (shared.geometry)()
+                || geometry != (shared.geometry)()
             {
                 continue;
             }
@@ -408,14 +452,23 @@ fn run(shared: Arc<Shared>, rx: mpsc::Receiver<()>) {
             };
             // The gate is checked on every physical transition, including Unicode
             // batches; closing a channel must not finish an old queued sequence.
+            let expected_geometry = geometry.clone();
             let permitted = || {
                 let gate = lock(&shared.gate);
                 shared.permitted()
                     && !gate.faulted
                     && Some(gate.generation) == generation
                     && gate.stream.is_some()
+                    && expected_geometry == (shared.geometry)()
             };
-            let result = engine.apply(item.event, item.geometry, permitted);
+            let started = std::time::Instant::now();
+            lock(&shared.gate).executing = Some((started, events.len()));
+            let result = engine.apply(events, geometry, permitted);
+            {
+                let mut gate = lock(&shared.gate);
+                gate.executing = None;
+                gate.last_execution = started.elapsed();
+            }
             if let Err(error) = result {
                 let release = engine.release();
                 shared.lease.input_status(
@@ -426,6 +479,7 @@ fn run(shared: Arc<Shared>, rx: mpsc::Receiver<()>) {
                     }),
                 );
             } else {
+                attempts = 0;
                 shared.lease.input_status(Some(engine.backend()), None);
             }
         }
@@ -449,9 +503,12 @@ fn run(shared: Arc<Shared>, rx: mpsc::Receiver<()>) {
             }
         }
         if engine.as_ref().is_some_and(|engine| !engine.healthy()) {
+            tracing::warn!(
+                attempts,
+                "host input service transport failed; releasing and rebuilding backend"
+            );
             engine.take();
-            prepare_at =
-                std::time::Instant::now() + Duration::from_secs(1u64 << attempts.saturating_sub(1));
+            prepare_at = std::time::Instant::now() + recovery_delay(attempts);
             let mut gate = lock(&shared.gate);
             gate.generation = gate.generation.wrapping_add(1);
             gate.faulted = true;
@@ -464,4 +521,8 @@ fn run(shared: Arc<Shared>, rx: mpsc::Receiver<()>) {
             tracing::warn!(%error,"host input final release failed");
         }
     }
+}
+
+fn recovery_delay(attempts: u8) -> Duration {
+    Duration::from_secs(1u64 << attempts.saturating_sub(1).min(4))
 }

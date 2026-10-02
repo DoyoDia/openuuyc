@@ -13,12 +13,15 @@ use std::time::{Duration, Instant};
 
 #[derive(Serialize, Deserialize)]
 enum Request {
+    SecureAttention {
+        origin: u32,
+    },
     Hello {
         policy: super::wire::Policy,
         origin: u32,
     },
     Input {
-        event: Event,
+        events: Vec<Event>,
         geometry: Geometry,
     },
     Release,
@@ -33,6 +36,39 @@ struct Reply {
     error: Option<String>,
     sas: bool,
     mouse_policy: super::config::MousePolicy,
+}
+
+/// Finish framing even when the input generation is revoked. A Release queued
+/// behind the request cancels the agent's remaining transitions; drain both
+/// replies before reusing the pipe. Only a real I/O failure poisons the channel.
+fn exchange(pipe: &Pipe, request: &Request, permitted: impl Fn() -> bool) -> Result<Reply> {
+    use std::cell::{Cell, RefCell};
+    pipe.send(request, || true)?;
+    let cancelled = Cell::new(false);
+    let failure = RefCell::new(None);
+    let poll = || {
+        if !permitted() && !cancelled.replace(true) {
+            if let Err(error) = pipe.send(&Request::Release, || true) {
+                *failure.borrow_mut() = Some(error);
+            }
+        }
+        failure.borrow().is_none()
+    };
+    ensure!(poll(), "输入取消请求发送失败");
+    let reply = pipe.receive(&poll);
+    let _ = poll();
+    if let Some(error) = failure.into_inner() {
+        return Err(error);
+    }
+    let mut reply: Reply = reply?;
+    if cancelled.get() {
+        reply = pipe.receive(|| true)?;
+        reply.sas = false;
+        if reply.error.is_none() {
+            reply.error = Some("本次输入已取消，已释放持有状态".into());
+        }
+    }
+    Ok(reply)
 }
 pub(crate) struct Remote {
     pipe: Pipe,
@@ -85,11 +121,8 @@ impl Remote {
     }
     fn request(&mut self, request: Request, permitted: impl Fn() -> bool) -> Result<()> {
         ensure!(!self.failed, "被控服务连接已失效");
-        let result = (|| {
-            self.pipe.send(&request, &permitted)?;
-            let reply: Reply = self.pipe.receive(&permitted)?;
-            Ok(reply)
-        })();
+        ensure!(permitted(), "本次输入已取消");
+        let result = exchange(&self.pipe, &request, permitted);
         // A lost response does not authorize replaying the command through another
         // backend. Disconnect is the only recovery for this input generation.
         match result {
@@ -110,11 +143,11 @@ impl Remote {
     }
     pub fn apply(
         &mut self,
-        event: Event,
+        events: Vec<Event>,
         geometry: Geometry,
         permitted: impl Fn() -> bool,
     ) -> Result<()> {
-        self.request(Request::Input { event, geometry }, permitted)
+        self.request(Request::Input { events, geometry }, permitted)
     }
     pub fn release(&mut self) -> Result<()> {
         self.request(Request::Release, || true)
@@ -195,7 +228,7 @@ pub(crate) fn agent(name: &str, parent: u32) -> Result<()> {
     let Request::Hello { policy, origin } = pipe.receive(permitted)? else {
         anyhow::bail!("缺少输入会话握手")
     };
-    let mut engine = Engine::new(hardware, policy, origin)?;
+    let mut engine = Engine::new(hardware, policy, origin, true)?;
     pipe.send(
         &Reply {
             backend: engine.backend().into(),
@@ -214,14 +247,32 @@ pub(crate) fn agent(name: &str, parent: u32) -> Result<()> {
         let request: Request = pipe.receive(permitted)?;
         let close = matches!(request, Request::Close);
         let result = match request {
-            Request::Input { event, geometry } => {
-                event.validate()?;
+            Request::Input { events, geometry } => {
+                ensure!(
+                    !events.is_empty() && events.len() <= super::MAX_BATCH,
+                    "输入批次长度无效"
+                );
+                for event in &events {
+                    event.validate()?;
+                }
                 geometry.validate()?;
                 // The broker is request/response serialized. Extra incoming data
                 // during execution is its cancellation/close request.
-                engine.apply(event, geometry, || {
-                    permitted() && pipe.queued_bytes().is_ok_and(|n| n == 0)
-                })
+                let count = events.len();
+                let started = Instant::now();
+                let result = events.into_iter().try_for_each(|event| {
+                    engine.apply(event, geometry.clone(), || {
+                        permitted() && pipe.queued_bytes().is_ok_and(|n| n == 0)
+                    })
+                });
+                if started.elapsed() >= Duration::from_millis(100) {
+                    tracing::warn!(
+                        events = count,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "host input agent execution stalled"
+                    );
+                }
+                result
             }
             Request::Release | Request::Close => engine.release(),
             Request::Alive => engine.tick(),
@@ -230,7 +281,9 @@ pub(crate) fn agent(name: &str, parent: u32) -> Result<()> {
                 engine.synchronize(geometry)
             }
             Request::Configure(configuration) => engine.configure(configuration),
-            Request::Hello { .. } => anyhow::bail!("重复输入会话握手"),
+            Request::Hello { .. } | Request::SecureAttention { .. } => {
+                anyhow::bail!("输入会话请求无效")
+            }
         };
         if result.is_err() {
             let _ = engine.release();
@@ -264,7 +317,25 @@ pub(crate) fn serve(pipe: Pipe, permitted: impl Fn() -> bool) -> Result<()> {
     );
     let permitted =
         || permitted() && process::active_session() == session && pipe.queued_bytes().is_ok();
-    let Request::Hello { policy, origin } = pipe.receive::<Request>(&permitted)? else {
+    let first = pipe.receive::<Request>(&permitted)?;
+    if let Request::SecureAttention { origin } = first {
+        ensure!(origin == pid, "输入来源进程不匹配");
+        ensure!(
+            permitted() && pipe.queued_bytes()? == 0,
+            "安全注意序列请求已撤销"
+        );
+        let result = crate::platform::windows::host_service::service::secure_attention();
+        return pipe.send(
+            &Reply {
+                backend: "Windows · 系统服务".into(),
+                error: result.err().map(|error| error.to_string()),
+                sas: false,
+                mouse_policy: Default::default(),
+            },
+            &permitted,
+        );
+    }
+    let Request::Hello { policy, origin } = first else {
         anyhow::bail!("缺少被控服务握手")
     };
     ensure!(origin == pid, "输入来源进程不匹配");
@@ -288,8 +359,10 @@ pub(crate) fn serve(pipe: Pipe, permitted: impl Fn() -> bool) -> Result<()> {
             }
             let request: Request = pipe.receive(&permitted)?;
             let close = matches!(request, Request::Close);
-            agent_pipe.send(&request, &permitted)?;
-            let mut reply: Reply = agent_pipe.receive(&permitted)?;
+            let input = matches!(request, Request::Input { .. });
+            let mut reply = exchange(&agent_pipe, &request, || {
+                permitted() && (!input || pipe.queued_bytes().is_ok_and(|n| n == 0))
+            })?;
             if reply.sas {
                 reply.sas = false;
                 ensure!(permitted(), "安全注意序列请求已撤销");
@@ -312,4 +385,23 @@ pub(crate) fn serve(pipe: Pipe, permitted: impl Fn() -> bool) -> Result<()> {
     let _ = agent_pipe.send(&Request::Close, || agent.alive());
     let _ = agent_pipe.receive::<Reply>(|| agent.alive());
     result
+}
+
+/// The resident already owns native input, but SAS remains an explicit service
+/// operation. No second HID owner or input-agent is created for this command.
+pub(super) fn secure_attention(permitted: impl Fn() -> bool) -> Result<()> {
+    ensure!(permitted(), "安全注意序列请求已撤销");
+    let pipe = Pipe::client(NAME)?.ok_or_else(|| anyhow::anyhow!("被控服务未运行"))?;
+    crate::platform::windows::host_service::install::verify_running(pipe.peer_pid(false)?)?;
+    pipe.send(
+        &Request::SecureAttention {
+            origin: std::process::id(),
+        },
+        &permitted,
+    )?;
+    let reply: Reply = pipe.receive(&permitted)?;
+    if let Some(error) = reply.error {
+        anyhow::bail!(error);
+    }
+    Ok(())
 }

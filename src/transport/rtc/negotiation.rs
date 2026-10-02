@@ -239,6 +239,13 @@ pub(super) fn register_uu_codecs(media_engine: &mut MediaEngine) -> Result<()> {
             primary_feedback.clone(),
         ),
         ("video/rtx", 105, "apt=104", repair_feedback.clone()),
+        (
+            "video/AV1",
+            106,
+            "profile=1;level-idx=17;tier=0",
+            primary_feedback.clone(),
+        ),
+        ("video/rtx", 107, "apt=106", repair_feedback.clone()),
         (MIME_TYPE_HEVC, 96, "", primary_feedback.clone()),
         ("video/rtx", 97, "apt=96", repair_feedback.clone()),
         (

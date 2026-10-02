@@ -37,6 +37,7 @@ impl Timeline {
 }
 pub(super) struct Worker {
     cancel: CancellationToken,
+    encode_cancel: Arc<AtomicBool>,
     source_missing: Arc<AtomicBool>,
     first_frame: Arc<AtomicBool>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
@@ -206,6 +207,8 @@ impl Worker {
         let sending_keyframe = keyframe.clone();
         let source_missing = Arc::new(AtomicBool::new(false));
         let missing = source_missing.clone();
+        let encode_cancel = Arc::new(AtomicBool::new(cancel.is_cancelled()));
+        let owner_encode_cancel = encode_cancel.clone();
         let capture = std::thread::Builder::new()
             .name("host-screen".into())
             .spawn(move || {
@@ -213,6 +216,7 @@ impl Worker {
                     screen,
                     owner_handle.clone(),
                     owner_cancel.clone(),
+                    owner_encode_cancel,
                     connected,
                     config,
                     owner_keyframe,
@@ -244,6 +248,12 @@ impl Worker {
                 cancel.cancel();
                 e
             })?;
+        let encoding_cancel_token = cancel.clone();
+        let encoding_cancel_flag = encode_cancel.clone();
+        let encoding_cancellation = tokio::spawn(async move {
+            encoding_cancel_token.cancelled().await;
+            encoding_cancel_flag.store(true, Ordering::Release);
+        });
         let send_cancel = cancel.clone();
         let send_handle = handle.clone();
         let first_frame = Arc::new(AtomicBool::new(false));
@@ -251,11 +261,19 @@ impl Worker {
         let sending = tokio::spawn(async move {
             let mut payloader = H264Payloader::default();
             let sequence = timeline.sequence.clone();
+            let mut awaiting_keyframe = false;
             loop {
                 let value = tokio::select! {_ = send_cancel.cancelled()=>break,v=frames.recv()=>v};
                 let Some(frame) = value else { break };
-                if !sending_formats.permits_codec(frame.format.codec) {
+                if !sending_formats.permits_format(frame.format) {
+                    awaiting_keyframe = true;
                     sending_keyframe.store(true, Ordering::Release);
+                    continue;
+                }
+                // An in-flight encoder may have queued a dependent P frame
+                // before a reoffer dropped its reference. Do not send that old
+                // dependency chain while the requested keyframe is being built.
+                if awaiting_keyframe && !frame.keyframe {
                     continue;
                 }
                 transport.frame(
@@ -404,12 +422,13 @@ impl Worker {
                             }
                         }
                     }
-                    match tokio::select! { _=send_cancel.cancelled()=>break, result=track.write(frame.format.codec, &packet)=>result }
+                    match tokio::select! { _=send_cancel.cancelled()=>break, result=track.write(frame.format, &packet)=>result }
                     {
                         Ok(0) => {
                             // Unbound during renegotiation: the encoder has
                             // advanced its references, but the peer missed this
                             // frame. Resume with an IDR instead of a broken P chain.
+                            awaiting_keyframe = true;
                             sending_keyframe.store(true, Ordering::Release);
                             complete = false;
                             break;
@@ -417,6 +436,7 @@ impl Worker {
                         Ok(_) => {}
                         Err(webrtc::Error::ErrUnsupportedCodec) => {
                             // A reoffer may retire this already queued format.
+                            awaiting_keyframe = true;
                             sending_keyframe.store(true, Ordering::Release);
                             complete = false;
                             break;
@@ -447,6 +467,7 @@ impl Worker {
                     drop(clock);
                 }
                 if complete && !send_cancel.is_cancelled() && send_handle.requested() {
+                    if frame.keyframe { awaiting_keyframe = false; }
                     sent_first_frame.store(true, Ordering::Release);
                     send_handle.frame();
                 }
@@ -455,13 +476,15 @@ impl Worker {
 
         Ok(Self {
             cancel,
+            encode_cancel,
             source_missing,
             first_frame,
-            tasks: vec![reports, feedback, sending],
+            tasks: vec![reports, feedback, sending, encoding_cancellation],
             capture: Some(capture),
         })
     }
     pub(super) async fn close(mut self) {
+        self.encode_cancel.store(true, Ordering::Release);
         self.cancel.cancel();
         for task in self.tasks.drain(..) {
             let _ = task.await;
@@ -482,6 +505,7 @@ impl Worker {
 }
 impl Drop for Worker {
     fn drop(&mut self) {
+        self.encode_cancel.store(true, Ordering::Release);
         self.cancel.cancel();
         for task in &self.tasks {
             task.abort();

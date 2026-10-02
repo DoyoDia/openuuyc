@@ -780,7 +780,7 @@ pub(super) async fn gui_worker_loop(
                     PresenceEvent::State(state) => {
                         let online = matches!(state, PresenceState::Online);
                         if online && !presence_online {
-                            device_sync.refresh(true);
+                            device_sync.resynchronize();
                             next_assist_refresh = Some(Instant::now());
                         }
                         presence_online = online;
@@ -796,6 +796,7 @@ pub(super) async fn gui_worker_loop(
                             .unwrap_or_default();
                         device_sync.change(change, &events, catalog_generation, &name);
                     }
+                    PresenceEvent::DevicesResync => device_sync.resynchronize(),
                     PresenceEvent::AccountEnded => {}
                 }
             }

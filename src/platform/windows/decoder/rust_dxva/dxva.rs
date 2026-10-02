@@ -50,6 +50,7 @@ fn select(
         (Codec::Hevc, 8, 1) => D3D11_DECODER_PROFILE_HEVC_VLD_MAIN,
         (Codec::Hevc, 10, 1) => D3D11_DECODER_PROFILE_HEVC_VLD_MAIN10,
         (Codec::Av1, 8 | 10, 1) => GUID::from_u128(0xb8be4ccb_cf53_46ba_8d59_d6b8a6da5d2a),
+        (Codec::Av1, 8 | 10, 3) => GUID::from_u128(0x6936ff0f_45b1_4163_9cc1_646ef6946108),
         (Codec::Hevc, 8, 3) => GUID::from_u128(0x4008018f_f537_4b36_98cf_61af8a2c1a33),
         (Codec::Hevc, 10, 3) => GUID::from_u128(0x0dabeffa_4458_4602_bc03_0795659d617c),
         _ => bail!("unsupported codec/depth"),

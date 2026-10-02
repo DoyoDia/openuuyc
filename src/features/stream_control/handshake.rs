@@ -53,6 +53,10 @@ impl StreamControlHandle {
             _ => return,
         }
         if !open {
+            state.restore_input_pending = state.device_preferences.control_enabled
+                && state.viewing_enabled
+                && !state.annotation.enabled
+                && !state.annotation.toggling();
             self.microphone.disconnect();
             self.clipboard.suspend();
             state.peer_clipboard = 0;
@@ -173,9 +177,11 @@ impl StreamControlHandle {
         let mut state = lock(&self.shared);
         if enabled && !state.viewing_enabled {
             state.initial_capture_sync_sent = false;
+            state.restore_input_pending = state.device_preferences.control_enabled;
         }
         state.viewing_enabled = enabled;
         if !enabled {
+            state.restore_input_pending = false;
             self.disable_microphone_locked(&mut state);
             self.clipboard.suspend();
         }

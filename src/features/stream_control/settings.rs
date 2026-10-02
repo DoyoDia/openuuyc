@@ -40,6 +40,10 @@ impl StreamControlHandle {
             ?preferences,
             "restored viewing preferences for a new room generation"
         );
+        drop(state);
+        if let Some(device) = preferences.device {
+            self.restore_device_preferences(device);
+        }
         Ok(())
     }
 

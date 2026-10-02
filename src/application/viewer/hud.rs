@@ -20,22 +20,7 @@ pub(in crate::application) fn show_performance_overlay(
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(in crate::application) enum PerformancePanelMode {
-    Hidden,
-    Compact,
-    Detailed,
-}
-
-impl PerformancePanelMode {
-    pub(super) fn next(self) -> Self {
-        match self {
-            Self::Compact => Self::Detailed,
-            Self::Detailed => Self::Hidden,
-            Self::Hidden => Self::Compact,
-        }
-    }
-}
+pub(in crate::application) use crate::features::viewing_settings::PerformancePanelMode;
 
 pub(super) fn show_compact_performance(
     ctx: &egui::Context,

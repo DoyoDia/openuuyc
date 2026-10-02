@@ -21,6 +21,7 @@ use view::{CenterUi, configure_visuals};
 
 mod assist;
 mod catalog;
+mod controlled_caption;
 pub(crate) mod device_status;
 mod device_sync;
 mod diagnostics;
@@ -1137,6 +1138,9 @@ impl DeviceCenterApp {
 }
 
 impl crate::ui::App for DeviceCenterApp {
+    fn title_bar_alert(&self) -> Option<crate::ui::chrome::TitleBarAlert> {
+        self.controlled_caption()
+    }
     fn exit_ready(&self) -> bool {
         self.exit_ready
     }

@@ -444,6 +444,11 @@ impl Budget {
         };
         (f64::from(total) * (1.0 - overhead.min(0.5))) as u32
     }
+    /// Successful media/RTX/FEC egress bytes, including accounted wire overhead.
+    /// Diagnostic sampling must not reuse the short repair-budget rate window.
+    pub fn sent_totals(&self) -> [u64; 3] {
+        self.totals
+    }
     pub fn fec_demand(&mut self, rate: f64) {
         self.demand = rate.max(0.0).min(self.bwe);
     }

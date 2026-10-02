@@ -290,7 +290,13 @@ impl RawRouter {
         }
         let held = input.owner_holds_buttons(target.owner());
         let relative = input.relative_mode();
-        let position = target.position(msg.pt, held);
+        // Captured relative input is already accepted independently of pointer
+        // position. Avoid contending with egui/layout on every high-rate report.
+        let position = if relative {
+            None
+        } else {
+            target.position(msg.pt, held)
+        };
         let accepted = relative || position.is_some();
         if !relative {
             if let Some((screen, x, y)) = position {

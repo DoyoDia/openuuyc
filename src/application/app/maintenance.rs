@@ -342,14 +342,14 @@ fn update_running() -> Result<bool> {
     let mut had_window = running.is_some();
     let background = host_service::resident::managed() && host_service::install::running()?;
     let resume = background && !host_service::resident::paused()?;
-    let mut notified = false;
+    let mut preparing_update = false;
     let result = (|| -> Result<bool> {
         // Announce before the old GUI's normal exit path pauses the resident.
         // The protected deployment receipt distinguishes pre-notification builds
         // without sending an unknown IPC request to an older running service.
         if resume && host_service::install::supports_update_notice()? {
-            host_service::resident::call(host_service::resident::Request::PrepareUpdate)?;
-            notified = true;
+            preparing_update = true;
+            prepare_resident_update(host_service::resident::call)?;
         }
         if let Some(running) = running {
             running.close()?;
@@ -377,7 +377,7 @@ fn update_running() -> Result<bool> {
     })();
     drop(gate);
     if let Err(error) = result {
-        if notified {
+        if preparing_update {
             let _ = host_service::resident::call(host_service::resident::Request::CancelUpdate);
         }
         let restored = if had_window {
@@ -395,4 +395,41 @@ fn update_running() -> Result<bool> {
         };
     }
     result
+}
+
+fn prepare_resident_update(
+    mut request: impl FnMut(host_service::resident::Request) -> Result<host_service::resident::Reply>,
+) -> Result<()> {
+    use host_service::resident::{Reply, Request};
+    let error = match request(Request::PrepareUpdate) {
+        Ok(Reply::Done) => return Ok(()),
+        Ok(_) => anyhow::bail!("更新准备返回了无效响应"),
+        Err(error) => error,
+    };
+    // The running peer may close immediately after the update notice. Verify
+    // actual session retirement, rather than guessing from an error string or
+    // treating temporary loss of Connected as the absence of a session.
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        match request(Request::Snapshot {
+            ui: false,
+            device_cursor: None,
+        }) {
+            Ok(Reply::Snapshot(snapshot)) => {
+                if !snapshot.status.session_active && !snapshot.status.connected {
+                    // Re-arm the admission gate; a failed PrepareUpdate releases
+                    // it. The retired session must not receive a duplicate notice.
+                    return match request(Request::PrepareUpdate)? {
+                        Reply::Done => Ok(()),
+                        _ => anyhow::bail!("更新准备返回了无效响应"),
+                    };
+                }
+            }
+            _ => return Err(error.context("无法确认旧被控会话已结束，尚未开始更新")),
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(error.context("被控会话仍未结束，尚未开始更新"));
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }

@@ -4,7 +4,7 @@ use super::{
     params::{HevcParams, HevcRangeParams},
 };
 use anyhow::{Context, Result, ensure};
-use openuuyc_h265_syntax::{
+use openuuyc_codec::syntax::hevc::{
     bitreader::BitReader,
     dpb::{LongTermEntry, build_rps_poc_lists},
     nal::{NalHeader, strip_emulation_prevention},
@@ -75,7 +75,7 @@ impl Hevc {
             u16,
         )> = None;
         let mut slices = vec![];
-        for nal in openuuyc_h264::syntax::nal::AnnexBSplitter::new(data) {
+        for nal in openuuyc_codec::syntax::h264::nal::AnnexBSplitter::new(data) {
             let header = NalHeader::parse(nal)?;
             ensure!(header.nuh_layer_id == 0, "layered HEVC unsupported");
             let rbsp = strip_emulation_prevention(&nal[2..]);

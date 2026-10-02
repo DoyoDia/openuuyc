@@ -1,5 +1,4 @@
-//! Hardware first; the Rust H.264 core is the negotiated software fallback.
-use super::rust_h264::Encoder as SoftwareEncoder;
+//! Hardware first; negotiated Rust software codecs share the capture lifecycle.
 use anyhow::{Context, Result, ensure};
 use windows::{
     Win32::{Graphics::Direct3D11::*, System::Com::*},
@@ -63,10 +62,25 @@ pub(crate) fn probe(
         Backend::Software,
         Format::AVC,
     ));
+    for chroma in [1, 3] {
+        for depth in [8, 10] {
+            candidates.push((
+                adapter,
+                desktop.device.clone(),
+                Backend::Software,
+                Format {
+                    codec: Codec::Av1,
+                    chroma,
+                    depth,
+                },
+            ));
+        }
+    }
     let mut cached = None::<super::capture::Frame>;
     let mut cached_hdr = None;
     let mut result = Vec::new();
     let mut last_failure = None;
+    let mut acquired_frame = false;
     for (adapter, device, backend, format) in candidates {
         if !is_active() {
             anyhow::bail!("被控准备已取消");
@@ -80,6 +94,7 @@ pub(crate) fn probe(
                     anyhow::bail!("被控准备已取消");
                 }
                 if let Some(frame) = desktop.next(50, 1, false, format.hdr(), (1280, 720))? {
+                    acquired_frame = true;
                     cached = Some(frame);
                     break;
                 }
@@ -109,7 +124,7 @@ pub(crate) fn probe(
                 None
             };
             let mut encoder = if backend == Backend::Software {
-                Encoder::software(&device, frame.width, frame.height, 30, rate.target)?
+                Encoder::software_format(&device, (frame.width, frame.height), format, rate)?
             } else {
                 Encoder::hardware_format(&device, (frame.width, frame.height), format, rate)?
             };
@@ -165,7 +180,10 @@ pub(crate) fn probe(
         })();
         match probe {
             Ok(cap) => {
-                tracing::debug!(?cap, "host encoder capability verified from SPS");
+                tracing::debug!(
+                    ?cap,
+                    "host encoder capability verified from sequence header"
+                );
                 result.push(cap)
             }
             Err(error) => {
@@ -174,6 +192,11 @@ pub(crate) fn probe(
             }
         }
     }
+    ensure!(
+        acquired_frame,
+        "所选桌面尚未提供可采集的画面：{}",
+        last_failure.as_deref().unwrap_or("未取得桌面首帧")
+    );
     ensure!(
         !result.is_empty(),
         "所选桌面没有可用的视频编码器：{}",
@@ -219,12 +242,7 @@ pub(crate) enum Encoder {
     Nvidia(super::nvenc::Encoder),
     Amd(super::amf::Encoder),
     Intel(super::qsv::Encoder),
-    Software {
-        encoder: SoftwareEncoder,
-        context: ID3D11DeviceContext,
-        staging: ID3D11Texture2D,
-        pixels: Vec<u8>,
-    },
+    Software(Box<super::software_encoder::Encoder>),
 }
 impl Encoder {
     pub(crate) fn hardware_format(
@@ -250,48 +268,22 @@ impl Encoder {
             }
         }
     }
-    pub(crate) fn software(
+    pub(crate) fn software_format(
         device: &ID3D11Device,
-        width: u32,
-        height: u32,
-        fps: u32,
-        bitrate: u32,
+        size: (u32, u32),
+        format: super::format::Format,
+        rate: super::format::Rate,
     ) -> Result<Self> {
-        let encoder = SoftwareEncoder::new(width, height, fps, bitrate)?;
-        unsafe {
-            let mut staging = None;
-            device.CreateTexture2D(
-                &D3D11_TEXTURE2D_DESC {
-                    Width: width,
-                    Height: height,
-                    MipLevels: 1,
-                    ArraySize: 1,
-                    Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
-                    SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
-                        Count: 1,
-                        Quality: 0,
-                    },
-                    Usage: D3D11_USAGE_STAGING,
-                    CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
-                    ..Default::default()
-                },
-                None,
-                Some(&mut staging),
-            )?;
-            Ok(Self::Software {
-                encoder,
-                context: device.GetImmediateContext()?,
-                staging: staging.context("软件编码读回纹理")?,
-                pixels: vec![0; width as usize * height as usize * 4],
-            })
-        }
+        Ok(Self::Software(Box::new(
+            super::software_encoder::Encoder::new(device, size, format, rate)?,
+        )))
     }
     pub(crate) fn implementation(&self) -> i32 {
         match self {
             Self::Nvidia(_) => 0,
             Self::Amd(_) => 1,
             Self::Intel(_) => 2,
-            Self::Software { .. } => 5,
+            Self::Software(_) => 5,
         }
     }
     pub(crate) fn maximum_size(&self) -> (u32, u32) {
@@ -299,7 +291,7 @@ impl Encoder {
             Self::Nvidia(e) => e.maximum_size(),
             Self::Amd(e) => e.maximum_size(),
             Self::Intel(e) => e.maximum_size(),
-            Self::Software { .. } => super::rust_h264::MAXIMUM,
+            Self::Software(encoder) => encoder.maximum_size(),
         }
     }
     pub(crate) fn configure_rate(&mut self, rate: super::format::Rate) -> Result<bool> {
@@ -307,7 +299,7 @@ impl Encoder {
             Self::Nvidia(e) => e.configure_rate(rate),
             Self::Amd(e) => e.configure(rate),
             Self::Intel(e) => e.configure(rate),
-            Self::Software { encoder, .. } => encoder.configure(rate),
+            Self::Software(encoder) => encoder.configure(rate),
         }
     }
     pub(crate) fn encode(
@@ -316,39 +308,32 @@ impl Encoder {
         timestamp: i64,
         keyframe: bool,
     ) -> Result<Vec<Encoded>> {
+        self.encode_cancellable(
+            texture,
+            timestamp,
+            keyframe,
+            &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+    }
+    pub(crate) fn encode_cancellable(
+        &mut self,
+        texture: &ID3D11Texture2D,
+        timestamp: i64,
+        keyframe: bool,
+        cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<Vec<Encoded>> {
+        if keyframe && let Self::Software(e) = self {
+            e.request_keyframe();
+        }
+        ensure!(
+            !cancel.load(std::sync::atomic::Ordering::Acquire),
+            "编码已取消"
+        );
         match self {
+            Self::Software(e) => e.encode(texture, timestamp, keyframe, cancel),
             Self::Nvidia(e) => e.encode(texture, timestamp, keyframe),
             Self::Amd(e) => e.encode(texture, timestamp, keyframe),
             Self::Intel(e) => e.encode(texture, timestamp, keyframe),
-            Self::Software {
-                encoder,
-                context,
-                staging,
-                pixels,
-            } => unsafe {
-                context.CopyResource(&*staging, texture);
-                let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-                context.Map(&*staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
-                let result = (|| {
-                    let row = encoder.width as usize * 4;
-                    ensure!(
-                        !mapped.pData.is_null() && mapped.RowPitch as usize >= row,
-                        "软件编码读回行跨度无效"
-                    );
-                    debug_assert_eq!(pixels.len(), row * encoder.height as usize);
-                    for y in 0..encoder.height as usize {
-                        std::ptr::copy_nonoverlapping(
-                            (mapped.pData as *const u8).add(y * mapped.RowPitch as usize),
-                            pixels.as_mut_ptr().add(y * row),
-                            row,
-                        );
-                    }
-                    Ok(())
-                })();
-                context.Unmap(&*staging, 0);
-                result?;
-                encoder.encode(pixels, timestamp, keyframe)
-            },
         }
     }
 }

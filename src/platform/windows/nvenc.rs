@@ -332,6 +332,10 @@ impl Encoder {
                 av1.set_repeatSeqHdr(1);
                 av1.set_outputAnnexBFormat(0);
                 av1.set_enableBitstreamPadding(0);
+                // Captured desktop pixels are coded directly; synthetic grain
+                // is outside the low-delay stream contract, including presets.
+                av1.set_enableFilmGrainParams(0);
+                av1.filmGrainParams = ptr::null_mut();
                 av1.maxTemporalLayersMinus1 = 0;
                 let color = format.color(None);
                 av1.colorPrimaries = nv::NV_ENC_VUI_COLOR_PRIMARIES(color.primaries.into());

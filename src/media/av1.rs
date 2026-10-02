@@ -1,20 +1,10 @@
 //! AV1 low-overhead OBUs and AOM RTP payloads. No decoder or GPU ownership.
 use anyhow::{Context, Result, ensure};
 use bytes::Bytes;
-use cros_codecs::codec::av1::parser::{ObuAction, ParsedObu, Parser};
+use openuuyc_codec::syntax::av1::{Chroma, Sequence, obu::Units};
 
 pub(crate) fn leb(data: &[u8], at: &mut usize) -> Result<usize> {
-    let mut value = 0u64;
-    for shift in (0..56).step_by(7) {
-        let byte = *data.get(*at).context("truncated AV1 size")?;
-        *at += 1;
-        value |= u64::from(byte & 127) << shift;
-        if byte & 128 == 0 {
-            ensure!(value <= u32::MAX as u64, "AV1 size overflow");
-            return Ok(value as usize);
-        }
-    }
-    anyhow::bail!("AV1 size overflow")
+    Ok(openuuyc_codec::syntax::av1::obu::leb128(data, at)?)
 }
 fn put_leb(mut value: usize, out: &mut Vec<u8>) {
     while value >= 128 {
@@ -24,57 +14,33 @@ fn put_leb(mut value: usize, out: &mut Vec<u8>) {
     out.push(value as u8);
 }
 
-/// Complete OBU slices, including their size fields.
-pub(crate) fn units(data: &[u8]) -> Result<Vec<&[u8]>> {
-    ensure!(data.len() <= 64 * 1024 * 1024, "AV1 frame too large");
-    let mut result = Vec::new();
-    let mut at = 0;
-    while at < data.len() {
-        let begin = at;
-        let header = data[at];
-        at += 1;
-        ensure!(header & 0x83 == 2, "invalid low-overhead AV1 OBU header");
-        if header & 4 != 0 {
-            let ext = *data.get(at).context("missing AV1 extension")?;
-            at += 1;
-            ensure!(ext & 7 == 0, "invalid AV1 extension");
-        }
-        let size = leb(data, &mut at)?;
-        at = at
-            .checked_add(size)
-            .filter(|n| *n <= data.len())
-            .context("truncated AV1 OBU")?;
-        result.push(&data[begin..at]);
-        ensure!(result.len() <= 1024, "too many AV1 OBUs");
-    }
-    Ok(result)
+pub(crate) fn units(data: &[u8]) -> Result<Units<'_>> {
+    Ok(Units::new(data)?)
 }
 
 pub(crate) fn parameters(data: &[u8]) -> Option<Bytes> {
-    units(data)
-        .ok()?
-        .into_iter()
-        .find(|u| (u[0] >> 3) & 15 == 1)
-        .map(Bytes::copy_from_slice)
+    let mut sequence = None;
+    for unit in units(data).ok()? {
+        let unit = unit.ok()?;
+        if unit.kind == 1 && sequence.is_none() {
+            sequence = Some(unit.bytes);
+        }
+    }
+    sequence.map(Bytes::copy_from_slice)
 }
 pub(crate) fn format(data: &[u8]) -> Option<super::video_format::VideoFormatSignature> {
-    // Sequence headers arrive on the network receive task, before the decoder
-    // worker's panic boundary. Keep parser failures local to this frame.
-    std::panic::catch_unwind(|| sequence_format(data))
-        .ok()
-        .flatten()
-}
-fn sequence_format(data: &[u8]) -> Option<super::video_format::VideoFormatSignature> {
-    let seq = parameters(data)?;
-    let mut parser = Parser::default();
-    let ObuAction::Process(obu) = parser.read_obu(&seq).ok()? else {
-        return None;
-    };
-    let ParsedObu::SequenceHeader(s) = parser.parse_obu(obu).ok()? else {
-        return None;
-    };
-    let w = u32::from(s.max_frame_width_minus_1) + 1;
-    let h = u32::from(s.max_frame_height_minus_1) + 1;
+    // This runs on the receive task. Metadata parsing borrows the input and
+    // needs neither a full frame parser nor copied sequence-header storage.
+    let mut sequence = None;
+    for unit in units(data).ok()? {
+        let unit = unit.ok()?;
+        if unit.kind == 1 && sequence.is_none() {
+            sequence = Some(Sequence::parse(unit).ok()?);
+        }
+    }
+    let s = sequence?;
+    let w = s.max_width;
+    let h = s.max_height;
     Some(super::video_format::VideoFormatSignature {
         coded_width: w,
         coded_height: h,
@@ -82,13 +48,14 @@ fn sequence_format(data: &[u8]) -> Option<super::video_format::VideoFormatSignat
         visible_height: h,
         crop_left: 0,
         crop_top: 0,
-        chroma_format_idc: if s.color_config.subsampling_x && s.color_config.subsampling_y {
-            1
-        } else {
-            3
+        chroma_format_idc: match s.chroma {
+            Chroma::Monochrome => 0,
+            Chroma::Yuv420 => 1,
+            Chroma::Yuv422 => 2,
+            Chroma::Yuv444 => 3,
         },
-        bit_depth_luma: 8 + 2 * s.bit_depth as u8,
-        bit_depth_chroma: 8 + 2 * s.bit_depth as u8,
+        bit_depth_luma: s.depth,
+        bit_depth_chroma: s.depth,
     })
 }
 
@@ -99,6 +66,7 @@ pub(crate) fn payloads(mtu: usize, data: &[u8], key: bool) -> Result<Vec<Bytes>>
     let mut packets = Vec::new();
     let mut packet = vec![if key { 8 } else { 0 }];
     for unit in units(data)? {
+        let unit = unit?.bytes;
         let typ = (unit[0] >> 3) & 15;
         if matches!(typ, 2 | 15) {
             continue;
@@ -226,6 +194,27 @@ pub(crate) fn assemble(records: &[u8]) -> Result<Vec<u8>> {
         !fragment && pending.is_empty() && !out.is_empty(),
         "incomplete AV1 picture"
     );
-    units(&out)?;
+    for unit in units(&out)? {
+        unit?;
+    }
     Ok(out)
+}
+
+/// RTP profile defaults to Main when omitted. Reject invalid or conflicting
+/// declarations instead of accidentally treating them as the 4:4:4 payload.
+pub(crate) fn rtp_profile(fmtp: &str) -> Option<u8> {
+    let mut profile = None;
+    for part in fmtp.split(';') {
+        let Some((key, value)) = part.trim().split_once('=') else {
+            continue;
+        };
+        if key.trim().eq_ignore_ascii_case("profile") {
+            let value = value.trim().parse::<u8>().ok()?;
+            if value > 2 || profile.is_some_and(|old| old != value) {
+                return None;
+            }
+            profile = Some(value);
+        }
+    }
+    Some(profile.unwrap_or(0))
 }

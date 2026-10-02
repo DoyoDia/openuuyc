@@ -10,7 +10,7 @@ OpenUUYC 是用 Rust 编写的 UU 远程第三方 Windows 客户端。使用已�
 
 从 [Releases](https://github.com/djkcyl/openuuyc/releases) 下载 Windows x64 客户端，扫码或短信登录后连接设备，支持 UU 官方客户端；无需登录也可在登录页开启“接受远程协助”。
 
-最新稳定版为 [v0.7.0](https://github.com/djkcyl/openuuyc/releases/tag/v0.7.0)。[v1.0.0-alpha.8 预发布](https://github.com/djkcyl/openuuyc/releases/tag/v1.0.0-alpha.8)提供正在开发的本机被控能力。
+最新稳定版为 [v0.7.0](https://github.com/djkcyl/openuuyc/releases/tag/v0.7.0)。[v1.0.0-alpha.9 预发布](https://github.com/djkcyl/openuuyc/releases/tag/v1.0.0-alpha.9)提供正在开发的本机被控能力。
 
 **从 alpha.6 或更早版本升级需重新登录，设备 ID 会改变；已使用 alpha.7 的用户不会再次重置。** 旧设备条目请在列表中手动删除。设备资料使用本机真实硬件及当前 Windows 壁纸，上传的壁纸副本添加 OpenUUYC Logo，不修改系统原图。
 
@@ -22,8 +22,8 @@ OpenUUYC 是用 Rust 编写的 UU 远程第三方 Windows 客户端。使用已�
 | --- | --- | --- | --- |
 | 同账号远程连接 | 支持同时连接多台设备 | 支持 | 本机在连接设置中开启“允许被控” |
 | 设备 ID / 验证码协助 | 支持主动连接 | 支持账号及游客协助 | 随机 / 自定义密码、本机确认；主控支持最近连接和收藏 |
-| 画面传输 | 接收与播放 | 采集与编码 | H.264 / H.265 / AV1，支持画质、码率、帧率、真彩及 HDR；AV1 需两端 OpenUUYC 及对应硬件能力 |
-| 编解码 | DXVA11 硬解 / Rust 软解 | NVENC、AMF、QSV 硬编 / Rust 软编 | 按硬件能力选择，软件路径仅支持 H.264，整个客户端最多一个软解播放窗口 |
+| 画面传输 | 接收与播放 | 采集与编码 | H.264 / H.265 / AV1，支持画质、码率、帧率、真彩及 HDR；AV1 需两端 OpenUUYC，按双方编解码能力协商 |
+| 编解码 | DXVA11 硬解 / Rust 软解 | NVENC、AMF、QSV 硬编 / Rust 软编 | 软件支持 H.264 / AV1；AV1 软编软解支持 4:2:0 / 4:4:4、8 / 10 位，软编最高 1080p30；整个客户端最多一个软解播放窗口 |
 | 键鼠与触摸 | 键盘、鼠标控制 | 键鼠及移动端原生触摸接收 | 相对/绝对鼠标、组合键、光标同步；触摸来自移动端官方客户端 |
 | 多显示器与显示设置 | 切屏、多窗口、分辨率及 DPI 调整 | 多屏采集与设置接收 | 屏幕标签可拖出独立窗口，显示设置按目标支持的配置应用 |
 | 虚拟屏、超级屏与无屏接管 | 支持操作远端 | 支持 | 需安装显示驱动；自动兜底屏断线保留，其他可用屏幕接入后回收 |
@@ -57,7 +57,7 @@ OpenUUYC 是用 Rust 编写的 UU 远程第三方 Windows 客户端。使用已�
 
 ## 构建
 
-需要 Rust stable（MSVC）、Visual Studio C++ 构建工具、Windows SDK、CMake 和 UPX。软件 H.264 编解码使用项目 Rust 核心。
+需要 Rust stable（MSVC）、Visual Studio C++ 构建工具、Windows SDK、CMake、NASM 和 UPX，命令行工具需加入 PATH。H.264 / AV1 软件编解码使用项目 Rust 核心及 SIMD 汇编。
 
 ```powershell
 git clone https://github.com/djkcyl/openuuyc.git
