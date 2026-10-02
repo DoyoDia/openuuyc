@@ -12,14 +12,14 @@ pub enum DecoderMode {
     /// Windows, VA-API surfaces read back on Linux).
     #[default]
     Hardware,
-    /// Decode with the Rust H.264 core.
+    /// Decode with the selected Rust software core.
     Software,
 }
 
 /// Parameters for opening a video decoder session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VideoDecoderConfig {
-    /// Input codec (H.264 or HEVC).
+    /// Input video codec.
     pub codec: VideoCodec,
     /// Expected width (may be refined from bitstream).
     pub width: u32,
@@ -47,6 +47,10 @@ impl DecoderNotification {
 
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) fn shared_cancellation(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        self.cancelled.clone()
     }
 
     pub(crate) fn cancellation(&self) -> &std::sync::atomic::AtomicBool {

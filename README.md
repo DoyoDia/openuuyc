@@ -10,7 +10,7 @@ OpenUUYC 是用 Rust 编写的 UU 远程第三方客户端，支持 Windows 和 
 
 从 [Releases](https://github.com/djkcyl/openuuyc/releases) 下载 Windows x64 客户端，扫码或短信登录后连接设备，支持 UU 官方客户端；无需登录也可在登录页开启“接受远程协助”。
 
-最新稳定版为 [v0.7.0](https://github.com/djkcyl/openuuyc/releases/tag/v0.7.0)。[v1.0.0-alpha.8 预发布](https://github.com/djkcyl/openuuyc/releases/tag/v1.0.0-alpha.8)提供正在开发的本机被控能力。
+最新稳定版为 [v0.7.0](https://github.com/djkcyl/openuuyc/releases/tag/v0.7.0)。[v1.0.0-alpha.9 预发布](https://github.com/djkcyl/openuuyc/releases/tag/v1.0.0-alpha.9)提供正在开发的本机被控能力。
 
 **从 alpha.6 或更早版本升级需重新登录，设备 ID 会改变；已使用 alpha.7 的用户不会再次重置。** 旧设备条目请在列表中手动删除。设备资料使用本机真实硬件及当前 Windows 壁纸，上传的壁纸副本添加 OpenUUYC Logo，不修改系统原图。
 
@@ -22,8 +22,8 @@ OpenUUYC 是用 Rust 编写的 UU 远程第三方客户端，支持 Windows 和 
 | --- | --- | --- | --- |
 | 同账号远程连接 | 支持同时连接多台设备 | 支持 | 本机在连接设置中开启“允许被控” |
 | 设备 ID / 验证码协助 | 支持主动连接 | 支持账号及游客协助 | 随机 / 自定义密码、本机确认；主控支持最近连接和收藏 |
-| 画面传输 | 接收与播放 | 采集与编码 | H.264 / H.265 / AV1，支持画质、码率、帧率、真彩及 HDR；AV1 需两端 OpenUUYC 及对应硬件能力 |
-| 编解码 | DXVA11 硬解 / Rust 软解 | NVENC、AMF、QSV 硬编 / Rust 软编 | 按硬件能力选择，软件路径仅支持 H.264，整个客户端最多一个软解播放窗口 |
+| 画面传输 | 接收与播放 | 采集与编码 | H.264 / H.265 / AV1，支持画质、码率、帧率、真彩及 HDR；AV1 需两端 OpenUUYC，按双方编解码能力协商 |
+| 编解码 | DXVA11 硬解 / Rust 软解 | NVENC、AMF、QSV 硬编 / Rust 软编 | 软件支持 H.264 / AV1；AV1 软编软解支持 4:2:0 / 4:4:4、8 / 10 位，软编最高 1080p30；整个客户端最多一个软解播放窗口 |
 | 键鼠与触摸 | 键盘、鼠标控制 | 键鼠及移动端原生触摸接收 | 相对/绝对鼠标、组合键、光标同步；触摸来自移动端官方客户端 |
 | 多显示器与显示设置 | 切屏、多窗口、分辨率及 DPI 调整 | 多屏采集与设置接收 | 屏幕标签可拖出独立窗口，显示设置按目标支持的配置应用 |
 | 虚拟屏、超级屏与无屏接管 | 支持操作远端 | 支持 | 需安装显示驱动；自动兜底屏断线保留，其他可用屏幕接入后回收 |
@@ -59,9 +59,9 @@ OpenUUYC 是用 Rust 编写的 UU 远程第三方客户端，支持 Windows 和 
 
 Linux 版可以登录、管理设备、观看和控制远端桌面，界面走 wgpu（Vulkan，缺失时回退 OpenGL），X11 与 Wayland 均可运行。本机被控在 Xorg 会话中可用。与 Windows 版相比：
 
-- **解码**：H.264 通过 VA-API 硬件解码（Constrained Baseline、Main、High，8 位 4:2:0），其余 H.264 格式使用 Rust 软件解码；H.265 与 AV1 暂不支持（不会向对端声明，对端会改用 H.264）。硬件解码需要对应的 VA-API 驱动。
+- **解码**：H.264 通过 VA-API 硬件解码（Constrained Baseline、Main、High，8 位 4:2:0），其余 H.264 格式与 AV1 使用 Rust 软件解码；AV1 软解只声明 8 位 4:2:0（播放窗口按 NV12 绘制），10 位与 4:4:4 不向对端声明。H.265 暂不支持。双方都有硬件编解码时协商优先选硬件。硬件解码需要对应的 VA-API 驱动。
 - **剪贴板**：文字、图片与文件双向同步。粘贴远端复制的文件时，文件通过挂载在 `$XDG_RUNTIME_DIR` 下的只读 FUSE 文件系统按需读取，需要安装 `fuse3`。
-- **本机被控**：在已登录的桌面内运行。画面采集按 Sunshine 的优先级选择：Xorg 下先用 NVIDIA NvFBC（画面直接抓进显存交给 NVENC，仅在 NVENC 可用时选用），再到 X11 MIT-SHM，最后是 XDG 屏幕共享门户（PipeWire）；Wayland 下只用门户。门户第一次使用时需要在本机屏幕上点“共享”，授权会被记住（`~/.local/share/OpenUUYC/screencast-restore-token`，在系统隐私设置中可撤销）；可用环境变量 `OPENUUYC_CAPTURE`（如 `nvfbc`、`x11,portal`）指定顺序。编码优先用 NVENC（H.264/H.265，4:2:0 与 4:4:4，8 位；AV1 为 4:2:0 8 位，需要带 AV1 编码单元的显卡，尚未在这类显卡上实测），不可用时回退 Rust H.264 软件编码；桌面声音参照 Sunshine 经 PulseAudio 客户端接口录制所选播放设备的监听源（PulseAudio 与 PipeWire 均可）；该设备静音或音量为 0 时可能录不到声音；键鼠经 XTest 注入（按物理键位映射，文字输入不依赖键盘布局，移动端触摸按单指指针模拟），因此键鼠目前只在 Xorg 会话可用；支持物理多屏与通过 RandR 切换分辨率，退出时恢复。暂无 AMD/Intel 硬件编码、10 位与 HDR、KMS 采集、虚拟屏、超级屏、无显示器兜底屏、按显示器 DPI、远端麦克风与调整默认音频设备（OpenUUYC Audio 虚拟声卡是 Windows 驱动；Linux 上开启时会提示暂不支持），也没有后台服务，因此无法在登录界面或锁屏时被控。
+- **本机被控**：在已登录的桌面内运行。画面采集按 Sunshine 的优先级选择：Xorg 下先用 NVIDIA NvFBC（画面直接抓进显存交给 NVENC，仅在 NVENC 可用时选用），再到 X11 MIT-SHM，最后是 XDG 屏幕共享门户（PipeWire）；Wayland 下只用门户。门户第一次使用时需要在本机屏幕上点“共享”，授权会被记住（`~/.local/share/OpenUUYC/screencast-restore-token`，在系统隐私设置中可撤销）；可用环境变量 `OPENUUYC_CAPTURE`（如 `nvfbc`、`x11,portal`）指定顺序。编码优先用 NVENC（H.264/H.265，4:2:0 与 4:4:4，8 位；AV1 为 4:2:0 8 位，需要带 AV1 编码单元的显卡，尚未在这类显卡上实测），不可用时回退 Rust 软件编码（H.264，以及 AV1 8 位 4:2:0 / 4:4:4，由 CPU 转换为 NV12 / AYUV；没有 HDR 采集，因此没有 10 位）；桌面声音参照 Sunshine 经 PulseAudio 客户端接口录制所选播放设备的监听源（PulseAudio 与 PipeWire 均可）；该设备静音或音量为 0 时可能录不到声音；键鼠经 XTest 注入（按物理键位映射，文字输入不依赖键盘布局，移动端触摸按单指指针模拟），因此键鼠目前只在 Xorg 会话可用；支持物理多屏与通过 RandR 切换分辨率，退出时恢复。暂无 AMD/Intel 硬件编码、10 位与 HDR、KMS 采集、虚拟屏、超级屏、无显示器兜底屏、按显示器 DPI、远端麦克风与调整默认音频设备（OpenUUYC Audio 虚拟声卡是 Windows 驱动；Linux 上开启时会提示暂不支持），也没有后台服务，因此无法在登录界面或锁屏时被控。
 - **设备资料**：上报本机真实硬件，取自主机名、`/etc/os-release` 与内核版本、`/proc`、DMI 主板信息、PCI 显卡（按 `pci.ids` 命名）和默认路由所在网卡。SMBIOS 系统 UUID 只有 root 能读，因此系统标识由 `/etc/machine-id` 派生，重装系统后视为新设备。壁纸从 GNOME、Cinnamon、MATE 的 GSettings 或 KDE Plasma 配置读取，其他桌面会在诊断页提示暂不支持。
 - **安装与托盘**：没有“安装服务”，直接运行构建出的程序。关闭窗口隐藏到托盘（StatusNotifierItem；GNOME 需 AppIndicator 扩展，Ubuntu 默认启用），桌面没有托盘时关闭即退出。
 - **未接入**：批注与白板、插件节点图、多显示器独立窗口、HDR、全局快捷键（快捷键仅在播放窗口获得焦点时生效），以及诊断页中的解码检查。
@@ -73,7 +73,7 @@ Wayland 下窗口的拖动与缩放由合成器接管，因此不支持窗口吸
 
 ### Windows
 
-需要 Rust stable（MSVC）、Visual Studio C++ 构建工具、Windows SDK、CMake 和 UPX。软件 H.264 编解码使用项目 Rust 核心。
+需要 Rust stable（MSVC）、Visual Studio C++ 构建工具、Windows SDK、CMake、NASM 和 UPX，命令行工具需加入 PATH。H.264 / AV1 软件编解码使用项目 Rust 核心及 SIMD 汇编。
 
 ```powershell
 git clone https://github.com/djkcyl/openuuyc.git
@@ -90,7 +90,7 @@ cargo dist
 需要 Rust stable（edition 2024）与 C/C++ 工具链。Ubuntu 22.04 及以上：
 
 ```bash
-sudo apt install build-essential cmake clang pkg-config libva-dev \
+sudo apt install build-essential cmake clang nasm pkg-config libva-dev \
     libasound2-dev libdbus-1-dev libxkbcommon-dev libxkbcommon-x11-dev \
     libwayland-dev libx11-dev libxcb1-dev libxrandr-dev libxi-dev libxcursor-dev \
     libgl1-mesa-dev libvulkan-dev libudev-dev libssl-dev fonts-noto-cjk fuse3

@@ -14,6 +14,10 @@ impl StreamControlHandle {
         let mut state = lock(&self.shared);
         state.mouse_transport_connected = connected;
         if !connected {
+            state.restore_input_pending = state.device_preferences.control_enabled
+                && state.viewing_enabled
+                && !state.annotation.enabled
+                && !state.annotation.toggling();
             self.microphone.disconnect();
             self.clipboard.suspend();
             state.annotation.disconnect();
@@ -21,7 +25,8 @@ impl StreamControlHandle {
             state.cursor_sync_needed = false;
             state.cursor_desired_capture = true;
             state.mouse_restore_point = None;
-            // Reconnect always starts in View, even after a failed mode change.
+            // Revoke actual input now. A focused, ready viewer may later restore
+            // the separately saved intent; held keys/clicks are never replayed.
             state.baseline.cursor_capture = true;
             state.initial_capture_sync_sent = false;
             if let Some((sequence, _, _)) = state.cursor_pending {
@@ -40,7 +45,6 @@ impl StreamControlHandle {
                     && state.control_channel_open
                     && state.text_channel_open,
             );
-            self.maybe_auto_take_mouse(&mut state);
             self.maybe_send_initial_capture_sync(&mut state);
         }
     }
@@ -88,74 +92,83 @@ impl StreamControlHandle {
     }
 
     pub fn set_mouse_mode(&self, mode: MouseMode) -> Result<()> {
-        let mut state = lock(&self.shared);
-        // An explicit choice overrides the automatic hand-over, in both
-        // directions, for the rest of this session.
-        state.auto_mouse_declined = mode == MouseMode::View;
-        let result = self.apply_mouse_mode(&mut state, mode);
-        drop(state);
-        self.mouse.repaint();
-        result
+        self.change_mouse_mode(mode, true)
     }
 
-    fn apply_mouse_mode(&self, state: &mut StreamControlState, mode: MouseMode) -> Result<()> {
-        expire_cursor_request(state);
+    pub(crate) fn suspend_mouse_control(&self) -> Result<()> {
+        self.change_mouse_mode(MouseMode::View, false)
+    }
+
+    pub(crate) fn reconcile_mouse_failure(&self) {
+        // RemoteInput already released the failed activation. Update cursor and
+        // clipboard policy without canceling restoration armed by a concurrent
+        // transport loss. With no new connection, no restore is armed at all.
+        let mut state = lock(&self.shared);
+        state.cursor_sync_needed = true;
+        self.refresh_mouse_policy(&mut state);
+    }
+
+    fn change_mouse_mode(&self, mode: MouseMode, user_choice: bool) -> Result<()> {
+        let mut state = lock(&self.shared);
+        expire_cursor_request(&mut state);
         state.mouse_restore_point = None;
         if mode == MouseMode::View {
             // Local revocation never waits for remote settings.
             state.mouse.disable();
         } else {
-            ensure_ready(state)?;
+            ensure_ready(&state)?;
             if state.annotation.enabled || state.annotation.toggling() {
                 bail!("请先关闭批注，再开启键鼠控制");
             }
-            let (relative, _) = mouse_policy(state, mode);
+            let (relative, _) = mouse_policy(&state, mode);
             state.mouse.enable(mode, relative)?;
-            state.preferred_mouse_mode = mode;
+        }
+        state.restore_input_pending = false;
+        if user_choice {
+            let previous = state.device_preferences;
+            state.device_preferences.control_enabled = mode != MouseMode::View;
+            if mode != MouseMode::View {
+                state.device_preferences.mouse_mode = mode;
+            }
+            if state.device_preferences != previous {
+                self.publish_device_preferences(&mut state);
+            }
         }
         // Explicit choices may retry uncertain cursor capture; newer intent is
         // independent of an earlier cursor request still awaiting its response.
         state.cursor_sync_needed = true;
-        self.refresh_mouse_policy(state);
+        self.refresh_mouse_policy(&mut state);
+        drop(state);
+        self.mouse.repaint();
         Ok(())
     }
 
-    /// Hand control over as soon as it is possible, when the viewer asked for
-    /// that in the connection settings and has not taken it back since.
-    pub(super) fn maybe_auto_take_mouse(&self, state: &mut StreamControlState) {
-        if !state.auto_mouse_control
-            || state.auto_mouse_declined
-            || state.mouse.mode() != MouseMode::View
-        {
-            return;
+    /// Called only by a focused viewer after its first frame and outside local
+    /// menus/transitions. One attempt per restored connection, not a retry loop.
+    pub(crate) fn restore_input_control(&self) -> Result<()> {
+        let mut state = lock(&self.shared);
+        if !state.restore_input_pending || !state.device_preferences.control_enabled {
+            return Ok(());
+        }
+        if state.annotation.enabled || state.annotation.toggling() {
+            state.restore_input_pending = false;
+            return Ok(());
         }
         if !state.viewing_enabled
-            || state.annotation.enabled
-            || state.annotation.toggling()
-            || ensure_ready(state).is_err()
+            || !state.mouse_transport_connected
+            || ensure_ready(&state).is_err()
         {
-            if !state.auto_mouse_reported {
-                state.auto_mouse_reported = true;
-                tracing::debug!(
-                    viewing = state.viewing_enabled,
-                    annotation = state.annotation.enabled,
-                    ready = ensure_ready(state).is_ok(),
-                    "自动键鼠控制等待连接就绪"
-                );
-            }
-            return;
+            return Ok(());
         }
-        let mode = state.preferred_mouse_mode;
-        let mode = if mode == MouseMode::View {
-            MouseMode::Smart
-        } else {
-            mode
-        };
-        if let Err(error) = self.apply_mouse_mode(state, mode) {
-            tracing::debug!(%error, "自动开启键鼠控制暂不可用");
-        } else {
-            tracing::info!(?mode, "已按连接设置自动开启键鼠控制");
-        }
+        state.restore_input_pending = false;
+        let mode = state.device_preferences.mouse_mode;
+        let (relative, _) = mouse_policy(&state, mode);
+        state.mouse.enable(mode, relative)?;
+        state.cursor_sync_needed = true;
+        self.refresh_mouse_policy(&mut state);
+        drop(state);
+        self.mouse.repaint();
+        Ok(())
     }
 
     pub(super) fn request_cursor_locked(

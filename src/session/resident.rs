@@ -12,6 +12,8 @@ pub(crate) enum Request {
     CancelUpdate,
     Snapshot {
         ui: bool,
+        #[serde(default)]
+        device_cursor: Option<crate::account::device_change::relay::Cursor>,
     },
     Assist {
         account: String,
@@ -47,6 +49,8 @@ pub(crate) enum Request {
 }
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Snapshot {
+    #[serde(default)]
+    pub device_changes: Option<crate::account::device_change::relay::Batch>,
     pub assistance: host::assist::Snapshot,
     pub publication: crate::account::reporting::Snapshot,
     pub account: String,

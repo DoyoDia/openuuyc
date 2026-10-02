@@ -284,7 +284,8 @@ impl DecoderPool {
                     #[cfg(windows)]
                     DecoderCandidate::WindowsD3d11 => {
                         (format.chroma_format_idc == 1
-                            || self.codec == VideoCodec::H265 && format.chroma_format_idc == 3)
+                            || matches!(self.codec, VideoCodec::H265 | VideoCodec::Av1)
+                                && format.chroma_format_idc == 3)
                             && format.bit_depth_luma == format.bit_depth_chroma
                             && (format.bit_depth_luma == 8
                                 || matches!(self.codec, VideoCodec::H265 | VideoCodec::Av1)
@@ -297,11 +298,14 @@ impl DecoderPool {
                             && format.bit_depth_luma == 8
                             && format.bit_depth_chroma == 8
                     }
-                    DecoderCandidate::SoftwareH264 => {
-                        self.codec == VideoCodec::H264
-                            && matches!(format.chroma_format_idc, 1 | 3)
-                            && format.bit_depth_luma == 8
-                            && format.bit_depth_chroma == 8
+                    DecoderCandidate::Software => {
+                        openuuyc_codec::Format {
+                            codec: self.codec,
+                            chroma: format.chroma_format_idc,
+                            depth: format.bit_depth_luma,
+                        }
+                        .can_decode()
+                            && format.bit_depth_luma == format.bit_depth_chroma
                     }
                 };
                 if !supported {

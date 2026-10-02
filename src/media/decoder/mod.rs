@@ -120,7 +120,7 @@ pub(crate) enum DecoderCandidate {
     #[cfg(not(windows))]
     LinuxVaapi,
 
-    SoftwareH264,
+    Software,
 }
 
 impl DecoderCandidate {
@@ -133,8 +133,9 @@ impl DecoderCandidate {
             candidates.push(Self::LinuxVaapi);
         }
 
-        if codec == VideoCodec::H264 {
-            candidates.push(Self::SoftwareH264);
+        match codec {
+            VideoCodec::H264 | VideoCodec::Av1 => candidates.push(Self::Software),
+            _ => {}
         }
 
         candidates
@@ -278,7 +279,16 @@ impl NativeVideoDecoder {
                 Self::open_windows_hardware(codec, width, height, writer, extra_data)
             }
 
-            DecoderCandidate::SoftwareH264 => {
+            DecoderCandidate::Software => {
+                if !(openuuyc_codec::Format {
+                    codec,
+                    chroma,
+                    depth,
+                })
+                .can_decode()
+                {
+                    return Err(DecodeError::Unsupported.into());
+                }
                 let software_slot =
                     Some(software_slot.map_or_else(software_slot::SoftwareSlot::acquire, Ok)?);
                 let config = decoder_config(
@@ -290,12 +300,27 @@ impl NativeVideoDecoder {
                     extra_data,
                 );
                 let decoder = PlatformDecoder::open(&config)?;
-                let label = { "Rust H.264 软件解码" };
+                // Windows uploads AV1's packed formats through its texture
+                // writer. The Linux presenter draws every software format it
+                // advertises straight from the CPU.
+                #[cfg(windows)]
+                let frame_reader = if codec == VideoCodec::Av1 {
+                    FrameReader::Windows(
+                        surface_writer.map_or_else(windows_surface::D3D11SurfaceWriter::new, Ok)?,
+                    )
+                } else {
+                    FrameReader::Cpu
+                };
+                #[cfg(not(windows))]
+                let frame_reader = {
+                    let _ = surface_writer;
+                    FrameReader::Cpu
+                };
                 Ok(Self {
                     decoder: Box::new(decoder),
-                    frame_reader: FrameReader::Cpu,
+                    frame_reader,
                     candidate,
-                    label: label.to_owned(),
+                    label: "OpenUUYC 软件解码".to_owned(),
 
                     software_slot,
                 })
@@ -369,7 +394,7 @@ impl NativeVideoDecoder {
         let input_error = self
             .decoder
             .push_packet(&frame.data, decode_token)
-            .context("submit Annex-B frame to native decoder")
+            .context("submit encoded video frame to native decoder")
             .err();
         let mut batch = poll_platform_decoder(&mut self.decoder, &mut self.frame_reader);
         batch.input_error = input_error;
@@ -429,10 +454,16 @@ fn poll_platform_decoder(
                 },
             ),
             PlatformDecodedFrame::Cpu(frame) => {
-                let surface = match frame.format {
-                    CpuFormat::Nv12 => nv12_layout(frame.width, frame.height, &frame.data)
-                        .map(|_| DecodedSurface::CpuNv12(frame.data)),
-                    CpuFormat::I444 => Ok(DecodedSurface::CpuI444(frame.data)),
+                let surface = if let FrameReader::Windows(writer) = frame_reader {
+                    writer.upload_cpu(&frame).map(DecodedSurface::D3D11)
+                } else {
+                    match frame.format {
+                        CpuFormat::Nv12 => nv12_layout(frame.width, frame.height, &frame.data)
+                            .map(|_| DecodedSurface::CpuNv12(frame.data)),
+                        CpuFormat::I444 => Ok(DecodedSurface::CpuI444(frame.data)),
+                        #[allow(unreachable_patterns, reason = "Linux decodes only these two.")]
+                        _ => Err(anyhow!("software video format requires a texture uploader")),
+                    }
                 };
                 (frame.pts, frame.width, frame.height, surface)
             }
@@ -506,6 +537,42 @@ pub(crate) fn detect_native_decoder_support(
                 });
             }
         }
+        // The Linux presenter draws software frames as NV12, which the AV1
+        // decoder produces for 8-bit 4:2:0 only.
+        #[cfg(not(windows))]
+        if profile.codec.accepts(VideoCodec::Av1) {
+            capabilities.push(CodecCapability {
+                video_codec: 5,
+                width: 1920,
+                height: 1080,
+                chroma_sampling: 1,
+                bit_depth: 8,
+                codec_impl: 37,
+            });
+        }
+        #[cfg(windows)]
+        if profile.codec.accepts(VideoCodec::Av1) {
+            if let Ok(writer) = windows_surface::D3D11SurfaceWriter::new() {
+                for chroma in [1, 3] {
+                    for depth in [8, 10] {
+                        // Advertise support independently of other codecs. Only
+                        // the common capabilities can establish a usable hardware
+                        // alternative; DualCapability selects that after negotiation.
+                        if writer.supports_software_av1(depth, chroma) {
+                            capabilities.push(CodecCapability {
+                                video_codec: 5,
+                                width: 1920,
+                                height: 1080,
+                                chroma_sampling: chroma,
+                                bit_depth: depth,
+                                codec_impl: 37,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
         if capabilities.is_empty() {
             bail!("no decoder supports the selected codec and decoding mode");
         }

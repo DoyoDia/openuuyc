@@ -9,8 +9,8 @@ use super::swapchain::fit_rect;
 use super::worker::{RenderCommand, RenderWorker};
 use crate::application::viewer::windows_ui::{UiPresenter, UiTimingAudit, VideoWindow};
 use crate::application::viewer::{
-    ConnectionProgressApp, NativeViewerSession, PerformancePanelMode, StreamControlUi,
-    ViewerPreferences, mutex_lock, show_stream_control_window,
+    ConnectionProgressApp, NativeViewerSession, PerformancePanelMode, StreamControlUi, mutex_lock,
+    show_stream_control_window,
 };
 use crate::application::viewer_shortcuts::Action as ViewerShortcut;
 use crate::diagnostics::performance::PerformanceMonitor;
@@ -126,11 +126,11 @@ impl ThreadedWindowsApp {
         window: &Window,
         session: Arc<NativeViewerSession>,
         connecting: WindowsConnectionApp,
-        preferences: ViewerPreferences,
     ) -> Result<Self> {
         let title = session.title.clone();
         let performance = session.performance.clone();
         let stream_control = session.stream_control.clone();
+        let preferences = stream_control.device_preferences();
         let shutdown = Arc::clone(&session.shutdown);
         let fatal_error = Arc::clone(&session.fatal_error);
         let video_window = VideoWindow::new(window)?;
@@ -287,14 +287,30 @@ impl ThreadedWindowsApp {
                 self.close_requested = true;
             }
             ViewerShortcut::Performance => {
-                self.performance_mode = self.performance_mode.next();
+                self.performance_mode = self
+                    .stream_control
+                    .device_preferences()
+                    .performance_mode
+                    .next();
+                self.stream_control
+                    .set_performance_mode(self.performance_mode);
             }
         }
         window.request_redraw();
         Ok(())
     }
 
+    fn sync_device_view_preferences(&mut self, window: &Window) {
+        let preferences = self.stream_control.device_preferences();
+        self.performance_mode = preferences.performance_mode;
+        if self.intercept_shortcuts != preferences.intercept_shortcuts {
+            self.mouse.release(window);
+            self.intercept_shortcuts = preferences.intercept_shortcuts;
+        }
+    }
+
     pub(super) fn refresh_mouse(&mut self, window: &Window, event_loop: &ActiveEventLoop) {
+        self.sync_device_view_preferences(window);
         if let Ok(hwnd) = window_hwnd(window) {
             crate::application::viewer::windows_keyboard::finish_lock_releases(hwnd.0 as u64);
         }
@@ -316,9 +332,7 @@ impl ThreadedWindowsApp {
             && mode == crate::features::remote_input::MouseMode::View
             && self.stream_control.mouse().error().is_some()
         {
-            let _ = self
-                .stream_control
-                .set_mouse_mode(crate::features::remote_input::MouseMode::View);
+            self.stream_control.reconcile_mouse_failure();
         }
         if self.last_mouse_mode != mode && mode != crate::features::remote_input::MouseMode::View {
             self.stream_control_ui.open = false;
@@ -346,6 +360,18 @@ impl ThreadedWindowsApp {
                 .stream_control
                 .pending_display_resolution(self._session.screen_id())
                 .is_some();
+        if window.has_focus()
+            && !window.is_minimized().unwrap_or(false)
+            && !display_transition
+            && !self.stream_control_ui.open
+            && !self.plugin_menu_open
+            && !self.screen_tabs.is_pending()
+            && !self.egui_context.any_popup_open()
+            && !self.egui_context.text_edit_focused()
+            && let Err(error) = self.stream_control.restore_input_control()
+        {
+            self.stream_control.mouse().fail(error.to_string());
+        }
         self.renderer.plugins.input_context(
             self.stream_control.mouse().clone(),
             window_hwnd(window).map_or(0, |h| h.0 as u64),
@@ -374,6 +400,7 @@ impl ThreadedWindowsApp {
     }
 
     pub(in crate::application::viewer) fn draw_ui(&mut self, window: &Window) -> Result<()> {
+        self.sync_device_view_preferences(window);
         self.egui_context
             .request_repaint_after(Duration::from_millis(500));
         if self.renderer.first_presented.load(Ordering::Acquire) {
@@ -500,10 +527,16 @@ impl ThreadedWindowsApp {
             }
             crate::ui::controls::show_notices(&ctx);
         });
-        self.performance_mode = view.performance_mode;
+        if self.performance_mode != view.performance_mode {
+            self.stream_control
+                .set_performance_mode(view.performance_mode);
+            self.performance_mode = view.performance_mode;
+        }
         if self.intercept_shortcuts != view.intercept_shortcuts {
             self.mouse.release(window);
             self.intercept_shortcuts = view.intercept_shortcuts;
+            self.stream_control
+                .set_intercept_shortcuts(view.intercept_shortcuts);
         }
         if view.send_ctrl_alt_del && window.has_focus() {
             self.mouse.release(window);

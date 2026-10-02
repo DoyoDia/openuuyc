@@ -165,21 +165,6 @@ pub(crate) enum ViewerWindowEvent {
     },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct ViewerPreferences {
-    performance_mode: PerformancePanelMode,
-    intercept_shortcuts: bool,
-}
-
-impl Default for ViewerPreferences {
-    fn default() -> Self {
-        Self {
-            performance_mode: PerformancePanelMode::Compact,
-            intercept_shortcuts: true,
-        }
-    }
-}
-
 pub(super) struct ConnectionProgressApp {
     alias: String,
     receiver: std_mpsc::Receiver<ConnectionProgress>,

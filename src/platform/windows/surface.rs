@@ -23,7 +23,8 @@ pub(crate) struct D3D11SurfaceWriter {
 }
 
 pub(crate) struct D3D11Surface {
-    frame: WindowsGpuVideoFrame,
+    _frame: Option<WindowsGpuVideoFrame>,
+    visible_origin: (u32, u32),
     texture: ID3D11Texture2D,
     subresource: u32,
     desc: D3D11_TEXTURE2D_DESC,
@@ -219,6 +220,104 @@ impl D3D11SurfaceWriter {
         create_renderer_device(&self.shared.device)
     }
 
+    pub(crate) fn supports_software_av1(&self, depth: u8, chroma: u8) -> bool {
+        use crate::platform::decoder::{WindowsCpuFormat as F, WindowsCpuVideoFrame};
+        let (format, len) = match (chroma, depth) {
+            (1, 8) => (F::Nv12, 6),
+            (1, 10) => (F::P010, 12),
+            (3, 8) => (F::Ayuv, 16),
+            (3, 10) => (F::Y410, 16),
+            _ => return false,
+        };
+        self.upload_cpu(&WindowsCpuVideoFrame {
+            pts: 0,
+            width: 2,
+            height: 2,
+            coded_width: 2,
+            coded_height: 2,
+            format,
+            data: bytes::Bytes::from(vec![0; len]),
+        })
+        .is_ok()
+    }
+
+    pub(crate) fn upload_cpu(
+        &self,
+        frame: &crate::platform::decoder::WindowsCpuVideoFrame,
+    ) -> Result<D3D11Surface> {
+        use crate::platform::decoder::WindowsCpuFormat;
+        use windows::Win32::Graphics::Direct3D11::{
+            D3D11_BIND_SHADER_RESOURCE, D3D11_SUBRESOURCE_DATA, D3D11_USAGE_DEFAULT,
+        };
+        let (format, bytes, planar) = match frame.format {
+            WindowsCpuFormat::Nv12 => (DXGI_FORMAT_NV12, 1, true),
+            WindowsCpuFormat::P010 => (DXGI_FORMAT_P010, 2, true),
+            WindowsCpuFormat::Ayuv => (DXGI_FORMAT_AYUV, 4, false),
+            WindowsCpuFormat::Y410 => (DXGI_FORMAT_Y410, 4, false),
+            WindowsCpuFormat::I444 => bail!("planar I444 is not a packed upload format"),
+        };
+        let (w, h) = (frame.coded_width, frame.coded_height);
+        anyhow::ensure!(
+            w > 0 && h > 0 && w >= frame.width && h >= frame.height,
+            "invalid software video dimensions"
+        );
+        anyhow::ensure!(
+            !planar || w % 2 == 0 && h % 2 == 0,
+            "invalid planar upload alignment"
+        );
+        let pitch = w
+            .checked_mul(bytes)
+            .context("software video row overflow")?;
+        let rows = if planar {
+            h.checked_add(h / 2)
+                .context("software video height overflow")?
+        } else {
+            h
+        };
+        let length = (pitch as usize)
+            .checked_mul(rows as usize)
+            .context("software video allocation overflow")?;
+        anyhow::ensure!(
+            frame.data.len() == length,
+            "software video data length mismatch"
+        );
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: w,
+            Height: h,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: format,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            ..Default::default()
+        };
+        let input = D3D11_SUBRESOURCE_DATA {
+            pSysMem: frame.data.as_ptr().cast(),
+            SysMemPitch: pitch,
+            SysMemSlicePitch: 0,
+        };
+        let mut texture = None;
+        unsafe {
+            self.shared
+                .device
+                .CreateTexture2D(&desc, Some(&input), Some(&mut texture))
+        }
+        .context("upload software decoded video")?;
+        Ok(D3D11Surface {
+            texture: texture.context("missing uploaded video texture")?,
+            subresource: 0,
+            desc,
+            shared_handle: None,
+            _frame: None,
+            visible_origin: (0, 0),
+            shared: Arc::clone(&self.shared),
+        })
+    }
+
     pub(crate) fn wrap_decoded_surface(&self, frame: WindowsGpuVideoFrame) -> Result<D3D11Surface> {
         let mut source_desc = D3D11_TEXTURE2D_DESC::default();
         unsafe { frame.texture().GetDesc(&raw mut source_desc) };
@@ -274,7 +373,8 @@ impl D3D11SurfaceWriter {
             subresource: frame.subresource(),
             desc: source_desc,
             shared_handle,
-            frame,
+            visible_origin: (frame.visible_x(), frame.visible_y()),
+            _frame: Some(frame),
             shared: Arc::clone(&self.shared),
         })
     }
@@ -366,7 +466,7 @@ impl D3D11Surface {
     }
 
     pub(crate) const fn visible_origin(&self) -> (u32, u32) {
-        (self.frame.visible_x(), self.frame.visible_y())
+        self.visible_origin
     }
 
     pub(crate) fn format(&self) -> windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT {

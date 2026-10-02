@@ -131,8 +131,9 @@ impl ResolvedConnection {
                         cancel,
                     ));
                 }
+                store.restore_device(&handle).await;
                 connection.preference_writer = Some(store.clone().bind(handle.clone()));
-                connection.audio_preference_writer = Some(store.bind_audio(handle));
+                connection.local_preference_writer = Some(store.bind_local_preferences(handle));
                 connection.activate_viewing().await
             };
             if let Err(error) =
@@ -339,6 +340,7 @@ impl ResolvedConnection {
         handle.set_audio_persistence_error(audio_persistence_error);
         connection.preference_writer = store.clone().map(|store| store.bind(handle.clone()));
         if let Some(store) = &store {
+            store.restore_device(&handle).await;
             match store.load_microphone().await {
                 Ok(quality) => {
                     handle.microphone().set_quality(quality)?;
@@ -346,7 +348,8 @@ impl ResolvedConnection {
                 Err(error) => handle.set_audio_persistence_error(Some(error.to_string())),
             }
         }
-        connection.audio_preference_writer = store.map(|store| store.bind_audio(handle));
+        connection.local_preference_writer =
+            store.map(|store| store.bind_local_preferences(handle));
         Ok(connection)
     }
 }

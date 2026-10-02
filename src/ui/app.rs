@@ -1,5 +1,8 @@
 //! The model/view contract is independent of platform and renderer.
 pub(crate) trait App {
+    fn title_bar_alert(&self) -> Option<super::chrome::TitleBarAlert> {
+        None
+    }
     fn uses_tray(&self) -> bool {
         true
     }

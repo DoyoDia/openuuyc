@@ -67,11 +67,14 @@ pub(crate) struct DualCapability {
     pub remote_display_info: Vec<DisplayCapability>,
     pub local_display_info: Vec<DisplayCapability>,
     pub frame_quality_capability: Vec<FrameQualityCapability>,
+    #[serde(skip)]
+    preferred_hardware: Vec<FrameQualityCapability>,
 }
 
 impl DualCapability {
     pub(crate) fn negotiate(local: &DeviceCapability, remote: DeviceCapability) -> Self {
         let mut rows = Vec::with_capacity(8);
+        let mut preferred_hardware = Vec::new();
         for video_codec in [1, 2, AV1_CODEC_ID] {
             if video_codec == AV1_CODEC_ID
                 && (!local
@@ -117,6 +120,39 @@ impl DualCapability {
                     } else {
                         QUALITY_DIMENSIONS[1]
                     };
+                    // Implementation 5 is the software encoder and 37 the
+                    // software decoder. Keep this local preference out of UU's
+                    // serialized capability contract.
+                    let native_maximum = |caps: &[CodecCapability]| {
+                        caps.iter()
+                            .filter(|cap| {
+                                (cap.video_codec, cap.chroma_sampling, cap.bit_depth)
+                                    == (video_codec, chroma_sampling, bit_depth)
+                                    && !matches!(cap.codec_impl, 5 | 37)
+                            })
+                            .map(|cap| (cap.width, cap.height))
+                            .max()
+                    };
+                    if let (Some(a), Some(b)) = (
+                        native_maximum(&local.video_codec_capability),
+                        native_maximum(&remote.video_codec_capability),
+                    ) {
+                        if let Some(tier) = QUALITY_DIMENSIONS
+                            .iter()
+                            .rposition(|size| *size <= a.min(b))
+                        {
+                            let (max_width, max_height) = QUALITY_DIMENSIONS[tier];
+                            preferred_hardware.push(FrameQualityCapability {
+                                video_codec,
+                                chroma_sampling,
+                                bit_depth,
+                                max_width,
+                                max_height,
+                                max_frame_quality: tier as i32 + 1,
+                                result: 0,
+                            });
+                        }
+                    }
                     rows.push(FrameQualityCapability {
                         video_codec,
                         chroma_sampling,
@@ -133,6 +169,7 @@ impl DualCapability {
             remote_display_info: remote.display_info,
             local_display_info: local.display_info.clone(),
             frame_quality_capability: rows,
+            preferred_hardware,
         }
     }
 
@@ -158,6 +195,19 @@ impl DualCapability {
         let h264 = self.exact(1, chroma, hdr);
         let h265 = self.exact(2, chroma, hdr);
         let av1 = self.exact(AV1_CODEC_ID, chroma, hdr);
+        for codec in [AV1_CODEC_ID, 2, 1] {
+            if let Some(row) = self.preferred_hardware.iter().copied().find(|r| {
+                r.video_codec == codec
+                    && r.chroma_sampling == chroma
+                    && (r.bit_depth >= 10) == hdr
+                    && r.max_frame_quality >= minimum
+                    && self
+                        .exact(codec, chroma, hdr)
+                        .is_some_and(|current| current.valid())
+            }) {
+                return row;
+            }
+        }
         for row in [av1, h265, h264].into_iter().flatten() {
             if row.valid() && row.max_frame_quality >= minimum {
                 return row;

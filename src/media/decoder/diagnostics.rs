@@ -49,66 +49,55 @@ impl Format {
     }
     fn sample(self, size: (u32, u32)) -> Option<&'static [u8]> {
         macro_rules! sample {
-            ($name:literal) => {
+            ($name:literal, $extension:literal) => {
                 match size {
                     (1280, 720) => Some(
-                        include_bytes!(concat!("fixtures/matrix/", $name, "_1280x720.annexb"))
+                        include_bytes!(concat!("fixtures/matrix/", $name, "_1280x720", $extension))
                             .as_slice(),
                     ),
                     (1920, 1080) => Some(
-                        include_bytes!(concat!("fixtures/matrix/", $name, "_1920x1080.annexb"))
-                            .as_slice(),
+                        include_bytes!(concat!(
+                            "fixtures/matrix/",
+                            $name,
+                            "_1920x1080",
+                            $extension
+                        ))
+                        .as_slice(),
                     ),
                     (2560, 1440) => Some(
-                        include_bytes!(concat!("fixtures/matrix/", $name, "_2560x1440.annexb"))
-                            .as_slice(),
+                        include_bytes!(concat!(
+                            "fixtures/matrix/",
+                            $name,
+                            "_2560x1440",
+                            $extension
+                        ))
+                        .as_slice(),
                     ),
                     (3840, 2160) => Some(
-                        include_bytes!(concat!("fixtures/matrix/", $name, "_3840x2160.annexb"))
-                            .as_slice(),
+                        include_bytes!(concat!(
+                            "fixtures/matrix/",
+                            $name,
+                            "_3840x2160",
+                            $extension
+                        ))
+                        .as_slice(),
                     ),
                     _ => None,
                 }
             };
         }
         match (self.codec, self.chroma, self.depth) {
-            (VideoCodec::Av1, 1, 8) => match size {
-                (1280, 720) => {
-                    Some(include_bytes!("fixtures/matrix/av1_8_1280x720.obu").as_slice())
-                }
-                (1920, 1080) => {
-                    Some(include_bytes!("fixtures/matrix/av1_8_1920x1080.obu").as_slice())
-                }
-                (2560, 1440) => {
-                    Some(include_bytes!("fixtures/matrix/av1_8_2560x1440.obu").as_slice())
-                }
-                (3840, 2160) => {
-                    Some(include_bytes!("fixtures/matrix/av1_8_3840x2160.obu").as_slice())
-                }
-                _ => None,
-            },
-            (VideoCodec::Av1, 1, 10) => match size {
-                (1280, 720) => {
-                    Some(include_bytes!("fixtures/matrix/av1_10_1280x720.obu").as_slice())
-                }
-                (1920, 1080) => {
-                    Some(include_bytes!("fixtures/matrix/av1_10_1920x1080.obu").as_slice())
-                }
-                (2560, 1440) => {
-                    Some(include_bytes!("fixtures/matrix/av1_10_2560x1440.obu").as_slice())
-                }
-                (3840, 2160) => {
-                    Some(include_bytes!("fixtures/matrix/av1_10_3840x2160.obu").as_slice())
-                }
-                _ => None,
-            },
+            (VideoCodec::Av1, 1, 8) => sample!("av1_8", ".obu"),
+            (VideoCodec::Av1, 1, 10) => sample!("av1_10", ".obu"),
+            (VideoCodec::Av1, 3, 8) => sample!("av1_444_8", ".obu"),
+            (VideoCodec::Av1, 3, 10) => sample!("av1_444_10", ".obu"),
 
-            (VideoCodec::H264, 1, 8) => sample!("h264"),
-            (VideoCodec::H264, 3, 8) => sample!("h264_444"),
-            (VideoCodec::H265, 1, 8) => sample!("hevc"),
-            (VideoCodec::H265, 1, 10) => sample!("main10"),
-            (VideoCodec::H265, 3, 8) => sample!("hevc_444"),
-            (VideoCodec::H265, 3, 10) => sample!("hevc_444_10"),
+            (VideoCodec::H264, 1, 8) => sample!("h264", ".annexb"),
+            (VideoCodec::H264, 3, 8) => sample!("h264_444", ".annexb"),
+            (VideoCodec::H265, 1, 8) => sample!("hevc", ".annexb"),
+            (VideoCodec::H265, 1, 10) => sample!("main10", ".annexb"),
+            (VideoCodec::H265, 3, 8) => sample!("hevc_444", ".annexb"),
+            (VideoCodec::H265, 3, 10) => sample!("hevc_444_10", ".annexb"),
             _ => None,
         }
     }
@@ -127,6 +116,7 @@ fn formats() -> Vec<Format> {
         })
         .collect()
 }
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Status {
     Pending,
@@ -206,7 +196,7 @@ pub(crate) fn run(
         .into_iter()
         .map(|(name, writer)| (format!("DXVA11 · {name}"), Some(name), Some(writer)))
         .collect();
-    all.push(("OpenUUYC H264 · 软件".into(), None, None));
+    all.push(("OpenUUYC · 软件".into(), None, None));
     let mut sizes: Vec<_> = crate::protocol::capability::QUALITY_DIMENSIONS
         .iter()
         .map(|&(w, h)| (w as u32, h as u32))
@@ -248,11 +238,15 @@ pub(crate) fn run(
                     return Ok(());
                 }
                 let supported = if device.is_some() {
-                    format.codec == VideoCodec::H265
-                        || (format.chroma == 1
-                            && (format.depth == 8 || format.codec == VideoCodec::Av1))
+                    matches!(format.codec, VideoCodec::H265 | VideoCodec::Av1)
+                        || (format.chroma == 1 && format.depth == 8)
                 } else {
-                    format.codec == VideoCodec::H264 && format.depth == 8
+                    openuuyc_codec::Format {
+                        codec: format.codec,
+                        chroma: format.chroma,
+                        depth: format.depth,
+                    }
+                    .can_decode()
                 };
                 let mut cell = Cell {
                     status: Status::Unchecked,
@@ -433,24 +427,7 @@ fn decode_sample(
                     }
                     ensure!(desc.Format == expected, "GPU输出像素格式与样本不一致");
                     let pixels = frame.diagnostic_pixels(&points, &cancel)?;
-                    if format.codec == VideoCodec::Av1 {
-                        for (i, p) in pixels.iter().enumerate() {
-                            let y = match (format.depth, i == 2) {
-                                (8, false) => 71,
-                                (8, true) => 181,
-                                (_, false) => 91,
-                                (_, true) => 117,
-                            };
-                            ensure!(
-                                p[0].abs_diff(y) <= 8
-                                    && p[1].abs_diff(128) <= 8
-                                    && p[2].abs_diff(128) <= 8,
-                                "AV1合成图案像素不符"
-                            );
-                        }
-                    } else {
-                        check_pattern(&pixels)?;
-                    }
+                    check_codec_pattern(format, size, &points, &pixels)?;
                     let actual = (frame.width(), frame.height());
                     let _surface = writer
                         .context("缺少D3D11输出拥有者")?
@@ -459,44 +436,84 @@ fn decode_sample(
                 }
                 WindowsDecodedFrame::Cpu(frame) => {
                     use crate::platform::decoder::WindowsCpuFormat;
-                    let expected = if format.chroma == 3 {
+                    let expected = if format.codec == VideoCodec::Av1 {
+                        match (format.chroma, format.depth) {
+                            (1, 8) => WindowsCpuFormat::Nv12,
+                            (1, 10) => WindowsCpuFormat::P010,
+                            (3, 8) => WindowsCpuFormat::Ayuv,
+                            (3, 10) => WindowsCpuFormat::Y410,
+                            _ => unreachable!(),
+                        }
+                    } else if format.chroma == 3 {
                         WindowsCpuFormat::I444
                     } else {
                         WindowsCpuFormat::Nv12
                     };
                     ensure!(frame.format == expected, "软件输出像素格式与样本不一致");
-                    let plane = frame.width as usize * frame.height as usize;
-                    ensure!(
-                        frame.data.len()
-                            == if format.chroma == 3 {
-                                plane * 3
-                            } else {
-                                plane + plane / 2
-                            },
-                        "软件输出平面长度不符"
-                    );
                     ensure!(
                         (frame.width, frame.height) == (w, h),
                         "软件输出尺寸与样本不一致"
                     );
+                    let cw = frame.coded_width as usize;
+                    let ch = frame.coded_height as usize;
+                    let plane = cw * ch;
+                    let length = match frame.format {
+                        WindowsCpuFormat::Nv12 => plane * 3 / 2,
+                        WindowsCpuFormat::P010 | WindowsCpuFormat::I444 => plane * 3,
+                        _ => plane * 4,
+                    };
+                    ensure!(frame.data.len() == length, "软件输出平面长度不符");
                     let pixels: Vec<_> = points
                         .iter()
                         .map(|&(x, y)| {
-                            let offset = (y * w + x) as usize;
-                            let (u, v) = if format.chroma == 3 {
-                                (plane + offset, plane * 2 + offset)
-                            } else {
-                                let u = plane + (y / 2 * w + x / 2 * 2) as usize;
-                                (u, u + 1)
-                            };
-                            [
-                                frame.data[offset] as u16,
-                                frame.data[u] as u16,
-                                frame.data[v] as u16,
-                            ]
+                            let (x, y) = (x as usize, y as usize);
+                            let at = y * cw + x;
+                            match frame.format {
+                                WindowsCpuFormat::Nv12 => {
+                                    let uv = plane + (y / 2 * cw + x / 2 * 2);
+                                    [
+                                        frame.data[at] as u16,
+                                        frame.data[uv] as u16,
+                                        frame.data[uv + 1] as u16,
+                                    ]
+                                }
+                                WindowsCpuFormat::I444 => [
+                                    frame.data[at] as u16,
+                                    frame.data[plane + at] as u16,
+                                    frame.data[2 * plane + at] as u16,
+                                ],
+                                WindowsCpuFormat::P010 => {
+                                    let uv = plane + y / 2 * cw + x / 2 * 2;
+                                    let get = |i: usize| {
+                                        u16::from_le_bytes(
+                                            frame.data[i * 2..i * 2 + 2].try_into().unwrap(),
+                                        ) >> 8
+                                    };
+                                    [get(at), get(uv), get(uv + 1)]
+                                }
+                                WindowsCpuFormat::Ayuv => [
+                                    frame.data[at * 4 + 2] as u16,
+                                    frame.data[at * 4 + 1] as u16,
+                                    frame.data[at * 4] as u16,
+                                ],
+                                WindowsCpuFormat::Y410 => {
+                                    let v = u32::from_le_bytes(
+                                        frame.data[at * 4..at * 4 + 4].try_into().unwrap(),
+                                    );
+                                    [
+                                        ((v >> 10 & 1023) >> 2) as u16,
+                                        ((v & 1023) >> 2) as u16,
+                                        ((v >> 20 & 1023) >> 2) as u16,
+                                    ]
+                                }
+                            }
                         })
                         .collect();
-                    check_pattern(&pixels)?;
+                    check_codec_pattern(format, size, &points, &pixels)?;
+                    if format.codec == VideoCodec::Av1 {
+                        let uploader = D3D11SurfaceWriter::new()?;
+                        let _surface = uploader.upload_cpu(&frame)?;
+                    }
                     (frame.width, frame.height)
                 }
             };
@@ -523,5 +540,45 @@ fn check_pattern(pixels: &[[u16; 3]]) -> Result<()> {
             expected
         );
     }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn check_codec_pattern(
+    format: Format,
+    (w, h): (u32, u32),
+    points: &[(u32, u32)],
+    pixels: &[[u16; 3]],
+) -> Result<()> {
+    if format.codec == VideoCodec::Av1 && format.chroma == 3 {
+        for (i, p) in pixels.iter().enumerate() {
+            let (x, y) = points[i];
+            let expected = [
+                if i == 2 { 181 } else { 71 },
+                if x < w / 2 { 80 } else { 176 },
+                if y < h / 2 { 96 } else { 160 },
+            ];
+            ensure!(
+                p.iter().zip(expected).all(|(a, b)| a.abs_diff(b) <= 8),
+                "AV1 4:4:4合成色块像素不符"
+            );
+        }
+    } else if format.codec == VideoCodec::Av1 {
+        for (i, p) in pixels.iter().enumerate() {
+            let y = match (format.depth, i == 2) {
+                (8, false) => 71,
+                (8, true) => 181,
+                (_, false) => 91,
+                (_, true) => 117,
+            };
+            ensure!(
+                p[0].abs_diff(y) <= 8 && p[1].abs_diff(128) <= 8 && p[2].abs_diff(128) <= 8,
+                "AV1合成图案像素不符"
+            );
+        }
+    } else {
+        check_pattern(&pixels)?;
+    }
+
     Ok(())
 }

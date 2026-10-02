@@ -11,11 +11,68 @@ use crate::features::stream_control::{
     StreamControlSettings, ViewingPreferenceUpdate,
 };
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum PerformancePanelMode {
+    Hidden,
+    Compact,
+    Detailed,
+}
+impl PerformancePanelMode {
+    pub(crate) fn next(self) -> Self {
+        match self {
+            Self::Compact => Self::Detailed,
+            Self::Detailed => Self::Hidden,
+            Self::Hidden => Self::Compact,
+        }
+    }
+}
+
+/// Explicit user choices. Runtime readiness, held input and clipboard contents
+/// must never be serialized here or written back by session cleanup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct DevicePreferences {
+    pub clipboard_sync: bool,
+    pub clipboard_files: bool,
+    pub control_enabled: bool,
+    pub mouse_mode: crate::features::remote_input::MouseMode,
+    pub intercept_shortcuts: bool,
+    pub performance_mode: PerformancePanelMode,
+}
+impl Default for DevicePreferences {
+    fn default() -> Self {
+        Self {
+            clipboard_sync: false,
+            clipboard_files: true,
+            control_enabled: false,
+            mouse_mode: crate::features::remote_input::MouseMode::Smart,
+            intercept_shortcuts: true,
+            performance_mode: PerformancePanelMode::Compact,
+        }
+    }
+}
+impl DevicePreferences {
+    fn validate(self) -> Result<Self> {
+        anyhow::ensure!(
+            self.mouse_mode != crate::features::remote_input::MouseMode::View,
+            "已保存的鼠标模式无效"
+        );
+        Ok(self)
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct DeviceRecord {
+    schema: u8,
+    preferences: DevicePreferences,
+}
+
 #[derive(Clone)]
 pub(crate) struct ViewingSettingsStore {
     viewing: Arc<Entry>,
     audio: Arc<Entry>,
     microphone: Arc<Entry>,
+    device: Arc<Entry>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -47,6 +104,16 @@ impl ViewingSettingsStore {
             Sha256::digest(user_id.as_bytes())
         );
         Ok(Self {
+            device: Arc::new(
+                Entry::new(
+                    &format!(
+                        "com.openuuyc.device-preferences.{:x}",
+                        Sha256::digest(user_id.as_bytes())
+                    ),
+                    publisher_id,
+                )
+                .map_err(|_| anyhow::anyhow!("设备偏好存储不可用"))?,
+            ),
             viewing: Arc::new(
                 Entry::new(&service, publisher_id)
                     .map_err(|_| anyhow::anyhow!("画面设置存储不可用"))?,
@@ -170,11 +237,55 @@ impl ViewingSettingsStore {
         .await
         .context("麦克风设置保存任务中断")?
     }
-    pub(crate) fn bind_audio(self, handle: StreamControlHandle) -> PreferenceWriter {
+    pub(crate) async fn restore_device(&self, handle: &StreamControlHandle) {
+        // A shared session or an in-memory room replacement already owns newer
+        // intent; a stale credential read must not overwrite it.
+        if handle.device_preferences_loaded() {
+            return;
+        }
+        let entry = self.device.clone();
+        let result = tokio::task::spawn_blocking(move || -> Result<DevicePreferences> {
+            let bytes = match entry.get_secret() {
+                Ok(bytes) => bytes,
+                Err(Error::NoEntry) => return Ok(DevicePreferences::default()),
+                Err(_) => bail!("无法读取此设备的控制偏好"),
+            };
+            let record: DeviceRecord =
+                serde_json::from_slice(&bytes).context("设备偏好格式无效")?;
+            anyhow::ensure!(record.schema == 1, "设备偏好版本无效");
+            record.preferences.validate()
+        })
+        .await
+        .context("设备偏好读取任务中断")
+        .and_then(|r| r);
+        match result {
+            Ok(preferences) => handle.restore_device_preferences(preferences),
+            Err(error) => handle.set_device_persistence_error(Some(error.to_string())),
+        }
+    }
+
+    async fn save_device(&self, preferences: DevicePreferences) -> Result<()> {
+        let entry = self.device.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let preferences = preferences.validate()?;
+            let bytes = serde_json::to_vec(&DeviceRecord {
+                schema: 1,
+                preferences,
+            })?;
+            entry
+                .set_secret(&bytes)
+                .map_err(|_| anyhow::anyhow!("无法保存此设备的控制偏好"))
+        })
+        .await
+        .context("设备偏好写入任务中断")?
+    }
+
+    pub(crate) fn bind_local_preferences(self, handle: StreamControlHandle) -> PreferenceWriter {
         // Subscribe after restoring startup settings, so --mute and defaults
         // do not silently overwrite saved user choices.
         let mut updates = handle.audio().preference_updates();
         let mut microphone = handle.microphone().quality_updates();
+        let mut device = handle.device_preference_updates();
         let stop = CancellationToken::new();
         let cancelled = stop.clone();
         let task = tokio::spawn(async move {
@@ -183,6 +294,7 @@ impl ViewingSettingsStore {
                     _ = cancelled.cancelled() => 0u8,
                     changed = updates.changed() => if changed.is_ok(){1}else{0},
                     changed = microphone.changed() => if changed.is_ok(){2}else{0},
+                    changed = device.changed() => if changed.is_ok(){4}else{0},
                 };
                 if changed != 0 {
                     tokio::select! { _=cancelled.cancelled()=>{}, _=tokio::time::sleep(std::time::Duration::from_millis(250))=>{} }
@@ -192,6 +304,9 @@ impl ViewingSettingsStore {
                 }
                 if microphone.has_changed().unwrap_or(false) {
                     changed |= 2;
+                }
+                if device.has_changed().unwrap_or(false) {
+                    changed |= 4;
                 }
                 let mut error = None;
                 if changed & 1 != 0 {
@@ -214,10 +329,25 @@ impl ViewingSettingsStore {
                             .or(error);
                     }
                 }
-                if changed != 0 {
+                if changed & 3 != 0 {
                     handle.set_audio_persistence_error(error);
                 }
-                if cancelled.is_cancelled() || changed == 0 {
+                if changed & 4 != 0 {
+                    let preferences = *device.borrow_and_update();
+                    if let Some(preferences) = preferences {
+                        let error = self
+                            .save_device(preferences)
+                            .await
+                            .err()
+                            .map(|e| e.to_string());
+                        handle.set_device_persistence_error(error);
+                    }
+                }
+                if (cancelled.is_cancelled() || changed == 0)
+                    && !updates.has_changed().unwrap_or(false)
+                    && !microphone.has_changed().unwrap_or(false)
+                    && !device.has_changed().unwrap_or(false)
+                {
                     break;
                 }
             }

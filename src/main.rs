@@ -109,12 +109,6 @@ enum Commands {
         /// 传输策略：auto、p2p 或 relay
         #[arg(long, default_value = "auto")]
         transport: media::TransportChoice,
-        /// 连接后是否自动开启键鼠控制
-        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-        auto_mouse_control: bool,
-        /// 是否默认开启剪贴板文件复制
-        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
-        clipboard_files: bool,
     },
     /// 恢复保存的登录态，或进行二维码登录
     Login,
@@ -146,12 +140,6 @@ enum Commands {
         /// 传输策略：auto、p2p 或 relay
         #[arg(long, default_value = "auto")]
         transport: media::TransportChoice,
-        /// 连接后是否自动开启键鼠控制
-        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-        auto_mouse_control: bool,
-        /// 是否默认开启剪贴板文件复制
-        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
-        clipboard_files: bool,
     },
 }
 
@@ -171,8 +159,6 @@ fn main() -> Result<()> {
         codec: media::CodecPreference::Auto,
         hardware_decode: true,
         transport: media::TransportChoice::Auto,
-        auto_mouse_control: true,
-        clipboard_files: false,
     });
 
     if matches!(command, Commands::Gui { .. }) && openuuyc::application::route_installed_gui()? {
@@ -262,8 +248,6 @@ fn main() -> Result<()> {
             codec,
             hardware_decode,
             transport,
-            auto_mouse_control,
-            clipboard_files,
         } => app::run(app::GuiOptions {
             background,
             media: media::ConnectionMediaOptions {
@@ -273,8 +257,6 @@ fn main() -> Result<()> {
                 codec,
                 hardware_decode,
                 transport,
-                auto_mouse_control,
-                clipboard_files,
             },
         }),
         Commands::Login => {
@@ -291,8 +273,6 @@ fn main() -> Result<()> {
             codec,
             hardware_decode,
             transport,
-            auto_mouse_control,
-            clipboard_files,
         } => tokio::runtime::Runtime::new()?.block_on(connect_device(
             device,
             media::ConnectionMediaOptions {
@@ -302,8 +282,6 @@ fn main() -> Result<()> {
                 codec,
                 hardware_decode,
                 transport,
-                auto_mouse_control,
-                clipboard_files,
             },
             device_id,
         )),

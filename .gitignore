@@ -13,7 +13,9 @@ captures/
 *.md
 *.markdown
 !/README.md
-!/crates/h264-core/README.md
+!/crates/codec/README.md
+!/crates/codec/kernels/h264/README.md
+!/crates/codec/kernels/av1/README.md
 !/drivers/README.md
 !/drivers/display/UPSTREAM.md
 !/drivers/audio/UPSTREAM.md

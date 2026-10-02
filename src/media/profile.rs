@@ -170,14 +170,6 @@ pub struct ConnectionMediaOptions {
     pub codec: CodecPreference,
     pub hardware_decode: bool,
     pub transport: TransportChoice,
-    /// Take keyboard and mouse control as soon as the control channel is ready,
-    /// instead of waiting for the player's 键鼠控制 button.
-    pub auto_mouse_control: bool,
-    /// Offer and accept files through the clipboard. Off by default: a copy
-    /// reaches for whatever it names, so it carries more than a paste of text
-    /// or a picture does, and the player's 文件复制 switch turns it on per
-    /// session.
-    pub clipboard_files: bool,
 }
 
 impl Default for ConnectionMediaOptions {
@@ -189,8 +181,6 @@ impl Default for ConnectionMediaOptions {
             codec: CodecPreference::Auto,
             hardware_decode: true,
             transport: TransportChoice::Auto,
-            auto_mouse_control: true,
-            clipboard_files: false,
         }
     }
 }
@@ -204,8 +194,6 @@ pub(crate) struct ConnectionMediaProfile {
     pub decoder_fps_cap: u32,
     pub codec: CodecPreference,
     pub hardware_decode: bool,
-    pub auto_mouse_control: bool,
-    pub clipboard_files: bool,
 }
 
 impl ConnectionMediaOptions {
@@ -219,8 +207,6 @@ impl ConnectionMediaOptions {
             decoder_fps_cap: display.refresh_hz.max(stream_fps),
             codec: self.codec,
             hardware_decode: self.hardware_decode,
-            auto_mouse_control: self.auto_mouse_control,
-            clipboard_files: self.clipboard_files,
         })
     }
 }
@@ -232,22 +218,4 @@ fn max_frame_rate_level(refresh_hz: u32) -> u32 {
         .unwrap_or(144)
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum VideoCodec {
-    H264,
-    H265,
-    Av1,
-}
-
-impl std::str::FromStr for VideoCodec {
-    type Err = anyhow::Error;
-
-    fn from_str(value: &str) -> Result<Self> {
-        match value.to_ascii_lowercase().as_str() {
-            "h264" | "avc" => Ok(Self::H264),
-            "h265" | "hevc" => Ok(Self::H265),
-            "av1" => Ok(Self::Av1),
-            _ => bail!("unsupported video codec: {value}"),
-        }
-    }
-}
+pub use openuuyc_codec::Codec as VideoCodec;

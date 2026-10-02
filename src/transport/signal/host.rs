@@ -363,6 +363,7 @@ impl Session {
                     peer.close().await;
                 }
                 let owner = authorization.peer_lease()?;
+                owner.controller(&options.device_id, &client_id);
                 let cancel = tokio_util::sync::CancellationToken::new();
                 let lease = owner.with_cancellation(cancel.clone());
                 let displays = crate::features::host::displays::Session::new(

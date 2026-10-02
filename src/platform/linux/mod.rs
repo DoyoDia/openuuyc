@@ -14,6 +14,7 @@ pub(crate) mod host_service;
 pub(crate) mod input;
 pub(crate) mod loopback;
 pub(crate) mod nvenc;
+mod software_encoder;
 pub(crate) mod surface;
 pub(crate) mod transfer;
 mod video_layer;

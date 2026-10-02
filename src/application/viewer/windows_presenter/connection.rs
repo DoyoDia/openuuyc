@@ -5,7 +5,7 @@ use super::screen_windows::ScreenWindows;
 use crate::application::viewer::windows_ui::{UiPresenter, UiTimingAudit};
 use crate::application::viewer::{
     ConnectionProgress, ConnectionProgressApp, NativeViewerSession, ViewerDisplayHandle,
-    ViewerPreferences, ViewerWindowEvent, configure_viewer_visuals, mutex_lock,
+    ViewerWindowEvent, configure_viewer_visuals, mutex_lock,
 };
 use crate::ui::chrome::{
     configure_dwm_window, title_bar_height, title_bar_panel, window_title_bar,
@@ -101,7 +101,6 @@ pub(crate) struct ConnectingWindowsRunner {
     )>,
     pub(in crate::application::viewer) embedded: bool,
     pub(super) screens: Option<ScreenWindows>,
-    pub(in crate::application::viewer) preferences: ViewerPreferences,
     pub(in crate::application::viewer) close_requested: bool,
     pub(in crate::application::viewer) attributes: WindowAttributes,
     pub(in crate::application::viewer) alias: String,
@@ -392,7 +391,6 @@ impl ConnectingWindowsRunner {
             embedded,
             ui_generation: 1,
             close_requested: false,
-            preferences: ViewerPreferences::default(),
             screens: None,
         }
     }
@@ -449,18 +447,10 @@ impl ConnectingWindowsRunner {
                 } => {
                     self.alias = alias;
                     if let Some(mut screens) = self.screens.take() {
-                        self.preferences = screens.viewer_preferences(preferred);
                         self.window = screens.take_window(preferred);
                     }
                     // Keep the OS window, but join and discard the old room's
                     // render/decoder owners before attaching a new media peer.
-                    if let Some(playing) = self.playing.as_ref() {
-                        self.preferences = ViewerPreferences {
-                            performance_mode: playing.performance_mode,
-                            intercept_shortcuts: playing.intercept_shortcuts,
-                        };
-                        tracing::debug!(?self.preferences, "preserved local viewer preferences across room replacement");
-                    }
                     self.playing.take();
                     self.connecting.take();
                     self.ui_generation = self.ui_generation.wrapping_add(1);
@@ -522,7 +512,6 @@ impl ConnectingWindowsRunner {
             window,
             session,
             connecting,
-            self.preferences,
             self.repaint_proxy.clone(),
             self.ui_generation,
         )?);

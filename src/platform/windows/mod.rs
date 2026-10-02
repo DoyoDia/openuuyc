@@ -20,13 +20,13 @@ pub(crate) mod nvenc;
 pub(crate) mod preprocess;
 pub(crate) mod qsv;
 pub(crate) mod qsv_allocator;
+mod software_encoder;
 pub(crate) mod surface;
 pub(crate) mod transfer;
 pub(crate) mod virtual_audio;
 
 use crate::media::encoding as format;
 use crate::media::encoding::rate as encoder_rate;
-use crate::media::encoding::software as rust_h264;
 use crate::media::geometry::{fit_size, output_size};
 fn lock<T>(value: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     value

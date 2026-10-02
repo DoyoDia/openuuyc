@@ -1,5 +1,8 @@
 //! One ordinary video SSRC, with only SDP-negotiated codec payload types.
-use super::{format::Codec, lock};
+use super::{
+    format::{Codec, Format},
+    lock,
+};
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::{
@@ -41,14 +44,30 @@ impl VideoTrack {
         }
         *current = negotiated;
     }
-    pub async fn write(&self, codec: Codec, packet: &Packet) -> webrtc::error::Result<usize> {
+    pub async fn write(&self, format: Format, packet: &Packet) -> webrtc::error::Result<usize> {
         let Some(binding) = lock(&self.binding).clone() else {
             return Ok(0);
         };
         let payload = binding
             .codec_parameters()
             .iter()
-            .find(|p| p.capability.mime_type.eq_ignore_ascii_case(codec.mime()))
+            .filter(|p| {
+                p.capability
+                    .mime_type
+                    .eq_ignore_ascii_case(format.codec.mime())
+            })
+            .filter(|p| {
+                format.codec != Codec::Av1
+                    || crate::media::av1::rtp_profile(&p.capability.sdp_fmtp_line)
+                        .is_some_and(|profile| profile >= u8::from(format.chroma == 3))
+            })
+            .min_by_key(|p| {
+                if format.codec == Codec::Av1 {
+                    crate::media::av1::rtp_profile(&p.capability.sdp_fmtp_line).unwrap_or(255)
+                } else {
+                    0
+                }
+            })
             .ok_or(Error::ErrUnsupportedCodec)?
             .payload_type;
         let mut packet = packet.clone();

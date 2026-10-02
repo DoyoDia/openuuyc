@@ -1,10 +1,9 @@
 //! Linux host encoding: NVENC on the GPU driving the display when the driver
-//! offers it, the Rust H.264 core otherwise. As on Windows, hardware comes
+//! offers it, the Rust software codecs (H.264, AV1) otherwise. As on Windows, hardware comes
 //! first and every candidate is proven on the selected desktop by encoding a
 //! frame and checking the SPS it produced.
 use super::capture::{Desktop, Device, Image};
 use super::cuda;
-use crate::media::encoding::software::{Encoder as SoftwareEncoder, MAXIMUM};
 use crate::media::encoding::{Backend, Capability, Codec, Format, QualityTarget, Rate};
 use anyhow::{Context, Result, bail, ensure};
 
@@ -41,6 +40,16 @@ pub(crate) fn probe(
         }
     }
     candidates.push((Backend::Software, Format::AVC));
+    for chroma in [1, 3] {
+        let format = Format {
+            codec: Codec::Av1,
+            chroma,
+            depth: 8,
+        };
+        if super::software_encoder::Encoder::accepts(format) {
+            candidates.push((Backend::Software, format));
+        }
+    }
     let rate = Rate {
         target: 2_000_000,
         peak: 2_000_000,
@@ -59,7 +68,7 @@ pub(crate) fn probe(
         let probe = (|| -> Result<Capability> {
             let size = (frame.width, frame.height);
             let mut encoder = if backend == Backend::Software {
-                Encoder::software(&desktop.device, size.0, size.1, 30, rate.target)?
+                Encoder::software_format(&desktop.device, size, format, rate)?
             } else {
                 Encoder::hardware_format(&desktop.device, size, format, rate)?
             };
@@ -120,7 +129,7 @@ impl Runtime {
 
 pub(crate) enum Encoder {
     Nvidia(super::nvenc::Encoder),
-    Software(SoftwareEncoder),
+    Software(Box<super::software_encoder::Encoder>),
 }
 impl Encoder {
     pub(crate) fn hardware_format(
@@ -138,16 +147,15 @@ impl Encoder {
             &context, size, format, rate,
         )?))
     }
-    pub(crate) fn software(
+    pub(crate) fn software_format(
         _device: &Device,
-        width: u32,
-        height: u32,
-        fps: u32,
-        bitrate: u32,
+        size: (u32, u32),
+        format: Format,
+        rate: Rate,
     ) -> Result<Self> {
-        Ok(Self::Software(SoftwareEncoder::new(
-            width, height, fps, bitrate,
-        )?))
+        Ok(Self::Software(Box::new(
+            super::software_encoder::Encoder::new(size, format, rate)?,
+        )))
     }
     pub(crate) fn implementation(&self) -> i32 {
         match self {
@@ -158,7 +166,7 @@ impl Encoder {
     pub(crate) fn maximum_size(&self) -> (u32, u32) {
         match self {
             Self::Nvidia(encoder) => encoder.maximum_size(),
-            Self::Software(_) => MAXIMUM,
+            Self::Software(encoder) => encoder.maximum_size(),
         }
     }
     pub(crate) fn configure_rate(&mut self, rate: Rate) -> Result<bool> {
@@ -173,16 +181,30 @@ impl Encoder {
         timestamp: i64,
         keyframe: bool,
     ) -> Result<Vec<Encoded>> {
+        self.encode_cancellable(
+            image,
+            timestamp,
+            keyframe,
+            &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+    }
+    pub(crate) fn encode_cancellable(
+        &mut self,
+        image: &Image,
+        timestamp: i64,
+        keyframe: bool,
+        cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<Vec<Encoded>> {
+        if keyframe && let Self::Software(e) = self {
+            e.request_keyframe();
+        }
+        ensure!(
+            !cancel.load(std::sync::atomic::Ordering::Acquire),
+            "编码已取消"
+        );
         match self {
             Self::Nvidia(encoder) => encoder.encode(image, timestamp, keyframe),
-            Self::Software(encoder) => {
-                let (width, height) = image.size();
-                ensure!(
-                    (width, height) == (encoder.width, encoder.height),
-                    "采集画面尺寸与编码器不一致"
-                );
-                encoder.encode(&image.pixels()?, timestamp, keyframe)
-            }
+            Self::Software(encoder) => encoder.encode(image, timestamp, keyframe, cancel),
         }
     }
 }

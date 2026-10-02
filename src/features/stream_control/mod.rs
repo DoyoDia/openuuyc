@@ -47,6 +47,7 @@ pub(crate) mod annotation;
 mod display_settings;
 mod display_topology;
 mod microphone;
+mod preferences;
 pub(crate) mod publisher;
 
 const VIDEO_QUALITY_FAST: i32 = 1;
@@ -201,6 +202,7 @@ pub(crate) struct StreamControlPreferences {
     pub(crate) custom_bitrate_limit: Option<u32>,
     audio: Option<crate::media::audio::AudioSettings>,
     auto_frame_quality: i32,
+    device: Option<crate::features::viewing_settings::DevicePreferences>,
 }
 
 impl StreamControlPreferences {
@@ -242,6 +244,7 @@ impl StreamControlPreferences {
         settings.custom_bitrate_mbps = normalize_custom_bitrate(settings.custom_bitrate_mbps);
         Self {
             settings,
+            device: None,
             custom_bitrate_limit: None,
             audio: None,
             auto_frame_quality: if settings.quality == StreamQuality::Auto {
@@ -426,14 +429,17 @@ struct StreamControlState {
     custom_bitrate_limit: u32,
     features: Option<crate::account::feature_ability::FeaturePolicy>,
     remote_notice: Option<(Instant, &'static str)>,
-    preferred_mouse_mode: MouseMode,
-    /// Take control automatically once the control channel is usable.
-    auto_mouse_control: bool,
-    /// Set when the viewer explicitly gives control back, so an automatic
-    /// hand-over does not fight that choice on the next reconnect.
-    auto_mouse_declined: bool,
-    /// Keeps the "still waiting" diagnostic to one line per session.
-    auto_mouse_reported: bool,
+    device_preferences: crate::features::viewing_settings::DevicePreferences,
+    device_preferences_loaded: bool,
+    device_preference_updates:
+        tokio::sync::watch::Sender<Option<crate::features::viewing_settings::DevicePreferences>>,
+    device_persistence_error: Option<String>,
+    restore_input_pending: bool,
+    #[allow(
+        dead_code,
+        reason = "Smart mouse waits for special_game_mouse instead of inferring from a hidden cursor."
+    )]
+    remote_cursor: crate::features::remote_cursor::RemoteCursorState,
     peer_mouse_relative: Option<bool>,
     cursor_sync_needed: bool,
     cursor_desired_capture: bool,
@@ -499,10 +505,6 @@ impl StreamControlHandle {
             .clamp(1, profile.stream_fps.max(1));
         let mouse = crate::features::remote_input::RemoteInput::default();
         let cursor = crate::features::remote_cursor::RemoteCursorState::default();
-        tracing::debug!(
-            auto_mouse_control = profile.auto_mouse_control,
-            "stream control created"
-        );
         let state = StreamControlState {
             peer_clipboard: 0,
             clipboard_files_allowed: true,
@@ -511,11 +513,13 @@ impl StreamControlHandle {
             annotation: Default::default(),
             custom_bitrate_limit: MAX_CUSTOM_BITRATE_MBPS,
             features: None,
-            preferred_mouse_mode: MouseMode::Smart,
-            auto_mouse_control: profile.auto_mouse_control,
-            auto_mouse_declined: false,
-            auto_mouse_reported: false,
+            device_preferences: Default::default(),
+            device_preferences_loaded: false,
+            device_preference_updates: tokio::sync::watch::channel(None).0,
+            device_persistence_error: None,
+            restore_input_pending: false,
             remote_notice: None,
+            remote_cursor: cursor.clone(),
             peer_mouse_relative: None,
             cursor_sync_needed: false,
             cursor_desired_capture: true,
@@ -580,6 +584,7 @@ impl StreamControlHandle {
             last_notice: None,
             preference_updates: tokio::sync::watch::channel(None).0,
             confirmed_preferences: StreamControlPreferences {
+                device: None,
                 custom_bitrate_limit: None,
                 settings: StreamControlSettings {
                     true_color: false,
@@ -603,16 +608,12 @@ impl StreamControlHandle {
             volume: 100,
             muted: profile.muted,
         });
-        let clipboard = crate::features::clipboard::Clipboard::new();
-        // The connection setting decides where the per-session 文件复制 switch
-        // starts; the player can still turn it on or off afterwards.
-        clipboard.set_files(profile.clipboard_files);
         (
             Self {
                 audio_mode: tokio::sync::watch::channel(profile.audio_only).0,
                 audio_quality: Arc::new(Mutex::new(audio_quality::State::new(profile.audio_only))),
                 microphone: crate::media::microphone::Microphone::new(),
-                clipboard,
+                clipboard: crate::features::clipboard::Clipboard::new(),
                 files: Arc::new(crate::features::file_transfer::Transport::default()),
                 mouse,
                 cursor,
@@ -688,7 +689,7 @@ impl StreamControlHandle {
                 .map(|cap| cap.select(3, state.settings.hdr, 0))
                 .filter(|cap| cap.result == 0)
                 .and_then(|cap| quality_from_capability(cap.max_frame_quality)),
-            mouse_preference: state.preferred_mouse_mode,
+            mouse_preference: state.device_preferences.mouse_mode,
             mouse_mode: state.mouse.mode(),
             mouse_pending: state.mouse.waiting_for_neutral(),
             mouse_error: state.mouse.error(),
@@ -747,7 +748,8 @@ impl StreamControlHandle {
             persistence_error: state
                 .persistence_error
                 .clone()
-                .or_else(|| state.audio_persistence_error.clone()),
+                .or_else(|| state.audio_persistence_error.clone())
+                .or_else(|| state.device_persistence_error.clone()),
             network,
         }
     }
@@ -768,6 +770,7 @@ impl StreamControlHandle {
     pub(crate) fn preferences(&self) -> StreamControlPreferences {
         let state = lock(&self.shared);
         StreamControlPreferences {
+            device: Some(state.device_preferences),
             settings: state.confirmed_preferences.settings,
             custom_bitrate_limit: (state.custom_bitrate_limit < MAX_CUSTOM_BITRATE_MBPS)
                 .then_some(state.custom_bitrate_limit),
@@ -852,6 +855,7 @@ impl StreamControlHandle {
             .push_back(PendingCapturePreferences {
                 sequence,
                 preferences: StreamControlPreferences {
+                    device: None,
                     custom_bitrate_limit: (state.custom_bitrate_limit < MAX_CUSTOM_BITRATE_MBPS)
                         .then_some(state.custom_bitrate_limit),
                     settings: state.settings,

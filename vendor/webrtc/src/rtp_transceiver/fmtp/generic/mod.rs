@@ -43,6 +43,14 @@ impl Fmtp for GenericFmtp {
                 return false;
             }
 
+            if self.mime_type.eq_ignore_ascii_case("video/AV1") {
+                // Profile is not a wildcard when omitted: AV1 RTP defaults to 0.
+                // Keep separately registered Main/High payload mappings distinct.
+                let profile=|params:&HashMap<String,String>| {
+                    params.get("profile").map_or(Some(0u8),|v|v.parse::<u8>().ok()).filter(|p|*p<=2)
+                };
+                if profile(&self.parameters).is_none() || profile(&self.parameters)!=profile(&c.parameters) {return false;}
+            }
             fmtp_consist(&self.parameters, &c.parameters)
         } else {
             false

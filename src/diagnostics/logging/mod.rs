@@ -72,11 +72,11 @@ modules! {
     ("auth", "登录与凭据", false, ["openuuyc::account::auth", "openuuyc::account::login", "openuuyc::account::session_restore"]),
     ("api", "账号接口", false, ["openuuyc::account::api", "openuuyc::account::client", "openuuyc::account::nrd_http", "openuuyc::account::assist"]),
     ("presence", "在线状态", false, ["openuuyc::session::presence", "openuuyc::session::device_session"]),
-    ("host", "本机被控", false, ["openuuyc::features::host", "openuuyc::media::encoding", "openuuyc::platform::windows::capture", "openuuyc::platform::windows::encoder", "openuuyc::platform::windows::nvenc", "openuuyc::platform::windows::amf", "openuuyc::platform::windows::qsv", "openuuyc::platform::windows::gdi", "openuuyc::platform::windows::preprocess", "openuuyc::platform::windows::transfer", "openuuyc::platform::windows::gpu_conversion", "openuuyc::platform::windows::cursor"]),
+    ("host", "本机被控", false, ["openuuyc::features::host", "openuuyc_codec::encoder", "openuuyc_av1::encoder", "openuuyc::platform::windows::software_encoder", "openuuyc::media::encoding", "openuuyc::platform::windows::capture", "openuuyc::platform::windows::encoder", "openuuyc::platform::windows::nvenc", "openuuyc::platform::windows::amf", "openuuyc::platform::windows::qsv", "openuuyc::platform::windows::gdi", "openuuyc::platform::windows::preprocess", "openuuyc::platform::windows::transfer", "openuuyc::platform::windows::gpu_conversion", "openuuyc::platform::windows::cursor"]),
     ("signal", "信令与协商", false, ["openuuyc::transport::signal"]),
     ("rtc", "实时传输", false, ["openuuyc::transport::rtc", "openuuyc::transport::uu_kcp"]),
     ("recovery", "丢包恢复", false, ["openuuyc::transport::official_receiver", "openuuyc::nack_audit", "openuuyc::transport::rsfec", "openuuyc::transport::ulpfec", "openuuyc::transport::flexfec", "openuuyc::transport::xor_fec"]),
-    ("decoder", "视频解码", false, ["openuuyc::media::decoder", "openuuyc::media::decoder_pool", "openuuyc::media::decoder_result", "openuuyc::media::codec_parameters", "openuuyc_h264", "openuuyc::platform::windows::decoder", "openuuyc::platform::windows::surface"]),
+    ("decoder", "视频解码", false, ["openuuyc::media::decoder", "openuuyc::media::decoder_pool", "openuuyc::media::decoder_result", "openuuyc::media::codec_parameters", "openuuyc_codec::decoder", "openuuyc_h264", "openuuyc_av1::bitstream", "openuuyc_av1::decoder", "openuuyc::platform::windows::decoder", "openuuyc::platform::windows::surface"]),
     ("viewer", "播放窗口", false, ["openuuyc::application::viewer", "openuuyc::session::controller::windows", "openuuyc::media::video_color", "openuuyc::media::video_format", "openuuyc::platform::windows::video_shader", "openuuyc::platform::windows::swapchain"]),
     ("audio", "音频", false, ["openuuyc::media::audio", "openuuyc::media::microphone"]),
     ("control", "串流设置", false, ["openuuyc::features::stream_control", "openuuyc::features::viewing_settings"]),
@@ -123,10 +123,9 @@ impl Settings {
             }
         }
         let mut directives = format!(
-            "{},openuuyc={},openuuyc_h264={}",
+            "{},openuuyc={app},openuuyc_codec={app},openuuyc_h264={app},openuuyc_av1={app}",
             self.dependencies.directive(),
-            self.application.directive(),
-            self.application.directive()
+            app = self.application.directive()
         );
         for module in MODULES {
             if let Some(level) = self.modules.get(module.id) {

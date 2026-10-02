@@ -1,4 +1,5 @@
-//! Linux video decoding: VA-API in hardware, Rust H.264 in software.
+//! Linux video decoding: VA-API in hardware, the Rust H.264/AV1 codecs in
+//! software.
 //! Both paths hand the picture over on the CPU; VA-API surfaces are copied
 //! out rather than shared with the renderer, so there is no zero-copy yet.
 #![cfg(not(windows))]
@@ -39,7 +40,7 @@ pub fn probe_hardware(codec: VideoCodec, width: u32, height: u32, depth: u8, chr
 enum Backend {
     /// VA-API, which decodes one access unit per call.
     Hardware(Box<vaapi::Session>),
-    Software(Box<openuuyc_h264::stream::Decoder>),
+    Software(Box<openuuyc_codec::decoder::Decoder>),
 }
 
 pub struct LinuxVideoDecoder {
@@ -48,14 +49,15 @@ pub struct LinuxVideoDecoder {
     notification: DecoderNotification,
 }
 
-fn software_error(error: openuuyc_h264::Error) -> DecodeError {
-    use openuuyc_h264::Error;
+fn software_error(error: openuuyc_codec::decoder::Error) -> DecodeError {
+    use openuuyc_codec::decoder::Error;
     match error {
-        Error::Cancelled | Error::Closed => DecodeError::Closed,
-        Error::Unsupported(_) => DecodeError::Unsupported,
+        Error::Closed => DecodeError::Closed,
+        Error::Unsupported => DecodeError::Unsupported,
         Error::Allocation => DecodeError::Backend,
-        Error::NeedKeyframe | Error::Truncated | Error::Invalid(_) => {
-            tracing::debug!(%error, "Rust H264 input requires a new keyframe");
+        Error::InvalidInput => DecodeError::InvalidInput,
+        Error::NeedKeyframe => {
+            tracing::debug!(%error, "software decoder input requires a new keyframe");
             DecodeError::NeedKeyframe
         }
     }
@@ -67,9 +69,6 @@ impl LinuxVideoDecoder {
             // Hardware surfaces still come back on the CPU.
             DecoderMode::Hardware => Backend::Hardware(Box::new(vaapi::Session::open(config)?)),
             DecoderMode::Software => {
-                if config.codec != VideoCodec::H264 {
-                    return Err(DecodeError::Unsupported);
-                }
                 if config.width == 0
                     || config.height == 0
                     || config.width > 16384
@@ -77,8 +76,9 @@ impl LinuxVideoDecoder {
                 {
                     return Err(DecodeError::InvalidInput);
                 }
-                let mut decoder = openuuyc_h264::stream::Decoder::new();
-                decoder.seed(&config.extra_data).map_err(software_error)?;
+                let decoder =
+                    openuuyc_codec::decoder::Decoder::new(config.codec, &config.extra_data)
+                        .map_err(software_error)?;
                 Backend::Software(Box::new(decoder))
             }
         };
@@ -126,6 +126,9 @@ impl LinuxVideoDecoder {
 
 impl LinuxVideoDecoder {
     pub fn set_notification(&mut self, notification: DecoderNotification) {
+        if let Backend::Software(decoder) = &mut self.backend {
+            decoder.set_cancellation(notification.shared_cancellation());
+        }
         self.notification = notification;
     }
 
@@ -148,28 +151,26 @@ impl LinuxVideoDecoder {
             }
             Backend::Software(decoder) => decoder,
         };
-        let outputs = decoder
-            .submit_with_cancel(payload, token as u64, self.notification.cancellation())
-            .map_err(software_error)?;
-        for output in outputs {
-            let picture = output.picture;
-            let mut packed = Vec::new();
-            picture.pack_into(&mut packed).map_err(software_error)?;
+        for frame in decoder.push(payload, token).map_err(software_error)? {
             if self.notification.is_cancelled() {
                 self.pending.clear();
                 return Err(DecodeError::Closed);
             }
+            let format = match frame.format {
+                openuuyc_codec::PixelFormat::Nv12 => CpuFormat::Nv12,
+                openuuyc_codec::PixelFormat::I444 => CpuFormat::I444,
+                // 10-bit and packed 4:4:4 AV1 are never advertised here.
+                _ => return Err(DecodeError::Unsupported),
+            };
+            // AV1 pads odd NV12 sizes to even ones, repeating the edge pixels;
+            // the packed planes are laid out at the coded size.
             self.pending
                 .push_back(PlatformDecodedFrame::Cpu(CpuVideoFrame {
-                    pts: output.token as i64,
-                    width: picture.crop.width as u32,
-                    height: picture.crop.height as u32,
-                    format: if picture.chroma == openuuyc_h264::picture::Chroma::Yuv444 {
-                        CpuFormat::I444
-                    } else {
-                        CpuFormat::Nv12
-                    },
-                    data: Bytes::from(packed),
+                    pts: frame.pts,
+                    width: frame.coded_width,
+                    height: frame.coded_height,
+                    format,
+                    data: frame.data,
                 }));
         }
         Ok(())

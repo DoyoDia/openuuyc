@@ -27,9 +27,6 @@ impl StreamControlHandle {
         let mut state = lock(&self.shared);
         self.drive_display_changes(&mut state);
         expire_cursor_request(&mut state);
-        // Readiness can complete through several different paths; checking here
-        // means the hand-over does not depend on which one finished last.
-        self.maybe_auto_take_mouse(&mut state);
         self.refresh_mouse_policy(&mut state);
     }
 
@@ -56,6 +53,10 @@ impl StreamControlHandle {
             _ => return,
         }
         if !open {
+            state.restore_input_pending = state.device_preferences.control_enabled
+                && state.viewing_enabled
+                && !state.annotation.enabled
+                && !state.annotation.toggling();
             self.microphone.disconnect();
             self.clipboard.suspend();
             state.peer_clipboard = 0;
@@ -91,7 +92,6 @@ impl StreamControlHandle {
             && state.text_channel_open
         {
             state.mouse.set_ready(state.mouse_transport_connected);
-            self.maybe_auto_take_mouse(&mut state);
         }
         drop(state);
         if !open {
@@ -177,9 +177,11 @@ impl StreamControlHandle {
         let mut state = lock(&self.shared);
         if enabled && !state.viewing_enabled {
             state.initial_capture_sync_sent = false;
+            state.restore_input_pending = state.device_preferences.control_enabled;
         }
         state.viewing_enabled = enabled;
         if !enabled {
+            state.restore_input_pending = false;
             self.disable_microphone_locked(&mut state);
             self.clipboard.suspend();
         }
@@ -277,7 +279,6 @@ impl StreamControlHandle {
                                     && protocol(&state) == StreamControlProtocol::CaptureSetting,
                             );
                             handshake_changed = true;
-                            self.maybe_auto_take_mouse(&mut state);
                             state.last_error = (protocol(&state)
                                 == StreamControlProtocol::Unsupported)
                                 .then(|| "对端不支持当前串流协议（需要CaptureSetting RPC）".into());

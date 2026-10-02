@@ -424,8 +424,8 @@ impl StreamControlHandle {
     }
     pub(crate) fn annotation_toggle(&self, enable: bool) -> Result<()> {
         // Explicit annotation entry revokes remote input, including already-held keys.
-        if enable && self.mouse.mode() != MouseMode::View {
-            self.set_mouse_mode(MouseMode::View)?;
+        if enable {
+            self.suspend_mouse_control()?;
         }
         let mut s = lock(&self.shared);
         if s.annotation.toggling() {

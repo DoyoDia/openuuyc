@@ -18,6 +18,7 @@ use windows::{
 
 pub(crate) use crate::media::capture::{Screen, SourceGone};
 mod inventory;
+mod power;
 mod recovery;
 
 /// Read the state of this process's interactive session. Unknown/failure is
@@ -350,6 +351,9 @@ pub(crate) struct Desktop {
     inventory: Option<inventory::Refresh>,
     sampler: super::cursor_shape::Sampler,
     pub cursor: Option<super::cursor_shape::Snapshot>,
+    // The privileged capture agent owns this when using the remote backend.
+    // Keep it until after the native capture resources have been destroyed.
+    _power: Option<power::Request>,
 }
 impl Desktop {
     pub fn open_selected(selected: &Screen) -> Result<Self> {
@@ -365,11 +369,13 @@ impl Desktop {
                 inventory: None,
                 sampler: Default::default(),
                 cursor: None,
+                _power: None,
             });
         }
         Self::open_local(selected)
     }
     pub(super) fn open_local(selected: &Screen) -> Result<Self> {
+        let power = power::Request::new()?;
         let screen = refresh(selected)?;
         let backend = match Duplication::open(&screen.device_name) {
             Ok(capture) => {
@@ -406,6 +412,7 @@ impl Desktop {
             inventory: None,
             sampler: Default::default(),
             cursor: None,
+            _power: Some(power),
         })
     }
     pub fn backend_name(&self) -> &'static str {

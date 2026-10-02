@@ -32,6 +32,7 @@ pub(crate) enum PresenceEvent {
     State(PresenceState),
     Warning(String),
     DeviceChanged(DeviceChange),
+    DevicesResync,
     AccountEnded,
 }
 
@@ -299,6 +300,7 @@ async fn run_remote(
     // Reuse the credential handle, not its contents: each poll must still see
     // logout/account changes and portable/resident storage transitions.
     let sessions = KeyringSessionStore::new()?;
+    let mut device_cursor = None;
     let mut tick = tokio::time::interval(Duration::from_millis(500));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     while !cancel.is_cancelled() {
@@ -327,15 +329,26 @@ async fn run_remote(
         }
         match resident::request(Request::Snapshot {
             ui: client.host.assistance.ui_present(),
+            device_cursor: device_cursor.clone(),
         })
         .await
         {
-            Ok(Reply::Snapshot(snapshot)) if snapshot.account == client.generation() => {
+            Ok(Reply::Snapshot(mut snapshot)) if snapshot.account == client.generation() => {
                 crate::account::reporting::replace(snapshot.publication.clone());
                 let _ = events.send(PresenceEvent::State(snapshot.online.clone()));
+                if let Some(batch) = snapshot.device_changes.take() {
+                    if batch.resync {
+                        let _ = events.send(PresenceEvent::DevicesResync);
+                    }
+                    for change in batch.changes {
+                        let _ = events.send(PresenceEvent::DeviceChanged(change));
+                    }
+                    device_cursor = Some(batch.cursor);
+                }
                 client.host.apply_remote(*snapshot).await;
             }
             Ok(Reply::Snapshot(_)) => {
+                device_cursor = None;
                 let _ = events.send(PresenceEvent::State(PresenceState::Connecting));
             }
             Ok(_) => (),

@@ -129,11 +129,25 @@ impl Controller {
     }
     fn apply(&mut self, update: NetworkControlUpdate) {
         if let Some(rate) = update.target_rate {
+            let previous = self.target;
             self.target = rate.target_rate.bps_or(0).clamp(0, self.maximum as i64) as u32;
             self.cwnd_reduce_ratio = rate.cwnd_reduce_ratio.clamp(0., 1.);
             self.loss = f64::from(rate.network_estimate.loss_rate_ratio).clamp(0.0, 1.0);
             if rate.network_estimate.round_trip_time.is_finite() {
                 self.rtt = rate.network_estimate.round_trip_time;
+            }
+            if previous >= 600_000 && self.target < previous / 2 {
+                tracing::info!(
+                    previous_bps = previous,
+                    target_bps = self.target,
+                    bounded_target_bps = self.core.bounded_target_rate().bps_or(0),
+                    loss = self.loss,
+                    rtt_ms = self.rtt.ms(),
+                    delay_overuse = self.delay_overuse(),
+                    link_pressure = self.link_pressure(),
+                    cwnd_reduce_ratio = self.cwnd_reduce_ratio,
+                    "host bandwidth estimate dropped"
+                );
             }
         }
         if let Some(pacer) = update.pacer_config {

@@ -440,7 +440,11 @@ impl Active {
             mfx.CodecId = codec(format);
             if format.codec == Codec::Av1 {
                 ensure!(version >= (2, 5), "QSV AV1需要oneVPL 2.5或更新驱动");
-                mfx.CodecProfile = v::MFX_PROFILE_AV1_MAIN as u16;
+                mfx.CodecProfile = if format.chroma == 3 {
+                    v::MFX_PROFILE_AV1_HIGH
+                } else {
+                    v::MFX_PROFILE_AV1_MAIN
+                } as u16;
             }
             mfx.LowPower = if format.codec == Codec::H265 { 16 } else { 0 };
             mfx.FrameInfo = v::mfxFrameInfo {
@@ -799,6 +803,13 @@ fn validate(params: &v::mfxVideoParam, size: (u32, u32), format: Format) -> Resu
         ensure!(
             params.AsyncDepth == 1
                 && mfx.CodecId == codec(format)
+                && (format.codec != Codec::Av1
+                    || mfx.CodecProfile
+                        == if format.chroma == 3 {
+                            v::MFX_PROFILE_AV1_HIGH
+                        } else {
+                            v::MFX_PROFILE_AV1_MAIN
+                        } as u16)
                 && info.FourCC == fourcc(format)
                 && info.ChromaFormat == u16::from(format.chroma)
                 && (info.BitDepthLuma == u16::from(format.depth)

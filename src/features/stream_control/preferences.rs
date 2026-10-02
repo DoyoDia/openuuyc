@@ -1,0 +1,76 @@
+//! Device-scoped user intent, separate from temporary session/input state.
+use super::{StreamControlHandle, StreamControlState, lock};
+use crate::features::viewing_settings::{DevicePreferences, PerformancePanelMode};
+use anyhow::Result;
+
+impl StreamControlHandle {
+    pub(crate) fn device_preferences(&self) -> DevicePreferences {
+        lock(&self.shared).device_preferences
+    }
+    pub(crate) fn device_preferences_loaded(&self) -> bool {
+        lock(&self.shared).device_preferences_loaded
+    }
+    pub(crate) fn device_preference_updates(
+        &self,
+    ) -> tokio::sync::watch::Receiver<Option<DevicePreferences>> {
+        lock(&self.shared).device_preference_updates.subscribe()
+    }
+    pub(crate) fn set_device_persistence_error(&self, error: Option<String>) {
+        lock(&self.shared).device_persistence_error = error;
+    }
+    pub(super) fn publish_device_preferences(&self, state: &mut StreamControlState) {
+        state.device_preferences_loaded = true;
+        state
+            .device_preference_updates
+            .send_replace(Some(state.device_preferences));
+    }
+    pub(crate) fn restore_device_preferences(&self, preferences: DevicePreferences) {
+        let mut state = lock(&self.shared);
+        if state.device_preferences_loaded {
+            return;
+        }
+        state.device_preferences = preferences;
+        state.device_preferences_loaded = true;
+        state.restore_input_pending = preferences.control_enabled;
+        self.clipboard.set_files(preferences.clipboard_files);
+        if let Err(error) = self.clipboard.set_enabled(preferences.clipboard_sync) {
+            self.clipboard
+                .protocol_error(format!("恢复剪贴板偏好失败：{error:#}"));
+        }
+        self.refresh_mouse_policy(&mut state);
+        // Loading is not a user edit and must not overwrite the saved record.
+    }
+    pub(crate) fn set_clipboard_enabled(&self, enabled: bool) -> Result<()> {
+        self.clipboard.set_enabled(enabled)?;
+        let mut state = lock(&self.shared);
+        if state.device_preferences.clipboard_sync != enabled {
+            state.device_preferences.clipboard_sync = enabled;
+            self.publish_device_preferences(&mut state);
+        }
+        self.refresh_mouse_policy(&mut state);
+        Ok(())
+    }
+    pub(crate) fn set_clipboard_files(&self, enabled: bool) {
+        self.clipboard.set_files(enabled);
+        let mut state = lock(&self.shared);
+        if state.device_preferences.clipboard_files != enabled {
+            state.device_preferences.clipboard_files = enabled;
+            self.publish_device_preferences(&mut state);
+        }
+        self.refresh_mouse_policy(&mut state);
+    }
+    pub(crate) fn set_intercept_shortcuts(&self, enabled: bool) {
+        let mut state = lock(&self.shared);
+        if state.device_preferences.intercept_shortcuts != enabled {
+            state.device_preferences.intercept_shortcuts = enabled;
+            self.publish_device_preferences(&mut state);
+        }
+    }
+    pub(crate) fn set_performance_mode(&self, mode: PerformancePanelMode) {
+        let mut state = lock(&self.shared);
+        if state.device_preferences.performance_mode != mode {
+            state.device_preferences.performance_mode = mode;
+            self.publish_device_preferences(&mut state);
+        }
+    }
+}

@@ -1,8 +1,6 @@
 //! Windows viewer composition. Window, render worker and GPU resource owners are separate.
 
-use crate::application::viewer::{
-    ConnectionProgress, NativeViewerSession, ViewerDisplayHandle, ViewerPreferences,
-};
+use crate::application::viewer::{ConnectionProgress, NativeViewerSession, ViewerDisplayHandle};
 pub(super) use crate::application::viewer_shortcuts::Action as ViewerShortcut;
 use crate::diagnostics::performance::RenderedFrameTiming;
 use crate::features::stream_control::StreamControlHandle;

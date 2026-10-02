@@ -26,6 +26,13 @@ impl D3D11SurfaceWriter {
         match *self {}
     }
 
+    pub(crate) fn upload_cpu(
+        &self,
+        _frame: &super::decoder::CpuVideoFrame,
+    ) -> Result<D3D11Surface> {
+        match *self {}
+    }
+
     pub(crate) fn wrap_decoded_surface(
         &self,
         _frame: std::convert::Infallible,

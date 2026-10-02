@@ -44,7 +44,14 @@ pub(crate) struct Engine {
 }
 
 impl Engine {
-    pub fn new(_hardware: bool, policy: super::wire::Policy, _origin: u32) -> Result<Self> {
+    /// `hardware`, `origin` and `privileged` describe a Windows session; the X
+    /// session injector is the same for every caller.
+    pub fn new(
+        _hardware: bool,
+        policy: super::wire::Policy,
+        _origin: u32,
+        _privileged: bool,
+    ) -> Result<Self> {
         let now = Instant::now();
         Ok(Self {
             injector: Injector::open()?,

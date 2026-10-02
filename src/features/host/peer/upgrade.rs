@@ -8,19 +8,19 @@ use webrtc::data_channel::data_channel_state::RTCDataChannelState;
 pub(crate) struct UpdateNotice {
     routes: ReportTarget,
     cancel: CancellationToken,
-    sent: tokio::sync::Mutex<bool>,
+    completed: tokio::sync::Mutex<bool>,
 }
 impl UpdateNotice {
     pub(super) fn new(routes: ReportTarget, cancel: CancellationToken) -> Arc<Self> {
         Arc::new(Self {
             routes,
             cancel,
-            sent: tokio::sync::Mutex::new(false),
+            completed: tokio::sync::Mutex::new(false),
         })
     }
     pub(crate) async fn send(&self) -> Result<()> {
-        let mut sent = self.sent.lock().await;
-        if *sent {
+        let mut completed = self.completed.lock().await;
+        if *completed {
             return Ok(());
         }
         let operation = async {
@@ -33,35 +33,59 @@ impl UpdateNotice {
                 .and_then(std::sync::Weak::upgrade)
                 .context("更新通知通道尚未就绪")?;
             ensure!(
-                channel.ready_state() == RTCDataChannelState::Open
-                    && channel.ordered()
+                channel.ordered()
                     && channel.max_packet_lifetime().is_none()
                     && channel.max_retransmits().is_none(),
                 "更新通知需要已就绪的可靠有序通道"
             );
+            match channel.ready_state() {
+                RTCDataChannelState::Open => {}
+                RTCDataChannelState::Closing | RTCDataChannelState::Closed => {
+                    // A TEXT close alone is not proof that the media session ended.
+                    self.cancel.cancelled().await;
+                    return Ok(false);
+                }
+                _ => anyhow::bail!("更新通知通道尚未就绪"),
+            }
             let bytes = crate::features::stream_control::publisher::update_started();
-            channel.send_text_bytes(&bytes::Bytes::from(bytes)).await?;
+            if let Err(error) = channel.send_text_bytes(&bytes::Bytes::from(bytes)).await {
+                if matches!(
+                    channel.ready_state(),
+                    RTCDataChannelState::Closing | RTCDataChannelState::Closed
+                ) {
+                    self.cancel.cancelled().await;
+                    return Ok(false);
+                }
+                return Err(error.into());
+            }
             // In our SCTP implementation this counter is released by SACK, not
             // merely when send() queues the message. Keep the connection alive
             // until delivery drains; do not replay this notice over another carrier.
             loop {
-                ensure!(
-                    channel.ready_state() == RTCDataChannelState::Open,
-                    "更新通知通道已关闭"
-                );
                 if channel.buffered_amount().await == 0 {
-                    break;
+                    return Ok(true);
+                }
+                if matches!(
+                    channel.ready_state(),
+                    RTCDataChannelState::Closing | RTCDataChannelState::Closed
+                ) {
+                    self.cancel.cancelled().await;
+                    return Ok(false);
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            anyhow::Ok(())
         };
-        tokio::select! {
-            _=self.cancel.cancelled()=>anyhow::bail!("被控连接已结束"),
+        let delivered = tokio::select! {
+            biased;
+            _=self.cancel.cancelled()=>false,
             result=tokio::time::timeout(Duration::from_secs(3),operation)=>result.context("更新通知发送超时，尚未退出旧版本")??,
+        };
+        *completed = true;
+        if delivered {
+            tracing::info!("local update start delivered to controller");
+        } else {
+            tracing::info!("controlled session ended while preparing local update");
         }
-        *sent = true;
-        tracing::info!("local update start delivered to controller");
         Ok(())
     }
 }

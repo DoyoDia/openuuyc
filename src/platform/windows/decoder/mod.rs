@@ -1,4 +1,4 @@
-//! Rust DXVA11 and H.264 software decoding.
+//! Rust DXVA11 and software video decoding.
 //! No MFT, native video bridge or implicit backend fallback.
 #![cfg(windows)]
 use crate::media::VideoCodec;
@@ -61,11 +61,16 @@ impl std::fmt::Debug for WindowsGpuVideoFrame {
 pub enum WindowsCpuFormat {
     Nv12,
     I444,
+    P010,
+    Ayuv,
+    Y410,
 }
 pub struct WindowsCpuVideoFrame {
     pub pts: i64,
     pub width: u32,
     pub height: u32,
+    pub coded_width: u32,
+    pub coded_height: u32,
     pub format: WindowsCpuFormat,
     pub data: Bytes,
 }
@@ -77,23 +82,44 @@ pub struct WindowsVideoDecoder {
     backend: Backend,
     pending: VecDeque<WindowsDecodedFrame>,
     notification: DecoderNotification,
+    dropped: VecDeque<i64>,
 }
 enum Backend {
     Hardware(Box<rust_dxva::Session>),
-    Software(Box<openuuyc_h264::stream::Decoder>),
+    Software(Box<openuuyc_codec::decoder::Decoder>),
 }
-fn software_error(error: openuuyc_h264::Error) -> DecodeError {
-    use openuuyc_h264::Error;
+fn software_error(error: openuuyc_codec::decoder::Error) -> DecodeError {
+    use openuuyc_codec::decoder::Error;
     match error {
-        Error::Cancelled | Error::Closed => DecodeError::Closed,
-        Error::Unsupported(_) => DecodeError::Unsupported,
+        Error::Closed => DecodeError::Closed,
+        Error::Unsupported => DecodeError::Unsupported,
         Error::Allocation => DecodeError::Backend,
-        Error::NeedKeyframe | Error::Truncated | Error::Invalid(_) => {
-            tracing::debug!(%error,"Rust H264 input requires a new keyframe");
-            DecodeError::NeedKeyframe
-        }
+        Error::InvalidInput => DecodeError::InvalidInput,
+        Error::NeedKeyframe => DecodeError::NeedKeyframe,
     }
 }
+fn software_frame(
+    frame: openuuyc_codec::decoder::Frame,
+) -> Result<WindowsDecodedFrame, DecodeError> {
+    use openuuyc_codec::PixelFormat as F;
+    Ok(WindowsDecodedFrame::Cpu(WindowsCpuVideoFrame {
+        pts: frame.pts,
+        width: frame.width,
+        height: frame.height,
+        coded_width: frame.coded_width,
+        coded_height: frame.coded_height,
+        data: frame.data,
+        format: match frame.format {
+            F::Nv12 => WindowsCpuFormat::Nv12,
+            F::I444 => WindowsCpuFormat::I444,
+            F::P010 => WindowsCpuFormat::P010,
+            F::Ayuv => WindowsCpuFormat::Ayuv,
+            F::Y410 => WindowsCpuFormat::Y410,
+            F::Bgra => return Err(DecodeError::Unsupported),
+        },
+    }))
+}
+
 impl WindowsVideoDecoder {
     pub(crate) fn check_format(
         device: ID3D11Device,
@@ -108,9 +134,6 @@ impl WindowsVideoDecoder {
     pub fn open(config: &VideoDecoderConfig) -> Result<Self, DecodeError> {
         let backend = match config.mode {
             DecoderMode::Software => {
-                if config.codec != VideoCodec::H264 {
-                    return Err(DecodeError::Unsupported);
-                }
                 if config.width == 0
                     || config.height == 0
                     || config.width > 16384
@@ -118,17 +141,22 @@ impl WindowsVideoDecoder {
                 {
                     return Err(DecodeError::InvalidInput);
                 }
-                let mut decoder = openuuyc_h264::stream::Decoder::new();
-                decoder.seed(&config.extra_data).map_err(software_error)?;
-                Backend::Software(Box::new(decoder))
+                Backend::Software(Box::new(
+                    openuuyc_codec::decoder::Decoder::new(config.codec, &config.extra_data)
+                        .map_err(software_error)?,
+                ))
             }
+
             DecoderMode::Hardware => Backend::Hardware(Box::new(rust_dxva::Session::open(config)?)),
         };
-        Ok(Self {
+        let mut decoder = Self {
             backend,
             pending: VecDeque::new(),
             notification: DecoderNotification::default(),
-        })
+            dropped: VecDeque::new(),
+        };
+        decoder.set_notification(decoder.notification.clone());
+        Ok(decoder)
     }
     pub fn probe_format(
         device: ID3D11Device,
@@ -156,11 +184,12 @@ impl WindowsVideoDecoder {
     pub fn poll_dropped_token(&mut self) -> Option<i64> {
         match &mut self.backend {
             Backend::Hardware(session) => session.poll_dropped(),
-            Backend::Software(_) => None,
+            Backend::Software(_) => self.dropped.pop_front(),
         }
     }
     pub fn reset_for_keyframe(&mut self) -> Result<(), DecodeError> {
         self.pending.clear();
+        self.dropped.clear();
         match &mut self.backend {
             Backend::Hardware(session) => {
                 session.reset();
@@ -172,39 +201,21 @@ impl WindowsVideoDecoder {
 }
 impl WindowsVideoDecoder {
     pub fn set_notification(&mut self, notification: DecoderNotification) {
+        if let Backend::Software(session) = &mut self.backend {
+            session.set_cancellation(notification.shared_cancellation());
+        }
         self.notification = notification;
     }
     pub fn push_packet(&mut self, payload: &[u8], token: i64) -> Result<(), DecodeError> {
         match &mut self.backend {
             Backend::Hardware(session) => session.push(payload, token, &self.notification),
             Backend::Software(session) => {
-                if payload.len() > i32::MAX as usize {
-                    return Err(DecodeError::InvalidInput);
+                let frames = session.push(payload, token).map_err(software_error)?;
+                if frames.is_empty() {
+                    self.dropped.push_back(token);
                 }
-                let outputs = session
-                    .submit_with_cancel(payload, token as u64, self.notification.cancellation())
-                    .map_err(software_error)?;
-                for output in outputs {
-                    let picture = output.picture;
-                    let mut packed = Vec::new();
-                    picture.pack_into(&mut packed).map_err(software_error)?;
-                    if self.notification.is_cancelled() {
-                        self.pending.clear();
-                        session.reset().map_err(software_error)?;
-                        return Err(DecodeError::Closed);
-                    }
-                    self.pending
-                        .push_back(WindowsDecodedFrame::Cpu(WindowsCpuVideoFrame {
-                            pts: output.token as i64,
-                            width: picture.crop.width as u32,
-                            height: picture.crop.height as u32,
-                            format: if picture.chroma == openuuyc_h264::picture::Chroma::Yuv444 {
-                                WindowsCpuFormat::I444
-                            } else {
-                                WindowsCpuFormat::Nv12
-                            },
-                            data: Bytes::from(packed),
-                        }));
+                for frame in frames {
+                    self.pending.push_back(software_frame(frame)?);
                 }
                 Ok(())
             }
