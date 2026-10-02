@@ -14,6 +14,7 @@ use windows::core::{BOOL, PCWSTR, w};
 
 pub struct Instance(HANDLE);
 const SHOW_SUBCLASS: usize = 0x4f554943;
+const NOTIFICATION_MESSAGE: usize = 0x4f554e54;
 static UPDATE_EXIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 pub(crate) fn take_update_exit() -> bool {
     UPDATE_EXIT.swap(false, std::sync::atomic::Ordering::AcqRel)
@@ -98,6 +99,26 @@ unsafe extern "system" fn window_message(
     _id: usize,
     _data: usize,
 ) -> LRESULT {
+    if message == windows::Win32::UI::WindowsAndMessaging::WM_COPYDATA && lparam.0 != 0 {
+        // WM_COPYDATA owns this buffer for the duration of the synchronous call.
+        let data =
+            unsafe { &*(lparam.0 as *const windows::Win32::System::DataExchange::COPYDATASTRUCT) };
+        if data.dwData == NOTIFICATION_MESSAGE
+            && data.cbData <= 256
+            && data.cbData > 0
+            && !data.lpData.is_null()
+        {
+            let bytes = unsafe {
+                std::slice::from_raw_parts(data.lpData.cast::<u8>(), data.cbData as usize)
+            };
+            if let Ok(uri) = std::str::from_utf8(bytes) {
+                return LRESULT(isize::from(
+                    crate::platform::windows::notifications::receive_activation(uri),
+                ));
+            }
+        }
+        return LRESULT(0);
+    }
     if message == exit_message() {
         if crate::platform::windows::components::maintaining() {
             return LRESULT(2);
@@ -177,10 +198,10 @@ pub(crate) struct Running {
     process: crate::platform::windows::host_service::pipe::Handle,
 }
 pub(crate) fn running_installed() -> Result<Option<Running>> {
-    use crate::platform::windows::{
-        components::application as deployment,
-        host_service::{pipe::Handle, process, vault},
-    };
+    running_image(&crate::platform::windows::components::application::image()?)
+}
+fn running_image(expected: &std::path::Path) -> Result<Option<Running>> {
+    use crate::platform::windows::host_service::{pipe::Handle, process, vault};
     use windows::Win32::System::Threading::*;
     unsafe extern "system" fn collect(hwnd: HWND, data: LPARAM) -> BOOL {
         if !unsafe { GetPropW(hwnd, w!("OpenUUYC.ControlCenter.Window.v1")) }.is_invalid() {
@@ -194,7 +215,7 @@ pub(crate) fn running_installed() -> Result<Option<Running>> {
     unsafe {
         EnumWindows(Some(collect), LPARAM(&mut windows as *mut _ as isize))?;
     }
-    let image = std::fs::canonicalize(deployment::image()?)?;
+    let image = std::fs::canonicalize(expected)?;
     let own = std::process::id();
     let sid = vault::sid(own)?;
     let session = process::session(own)?;
@@ -244,6 +265,42 @@ pub(crate) fn running_installed() -> Result<Option<Running>> {
         });
     }
     Ok(found)
+}
+pub(crate) fn deliver_notification(uri: &str) -> Result<()> {
+    use windows::Win32::{System::DataExchange::COPYDATASTRUCT, UI::WindowsAndMessaging::*};
+    anyhow::ensure!(uri.len() <= 256, "通知参数过长");
+    let running =
+        running_image(&std::env::current_exe()?)?.context("通知已过期或控制中心已退出")?;
+    // Protocol activation carries the user's foreground grant to the existing UI.
+    let mut pid = 0;
+    unsafe {
+        GetWindowThreadProcessId(running.window, Some(&mut pid));
+    }
+    if pid != 0 {
+        let _ = unsafe { AllowSetForegroundWindow(pid) };
+    }
+    let data = COPYDATASTRUCT {
+        dwData: NOTIFICATION_MESSAGE,
+        cbData: uri.len() as u32,
+        lpData: uri.as_ptr().cast_mut().cast(),
+    };
+    let mut accepted = 0usize;
+    let result = unsafe {
+        SendMessageTimeoutW(
+            running.window,
+            WM_COPYDATA,
+            WPARAM(0),
+            LPARAM(&data as *const _ as isize),
+            SMTO_ABORTIFHUNG,
+            2000,
+            Some(&mut accepted),
+        )
+    };
+    anyhow::ensure!(
+        result.0 != 0 && accepted == 1,
+        "通知已失效或控制中心暂时不可用"
+    );
+    Ok(())
 }
 impl Running {
     pub fn close(self) -> Result<()> {

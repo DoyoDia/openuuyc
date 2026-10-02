@@ -201,7 +201,8 @@ impl ThreadedWindowsApp {
             ..
         } = event
             && window.has_focus()
-            && !crate::platform::windows::input::system::own_message()
+            && (!crate::platform::windows::input::system::own_message()
+                || self.stream_control.mouse().accepts_host_input())
             && !self.egui_context.text_edit_focused()
             && key.state == winit::event::ElementState::Pressed
             && let Some(shortcut) = viewer_shortcut(self.modifiers, key.physical_key)
@@ -216,6 +217,10 @@ impl ThreadedWindowsApp {
             return Ok(());
         }
         let response = self.egui_winit.on_window_event(window, event);
+        if let WindowEvent::Focused(focused) = event {
+            tracing::debug!(focused, mouse_mode = ?self.stream_control.mouse().mode(),
+                "viewer input focus changed");
+        }
         if matches!(
             event,
             WindowEvent::Focused(false) | WindowEvent::Occluded(true)
@@ -526,6 +531,13 @@ impl ThreadedWindowsApp {
                 upgrade.show(&ctx, window.id(), &self.stream_control);
             }
             crate::ui::controls::show_notices(&ctx);
+            if window.has_focus() && !self.stream_control_ui.open && !self.plugin_menu_open {
+                crate::application::viewer::polling_warning::show(
+                    &ctx,
+                    self.stream_control.mouse(),
+                    ui.available_rect_before_wrap(),
+                );
+            }
         });
         if self.performance_mode != view.performance_mode {
             self.stream_control

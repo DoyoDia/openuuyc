@@ -160,7 +160,6 @@ pub(super) async fn gui_worker_loop(
     let mut host_signal: Option<ActivePresence> = None;
     let mut presence_stopped = false;
     let mut resident_mode = crate::platform::windows::host_service::resident::managed();
-    let mut shown_assistance = None;
     let mut guest = guest::Guest::default();
     let mut guest_allowed = false;
 
@@ -184,14 +183,6 @@ pub(super) async fn gui_worker_loop(
             .or_else(|| guest.client.as_ref().map(|c| &c.host))
         {
             host.assistance.touch_ui();
-            let pending = host.assistance.snapshot().pending.map(|p| p.id);
-            if pending.is_some() && pending != shown_assistance {
-                let _ =
-                    crate::ui::window_manager::send(crate::ui::window_manager::Request::ShowMain);
-            }
-            shown_assistance = pending;
-        } else {
-            shown_assistance = None;
         }
         let mode = crate::platform::windows::host_service::resident::managed();
         if mode != resident_mode {
@@ -220,7 +211,10 @@ pub(super) async fn gui_worker_loop(
                                 current.host.assistance.act(action)
                             };
                         if let Err(error) = result {
-                            let _ = events.send(GuiEvent::Error(error.to_string()));
+                            let _ = events.send(GuiEvent::HostAssistFailed {
+                                generation,
+                                error: error.to_string(),
+                            });
                         }
                     }
                 }

@@ -529,10 +529,12 @@ impl ScreenWindows {
         {
             return Ok(());
         }
+        let position = crate::ui::chrome::constrain_drag_position(
+            PhysicalPosition::new(at.x - 100, at.y - 18),
+            windows::Win32::Foundation::POINT { x: at.x, y: at.y },
+        );
         if source.tabs.len() == 1 {
-            source
-                .window
-                .set_outer_position(PhysicalPosition::new(at.x - 100, at.y - 18));
+            source.window.set_outer_position(position);
             return Ok(());
         }
         if source
@@ -551,7 +553,7 @@ impl ScreenWindows {
                     .with_decorations(false)
                     .with_inner_size(source.window.inner_size())
                     .with_min_inner_size(LogicalSize::new(760.0, 520.0))
-                    .with_position(PhysicalPosition::new(at.x - 100, at.y - 18)),
+                    .with_position(position),
             )?;
             crate::ui::branding::set_taskbar_icon(&window);
             configure_dwm_window(&window);

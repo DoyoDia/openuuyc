@@ -25,6 +25,7 @@ mod stream_menu;
 
 mod annotation;
 mod display_transition;
+mod polling_warning;
 
 mod windows_cursor;
 
@@ -51,6 +52,7 @@ const CONNECTION_PROGRESS_STEPS: u8 = 13;
 #[derive(Clone, Debug)]
 pub enum ConnectionProgressState {
     Working,
+    Updating(Instant),
     Ready,
     Failed,
 }
@@ -70,6 +72,13 @@ pub(crate) struct ViewerDisplayHandle {
 }
 
 impl ConnectionProgress {
+    pub(crate) fn updating(started: Instant) -> Self {
+        Self {
+            state: ConnectionProgressState::Updating(started),
+            ..Self::working(1, "等待被控端更新完成", "正在等待更新完成并恢复画面")
+        }
+    }
+
     pub fn working(step: u8, title: impl Into<String>, detail: impl Into<String>) -> Self {
         Self {
             step,
@@ -151,6 +160,7 @@ pub(super) struct ConnectionProgressApp {
     started_at: Instant,
     background: Option<crate::application::wallpaper::Source>,
     wallpapers: crate::application::wallpaper::Wallpapers,
+    update_started: Option<Instant>,
 }
 
 impl ConnectionProgressApp {
@@ -165,11 +175,17 @@ impl ConnectionProgressApp {
             started_at: Instant::now(),
             background: None,
             wallpapers: Default::default(),
+            update_started: None,
         }
     }
 
     pub(super) fn drain(&mut self) {
         while let Ok(mut progress) = self.receiver.try_recv() {
+            match progress.state {
+                ConnectionProgressState::Updating(started) => self.update_started = Some(started),
+                ConnectionProgressState::Failed => self.update_started = None,
+                _ => {}
+            }
             if let Some(source) = progress.background.take() {
                 if self.background.as_ref() != Some(&source) {
                     self.wallpapers.clear();

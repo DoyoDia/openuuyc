@@ -1,6 +1,43 @@
 use super::*;
 
 impl DeviceCenterApp {
+    pub(super) fn notification_settings(&mut self, ui: &mut egui::Ui) {
+        section(ui, "远程访问通知");
+        let mut mode = self.notifications.mode;
+        form_row(
+            ui,
+            "通知方式",
+            "申请连接与正在被控的提示；Windows 通知受系统通知和勿扰设置影响",
+            |ui| {
+                egui::ComboBox::from_id_salt("remote-notification-mode")
+                    .width(238.)
+                    .selected_text(mode.label())
+                    .show_ui(ui, |ui| {
+                        for item in super::super::notifications::Mode::ALL {
+                            ui.selectable_value(&mut mode, item, item.label());
+                        }
+                    });
+            },
+        );
+        if mode != self.notifications.mode {
+            self.notifications.set_mode(mode);
+        }
+        if let Some(error) = &self.notifications.error {
+            ui.label(egui::RichText::new(error).color(theme::AMBER));
+            if ui.button("重试通知").clicked() {
+                self.notifications.set_mode(mode);
+            }
+        }
+        if ui
+            .add_enabled(
+                self.notifications.available(),
+                crate::ui::controls::secondary("查看当前通知"),
+            )
+            .clicked()
+        {
+            self.notifications.reopen();
+        }
+    }
     pub(super) fn save_host_settings(&mut self) {
         if self
             .worker

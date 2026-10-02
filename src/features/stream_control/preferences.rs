@@ -32,6 +32,9 @@ impl StreamControlHandle {
         state.device_preferences = preferences;
         state.device_preferences_loaded = true;
         state.restore_input_pending = preferences.control_enabled;
+        if let Err(error) = state.mouse.set_throttle(preferences.mouse_throttle) {
+            state.device_persistence_error = Some(format!("鼠标节流未启用：{error:#}"));
+        }
         self.clipboard.set_files(preferences.clipboard_files);
         if let Err(error) = self.clipboard.set_enabled(preferences.clipboard_sync) {
             self.clipboard
@@ -65,6 +68,15 @@ impl StreamControlHandle {
             state.device_preferences.intercept_shortcuts = enabled;
             self.publish_device_preferences(&mut state);
         }
+    }
+    pub(crate) fn set_mouse_throttle(&self, enabled: bool) -> Result<()> {
+        let mut state = lock(&self.shared);
+        state.mouse.set_throttle(enabled)?;
+        if state.device_preferences.mouse_throttle != enabled {
+            state.device_preferences.mouse_throttle = enabled;
+            self.publish_device_preferences(&mut state);
+        }
+        Ok(())
     }
     pub(crate) fn set_performance_mode(&self, mode: PerformancePanelMode) {
         let mut state = lock(&self.shared);

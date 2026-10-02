@@ -7,6 +7,7 @@ use tokio::sync::watch;
 pub(crate) struct Status {
     #[serde(default)]
     pub connection: Option<ConnectionInfo>,
+    pub ended_connection: Option<EndedConnection>,
     pub ready: bool,
     pub connected: bool,
     pub session_active: bool,
@@ -34,6 +35,14 @@ pub(crate) struct ConnectionInfo {
     pub client_id: String,
     pub elapsed_seconds: Option<u64>,
     pub observation_lost: bool,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct EndedConnection {
+    pub id: String,
+    pub connection: ConnectionInfo,
+    pub assistance: bool,
+    pub ended_at: i64,
 }
 
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -141,6 +150,23 @@ impl Default for Handle {
 }
 
 fn finish_session(state: &mut Ownership) {
+    // Only the session owner has this clock. A GUI observer losing its IPC
+    // connection must not manufacture a remote-session termination event.
+    if let (Some(since), Some(connection)) = (state.connected_since, &state.status.connection) {
+        let mut connection = connection.clone();
+        connection.elapsed_seconds = Some(since.elapsed().as_secs());
+        connection.observation_lost = false;
+        state.status.ended_connection = Some(EndedConnection {
+            id: uuid::Uuid::new_v4().simple().to_string(),
+            connection,
+            assistance: state.status.assistance,
+            ended_at: chrono::Utc::now().timestamp(),
+        });
+    }
+    clear_session(state);
+}
+
+fn clear_session(state: &mut Ownership) {
     state.connected_since = None;
     state.status.connection = None;
     state.update_notice = None;
@@ -225,7 +251,7 @@ impl Handle {
     pub(crate) fn remote_failed(&self, error: String) {
         let mut state = lock(&self.ownership);
         let observed = state.status.connection.clone();
-        finish_session(&mut state);
+        clear_session(&mut state);
         // Losing the IPC observer is not evidence that remote access ended.
         state.status.connection = observed
             .filter(|c| c.elapsed_seconds.is_some())

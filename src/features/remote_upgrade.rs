@@ -105,8 +105,8 @@ impl RemoteUpgrade {
         self.state().prompt = None;
     }
 
-    pub(crate) fn started(&self) -> bool {
-        self.state().started.is_some()
+    pub(crate) fn started_at(&self) -> Option<Instant> {
+        self.state().started
     }
 
     pub(crate) fn owns_input(&self, window: WindowId) -> bool {
@@ -309,7 +309,7 @@ fn result_prompt(ctx: &egui::Context, message: &str) -> bool {
     close || response.should_close()
 }
 
-fn progress_prompt(ctx: &egui::Context, started: Instant) -> bool {
+pub(crate) fn progress_prompt(ctx: &egui::Context, started: Instant) -> bool {
     let mut close = false;
     egui::Modal::new(egui::Id::new("remote-upgrade-progress"))
         .frame(controls::dialog_frame())
@@ -318,12 +318,12 @@ fn progress_prompt(ctx: &egui::Context, started: Instant) -> bool {
                 theme::REMOTE_UPGRADE_WIDTH.min((ctx.content_rect().width() - 80.0).max(260.0)),
             );
             controls::dialog_header(ui, "正在更新被控端", controls::DialogIcon::Waiting, false);
-            ui.label(RichText::new("连接会暂时中断，请稍候。").color(theme::MUTED));
+            ui.label(RichText::new("正在等待更新完成并恢复画面，请稍候。").color(theme::MUTED));
             ui.add_space(16.0);
             ui.horizontal(|ui| {
                 ui.spinner();
                 ui.label(format!(
-                    "已等待 {} 秒 · 恢复可连接后自动重连",
+                    "已等待 {} 秒 · 就绪后自动恢复",
                     started.elapsed().as_secs()
                 ));
             });

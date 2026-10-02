@@ -37,6 +37,7 @@ pub(crate) struct DevicePreferences {
     pub control_enabled: bool,
     pub mouse_mode: crate::features::remote_input::MouseMode,
     pub intercept_shortcuts: bool,
+    pub mouse_throttle: bool,
     pub performance_mode: PerformancePanelMode,
 }
 impl Default for DevicePreferences {
@@ -47,6 +48,7 @@ impl Default for DevicePreferences {
             control_enabled: false,
             mouse_mode: crate::features::remote_input::MouseMode::Smart,
             intercept_shortcuts: true,
+            mouse_throttle: false,
             performance_mode: PerformancePanelMode::Compact,
         }
     }

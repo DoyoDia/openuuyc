@@ -21,6 +21,7 @@ pub(crate) trait App {
 pub(crate) struct WindowConfig {
     pub viewport: egui::ViewportBuilder,
     pub centered: bool,
+    pub notification: bool,
 }
 
 pub(crate) type AppFactory = Box<dyn FnOnce(&egui::Context, Option<String>) -> Box<dyn App> + Send>;

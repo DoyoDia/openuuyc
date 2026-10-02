@@ -130,17 +130,7 @@ impl Drop for Device {
 /// Set-1 scan code to HID keyboard usage. Layout resolution occurs before this
 /// mapping; media keys have their own consumer collection.
 pub(crate) fn usage(vk: u16) -> Option<u8> {
-    use windows::Win32::UI::{Input::KeyboardAndMouse::*, WindowsAndMessaging::*};
-    let scan = unsafe {
-        MapVirtualKeyExW(
-            u32::from(vk),
-            MAPVK_VK_TO_VSC_EX,
-            Some(GetKeyboardLayout(GetWindowThreadProcessId(
-                GetForegroundWindow(),
-                None,
-            ))),
-        )
-    };
+    let scan = super::keyboard::scan_code(vk);
     if scan & 0xff00 == 0xe000 {
         return Some(match scan & 255 {
             0x1c => 0x58,

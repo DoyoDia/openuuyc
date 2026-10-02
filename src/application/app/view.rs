@@ -1173,6 +1173,7 @@ impl DeviceCenterApp {
         self.alert(ui);
         crate::ui::controls::page_scroll("center-settings-scroll").show(ui, |ui| {
             self.host_settings(ui);
+            self.notification_settings(ui);
             section(ui, "画面与连接");
             form_row(ui, "串流帧率", "以远端实际刷新率为准", |ui| {
                 egui::ComboBox::from_id_salt("center-fps")
@@ -1549,6 +1550,7 @@ impl DeviceCenterApp {
                     ui.add_space(20.0);
                     if self.host.as_ref().is_some_and(|h| h.is_guest()) {
                         self.host_assist_controls(ui);
+                        self.notification_settings(ui);
                         if let Some(host) = &self.host {
                             let status = host.status();
                             ui.add_space(12.0);

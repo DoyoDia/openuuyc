@@ -1,4 +1,5 @@
 //! Host assistance policy and challenge handling, owned by the online account.
+
 use crate::session::host_client::HostClient;
 use anyhow::{Context, Result, ensure};
 use rand::Rng;
@@ -140,7 +141,15 @@ impl Settings {
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct Confirmation {
     pub id: String,
+    pub token: String,
     pub name: String,
+    pub expires_at: i64,
+    pub responding: bool,
+}
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct Attempt {
+    pub id: String,
+    pub verifying: bool,
     pub expires_at: i64,
 }
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -150,14 +159,25 @@ pub(crate) struct Snapshot {
     pub ready: bool,
     pub error: Option<String>,
     pub pending: Option<Confirmation>,
+    pub attempt: Option<Attempt>,
 }
 
 enum Push {
     Mode(String),
-    Verify { id: String, salt: String },
-    Confirm { id: String, name: String },
+    Verify {
+        id: String,
+        salt: String,
+    },
+    Confirm {
+        id: String,
+        name: String,
+    },
     Cancel(String),
-    Answer { id: String, allow: bool },
+    Answer {
+        id: String,
+        token: String,
+        allow: bool,
+    },
     Refresh,
     Reject(String),
 }
@@ -165,7 +185,11 @@ enum Push {
 #[derive(Serialize, Deserialize)]
 pub(crate) enum Action {
     Refresh,
-    Answer { id: String, allow: bool },
+    Answer {
+        id: String,
+        token: String,
+        allow: bool,
+    },
 }
 
 struct State {
@@ -175,6 +199,7 @@ struct State {
     operations: CancellationToken,
     admission: CancellationToken,
     pending_deadline: Option<Instant>,
+    attempt_deadline: Option<Instant>,
     ui_seen: Option<Instant>,
 }
 impl Default for State {
@@ -186,6 +211,7 @@ impl Default for State {
             operations: CancellationToken::new(),
             admission: CancellationToken::new(),
             pending_deadline: None,
+            attempt_deadline: None,
             ui_seen: None,
         }
     }
@@ -225,6 +251,8 @@ impl Handle {
             let _ = requests.try_send(Push::Reject(pending.id));
         }
         state.pending_deadline = None;
+        state.snapshot.attempt = None;
+        state.attempt_deadline = None;
         state.snapshot.error = None;
         Ok(true)
     }
@@ -237,6 +265,8 @@ impl Handle {
         state.snapshot.ready = false;
         state.snapshot.pending = None;
         state.pending_deadline = None;
+        state.snapshot.attempt = None;
+        state.attempt_deadline = None;
     }
     pub fn admission(&self) -> Result<CancellationToken> {
         let state = self.lock();
@@ -257,20 +287,24 @@ impl Handle {
     pub fn act(&self, action: Action) -> Result<()> {
         match action {
             Action::Refresh => self.refresh(),
-            Action::Answer { id, allow } => self.answer(id, allow),
+            Action::Answer { id, token, allow } => self.answer(id, token, allow),
         }
     }
-    pub fn answer(&self, id: String, allow: bool) -> Result<()> {
+    pub fn answer(&self, id: String, token: String, allow: bool) -> Result<()> {
         let state = self.lock();
         ensure!(
-            state.snapshot.pending.as_ref().is_some_and(|p| p.id == id),
+            state
+                .snapshot
+                .pending
+                .as_ref()
+                .is_some_and(|p| p.id == id && p.token == token && !p.responding),
             "协助请求已结束"
         );
         state
             .requests
             .as_ref()
             .context("协助后台未就绪")?
-            .try_send(Push::Answer { id, allow })
+            .try_send(Push::Answer { id, token, allow })
             .map_err(|_| anyhow::anyhow!("协助后台忙，请稍后重试"))
     }
     pub fn refresh(&self) -> Result<()> {
@@ -367,7 +401,11 @@ fn verifier(salt: &str, code: &str) -> String {
 
 enum Completion {
     Identity(Result<String>),
-    Reply { revision: u64, result: Result<()> },
+    Reply {
+        revision: u64,
+        request: Option<String>,
+        result: Result<()>,
+    },
 }
 
 fn report_failure(state: &mut State, error: &anyhow::Error) {
@@ -406,11 +444,19 @@ async fn run(client: HostClient, mut rx: mpsc::Receiver<Push>, stop: Cancellatio
                             Err(error) => report_failure(&mut state, &error),
                         }
                     }
-                    Ok(Completion::Reply { revision, result: Err(error) }) => {
+                    Ok(Completion::Reply { revision, request, result }) => {
                         let mut state = handle.lock();
-                        if revision == state.revision { report_failure(&mut state, &error); }
+                        if revision == state.revision {
+                            if let Some(token) = request {
+                                if state.snapshot.pending.as_ref().is_some_and(|p|p.token == token) {
+                                    state.snapshot.pending = None;
+                                    state.pending_deadline = None;
+                                    state.snapshot.error = None;
+                                }
+                            }
+                            if let Err(error) = result { report_failure(&mut state, &error); }
+                        }
                     }
-                    Ok(_) => (),
                     Err(_) => {
                         handle.unavailable();
                         handle.lock().snapshot.error = Some("协助后台已停止，请重新打开程序".into());
@@ -467,20 +513,38 @@ async fn run(client: HostClient, mut rx: mpsc::Receiver<Push>, stop: Cancellatio
             answered.pop_front();
         }
         let expired = {
-            let state = handle.lock();
+            let mut state = handle.lock();
+            if !allowed
+                || client.host.status().session_active
+                || state
+                    .attempt_deadline
+                    .is_some_and(|at| Instant::now() >= at)
+            {
+                state.snapshot.attempt = None;
+                state.attempt_deadline = None;
+            }
             if state
                 .pending_deadline
                 .is_some_and(|at| Instant::now() >= at)
                 || (!allowed && state.snapshot.pending.is_some())
             {
-                state.snapshot.pending.as_ref().map(|p| p.id.clone())
+                state
+                    .snapshot
+                    .pending
+                    .as_ref()
+                    .filter(|p| !p.responding)
+                    .map(|p| (p.id.clone(), p.token.clone()))
             } else {
                 None
             }
         };
         let mut events = std::collections::VecDeque::new();
-        if let Some(id) = expired {
-            events.push_back(Push::Answer { id, allow: false });
+        if let Some((id, token)) = expired {
+            events.push_back(Push::Answer {
+                id,
+                token,
+                allow: false,
+            });
         }
         if let Some(event) = event {
             events.push_back(event);
@@ -488,6 +552,7 @@ async fn run(client: HostClient, mut rx: mpsc::Receiver<Push>, stop: Cancellatio
         for event in events {
             let accept = allowed && settings.enabled;
             let mut outgoing = None;
+            let mut answered_request = None;
             match event {
                 Push::Refresh => (),
                 Push::Reject(id) => {
@@ -500,10 +565,35 @@ async fn run(client: HostClient, mut rx: mpsc::Receiver<Push>, stop: Cancellatio
                         state.snapshot.pending = None;
                         state.pending_deadline = None;
                     }
+                    if state.snapshot.attempt.as_ref().is_some_and(|p| p.id == id) {
+                        state.snapshot.attempt = None;
+                        state.attempt_deadline = None;
+                    }
                     answered.push_back((id, Instant::now()));
                 }
-                Push::Mode(id) => outgoing = Some(Reply::Mode(id, accept, settings.mode)),
+                Push::Mode(id) => {
+                    if accept && !client.host.status().session_active {
+                        let mut state = handle.lock();
+                        if state.snapshot.pending.is_none()
+                            && !answered.iter().any(|(known, _)| known == &id)
+                            && !state.snapshot.attempt.as_ref().is_some_and(|p| p.id == id)
+                        {
+                            state.snapshot.attempt = Some(Attempt {
+                                id: id.clone(),
+                                verifying: false,
+                                expires_at: chrono::Utc::now().timestamp() + 30,
+                            });
+                            state.attempt_deadline = Some(Instant::now() + Duration::from_secs(30));
+                        }
+                    }
+                    outgoing = Some(Reply::Mode(id, accept, settings.mode));
+                }
                 Push::Verify { id, salt } => {
+                    if let Some(attempt) = &mut handle.lock().snapshot.attempt {
+                        if attempt.id == id {
+                            attempt.verifying = true;
+                        }
+                    }
                     let code_available =
                         settings.mode.needs_password() && settings.validate().is_ok();
                     let (sign, backup) = if accept && code_available {
@@ -529,7 +619,6 @@ async fn run(client: HostClient, mut rx: mpsc::Receiver<Push>, stop: Cancellatio
                     }
                     // A confirmation can only be granted by a live user interface.
                     if !accept
-                        || !settings.mode.needs_confirmation()
                         || !ui_present
                         || state.snapshot.pending.is_some()
                         || crate::platform::capture::session_locked() != Some(false)
@@ -539,24 +628,41 @@ async fn run(client: HostClient, mut rx: mpsc::Receiver<Push>, stop: Cancellatio
                     } else {
                         state.snapshot.pending = Some(Confirmation {
                             id,
+                            token: uuid::Uuid::new_v4().simple().to_string(),
                             name,
                             expires_at: chrono::Utc::now().timestamp() + 60,
+                            responding: false,
                         });
+                        state.snapshot.attempt = None;
+                        state.attempt_deadline = None;
                         state.pending_deadline = Some(Instant::now() + Duration::from_secs(60));
                     }
                 }
-                Push::Answer { id, allow } => {
+                Push::Answer { id, token, allow } => {
                     let mut state = handle.lock();
-                    if !state.snapshot.pending.as_ref().is_some_and(|p| p.id == id) {
+                    if !state
+                        .snapshot
+                        .pending
+                        .as_ref()
+                        .is_some_and(|p| p.id == id && p.token == token && !p.responding)
+                    {
                         continue;
                     }
                     let live = state.pending_deadline.is_some_and(|at| Instant::now() < at);
-                    state.snapshot.pending = None;
-                    state.pending_deadline = None;
+                    if let Some(pending) = &mut state.snapshot.pending {
+                        pending.responding = true;
+                    }
+                    answered_request = Some(token);
                     outgoing = Some(Reply::Confirm(
                         id.clone(),
-                        allow && accept && live && ui_present,
-                        settings.mode.needs_password(),
+                        allow
+                            && accept
+                            && live
+                            && ui_present
+                            && crate::platform::capture::session_locked() == Some(false),
+                        // Explicit local consent grants this request only. The
+                        // configured password policy remains unchanged.
+                        false,
                     ));
                     answered.push_back((id, Instant::now()));
                 }
@@ -565,7 +671,7 @@ async fn run(client: HostClient, mut rx: mpsc::Receiver<Push>, stop: Cancellatio
                 answered.pop_front();
             }
             if let Some(reply) = outgoing {
-                if jobs.len() >= 8 {
+                if jobs.len() >= 8 && answered_request.is_none() {
                     continue;
                 }
                 let current = client.clone();
@@ -576,7 +682,11 @@ async fn run(client: HostClient, mut rx: mpsc::Receiver<Push>, stop: Cancellatio
                         _=guard.cancelled()=>Ok(()),
                         result=reply.send(&current)=>result,
                     };
-                    Completion::Reply { revision, result }
+                    Completion::Reply {
+                        revision,
+                        request: answered_request,
+                        result,
+                    }
                 });
             }
         }
