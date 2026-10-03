@@ -835,7 +835,10 @@ impl Player {
                 );
             });
         }
-        let snapshot = self.session.performance.snapshot();
+        // These choices are saved per device and shared by its viewer windows.
+        let preferences = self.session.stream_control.device_preferences();
+        self.performance_mode = preferences.performance_mode;
+        self.intercept_shortcuts = preferences.intercept_shortcuts;
         let mut view = super::stream_menu::LocalViewSettings {
             performance_mode: self.performance_mode,
             intercept_shortcuts: self.intercept_shortcuts,
@@ -851,8 +854,13 @@ impl Player {
             screen_id,
             display_size,
         );
-        self.performance_mode = view.performance_mode;
-        self.intercept_shortcuts = view.intercept_shortcuts;
+        self.set_performance_mode(view.performance_mode);
+        if self.intercept_shortcuts != view.intercept_shortcuts {
+            self.intercept_shortcuts = view.intercept_shortcuts;
+            self.session
+                .stream_control
+                .set_intercept_shortcuts(view.intercept_shortcuts);
+        }
         if view.send_ctrl_alt_del {
             let _ = self
                 .session
@@ -860,14 +868,13 @@ impl Player {
                 .mouse()
                 .send_ctrl_alt_del(self.owner);
         }
-        if self.performance_mode != PerformancePanelMode::Hidden {
-            super::performance_panel::show(
-                ui.ctx(),
-                &self.session.performance,
-                &snapshot,
-                "linux-player",
-            );
-        }
+        super::show_performance_overlay(
+            ui.ctx(),
+            &self.session.performance,
+            &self.session.stream_control.audio(),
+            self.performance_mode,
+            "linux-player",
+        );
         if self.focused && !self.stream_control_ui.open {
             super::polling_warning::show(
                 ui.ctx(),
@@ -1036,12 +1043,13 @@ impl Player {
         {
             // A caption button shows or hides; the stream menu chooses between
             // the compact and detailed panels.
-            self.performance_mode = if self.performance_mode == PerformancePanelMode::Hidden {
+            let mode = if self.performance_mode == PerformancePanelMode::Hidden {
                 self.performance_restore
             } else {
                 self.performance_restore = self.performance_mode;
                 PerformancePanelMode::Hidden
             };
+            self.set_performance_mode(mode);
         }
         if row.button("串流设置").clicked() {
             self.stream_control_ui.open = !self.stream_control_ui.open;
@@ -1334,8 +1342,17 @@ impl Player {
                 self.session.close_handle().close();
             }
             ViewerShortcut::Performance => {
-                self.performance_mode = self.performance_mode.next();
+                self.set_performance_mode(self.performance_mode.next());
             }
+        }
+    }
+
+    /// Shows the chosen panel and saves it for this device, as the Windows
+    /// player does.
+    fn set_performance_mode(&mut self, mode: PerformancePanelMode) {
+        if self.performance_mode != mode {
+            self.performance_mode = mode;
+            self.session.stream_control.set_performance_mode(mode);
         }
     }
 
