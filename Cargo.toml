@@ -12,6 +12,36 @@ autobins = false
 name = "OpenUUYC"
 path = "src/main.rs"
 
+# `cargo deb` (Linux only): the .deb the Linux workflow builds.
+[package.metadata.deb]
+name = "openuuyc"
+maintainer = "DoyoDia <79502694+DoyoDia@users.noreply.github.com>"
+copyright = "OpenUUYC contributors"
+license-file = ["LICENSE", "0"]
+extended-description = """\
+Third-party client for UU Remote: sign in with an existing UU account, then \
+view and control remote devices or accept remote control of this desktop \
+(Xorg session)."""
+section = "net"
+priority = "optional"
+# `$auto` covers what the binary links; the windowing, graphics and audio
+# libraries below are loaded at run time and so are named by hand. FUSE
+# serves pasted and dropped remote files; the UI needs a CJK font.
+depends = """$auto, fuse3, libx11-6, libx11-xcb1, libxcursor1, libxrandr2, libxi6, \
+libxfixes3, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, \
+libvulkan1 | libegl1, \
+fonts-noto-cjk | fonts-wqy-microhei | fonts-arphic-uming"""
+recommends = "libpulse0, libpipewire-0.3-0, gnome-keyring | kwalletmanager"
+suggests = "ethtool"
+assets = [
+    ["target/release/OpenUUYC", "usr/bin/", "755"],
+    ["packaging/linux/openuuyc.desktop", "usr/share/applications/", "644"],
+    ["assets/icon-256.png", "usr/share/icons/hicolor/256x256/apps/openuuyc.png", "644"],
+    ["README.md", "usr/share/doc/openuuyc/", "644"],
+    ["THIRD_PARTY_NOTICES", "usr/share/doc/openuuyc/", "644"],
+    ["assets/licenses/*", "usr/share/doc/openuuyc/licenses/", "644"],
+]
+
 [dependencies]
 anyhow = "1.0"
 async-trait = "0.1"

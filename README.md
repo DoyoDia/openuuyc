@@ -110,6 +110,17 @@ cargo build --release
 
 `cargo dist` 只用于 Windows 打包，Linux 直接用 `cargo build`。
 
+打包为 deb（GitHub Actions 的 “Linux deb” 工作流在 Ubuntu 22.04 上构建同样的包，产物见运行页面的 Artifacts，打 `v*` 标签时附到 Release）：
+
+```bash
+cargo install cargo-deb
+cargo build --release --bin OpenUUYC
+cargo deb --no-build
+sudo apt install ./target/debian/openuuyc_*.deb
+```
+
+安装后从应用菜单启动，或运行 `OpenUUYC`。
+
 ## 命令行更新
 
 从新下载的程序包运行 `OpenUUYC.exe update --silent`，更新已有安装而不显示更新窗口。保留账号、设置和驱动；会结束当前连接，完成后不自动打开控制中心、不自动重启 Windows。非管理员运行时仍需确认系统 UAC。
