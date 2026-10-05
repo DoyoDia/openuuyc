@@ -10,10 +10,7 @@ use crate::decoder::align::{Align16, AlignedVec2};
 use crate::decoder::cpu::CpuFlags;
 use crate::decoder::disjoint_mut::DisjointMut;
 use crate::decoder::ffi_safe::FFISafe;
-#[cfg(all(
-    feature = "asm",
-    not(any(target_arch = "riscv64", target_arch = "riscv32"))
-))]
+#[cfg(feature = "asm")]
 use crate::decoder::include::common::bitdepth::bd_fn;
 use crate::decoder::include::common::bitdepth::{AsPrimitive, BitDepth, DynPixel};
 use crate::decoder::include::common::intops::iclip;
@@ -398,7 +395,7 @@ impl Rav1dLoopFilterDSPContext {
         }
     }
 
-    #[cfg(all(feature = "asm", any(target_arch = "x86", target_arch = "x86_64")))]
+    #[cfg(feature = "asm")]
     #[inline(always)]
     const fn init_x86<BD: BitDepth>(mut self, flags: CpuFlags) -> Self {
         if !flags.contains(CpuFlags::SSSE3) {
@@ -438,32 +435,12 @@ impl Rav1dLoopFilterDSPContext {
         self
     }
 
-    #[cfg(all(feature = "asm", any(target_arch = "arm", target_arch = "aarch64")))]
-    #[inline(always)]
-    const fn init_arm<BD: BitDepth>(mut self, flags: CpuFlags) -> Self {
-        if !flags.contains(CpuFlags::NEON) {
-            return self;
-        }
-
-        self.loop_filter_sb.y.h = bd_fn!(loopfilter_sb::decl_fn, BD, lpf_h_sb_y, neon);
-        self.loop_filter_sb.y.v = bd_fn!(loopfilter_sb::decl_fn, BD, lpf_v_sb_y, neon);
-        self.loop_filter_sb.uv.h = bd_fn!(loopfilter_sb::decl_fn, BD, lpf_h_sb_uv, neon);
-        self.loop_filter_sb.uv.v = bd_fn!(loopfilter_sb::decl_fn, BD, lpf_v_sb_uv, neon);
-
-        self
-    }
-
     #[inline(always)]
     const fn init<BD: BitDepth>(self, flags: CpuFlags) -> Self {
         #[cfg(feature = "asm")]
         {
-            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             {
                 return self.init_x86::<BD>(flags);
-            }
-            #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
-            {
-                return self.init_arm::<BD>(flags);
             }
         }
 

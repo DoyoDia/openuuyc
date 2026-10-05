@@ -88,6 +88,7 @@ struct Form {
     target: String,
     remote: String,
     enabled: bool,
+    protocol: super::Protocol,
     new: bool,
 }
 impl From<&Rule> for Form {
@@ -100,6 +101,7 @@ impl From<&Rule> for Form {
             target: r.target.to_string(),
             remote: r.remote_port.to_string(),
             enabled: r.enabled,
+            protocol: r.protocol,
             new: false,
         }
     }
@@ -122,6 +124,7 @@ impl Form {
                 .context("请输入有效的 IPv4 或 IPv6 地址")?,
             remote_port: self.remote.trim().parse().context("目标端口应为 1–65535")?,
             enabled: self.enabled,
+            protocol: self.protocol,
         };
         rule.validate()?;
         Ok(rule)
@@ -149,6 +152,7 @@ impl Editor {
             target: "127.0.0.1".into(),
             remote: String::new(),
             enabled: true,
+            protocol: super::Protocol::Tcp,
             new: true,
         });
         self.error = None;
@@ -257,9 +261,11 @@ impl Editor {
                                     let local =
                                         std::net::SocketAddr::new(rule.local_addr, rule.local_port)
                                             .to_string();
-                                    let target =
+                                    let target = format!(
+                                        "{} · {}",
+                                        rule.protocol.label(),
                                         std::net::SocketAddr::new(rule.target, rule.remote_port)
-                                            .to_string();
+                                    );
                                     let (label, color) = if !snapshot.enabled {
                                         ("服务关闭".into(), theme::MUTED)
                                     } else if !rule.enabled {
@@ -268,6 +274,20 @@ impl Editor {
                                         ("监听异常".into(), theme::RED)
                                     } else if !status.listening {
                                         ("等待连接".into(), theme::MUTED)
+                                    } else if rule.protocol == super::Protocol::Udp {
+                                        (
+                                            if status.error.is_some() {
+                                                "UDP 转发异常"
+                                            } else {
+                                                "UDP 监听中"
+                                            }
+                                            .into(),
+                                            if status.error.is_some() {
+                                                theme::RED
+                                            } else {
+                                                theme::GREEN
+                                            },
+                                        )
                                     } else {
                                         match &status.probe {
                                             super::ProbeStatus::Unknown => {
@@ -316,9 +336,17 @@ impl Editor {
                                     } else {
                                         String::new()
                                     };
-                                    let hint = match &status.probe {
-                                        super::ProbeStatus::Unreachable(error) => error.as_str(),
-                                        _ => "经 UU 链路确认远端 TCP 建连；每 30 秒探测一次",
+                                    let hint = if rule.protocol == super::Protocol::Udp {
+                                        status.error.as_deref().unwrap_or(
+                                            "UDP 仅在本地收到数据报后连接目标，不进行 TCP 探测",
+                                        )
+                                    } else {
+                                        match &status.probe {
+                                            super::ProbeStatus::Unreachable(error) => {
+                                                error.as_str()
+                                            }
+                                            _ => "经 UU 链路确认远端 TCP 建连；每 30 秒探测一次",
+                                        }
                                     };
                                     let speed = if !snapshot.enabled || !rule.enabled {
                                         "—".into()
@@ -348,6 +376,7 @@ impl Editor {
                                             reachable,
                                             url: url.as_deref(),
                                             probing: status.probing,
+                                            can_probe: rule.protocol == super::Protocol::Tcp,
                                             enabled: rule.enabled,
                                             color,
                                         },
@@ -383,7 +412,7 @@ impl Editor {
         ui.add_space(10.0);
         ui.horizontal(|ui| {
             ui.label(
-                RichText::new("TCP 转发")
+                RichText::new("端口转发")
                     .size(theme::SMALL)
                     .color(theme::MUTED),
             );
@@ -429,6 +458,29 @@ impl Editor {
                         true,
                     );
                     field(ui, "规则名称", &mut form.name, "例如：开发服务");
+                    ui.horizontal(|ui| {
+                        ui.label("协议");
+                        egui::ComboBox::from_id_salt("mapping-protocol")
+                            .selected_text(form.protocol.label())
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut form.protocol,
+                                    super::Protocol::Tcp,
+                                    "TCP",
+                                );
+                                ui.selectable_value(
+                                    &mut form.protocol,
+                                    super::Protocol::Udp,
+                                    "UDP",
+                                );
+                            });
+                    });
+                    if form.protocol == super::Protocol::Udp {
+                        ui.label(
+                            RichText::new("UDP 需要两端 OpenUUYC；弱网下可靠传输可能增加等待。")
+                                .color(theme::MUTED),
+                        );
+                    }
                     ui.add_space(16.0);
                     ui.columns(2, |columns| {
                         egui::Frame::new()

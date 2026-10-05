@@ -306,6 +306,13 @@ impl StreamControlHandle {
                 && state.mouse.mode() != MouseMode::View,
             state.peer_clipboard >= 2 && state.clipboard_files_allowed,
         );
+        self.drag_drop.enable(
+            state.viewing_enabled
+                && state.pb_connected
+                && state.text_channel_open
+                && state.mouse_transport_connected
+                && self.files.allowed(),
+        );
         if !state.viewing_enabled {
             return;
         }

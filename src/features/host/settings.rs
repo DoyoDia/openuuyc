@@ -22,6 +22,19 @@ struct Record {
     audio_quality: crate::media::audio::encoder::Quality,
     #[serde(default)]
     assistance: super::assist::Settings,
+    #[serde(default)]
+    clipboard: super::clipboard::Settings,
+    #[serde(default = "file_transfer_default")]
+    file_transfer: bool,
+    #[serde(default)]
+    port_mapping: bool,
+    #[serde(default)]
+    remote_power: bool,
+    #[serde(default)]
+    wol: bool,
+}
+fn file_transfer_default() -> bool {
+    true
 }
 
 impl Store {
@@ -55,6 +68,11 @@ impl Store {
         super::audio::DefaultDevices,
         crate::media::audio::encoder::Quality,
         super::assist::Settings,
+        super::clipboard::Settings,
+        bool,
+        bool,
+        bool,
+        bool,
     )> {
         let bytes = match self.0.get_secret() {
             Ok(bytes) => bytes,
@@ -66,6 +84,11 @@ impl Store {
                     Default::default(),
                     Default::default(),
                     Default::default(),
+                    Default::default(),
+                    true,
+                    false,
+                    false,
+                    false,
                 ));
             }
             Err(_) => bail!("无法读取被控设置"),
@@ -86,6 +109,11 @@ impl Store {
             record.audio_defaults,
             audio_quality,
             record.assistance,
+            record.clipboard,
+            record.file_transfer,
+            record.port_mapping,
+            record.remote_power,
+            record.wol,
         ))
     }
     pub fn save(
@@ -96,6 +124,11 @@ impl Store {
         audio_defaults: super::audio::DefaultDevices,
         audio_quality: crate::media::audio::encoder::Quality,
         assistance: super::assist::Settings,
+        clipboard: super::clipboard::Settings,
+        file_transfer: bool,
+        port_mapping: bool,
+        remote_power: bool,
+        wol: bool,
     ) -> Result<()> {
         encoding.validate()?;
         audio_quality.validate()?;
@@ -112,6 +145,11 @@ impl Store {
                 audio_defaults,
                 audio_quality,
                 assistance,
+                clipboard,
+                file_transfer,
+                port_mapping,
+                remote_power,
+                wol,
             })?)
             .map_err(|_| anyhow::anyhow!("无法保存被控设置"))
     }

@@ -58,6 +58,14 @@ impl HostClient {
     pub fn is_guest(&self) -> bool {
         matches!(self.identity, Identity::Guest(_))
     }
+    pub(crate) fn controlling_features(
+        &self,
+    ) -> Option<crate::account::feature_ability::FeatureCatalog> {
+        match &self.identity {
+            Identity::Account(client) => Some(client.controlling_features()),
+            Identity::Guest(_) => None,
+        }
+    }
     pub fn generation(&self) -> String {
         match &self.identity {
             Identity::Account(c) => c.account_generation(),
@@ -163,6 +171,45 @@ impl HostClient {
             response.into_data()
         };
         tokio::select! { biased; _ = guest.ended.cancelled() => bail!("游客协助已结束"), result = operation => result }
+    }
+    pub(crate) async fn wol_info(
+        &self,
+        info: crate::features::host::wol::packet::LanInfo,
+    ) -> Result<bool> {
+        if self.is_guest() {
+            bail!("游客不支持局域网唤醒协助");
+        }
+        self.request(|api| async move { api.wol_info(info).await })
+            .await
+            .map(|r| r.support_wol)
+    }
+    pub(crate) async fn wol_enabled(&self) -> Result<bool> {
+        anyhow::ensure!(!self.is_guest(), "请先登录");
+        let devices = self
+            .request(|api| async move { api.list_devices().await })
+            .await?;
+        anyhow::ensure!(
+            devices.current_device.device_id == self.device_id(),
+            "本机设备身份已改变"
+        );
+        Ok(devices.current_device.support_wol)
+    }
+    pub(crate) async fn set_wol_enabled(&self, enabled: bool) -> Result<()> {
+        anyhow::ensure!(!self.is_guest(), "请先登录");
+        self.request(|api| async move { api.set_wol(enabled).await })
+            .await
+    }
+    pub(crate) async fn power_response(
+        &self,
+        call_id: String,
+        code: i32,
+        message: String,
+    ) -> Result<()> {
+        if self.is_guest() {
+            bail!("游客不支持电源操作");
+        }
+        self.request(|api| async move { api.host_power_response(call_id, code, message).await })
+            .await
     }
     pub async fn create_host_room(&self, interval: i64) -> Result<RoomSession> {
         let guest = self.is_guest();

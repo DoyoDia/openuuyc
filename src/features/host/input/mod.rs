@@ -74,6 +74,7 @@ struct Gate {
     pending: VecDeque<Envelope>,
     executing: Option<(std::time::Instant, usize)>,
     last_execution: Duration,
+    drag_pointer: bool,
 }
 impl Gate {
     fn batch(&mut self, first: Envelope) -> (u64, Geometry, Vec<wire::Event>) {
@@ -168,6 +169,13 @@ impl Drop for Session {
     }
 }
 impl Receiver {
+    pub fn drag_pointer(&self, owned: bool) {
+        let mut gate = lock(&self.shared.gate);
+        gate.drag_pointer = owned;
+        if owned {
+            gate.pending.retain(|p| !motion(&p.event));
+        }
+    }
     pub fn configure(&self, configuration: config::Configuration) {
         if self.shared.lease.requested() {
             self.shared
@@ -262,6 +270,9 @@ impl Receiver {
     }
     fn enqueue(&self, stream: Option<u16>, event: wire::Event) {
         let mut gate = lock(&self.shared.gate);
+        if gate.drag_pointer && motion(&event) {
+            return;
+        }
         if gate.stream.is_none()
             || stream.is_some_and(|id| gate.stream != Some(id))
             || gate.faulted

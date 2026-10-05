@@ -22,6 +22,7 @@ pub(crate) use notices::{
     progress_notice, show_notices,
 };
 pub(crate) mod files;
+pub(crate) mod file_icons;
 use dialogs::dialog_icon;
 pub(crate) use dialogs::{DialogAction, DialogIcon, dialog_actions, dialog_header};
 mod mapping;
@@ -767,6 +768,18 @@ pub(crate) fn centered_button(label: &str) -> egui::Button<'_> {
     egui::Button::new((egui::Atom::grow(), label, egui::Atom::grow()))
         .gap(0.0)
         .min_size(vec2(64.0, theme::CONTROL_HEIGHT))
+}
+
+pub(crate) fn centered_primary(label: &str) -> egui::Button<'_> {
+    egui::Button::new((
+        egui::Atom::grow(),
+        RichText::new(label).color(Color32::WHITE),
+        egui::Atom::grow(),
+    ))
+    .gap(0.0)
+    .fill(ACCENT)
+    .stroke(Stroke::NONE)
+    .min_size(vec2(64.0, HEIGHT))
 }
 
 pub(crate) fn section_frame() -> egui::Frame {

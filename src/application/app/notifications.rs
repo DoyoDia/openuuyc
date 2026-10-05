@@ -1,5 +1,6 @@
 //! Remote-access notices share one owner, independent of delivery surface.
 
+mod files;
 mod worker;
 use super::DeviceCenterApp;
 use crate::features::host::assist;
@@ -35,7 +36,14 @@ impl Mode {
     }
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TransferCard {
+    pub progress: Option<u16>,
+    pub folder: Option<std::path::PathBuf>,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Card {
+    pub disconnect: Option<String>,
+    pub transfer: Option<TransferCard>,
     pub ticket: String,
     pub title: String,
     pub body: String,
@@ -51,6 +59,72 @@ pub(crate) enum Verb {
     Reject,
     Open,
     Dismiss,
+    OpenFolder,
+    Disconnect,
+}
+#[derive(Clone, Copy)]
+pub(crate) enum ButtonKind {
+    Normal,
+    Primary,
+    Danger,
+}
+pub(crate) struct CardAction {
+    pub label: &'static str,
+    pub verb: Verb,
+    pub kind: ButtonKind,
+    pub enabled: bool,
+}
+impl Card {
+    pub fn actions(&self) -> Vec<CardAction> {
+        if self.confirmation {
+            let enabled = !self.busy && self.expires_at > chrono::Utc::now().timestamp();
+            return vec![
+                CardAction {
+                    label: "拒绝",
+                    verb: Verb::Reject,
+                    kind: ButtonKind::Normal,
+                    enabled,
+                },
+                CardAction {
+                    label: if self.busy {
+                        "正在提交"
+                    } else {
+                        "允许本次"
+                    },
+                    verb: Verb::Allow,
+                    kind: ButtonKind::Primary,
+                    enabled,
+                },
+            ];
+        }
+        let (label, verb) = if self.transfer.as_ref().is_some_and(|t| t.folder.is_some()) {
+            ("打开文件夹", Verb::OpenFolder)
+        } else {
+            (
+                if self.expires_at == 0 {
+                    "控制中心"
+                } else {
+                    "查看"
+                },
+                Verb::Open,
+            )
+        };
+        let mut actions = vec![CardAction {
+            label,
+            verb,
+            kind: ButtonKind::Normal,
+            enabled: true,
+        }];
+        if self.disconnect.is_some() {
+            actions.push(CardAction {
+                label: "断开连接",
+                verb: Verb::Disconnect,
+                kind: ButtonKind::Danger,
+                enabled: true,
+            });
+        }
+        actions
+    }
 }
 #[derive(Clone)]
 pub(crate) struct Action {
@@ -73,6 +147,8 @@ impl Action {
             "allow" => Verb::Allow,
             "reject" => Verb::Reject,
             "open" => Verb::Open,
+            "folder" => Verb::OpenFolder,
+            "disconnect" => Verb::Disconnect,
             _ => anyhow::bail!("不支持的通知操作"),
         };
         Ok(Self {
@@ -84,12 +160,16 @@ impl Action {
         let verb = match verb {
             Verb::Allow => "allow",
             Verb::Reject => "reject",
+            Verb::OpenFolder => "folder",
+            Verb::Disconnect => "disconnect",
             _ => "open",
         };
         format!("openuuyc-notification://{verb}/{ticket}")
     }
 }
 struct Target {
+    disconnect: Option<String>,
+    folder: Option<std::path::PathBuf>,
     generation: u64,
     request: Option<assist::Confirmation>,
 }
@@ -229,6 +309,7 @@ impl Center {
         &mut self,
         generation: u64,
         host: Option<&crate::features::host::Handle>,
+        status_snapshot: Option<crate::features::host::Status>,
         caption: Option<crate::ui::chrome::TitleBarAlert>,
         ended: Option<EndNotice>,
     ) {
@@ -261,6 +342,10 @@ impl Center {
             self.last_source = None;
         }
         let now = chrono::Utc::now().timestamp();
+        let disconnect = status_snapshot
+            .as_ref()
+            .and_then(|s| s.disconnect_target())
+            .map(str::to_owned);
         let mut items = Vec::new();
         if let Some(host) = host {
             let ended = ended.map(|mut notice| {
@@ -284,6 +369,7 @@ impl Center {
                 items.push((
                     key,
                     Card {
+                        disconnect: None,
                         ticket: String::new(),
                         title: "远程协助请求".into(),
                         body: clean(&p.name),
@@ -296,6 +382,7 @@ impl Center {
                         confirmation: true,
                         busy: p.responding,
                         connected: false,
+                        transfer: None,
                     },
                     Some(p),
                 ));
@@ -303,6 +390,7 @@ impl Center {
                 items.push((
                     format!("attempt:{}", a.id),
                     Card {
+                        disconnect: None,
                         ticket: String::new(),
                         title: "收到远程连接尝试".into(),
                         body: "对方正在申请连接这台电脑。".into(),
@@ -315,16 +403,17 @@ impl Center {
                         confirmation: false,
                         busy: false,
                         connected: false,
+                        transfer: None,
                     },
                     None,
                 ));
             }
             if let Some(caption) = caption {
-                let status = host.status();
+                let status = status_snapshot.as_ref().expect("host snapshot");
                 let key = status
                     .connection
                     .as_ref()
-                    .map(|c| format!("active:{}:{}", c.client_id, c.device_id))
+                    .map(|c| format!("active:{}:{}:{}", c.client_id, c.device_id, c.session_id))
                     .unwrap_or_else(|| "active".into());
                 let title = if status
                     .connection
@@ -348,6 +437,7 @@ impl Center {
                 items.push((
                     key,
                     Card {
+                        disconnect: disconnect.clone(),
                         ticket: String::new(),
                         title: title.into(),
                         body: clean(&caption.source),
@@ -356,9 +446,18 @@ impl Center {
                         confirmation: false,
                         busy: false,
                         connected: status.connected,
+                        transfer: None,
                     },
                     None,
                 ));
+            }
+        }
+        if let Some(snapshot) = status_snapshot {
+            for (key, mut card) in files::cards(snapshot.file_transfers, now) {
+                if card.transfer.as_ref().is_some_and(|t| t.progress.is_some()) {
+                    card.disconnect = disconnect.clone();
+                }
+                items.push((key, card, None));
             }
         }
         if let Some(notice) = &self.ended.current {
@@ -368,6 +467,7 @@ impl Center {
             items.push((
                 format!("feedback:{until}"),
                 Card {
+                    disconnect: None,
                     ticket: String::new(),
                     title: "远程协助提示".into(),
                     body: clean(error),
@@ -376,6 +476,7 @@ impl Center {
                     confirmation: false,
                     busy: false,
                     connected: false,
+                    transfer: None,
                 },
                 None,
             ));
@@ -398,6 +499,8 @@ impl Center {
             targets.insert(
                 ticket,
                 Target {
+                    disconnect: card.disconnect.clone(),
+                    folder: card.transfer.as_ref().and_then(|t| t.folder.clone()),
                     generation,
                     request,
                 },
@@ -503,12 +606,17 @@ impl App for Popup {
         // The card frames do not cover the complete native surface while its
         // size changes. Paint the window too, including any scroll-area gutter.
         ui.painter().rect_filled(ui.max_rect(), 0., theme::BG);
+        ui.spacing_mut().item_spacing.y = 0.;
         let content = egui::ScrollArea::vertical()
             .auto_shrink([false, true])
             .show(ui, |ui| {
                 for (index, card) in cards.iter().enumerate() {
                     if index > 0 {
-                        ui.separator();
+                        let (rect, _) = ui.allocate_exact_size(
+                            egui::vec2(ui.available_width(), 1.),
+                            egui::Sense::hover(),
+                        );
+                        ui.painter().rect_filled(rect, 0., theme::LINE);
                     }
                     if let Some(verb) = controls::host_notice(ui, card) {
                         let _ = self.sender.send(Action {
@@ -520,11 +628,10 @@ impl App for Popup {
             });
         // Item spacing already separates cards. Trailing spacers plus another
         // window margin used to leave an unpainted strip below the last card.
-        let height = content
-            .content_size
-            .y
-            .ceil()
-            .clamp(theme::NOTIFICATION_MIN_HEIGHT, 520.);
+        let height = content.content_size.y.ceil().clamp(
+            theme::NOTIFICATION_MIN_HEIGHT,
+            theme::NOTIFICATION_MAX_HEIGHT,
+        );
         if ui.ctx().input(|i| {
             i.viewport()
                 .inner_rect
@@ -542,49 +649,60 @@ impl App for Popup {
 }
 impl DeviceCenterApp {
     pub(super) fn tick_notifications(&mut self) {
-        let caption = self.controlled_caption();
         let host = if self.exit_requested || self.logout_pending {
             None
         } else {
             self.host.as_ref()
         };
-        let ended = host.and_then(|h| h.status().ended_connection).map(|end| {
-            let seconds = end.connection.elapsed_seconds.unwrap_or(0);
-            let peer = format!(
-                "active:{}:{}",
-                end.connection.client_id, end.connection.device_id
-            );
-            let status = crate::features::host::Status {
-                connected: true,
-                session_active: true,
-                assistance: end.assistance,
-                connection: Some(end.connection),
-                ..Default::default()
-            };
-            let source = super::controlled_caption::caption(
-                &status,
-                self.devices.as_ref(),
-                self.catalog.as_ref(),
-            )
-            .map(|c| c.source)
-            .unwrap_or_else(|| "远程设备".into());
-            EndNotice {
-                id: end.id,
-                peer,
-                card: Card {
-                    ticket: String::new(),
-                    title: "远程连接已结束".into(),
-                    body: clean(&source),
-                    detail: format!("本次连接 {}", super::controlled_caption::duration(seconds)),
-                    expires_at: end.ended_at.saturating_add(10),
-                    confirmation: false,
-                    busy: false,
-                    connected: false,
-                },
-            }
+        let snapshot = host.map(|h| h.status());
+        let caption = snapshot.as_ref().and_then(|status| {
+            super::controlled_caption::caption(status, self.devices.as_ref(), self.catalog.as_ref())
         });
+        let ended = snapshot
+            .as_ref()
+            .and_then(|s| s.ended_connection.clone())
+            .map(|end| {
+                let seconds = end.connection.elapsed_seconds.unwrap_or(0);
+                let peer = format!(
+                    "active:{}:{}:{}",
+                    end.connection.client_id, end.connection.device_id, end.connection.session_id
+                );
+                let status = crate::features::host::Status {
+                    connected: true,
+                    session_active: true,
+                    assistance: end.assistance,
+                    connection: Some(end.connection),
+                    ..Default::default()
+                };
+                let source = super::controlled_caption::caption(
+                    &status,
+                    self.devices.as_ref(),
+                    self.catalog.as_ref(),
+                )
+                .map(|c| c.source)
+                .unwrap_or_else(|| "远程设备".into());
+                EndNotice {
+                    id: end.id,
+                    peer,
+                    card: Card {
+                        disconnect: None,
+                        ticket: String::new(),
+                        title: "远程连接已结束".into(),
+                        body: clean(&source),
+                        detail: format!(
+                            "本次连接 {}",
+                            super::controlled_caption::duration(seconds)
+                        ),
+                        expires_at: end.ended_at.saturating_add(10),
+                        confirmation: false,
+                        busy: false,
+                        connected: false,
+                        transfer: None,
+                    },
+                }
+            });
         self.notifications
-            .update(self.login_generation, host, caption, ended);
+            .update(self.login_generation, host, snapshot, caption, ended);
         while let Ok(action) = self.notifications.events.try_recv() {
             let Some(target) = self.notifications.targets.get(&action.ticket) else {
                 continue;
@@ -596,8 +714,20 @@ impl DeviceCenterApp {
                 continue;
             }
             match action.verb {
+                Verb::Disconnect => {
+                    if let (Some(session), Some(host)) =
+                        (target.disconnect.as_deref(), self.host.as_ref())
+                    {
+                        host.disconnect_session(session);
+                    }
+                }
                 Verb::Dismiss => {
                     self.notifications.dismissed.insert(action.ticket);
+                }
+                Verb::OpenFolder => {
+                    if let Some(folder) = target.folder.clone() {
+                        self.notifications.worker.open_folder(folder);
+                    }
                 }
                 Verb::Open => {
                     let _ = crate::ui::window_manager::send(

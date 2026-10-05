@@ -48,6 +48,11 @@ pub(crate) enum Request {
         action: host::assist::Action,
     },
     RefreshPublication,
+    RefreshWol,
+    WolSetup {
+        account: String,
+        action: host::wol::setup::Action,
+    },
     Initialize {
         force: bool,
     },
@@ -64,9 +69,15 @@ pub(crate) enum Request {
         audio_defaults: host::audio::DefaultDevices,
         audio_quality: crate::media::audio::encoder::Quality,
         assistance: host::assist::Settings,
+        clipboard: host::clipboard::Settings,
+        file_transfer: bool,
+        port_mapping: bool,
+        remote_power: bool,
+        wol: bool,
     },
     Disconnect {
         account: String,
+        session: String,
     },
     Retry {
         account: String,
@@ -91,6 +102,16 @@ pub(crate) struct Snapshot {
     pub audio_defaults: host::audio::DefaultDevices,
     #[serde(default)]
     pub audio_quality: crate::media::audio::encoder::Quality,
+    #[serde(default)]
+    pub clipboard: host::clipboard::Settings,
+    #[serde(default)]
+    pub file_transfer: bool,
+    #[serde(default)]
+    pub port_mapping: bool,
+    #[serde(default)]
+    pub remote_power: bool,
+    #[serde(default)]
+    pub wol: bool,
     pub status: host::Status,
     pub capabilities: Option<host::desktop::Capabilities>,
 }
@@ -653,12 +674,23 @@ async fn run_account(mut incoming: Incoming, running: &impl Fn() -> bool) -> Res
                                     audio_device: current.host.audio_device(),
                                     audio_defaults: current.host.audio_defaults(),
                                     audio_quality: current.host.audio_quality(),
+                                    clipboard: current.host.clipboard_settings(),
+                                    file_transfer: current.host.file_transfer_allowed(),
+                                    port_mapping: current.host.port_mapping_allowed(),
+                                    remote_power: current.host.power_allowed(),
+                                    wol: current.host.wol_allowed(),
                                     status: current.host.status(),
                                     capabilities: current.host.capabilities().map(|v| (*v).clone()),
                                 })))},
                                 Request::Assist { account: expected, action } => {
                                     ensure!(expected == account, "账号已改变");
                                     current.host.assistance.act(action)?;
+                                    Ok(Reply::Done)
+                                },
+                                Request::RefreshWol => {ensure!(!current.is_guest(), "请先登录");current.host.wol.refresh();Ok(Reply::Done)},
+                                Request::WolSetup { account: expected, action } => {
+                                    ensure!(expected == account && !current.is_guest(), "账号已改变或未登录");
+                                    current.host.wol_setup.act(action)?;
                                     Ok(Reply::Done)
                                 },
                                 Request::RefreshPublication => {ensure!(!current.is_guest(), "请先登录");crate::account::reporting::REFRESH.notify_one();Ok(Reply::Done)},
@@ -670,6 +702,11 @@ async fn run_account(mut incoming: Incoming, running: &impl Fn() -> bool) -> Res
                                     audio_defaults,
                                     audio_quality,
                                     assistance,
+                                    clipboard,
+                                    file_transfer,
+                                    port_mapping,
+                                    remote_power,
+                                    wol,
                                 } => {
                                     ensure!(expected == account, "账号已改变");
                                     encoding.validate()?;
@@ -679,6 +716,11 @@ async fn run_account(mut incoming: Incoming, running: &impl Fn() -> bool) -> Res
                                     current.host.set_audio_defaults(audio_defaults)?;
                                     current.host.set_audio_quality(audio_quality)?;
                                     current.host.set_assistance(assistance)?;
+                                    current.host.set_clipboard_settings(clipboard)?;
+                                    current.host.set_file_transfer_allowed(file_transfer)?;
+                                    current.host.set_port_mapping_allowed(port_mapping)?;
+                                    current.host.set_power_allowed(remote_power)?;
+                                    current.host.set_wol_allowed(wol)?;
                                     current.host.set_allowed(allowed);
                                     current.host.persist_settings().await;
                                     if let Some(error) = current.host.status().settings_error {
@@ -686,9 +728,9 @@ async fn run_account(mut incoming: Incoming, running: &impl Fn() -> bool) -> Res
                                     }
                                     Ok(Reply::Done)
                                 }
-                                Request::Disconnect { account: expected } => {
+                                Request::Disconnect { account: expected, session } => {
                                     ensure!(expected == account, "账号已改变");
-                                    current.host.disconnect();
+                                    ensure!(current.host.disconnect_session(&session), "该连接已结束或已更换");
                                     Ok(Reply::Done)
                                 }
                                 Request::Retry { account: expected } => {

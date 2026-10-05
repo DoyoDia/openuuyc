@@ -131,61 +131,9 @@ fn strip_command() -> Option<String> {
     Some("strip".into())
 }
 
-#[cfg(feature = "asm")]
-fn build_asm_files() {
-    let mut config = "
-#define PRIVATE_PREFIX rav1e_
-#define ARCH_AARCH64 1
-#define ARCH_ARM 0
-#define CONFIG_LOG 1
-#define HAVE_ASM 1
-"
-    .to_owned();
-
-    if env::var("CARGO_CFG_TARGET_VENDOR").unwrap() == "apple" {
-        config += "#define PREFIX 1\n";
-    }
-    let out_dir = Path::new(&env::var("OUT_DIR").unwrap()).join("encoder");
-    fs::create_dir_all(&out_dir).unwrap();
-    let out_dir = out_dir.to_str().unwrap();
-    let dest_path = Path::new(&out_dir).join("config.h");
-    std::fs::write(&dest_path, config).expect("can write config.h");
-
-    let asm_files = &[
-        "src/encoder/arm/64/cdef.S",
-        "src/encoder/arm/64/cdef16.S",
-        "src/encoder/arm/64/cdef_dist.S",
-        "src/encoder/arm/64/mc.S",
-        "src/encoder/arm/64/mc16.S",
-        "src/encoder/arm/64/itx.S",
-        "src/encoder/arm/64/itx16.S",
-        "src/encoder/arm/64/ipred.S",
-        "src/encoder/arm/64/ipred16.S",
-        "src/encoder/arm/64/sad.S",
-        "src/encoder/arm/64/satd.S",
-        "src/encoder/arm/64/sse.S",
-        "src/encoder/arm/tables.S",
-    ];
-
-    cc::Build::new()
-        .out_dir(out_dir)
-        .files(asm_files)
-        .include(".")
-        .include(&out_dir)
-        .compile("rav1e-aarch64");
-}
-
 pub(super) fn build() {
-    #[cfg(feature = "asm")]
-    {
-        let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
-        if arch == "x86_64" {
-            println!("cargo:rustc-cfg=nasm_x86_64");
-            build_nasm_files();
-        }
-        if arch == "aarch64" {
-            println!("cargo:rustc-cfg=asm_neon");
-            build_asm_files();
-        }
+    if env::var("CARGO_CFG_TARGET_ARCH").unwrap() == "x86_64" {
+        println!("cargo:rustc-cfg=nasm_x86_64");
+        build_nasm_files();
     }
 }

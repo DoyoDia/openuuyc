@@ -140,6 +140,15 @@ impl Agent {
     pub fn start_capture(session: u32, pipe: &str) -> Result<Self> {
         Self::start_role(session, pipe, "capture-agent")
     }
+    pub fn start_clipboard(session: u32, pipe: &str) -> Result<Self> {
+        Self::start_role(session, pipe, "clipboard-agent")
+    }
+    pub fn start_annotation(session: u32, pipe: &str) -> Result<Self> {
+        Self::start_role(session, pipe, "annotation-agent")
+    }
+    pub fn start_files(session: u32, pipe: &str) -> Result<Self> {
+        Self::start_role(session, pipe, "file-agent")
+    }
     pub fn start_resident(session: u32) -> Result<Self> {
         Self::start_role(session, "", "host-resident")
     }
@@ -159,35 +168,44 @@ impl Agent {
         privilege(w!("SeTcbPrivilege"))?;
         privilege(w!("SeAssignPrimaryTokenPrivilege"))?;
         privilege(w!("SeIncreaseQuotaPrivilege"))?;
-        let mut token = HANDLE::default();
-        unsafe {
-            OpenProcessToken(
-                GetCurrentProcess(),
-                TOKEN_DUPLICATE | TOKEN_QUERY,
-                &mut token,
-            )?;
-        }
-        let token = Handle(token);
-        let mut primary = HANDLE::default();
-        unsafe {
-            DuplicateTokenEx(
-                token.0,
-                TOKEN_ALL_ACCESS,
-                None,
-                SecurityImpersonation,
-                TokenPrimary,
-                &mut primary,
-            )?;
-        }
-        let primary = Handle(primary);
-        unsafe {
-            SetTokenInformation(
-                primary.0,
-                TokenSessionId,
-                (&session as *const u32).cast(),
-                4,
-            )?;
-        }
+        let primary = if matches!(role, "clipboard-agent" | "file-agent" | "annotation-agent") {
+            let mut token = HANDLE::default();
+            unsafe {
+                WTSQueryUserToken(session, &mut token)?;
+            }
+            Handle(token)
+        } else {
+            let mut token = HANDLE::default();
+            unsafe {
+                OpenProcessToken(
+                    GetCurrentProcess(),
+                    TOKEN_DUPLICATE | TOKEN_QUERY,
+                    &mut token,
+                )?;
+            }
+            let token = Handle(token);
+            let mut primary = HANDLE::default();
+            unsafe {
+                DuplicateTokenEx(
+                    token.0,
+                    TOKEN_ALL_ACCESS,
+                    None,
+                    SecurityImpersonation,
+                    TokenPrimary,
+                    &mut primary,
+                )?;
+            }
+            let primary = Handle(primary);
+            unsafe {
+                SetTokenInformation(
+                    primary.0,
+                    TokenSessionId,
+                    (&session as *const u32).cast(),
+                    4,
+                )?;
+            }
+            primary
+        };
         let job = Handle(unsafe { CreateJobObjectW(None, None)? });
         let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
@@ -241,6 +259,27 @@ impl Agent {
             lpDesktop: PWSTR(desktop.as_mut_ptr()),
             ..Default::default()
         };
+        struct Environment(*mut std::ffi::c_void);
+        impl Drop for Environment {
+            fn drop(&mut self) {
+                if !self.0.is_null() {
+                    unsafe {
+                        let _ =
+                            windows::Win32::System::Environment::DestroyEnvironmentBlock(self.0);
+                    }
+                }
+            }
+        }
+        let mut environment = Environment(std::ptr::null_mut());
+        if matches!(role, "clipboard-agent" | "file-agent" | "annotation-agent") {
+            unsafe {
+                windows::Win32::System::Environment::CreateEnvironmentBlock(
+                    &mut environment.0,
+                    Some(primary.0),
+                    false,
+                )?;
+            }
+        }
         let mut info = PROCESS_INFORMATION::default();
         unsafe {
             CreateProcessAsUserW(
@@ -250,8 +289,8 @@ impl Agent {
                 None,
                 None,
                 false,
-                CREATE_NO_WINDOW | CREATE_SUSPENDED,
-                None,
+                CREATE_NO_WINDOW | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
+                (!environment.0.is_null()).then_some(environment.0.cast_const()),
                 None,
                 &startup,
                 &mut info,

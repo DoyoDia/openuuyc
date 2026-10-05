@@ -10,8 +10,6 @@
 cfg_if::cfg_if! {
   if #[cfg(nasm_x86_64)] {
     pub use crate::encoder::asm::x86::mc::*;
-  } else if #[cfg(asm_neon)] {
-    pub use crate::encoder::asm::aarch64::mc::*;
   } else {
     pub use self::rust::*;
   }

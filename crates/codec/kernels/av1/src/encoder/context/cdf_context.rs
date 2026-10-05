@@ -275,10 +275,12 @@ impl CDFContext {
     reset_4d!(self.coeff_br_cdf);
   }
 
+
   /// # Panics
   ///
   /// - If any of the CDF arrays are uninitialized.
   ///   This should never happen and indicates a development error.
+  #[cfg(test)]
   pub fn build_map(&self) -> Vec<(&'static str, usize, usize)> {
     use std::mem::size_of_val;
 
@@ -565,16 +567,6 @@ macro_rules! symbol_with_update {
   ($self:ident, $w:ident, $s:expr, $cdf:expr) => {
     let cdf = $self.fc.offset($cdf);
     $w.symbol_with_update($s, cdf, &mut $self.fc_log, &mut $self.fc);
-    symbol_with_update!($self, $cdf);
-  };
-  ($self:ident, $cdf:expr) => {
-    #[cfg(feature = "desync_finder")]
-    {
-      let cdf: &[_] = $cdf;
-      if let Some(map) = $self.fc_map.as_ref() {
-        map.lookup(cdf.as_ptr() as usize);
-      }
-    }
   };
 }
 
@@ -692,30 +684,12 @@ pub struct ContextWriter<'a> {
   pub bc: BlockContext<'a>,
   pub fc: &'a mut CDFContext,
   pub fc_log: CDFContextLog,
-  #[cfg(feature = "desync_finder")]
-  pub fc_map: Option<FieldMap>, // For debugging purposes
 }
 
 impl<'a> ContextWriter<'a> {
-  #[allow(clippy::let_and_return)]
   pub fn new(fc: &'a mut CDFContext, bc: BlockContext<'a>) -> Self {
     let fc_log = CDFContextLog::default();
-    #[allow(unused_mut)]
-    let mut cw = ContextWriter {
-      bc,
-      fc,
-      fc_log,
-      #[cfg(feature = "desync_finder")]
-      fc_map: Default::default(),
-    };
-    #[cfg(feature = "desync_finder")]
-    {
-      if std::env::var_os("RAV1E_DEBUG").is_some() {
-        cw.fc_map = Some(FieldMap { map: cw.fc.build_map() });
-      }
-    }
-
-    cw
+    ContextWriter { bc, fc, fc_log }
   }
 
   pub const fn cdf_element_prob(cdf: &[u16], element: usize) -> u16 {
@@ -735,11 +709,5 @@ impl<'a> ContextWriter<'a> {
   pub fn rollback(&mut self, checkpoint: &ContextWriterCheckpoint) {
     self.fc_log.rollback(self.fc, &checkpoint.fc);
     self.bc.rollback(&checkpoint.bc);
-    #[cfg(feature = "desync_finder")]
-    {
-      if self.fc_map.is_some() {
-        self.fc_map = Some(FieldMap { map: self.fc.build_map() });
-      }
-    }
   }
 }

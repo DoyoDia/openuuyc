@@ -1,14 +1,17 @@
 //! Local controlled-device services; access policy and media sessions have separate owners.
 mod access;
 mod allocation;
+pub(crate) mod annotation;
 pub(crate) mod assist;
 pub(crate) mod audio;
 mod burst;
+pub(crate) mod clipboard;
 mod congestion;
 pub(crate) mod desktop;
 pub(crate) mod displays;
 mod encoding_settings;
 mod fec;
+pub(crate) mod files;
 pub(crate) mod format;
 mod hevc;
 pub(crate) mod input;
@@ -17,10 +20,12 @@ pub(crate) mod microphone;
 pub(crate) mod network;
 pub(crate) mod parameters;
 pub(crate) mod peer;
+pub(crate) mod power;
 mod protection;
 mod settings;
 mod track;
 mod transport;
+pub(crate) mod wol;
 
 use std::sync::{Mutex, MutexGuard};
 
@@ -30,7 +35,9 @@ pub(crate) fn lock<T>(value: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-pub(crate) use access::{AccessRequest, ActiveEncoding, Handle, Lease, SessionLease, Status};
+pub(crate) use access::{
+    AccessRequest, ActiveEncoding, Handle, Lease, RemoteAction, SessionLease, Status,
+};
 pub(crate) use encoding_settings::{EncoderCodec, EncoderMode, EncodingSettings};
 
 pub(crate) fn enroll_settings(account: &str, device: &str) -> anyhow::Result<()> {

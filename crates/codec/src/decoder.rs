@@ -1,10 +1,11 @@
 //! One software decoder session for the supported low-delay video formats.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 mod av1;
 use crate::{Codec, PixelFormat};
 use bytes::Bytes;
 use std::sync::{
-    Arc,
     atomic::{AtomicBool, Ordering},
+    Arc,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -34,6 +35,7 @@ pub struct Frame {
 }
 enum Kernel {
     H264(Box<openuuyc_h264::stream::Decoder>),
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     Av1(Box<av1::Session>),
 }
 pub struct Decoder {
@@ -48,7 +50,10 @@ impl Decoder {
                 core.seed(extra).map_err(h264_error)?;
                 Kernel::H264(Box::new(core))
             }
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             Codec::Av1 => Kernel::Av1(Box::new(av1::Session::new(extra)?)),
+            #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+            Codec::Av1 => return Err(Error::Unsupported),
             Codec::H265 => return Err(Error::Unsupported),
         };
         let mut session = Self {
@@ -59,6 +64,7 @@ impl Decoder {
         Ok(session)
     }
     pub fn set_cancellation(&mut self, cancel: Arc<AtomicBool>) {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         if let Kernel::Av1(core) = &mut self.kernel {
             core.set_cancellation(cancel.clone());
         }
@@ -67,6 +73,7 @@ impl Decoder {
     pub fn reset(&mut self) -> Result<()> {
         match &mut self.kernel {
             Kernel::H264(core) => core.reset().map_err(h264_error),
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             Kernel::Av1(core) => core.reset(),
         }
     }
@@ -78,6 +85,7 @@ impl Decoder {
             return Err(Error::InvalidInput);
         }
         match &mut self.kernel {
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             Kernel::Av1(core) => Ok(core.push(data, token, &self.cancel)?.into_iter().collect()),
             Kernel::H264(core) => {
                 let pictures = core

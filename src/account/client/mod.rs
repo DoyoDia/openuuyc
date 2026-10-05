@@ -45,6 +45,7 @@ pub struct AuthenticatedClient {
     account_name: Mutex<String>,
     publication: Mutex<publication::Sync>,
     features: crate::account::feature_ability::FeatureCatalog,
+    controlling_features: crate::account::feature_ability::FeatureCatalog,
 }
 
 #[derive(Default)]
@@ -118,6 +119,7 @@ impl AuthenticatedClient {
             account_name,
             publication: Mutex::new(publication::Sync::default()),
             features: crate::account::feature_ability::FeatureCatalog::default(),
+            controlling_features: crate::account::feature_ability::FeatureCatalog::new(true),
         })
     }
 
@@ -275,6 +277,7 @@ impl AuthenticatedClient {
             let _ = task.await;
         }
         self.features.close().await;
+        self.controlling_features.close().await;
         self.close_device_owner().await;
     }
 
@@ -416,10 +419,16 @@ impl AuthenticatedClient {
     pub(crate) fn feature_catalog(&self) -> crate::account::feature_ability::FeatureCatalog {
         self.features.clone()
     }
+    pub(crate) fn controlling_features(&self) -> crate::account::feature_ability::FeatureCatalog {
+        self.schedule_feature_refresh(true);
+        self.controlling_features.clone()
+    }
 
     pub(crate) fn schedule_feature_refresh(&self, session_create: bool) {
         if let Some(api) = self.api.lock().unwrap_or_else(|e| e.into_inner()).clone() {
             self.features
+                .refresh(api.clone(), self.ended.clone(), session_create);
+            self.controlling_features
                 .refresh(api, self.ended.clone(), session_create);
         }
     }

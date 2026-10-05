@@ -1,6 +1,8 @@
 # OpenUUYC video codecs
 
-One platform-independent library for low-delay desktop streaming.
+One library for low-delay desktop streaming. AV1 software encoding and decoding
+are available only on x86 and x86_64; other architectures report AV1 software
+support as unavailable. Shared bitstream parsing remains architecture-independent.
 
 | Format | Software encoding | Software decoding |
 | --- | --- | --- |

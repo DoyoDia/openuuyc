@@ -1,15 +1,12 @@
-//! An opaque Draw stroke below regular ink, scoped to one existing screen.
+//! Per-screen background intent; official pen geometry lives in its adapter.
 use super::*;
-mod branding;
-
-const BRUSH_WIDTH: f32 = 64.;
+mod official;
 
 #[derive(Clone)]
 pub(super) struct Board {
-    stroke: Stroke,
-    logical_height: f32,
+    color: u32,
     metrics: Metrics,
-    marks: Vec<Stroke>,
+    official: Option<official::Geometry>,
 }
 pub(super) struct BoardEdit {
     screen: i32,
@@ -55,36 +52,6 @@ impl Metrics {
     }
 }
 
-fn fill(id: u32, screen: i32, metrics: Metrics, rgb: [u8; 3]) -> Result<Board> {
-    let height = metrics.logical_height();
-    let rows = (height / (BRUSH_WIDTH * 0.5)).ceil().max(1.) as usize;
-    if rows > MAX_POINTS / 6 - 1 {
-        bail!("当前屏幕尺寸超出白板绘制范围");
-    }
-    let mut points = Vec::with_capacity((rows + 1) * 6);
-    for row in 0..=rows {
-        let y = row as f32 / rows as f32;
-        let (left, right) = if row % 2 == 0 { (0., 1.) } else { (1., 0.) };
-        // Duplicate turns preserve coverage at the edges under host Bezier smoothing.
-        points.extend([Point { x: left, y }; 3]);
-        points.extend([Point { x: right, y }; 3]);
-    }
-    Ok(Board {
-        stroke: Stroke {
-            id,
-            screen,
-            points,
-            style: Style {
-                argb: u32::from_be_bytes([255, rgb[0], rgb[1], rgb[2]]),
-                width: BRUSH_WIDTH,
-            },
-        },
-        logical_height: height,
-        metrics,
-        marks: Vec::new(),
-    })
-}
-
 impl StreamControlHandle {
     pub(crate) fn annotation_board_color(&self, screen: i32) -> Option<[u8; 3]> {
         lock(&self.shared)
@@ -92,7 +59,7 @@ impl StreamControlHandle {
             .boards
             .get(&screen)
             .map(|board| {
-                let [_, r, g, b] = board.stroke.style.argb.to_be_bytes();
+                let [_, r, g, b] = board.color.to_be_bytes();
                 [r, g, b]
             })
     }
@@ -129,75 +96,41 @@ impl StreamControlHandle {
             .find(|v| v.id == screen && screen >= 0)
             .ok_or_else(|| anyhow!("批注屏幕已变化"))?;
         let metrics = Metrics::from_display(display);
-        let height = metrics.logical_height();
+        let wanted = color.map(|rgb| u32::from_be_bytes([255, rgb[0], rgb[1], rgb[2]]));
         let old = s.annotation.boards.get(&screen);
-        let mut requests = Vec::new();
-        let mut value = if let Some(rgb) = color {
-            let id = if let Some(board) = old {
-                board.stroke.id
-            } else {
-                (1..=BOARD_IDS)
-                    .step_by(BOARD_SLOT_IDS as usize)
-                    .find(|id| !s.annotation.boards.values().any(|b| b.stroke.id == *id))
-                    .ok_or_else(|| anyhow!("白板数量已达到上限"))?
-            };
-            let argb = u32::from_be_bytes([255, rgb[0], rgb[1], rgb[2]]);
-            if let Some(old) = old.filter(|board| height <= board.logical_height) {
-                if old.stroke.style.argb == argb && old.metrics == metrics {
-                    return Ok(());
+        if s.annotation.native_token.is_some() {
+            if old.map(|b| b.color) == wanted {
+                if let Some(board) = s.annotation.boards.get_mut(&screen) {
+                    board.metrics = metrics;
                 }
-                let mut board = old.clone();
-                board.stroke.style.argb = argb;
-                board.metrics = metrics;
-                if old.stroke.style.argb != argb {
-                    requests.push(stroke_request(
-                        &board.stroke,
-                        &[*board.stroke.points.last().unwrap()],
-                    ));
-                }
-                Some(board)
-            } else {
-                let board = fill(id, screen, metrics, rgb)?;
-                if old.is_some() {
-                    requests.push(clear_request(2, id, Some(screen)));
-                }
-                requests.extend(
-                    board
-                        .stroke
-                        .points
-                        .chunks(4096)
-                        .map(|points| stroke_request(&board.stroke, points)),
-                );
-                Some(board)
-            }
-        } else {
-            let Some(old) = old else {
                 return Ok(());
-            };
-            requests.push(clear_request(2, old.stroke.id, Some(screen)));
-            None
-        };
-        // All logo/text strokes share this screen's reserved background slot.
-        // Remove old lettering before changing the backdrop, then draw the new header.
-        let old_marks = old
-            .map(|board| {
-                board
-                    .marks
-                    .iter()
-                    .map(|mark| clear_request(2, mark.id, Some(screen)))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        requests.splice(0..0, old_marks);
-        if let Some(board) = &mut value {
-            let [_, r, g, b] = board.stroke.style.argb.to_be_bytes();
-            board.marks = branding::build(board.stroke.id, screen, metrics, [r, g, b])?;
-            requests.extend(board.marks.iter().flat_map(|mark| {
-                mark.points
-                    .chunks(4096)
-                    .map(|points| stroke_request(mark, points))
-            }));
+            }
+            s.annotation.board_edit = Some(BoardEdit {
+                screen,
+                value: wanted.map(|color| Board {
+                    color,
+                    metrics,
+                    official: None,
+                }),
+                remaining: 1,
+            });
+            let command = crate::protocol::annotation::Command::new(
+                crate::protocol::annotation::Operation::Board(crate::protocol::annotation::Board {
+                    screen,
+                    color: wanted,
+                }),
+            );
+            if let Err(error) = self.send_native_draw(s, command, Pending::Board) {
+                s.annotation.uncertain(error.to_string());
+                return Err(error);
+            }
+            return Ok(());
         }
+        let Some((value, requests)) =
+            official::plan(&s.annotation.boards, screen, metrics, wanted)?
+        else {
+            return Ok(());
+        };
         if requests.len() > MAX_PENDING {
             bail!("白板标识请求超出范围");
         }
@@ -208,12 +141,7 @@ impl StreamControlHandle {
         });
         s.annotation.error = None;
         for request in requests {
-            let kind = if matches!(request.payload, Some(PbDrawRequestKind::Stroke(_))) {
-                1
-            } else {
-                2
-            };
-            if let Err(e) = self.send_draw(s, request, Pending::Board(kind)) {
+            if let Err(e) = self.send_draw(s, request, Pending::Board) {
                 s.annotation.uncertain(e.to_string());
                 return Err(e);
             }
@@ -234,7 +162,7 @@ impl StreamControlHandle {
                 .find(|v| v.id == *screen)
                 .filter(|v| Metrics::from_display(v) != board.metrics)
                 .map(|_| {
-                    let [_, r, g, b] = board.stroke.style.argb.to_be_bytes();
+                    let [_, r, g, b] = board.color.to_be_bytes();
                     (*screen, [r, g, b])
                 })
         });

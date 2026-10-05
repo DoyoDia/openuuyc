@@ -177,6 +177,17 @@ impl Pipe {
         };
         Ok(pid)
     }
+    pub fn peer_session(&self, server: bool) -> Result<u32> {
+        let mut session = 0;
+        unsafe {
+            if server {
+                GetNamedPipeClientSessionId(self.handle.0, &mut session)?;
+            } else {
+                GetNamedPipeServerSessionId(self.handle.0, &mut session)?;
+            }
+        }
+        Ok(session)
+    }
     pub fn queued_bytes(&self) -> Result<u32> {
         let mut count = 0;
         unsafe {
@@ -301,7 +312,9 @@ impl Pipe {
         message: &T,
         permitted: impl Fn() -> bool,
     ) -> Result<()> {
-        let mut bytes = serde_json::to_vec(message)?;
+        self.send_raw(serde_json::to_vec(message)?, permitted)
+    }
+    pub(crate) fn send_raw(&self, mut bytes: Vec<u8>, permitted: impl Fn() -> bool) -> Result<()> {
         ensure!(bytes.len() <= MAX_FRAME, "被控服务消息过长");
         self.transfer(&mut (bytes.len() as u32).to_le_bytes(), true, &permitted)?;
         self.transfer(&mut bytes, true, &permitted)
@@ -317,6 +330,10 @@ impl Pipe {
         timeout: Duration,
         permitted: impl Fn() -> bool,
     ) -> Result<T> {
+        let bytes = self.receive_raw(timeout, permitted)?;
+        serde_json::from_slice(&bytes).map_err(|_| anyhow::anyhow!("被控服务消息无效"))
+    }
+    pub(crate) fn receive_raw(&self, timeout: Duration, permitted: impl Fn() -> bool) -> Result<Vec<u8>> {
         let deadline = Instant::now() + timeout;
         let mut size = [0; 4];
         if self.reader.borrow().is_some() {
@@ -337,6 +354,6 @@ impl Pipe {
         ensure!(size <= MAX_FRAME, "被控服务消息过长");
         let mut bytes = vec![0; size];
         self.transfer_until(&mut bytes, false, &permitted, deadline)?;
-        serde_json::from_slice(&bytes).map_err(|_| anyhow::anyhow!("被控服务消息无效"))
+        Ok(bytes)
     }
 }

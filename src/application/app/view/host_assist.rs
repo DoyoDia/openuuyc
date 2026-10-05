@@ -289,7 +289,9 @@ impl DeviceCenterApp {
         }
     }
     pub(super) fn host_assist_dialog(&mut self, ctx: &egui::Context) -> bool {
-        if self.assist_password_dialog(ctx) { return true; }
+        if self.assist_password_dialog(ctx) {
+            return true;
+        }
         self.assist_settings_dialog(ctx)
     }
 
@@ -380,6 +382,8 @@ impl DeviceCenterApp {
         };
         let original = host.assistance.settings();
         let mut settings = original.clone();
+        let original_clipboard = host.clipboard_settings();
+        let mut clipboard = original_clipboard;
         let mut close = false;
         let modal = egui::Modal::new(egui::Id::new("host-assist-settings"))
             .frame(dialog_frame())
@@ -454,6 +458,19 @@ impl DeviceCenterApp {
                         });
                     }
                 });
+                if host.is_guest() {
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        ui.label("允许剪贴板同步");
+                        crate::ui::controls::service_switch(ui, &mut clipboard.enabled);
+                    });
+                    ui.add_enabled_ui(clipboard.enabled, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("允许文件复制");
+                            crate::ui::controls::service_switch(ui, &mut clipboard.files);
+                        });
+                    });
+                }
                 close |= crate::ui::controls::dialog_actions(
                     ui,
                     Some(crate::ui::controls::DialogAction::new("完成")),
@@ -461,6 +478,12 @@ impl DeviceCenterApp {
                 )
                 .0;
             });
+        if clipboard != original_clipboard {
+            match host.set_clipboard_settings(clipboard) {
+                Ok(()) => self.save_host_settings(),
+                Err(error) => self.status = StatusMessage::error(error.to_string()),
+            }
+        }
         if settings != original {
             self.center_ui.host_assist_show_code = false;
             match host.set_assistance(settings) {

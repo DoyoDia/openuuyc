@@ -619,7 +619,8 @@ pub(super) fn show(
                     } else {
                         super::size(e.size)
                     },
-                    e.entry_type < 4,
+                    e.entry_type,
+                    &e.icon_type,
                     p.selection.contains(&e.full_path),
                 );
                 if response.double_clicked() && e.entry_type < 4 && nav_enabled {

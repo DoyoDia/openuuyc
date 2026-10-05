@@ -8,6 +8,12 @@ pub(crate) struct Status {
     #[serde(default)]
     pub connection: Option<ConnectionInfo>,
     pub ended_connection: Option<EndedConnection>,
+    #[serde(default)]
+    pub power_message: Option<String>,
+    #[serde(default)]
+    pub wol: super::wol::Status,
+    #[serde(default)]
+    pub wol_setup: super::wol::setup::Status,
     pub ready: bool,
     pub connected: bool,
     pub session_active: bool,
@@ -17,6 +23,14 @@ pub(crate) struct Status {
     pub settings_error: Option<String>,
     pub input_backend: Option<String>,
     pub input_error: Option<String>,
+    #[serde(default)]
+    pub clipboard: super::clipboard::Status,
+    #[serde(default)]
+    pub files: super::files::Status,
+    #[serde(default)]
+    pub file_transfers: Vec<crate::features::file_transfer::host::notices::Notice>,
+    #[serde(default)]
+    pub ports: crate::features::port_mapping::host::Status,
     #[serde(default)]
     pub audio: super::audio::Status,
     #[serde(default)]
@@ -29,8 +43,19 @@ pub(crate) struct Status {
     pub streams: std::collections::BTreeMap<usize, StreamStatus>,
 }
 
+impl Status {
+    pub(crate) fn disconnect_target(&self) -> Option<&str> {
+        self.connection
+            .as_ref()
+            .filter(|c| self.session_active && !c.observation_lost && !c.session_id.is_empty())
+            .map(|c| c.session_id.as_str())
+    }
+}
+
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ConnectionInfo {
+    #[serde(default)]
+    pub session_id: String,
     pub device_id: String,
     pub client_id: String,
     pub elapsed_seconds: Option<u64>,
@@ -80,10 +105,21 @@ pub(crate) struct AccessRequest {
     generation: u64,
 }
 
+pub(crate) enum RemoteAction {
+    Retry,
+    Disconnect(String),
+}
 struct Ownership {
     permission: u64,
     settings_revision: u64,
     encoding: super::EncodingSettings,
+    clipboard: super::clipboard::Settings,
+    file_transfer: bool,
+    port_mapping: bool,
+    remote_power: bool,
+    wol: bool,
+    power_executing: bool,
+    port_revision: u64,
     audio_device: watch::Sender<Option<super::audio::Device>>,
     audio_defaults: super::audio::DefaultDevices,
     audio_quality: crate::media::audio::encoder::Quality,
@@ -95,7 +131,7 @@ struct Ownership {
     dirty: bool,
     last_controlled: Option<std::time::Instant>,
     connected_since: Option<std::time::Instant>,
-    remote_action: Option<bool>,
+    remote_action: Option<RemoteAction>,
     updating: bool,
     update_notice: Option<Arc<super::peer::UpdateNotice>>,
     status: Status,
@@ -103,8 +139,12 @@ struct Ownership {
 
 #[derive(Clone)]
 pub(crate) struct Handle {
+    pub(crate) wol: super::wol::Handle,
+    pub(crate) wol_setup: super::wol::setup::Handle,
+    pub(crate) power: super::power::Handle,
     pub(crate) assistance: super::assist::Handle,
     desired: watch::Sender<Option<AccessRequest>>,
+    port_changed: watch::Sender<u64>,
     ownership: Arc<Mutex<Ownership>>,
     store: Option<settings::Store>,
     saving: Arc<tokio::sync::Mutex<()>>,
@@ -117,12 +157,23 @@ pub(crate) struct Handle {
 impl Default for Handle {
     fn default() -> Self {
         Self {
+            wol: Default::default(),
+            wol_setup: Default::default(),
+            power: Default::default(),
             assistance: Default::default(),
             desired: watch::channel(None).0,
+            port_changed: watch::channel(0).0,
             ownership: Arc::new(Mutex::new(Ownership {
                 permission: 0,
                 settings_revision: 0,
                 encoding: Default::default(),
+                clipboard: Default::default(),
+                file_transfer: true,
+                port_mapping: false,
+                remote_power: false,
+                wol: false,
+                power_executing: false,
+                port_revision: 0,
                 audio_device: watch::channel(None).0,
                 audio_defaults: Default::default(),
                 audio_quality: Default::default(),
@@ -163,9 +214,25 @@ fn finish_session(state: &mut Ownership) {
             ended_at: chrono::Utc::now().timestamp(),
         });
     }
+    for notice in &mut state.status.file_transfers {
+        notice.interrupt();
+    }
     clear_session(state);
 }
 
+fn disconnect_session(state: &mut Ownership, expected: &str, managed: bool) -> bool {
+    if !state.active || state.status.disconnect_target() != Some(expected) {
+        return false;
+    }
+    if managed {
+        state.remote_action = Some(RemoteAction::Disconnect(expected.to_owned()));
+    } else {
+        state.media = state.media.wrapping_add(1);
+        finish_session(state);
+        state.status.message = "等待连接".into();
+    }
+    true
+}
 fn clear_session(state: &mut Ownership) {
     state.connected_since = None;
     state.status.connection = None;
@@ -175,6 +242,9 @@ fn clear_session(state: &mut Ownership) {
     }
     state.status.connected = false;
     state.status.session_active = false;
+    state.status.clipboard = Default::default();
+    state.status.files = Default::default();
+    state.status.ports = Default::default();
     state.status.assistance = false;
     state.status.encoder = None;
     state.status.capture = None;
@@ -220,7 +290,7 @@ impl Handle {
     pub(crate) fn bind_account(&mut self, account: String) {
         self.account = account;
     }
-    pub(crate) fn take_remote_action(&self) -> Option<bool> {
+    pub(crate) fn take_remote_action(&self) -> Option<RemoteAction> {
         lock(&self.ownership).remote_action.take()
     }
     pub(crate) async fn apply_remote(
@@ -245,6 +315,11 @@ impl Handle {
         state.audio_device.send_replace(snapshot.audio_device);
         state.audio_defaults = snapshot.audio_defaults;
         state.audio_quality = snapshot.audio_quality;
+        state.clipboard = snapshot.clipboard;
+        state.file_transfer = snapshot.file_transfer;
+        state.port_mapping = snapshot.port_mapping;
+        state.remote_power = snapshot.remote_power;
+        state.wol = snapshot.wol;
         state.status = snapshot.status;
         self.assistance.replace(snapshot.assistance);
     }
@@ -311,7 +386,19 @@ impl Handle {
             store.load()
         });
         match result {
-            Ok((allowed, encoding, audio_device, audio_defaults, audio_quality, assistance)) => {
+            Ok((
+                allowed,
+                encoding,
+                audio_device,
+                audio_defaults,
+                audio_quality,
+                assistance,
+                clipboard,
+                file_transfer,
+                port_mapping,
+                remote_power,
+                wol,
+            )) => {
                 let _ = handle.assistance.configure(assistance);
                 handle.set_allowed(allowed);
                 let mut state = lock(&handle.ownership);
@@ -319,6 +406,11 @@ impl Handle {
                 state.audio_device.send_replace(audio_device);
                 state.audio_defaults = audio_defaults;
                 state.audio_quality = audio_quality;
+                state.clipboard = clipboard;
+                state.file_transfer = file_transfer;
+                state.port_mapping = port_mapping;
+                state.remote_power = remote_power;
+                state.wol = wol;
                 state.dirty = false;
                 state.status.saving = false;
             }
@@ -334,6 +426,156 @@ impl Handle {
     }
     pub(crate) fn audio_defaults(&self) -> super::audio::DefaultDevices {
         lock(&self.ownership).audio_defaults
+    }
+    pub(crate) fn file_transfer_allowed(&self) -> bool {
+        lock(&self.ownership).file_transfer
+    }
+    pub(crate) fn set_file_transfer_allowed(&self, allowed: bool) -> anyhow::Result<()> {
+        let mut state = lock(&self.ownership);
+        anyhow::ensure!(state.active, "账号会话已结束");
+        if state.file_transfer != allowed {
+            state.file_transfer = allowed;
+            state.settings_revision = state.settings_revision.wrapping_add(1);
+            state.dirty = true;
+            state.status.saving = true;
+            state.status.settings_error = None;
+        }
+        Ok(())
+    }
+    pub(crate) fn wol_allowed(&self) -> bool {
+        lock(&self.ownership).wol
+    }
+    pub(crate) fn wol_setup_status(&self, status: super::wol::setup::Status) {
+        let mut s = lock(&self.ownership);
+        if s.active {
+            s.status.wol_setup = status;
+        }
+    }
+    pub(crate) fn wol_setup_action(&self, action: super::wol::setup::Action) -> anyhow::Result<()> {
+        anyhow::ensure!(!self.guest && lock(&self.ownership).active, "请先登录");
+        use crate::platform::windows::host_service::resident;
+        if resident::managed() {
+            resident::call(resident::Request::WolSetup {
+                account: self.account.clone(),
+                action,
+            })
+            .map(|_| ())
+        } else {
+            self.wol_setup.act(action)
+        }
+    }
+    pub(crate) fn wol_permitted(&self) -> bool {
+        let s = lock(&self.ownership);
+        !self.guest && s.active && s.allowed && s.wol
+    }
+    pub(crate) fn wol_registration_permitted(&self) -> bool {
+        let s = lock(&self.ownership);
+        !self.guest && s.active && s.allowed && (s.wol || self.wol_setup.enabled())
+    }
+    pub(crate) fn set_wol_allowed(&self, allowed: bool) -> anyhow::Result<()> {
+        let mut s = lock(&self.ownership);
+        anyhow::ensure!(
+            s.active && (!allowed || !self.guest),
+            "当前账号不可启用局域网唤醒协助"
+        );
+        if s.wol != allowed {
+            s.wol = allowed;
+            s.settings_revision = s.settings_revision.wrapping_add(1);
+            s.dirty = true;
+            s.status.saving = true;
+            s.status.settings_error = None;
+            self.wol.change();
+        }
+        Ok(())
+    }
+    pub(crate) fn wol_status(&self, revision: u64, status: super::wol::Status) {
+        let mut s = lock(&self.ownership);
+        if s.active && self.wol.revision() == revision {
+            s.status.wol = status;
+        }
+    }
+    pub(crate) fn power_allowed(&self) -> bool {
+        lock(&self.ownership).remote_power
+    }
+    pub(crate) fn power_permitted(&self) -> bool {
+        let state = lock(&self.ownership);
+        !self.guest && state.active && state.allowed && state.remote_power && !state.updating
+    }
+    pub(crate) fn set_power_allowed(&self, allowed: bool) -> anyhow::Result<()> {
+        let mut state = lock(&self.ownership);
+        anyhow::ensure!(
+            state.active && (!allowed || !self.guest),
+            "当前账号不可启用远程电源操作"
+        );
+        if state.remote_power != allowed {
+            state.remote_power = allowed;
+            state.power_executing = false;
+            state.status.power_message = None;
+            state.settings_revision = state.settings_revision.wrapping_add(1);
+            state.dirty = true;
+            state.status.saving = true;
+            state.status.settings_error = None;
+            self.power.invalidate();
+        }
+        Ok(())
+    }
+    pub(crate) fn begin_power(&self) -> anyhow::Result<()> {
+        let mut state = lock(&self.ownership);
+        anyhow::ensure!(
+            !self.guest && state.active && state.allowed && state.remote_power && !state.updating,
+            "远程电源许可已撤销"
+        );
+        state.power_executing = true;
+        state.status.power_message = Some("正在结束连接并执行电源操作…".into());
+        Ok(())
+    }
+    pub(crate) fn power_result(&self, result: Result<(), String>) {
+        let mut state = lock(&self.ownership);
+        // Windows may allow the user to cancel shutdown for unsaved applications.
+        // Do not leave remote access permanently disabled after API acceptance.
+        state.power_executing = false;
+        match result {
+            Ok(()) => state.status.power_message = Some("Windows 已接受电源请求".into()),
+            Err(error) => {
+                state.power_executing = false;
+                state.status.power_message = Some(error);
+            }
+        }
+    }
+    pub(crate) fn port_mapping_allowed(&self) -> bool {
+        lock(&self.ownership).port_mapping
+    }
+    pub(crate) fn set_port_mapping_allowed(&self, allowed: bool) -> anyhow::Result<()> {
+        let mut state = lock(&self.ownership);
+        anyhow::ensure!(state.active, "账号会话已结束");
+        if state.port_mapping != allowed {
+            state.port_mapping = allowed;
+            state.port_revision = state.port_revision.wrapping_add(1);
+            self.port_changed.send_replace(state.port_revision);
+            state.settings_revision = state.settings_revision.wrapping_add(1);
+            state.dirty = true;
+            state.status.saving = true;
+            state.status.settings_error = None;
+        }
+        Ok(())
+    }
+    pub(crate) fn clipboard_settings(&self) -> super::clipboard::Settings {
+        lock(&self.ownership).clipboard
+    }
+    pub(crate) fn set_clipboard_settings(
+        &self,
+        settings: super::clipboard::Settings,
+    ) -> anyhow::Result<()> {
+        let mut state = lock(&self.ownership);
+        anyhow::ensure!(state.active, "账号会话已结束");
+        if state.clipboard != settings {
+            state.clipboard = settings;
+            state.settings_revision = state.settings_revision.wrapping_add(1);
+            state.dirty = true;
+            state.status.saving = true;
+            state.status.settings_error = None;
+        }
+        Ok(())
     }
     pub(crate) fn audio_quality(&self) -> crate::media::audio::encoder::Quality {
         lock(&self.ownership).audio_quality
@@ -462,11 +704,16 @@ impl Handle {
         self.media.snapshot()
     }
     pub(crate) fn set_allowed(&self, allowed: bool) {
+        if !allowed {
+            self.power.invalidate();
+        }
+
         let mut state = lock(&self.ownership);
         if !state.active || state.allowed == allowed {
             return;
         }
         state.allowed = allowed;
+        self.wol.change();
         state.settings_revision = state.settings_revision.wrapping_add(1);
         state.permission = state.permission.wrapping_add(1);
         state.dirty = true;
@@ -507,6 +754,11 @@ impl Handle {
                 audio_defaults,
                 audio_quality,
                 assistance,
+                clipboard,
+                file_transfer,
+                port_mapping,
+                remote_power,
+                wol,
             ) = {
                 let state = lock(&self.ownership);
                 if !state.dirty {
@@ -520,6 +772,11 @@ impl Handle {
                     state.audio_defaults,
                     state.audio_quality,
                     self.assistance.settings(),
+                    state.clipboard,
+                    state.file_transfer,
+                    state.port_mapping,
+                    state.remote_power,
+                    state.wol,
                 )
             };
             let result = if crate::platform::windows::host_service::resident::managed() {
@@ -532,6 +789,11 @@ impl Handle {
                         audio_defaults,
                         audio_quality,
                         assistance,
+                        clipboard,
+                        file_transfer,
+                        port_mapping,
+                        remote_power,
+                        wol,
                     },
                 )
                 .await
@@ -545,6 +807,11 @@ impl Handle {
                         audio_defaults,
                         audio_quality,
                         assistance,
+                        clipboard,
+                        file_transfer,
+                        port_mapping,
+                        remote_power,
+                        wol,
                     )
                 })
                 .await
@@ -565,7 +832,7 @@ impl Handle {
     }
     pub(crate) fn retry(&self) {
         if crate::platform::windows::host_service::resident::managed() {
-            lock(&self.ownership).remote_action = Some(true);
+            lock(&self.ownership).remote_action = Some(RemoteAction::Retry);
             return;
         }
         let mut state = lock(&self.ownership);
@@ -582,6 +849,8 @@ impl Handle {
         }));
     }
     pub(crate) fn retire(&self) {
+        self.wol.online(false);
+        self.power.invalidate();
         self.assistance.unavailable();
         let mut state = lock(&self.ownership);
         state.active = false;
@@ -604,21 +873,22 @@ impl Handle {
             }));
     }
     pub(crate) fn disconnect(&self) {
-        if crate::platform::windows::host_service::resident::managed() {
-            lock(&self.ownership).remote_action = Some(false);
-            return;
+        let session = lock(&self.ownership)
+            .status
+            .connection
+            .as_ref()
+            .map(|c| c.session_id.clone());
+        if let Some(session) = session {
+            self.disconnect_session(&session);
         }
-        let mut state = lock(&self.ownership);
-        if !state.status.session_active {
-            return;
-        }
-        state.media = state.media.wrapping_add(1);
-        finish_session(&mut state);
-        state.status.message = "等待连接".into();
+    }
+    pub(crate) fn disconnect_session(&self, session: &str) -> bool {
+        let managed = crate::platform::windows::host_service::resident::managed();
+        disconnect_session(&mut lock(&self.ownership), session, managed)
     }
     pub(crate) fn requested(&self) -> bool {
         let state = lock(&self.ownership);
-        state.active && state.allowed
+        state.active && state.allowed && !state.power_executing
     }
     pub(crate) fn subscribe(&self) -> watch::Receiver<Option<AccessRequest>> {
         self.desired.subscribe()
@@ -690,7 +960,14 @@ impl Drop for SessionLease {
 impl Lease {
     pub(crate) fn controller(&self, device_id: &str, client_id: &str) {
         self.modify(|state| {
+            let session_id = state
+                .status
+                .connection
+                .as_ref()
+                .map(|c| c.session_id.clone())
+                .unwrap_or_default();
             state.status.connection = Some(ConnectionInfo {
+                session_id,
                 device_id: if crate::account::api::validate_device_id(device_id).is_ok() {
                     device_id.to_owned()
                 } else {
@@ -794,9 +1071,14 @@ impl Lease {
         let mut state = lock(&self.handle.ownership);
         anyhow::ensure!(self.current(&state), "本次被控许可已失效");
         anyhow::ensure!(!state.updating, "被控端正在更新，请稍后重新连接");
+        anyhow::ensure!(!state.power_executing, "被控端正在执行电源操作");
         state.media = state.media.wrapping_add(1);
         finish_session(&mut state);
         state.status.session_active = true;
+        state.status.connection = Some(ConnectionInfo {
+            session_id: uuid::Uuid::new_v4().simple().to_string(),
+            ..Default::default()
+        });
         state.status.assistance = self.is_assistance();
         state.status.error = None;
         Ok(SessionLease(Self {
@@ -856,6 +1138,76 @@ impl Lease {
     }
     pub(crate) fn audio_status(&self, audio: super::audio::Status) {
         self.modify(|state| state.status.audio = audio);
+    }
+    pub(crate) fn clipboard_settings(&self) -> super::clipboard::Settings {
+        self.handle.clipboard_settings()
+    }
+    pub(crate) fn port_changes(&self) -> watch::Receiver<u64> {
+        self.handle.port_changed.subscribe()
+    }
+    pub(crate) fn port_policy(&self) -> (bool, u64) {
+        let state = lock(&self.handle.ownership);
+        (
+            self.current(&state)
+                && self.assistance.is_none()
+                && !self.handle.guest
+                && state.port_mapping,
+            state.port_revision,
+        )
+    }
+    pub(crate) fn port_status(&self, status: crate::features::port_mapping::host::Status) {
+        self.modify(|s| s.status.ports = status);
+    }
+    pub(crate) fn file_access(&self) -> bool {
+        self.requested()
+            && self.assistance.is_none()
+            && !self.handle.guest
+            && self.handle.file_transfer_allowed()
+    }
+    pub(crate) fn file_scope(&self) -> String {
+        let state = lock(&self.handle.ownership);
+        format!(
+            "{}:{}",
+            self.handle.scope,
+            state
+                .status
+                .connection
+                .as_ref()
+                .map_or("", |c| c.device_id.as_str())
+        )
+    }
+    pub(crate) fn file_notices(
+        &self,
+        updates: Vec<crate::features::file_transfer::host::notices::Notice>,
+    ) {
+        if updates.is_empty() {
+            return;
+        }
+        let mut state = lock(&self.handle.ownership);
+        // Permit this owner's final cancellation report, but never resurrect an old account/session.
+        if !self.current_owner(&state) {
+            return;
+        }
+        let notices = &mut state.status.file_transfers;
+        let now = chrono::Utc::now().timestamp();
+        notices.retain(|v| v.state == 0 || now.saturating_sub(v.updated) < 120);
+        for value in updates {
+            if let Some(old) = notices.iter_mut().find(|n| n.id == value.id) {
+                *old = value;
+            } else {
+                if notices.len() >= 24 {
+                    let index = notices.iter().position(|n| n.state != 0).unwrap_or(0);
+                    notices.remove(index);
+                }
+                notices.push(value);
+            }
+        }
+    }
+    pub(crate) fn file_status(&self, status: super::files::Status) {
+        self.modify(|s| s.status.files = status);
+    }
+    pub(crate) fn clipboard_status(&self, status: super::clipboard::Status) {
+        self.modify(|s| s.status.clipboard = status);
     }
     pub(crate) fn microphone_status(&self, microphone: super::microphone::Status) {
         self.modify(|state| state.status.microphone = microphone);

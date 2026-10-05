@@ -1,5 +1,4 @@
-//! Controller-side TCP tunnels over UU's FILE channel, with binary protobuf payloads.
-//! No incoming SYN is executed: this client never exposes a forwarding server.
+//! TCP streams and UDP datagrams over an authenticated device FILE channel.
 use anyhow::{Context, Result, ensure};
 use bytes::Bytes;
 use prost::Message;
@@ -21,8 +20,10 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use webrtc::data_channel::{RTCDataChannel, data_channel_state::RTCDataChannelState};
 
+pub(crate) mod host;
 pub(crate) mod service;
 pub(crate) mod store;
+mod udp;
 pub(crate) mod ui;
 
 const CHUNK: usize = 524_160;
@@ -47,6 +48,7 @@ struct Frame {
 struct Incoming {
     frame: Frame,
     _permit: OwnedSemaphorePermit,
+    _global: OwnedSemaphorePermit,
 }
 struct Route {
     sender: mpsc::Sender<Incoming>,
@@ -56,19 +58,38 @@ struct Route {
     fault: Arc<Mutex<Option<String>>>,
 }
 
-#[derive(Default)]
 pub(crate) struct Transport {
     channel: Mutex<Weak<RTCDataChannel>>,
     routes: Mutex<HashMap<(u64, u64), Route>>,
     changed: Notify,
     serial: AtomicU64,
     send_lock: tokio::sync::Mutex<()>,
+    budget: Arc<Semaphore>,
+}
+impl Default for Transport {
+    fn default() -> Self {
+        Self {
+            channel: Mutex::new(Weak::new()),
+            routes: Mutex::default(),
+            changed: Notify::new(),
+            serial: AtomicU64::new(0),
+            send_lock: tokio::sync::Mutex::new(()),
+            budget: Arc::new(Semaphore::new(32 * 1024 * 1024)),
+        }
+    }
 }
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 impl Transport {
+    fn register(&self, key: (u64, u64), route: Route) -> Result<()> {
+        let mut routes = lock(&self.routes);
+        ensure!(routes.len() < 128, "端口转发总连接数已达上限");
+        ensure!(!routes.contains_key(&key), "端口转发编号重复");
+        routes.insert(key, route);
+        Ok(())
+    }
     pub(crate) fn bind(&self, channel: &Arc<RTCDataChannel>) {
         *lock(&self.channel) = Arc::downgrade(channel);
         self.changed.notify_waiters();
@@ -109,20 +130,28 @@ impl Transport {
             return Ok(());
         };
         let frame = Frame::decode(frame.as_slice()).context("无效端口转发消息")?;
+        self.deliver(frame)
+    }
+    fn deliver(&self, frame: Frame) -> Result<()> {
         // Unknown oneof, unknown streams and SYN must never create remote side effects.
-        if !matches!(frame.kind, 1..=4) {
+        if !matches!(frame.kind, 1..=4 | 17..=20) {
             return Ok(());
         }
         let routes = lock(&self.routes);
         let Some(route) = routes.get(&(frame.rule_id, frame.stream_id)) else {
             return Ok(());
         };
-        if frame.kind == 1 {
+        if matches!(frame.kind, 1 | 19) {
             route.remote_fin.store(true, Ordering::Release);
         }
         let size = frame.payload.len().max(1);
         let Ok(permit) = Arc::clone(&route.budget).try_acquire_many_owned(size as u32) else {
-            *lock(&route.fault) = Some("端口转发接收缓存超过 8 MiB".into());
+            *lock(&route.fault) = Some("端口转发单连接接收缓存已满".into());
+            route.stop.cancel();
+            return Ok(());
+        };
+        let Ok(global) = self.budget.clone().try_acquire_many_owned(size as u32) else {
+            *lock(&route.fault) = Some("端口转发总接收缓存已满".into());
             route.stop.cancel();
             return Ok(());
         };
@@ -131,6 +160,7 @@ impl Transport {
             .try_send(Incoming {
                 frame,
                 _permit: permit,
+                _global: global,
             })
             .is_err()
         {
@@ -154,8 +184,8 @@ impl Transport {
         let channel = lock(&self.channel)
             .upgrade()
             .context("端口转发连接已关闭")?;
-        // Serialize the capacity check with submission; the underlying writer
-        // otherwise accepts into an unbounded queue. Stop reading TCP while full.
+        // Serialize the per-device budget check with submission. Stop reading
+        // TCP while full; the SCTP association also has its own bounded budget.
         tokio::time::timeout(TIMEOUT, async {
             let _guard = self.send_lock.lock().await;
             loop {
@@ -187,12 +217,16 @@ impl Transport {
         let payload = serde_json::to_vec(
             &serde_json::json!({"target_host":rule.target,"target_port":rule.remote_port,"version":1}),
         )?;
-        self.send(rule.id, stream, 0, payload.into()).await?;
+        self.send(rule.id, stream, rule.protocol.syn(), payload.into())
+            .await?;
         let response = tokio::time::timeout(TIMEOUT, incoming.recv())
             .await
             .context("目标连接握手超时")?
             .context("端口转发已关闭")?;
-        ensure!(response.frame.kind == 3, "端口转发握手顺序错误");
+        ensure!(
+            response.frame.kind == rule.protocol.ack(),
+            "被控端不支持所选转发协议"
+        );
         #[derive(serde::Deserialize)]
         struct Reply {
             ok: bool,
@@ -207,7 +241,8 @@ impl Transport {
         ensure!(reply.ok, "目标连接失败：{}", reply.error);
         ensure!(reply.version == 1, "目标端口转发协议版本不支持");
         drop(response);
-        self.send(rule.id, stream, 4, Bytes::new()).await?;
+        self.send(rule.id, stream, rule.protocol.ready(), Bytes::new())
+            .await?;
         Ok(())
     }
 
@@ -219,7 +254,7 @@ impl Transport {
         let cancel = parent.child_token();
         let (sender, mut incoming) = mpsc::channel(32);
         let remote_fin = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        lock(&self.routes).insert(
+        if let Err(error) = self.register(
             (rule.id, stream),
             Route {
                 sender,
@@ -228,7 +263,9 @@ impl Transport {
                 remote_fin: Arc::clone(&remote_fin),
                 fault: Arc::new(Mutex::new(None)),
             },
-        );
+        ) {
+            return ProbeStatus::Unreachable(error.to_string());
+        }
         let started = std::time::Instant::now();
         let connected = tokio::select! {
             biased;
@@ -289,7 +326,7 @@ impl Transport {
         let remote_fin = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let fault = Arc::new(Mutex::new(None));
         let (sender, mut incoming) = mpsc::channel(1024);
-        lock(&self.routes).insert(
+        if let Err(error) = self.register(
             (rule.id, stream),
             Route {
                 sender,
@@ -298,7 +335,10 @@ impl Transport {
                 remote_fin: Arc::clone(&remote_fin),
                 fault: Arc::clone(&fault),
             },
-        );
+        ) {
+            lock(&stats).error = Some(error.to_string());
+            return;
+        }
         lock(&stats).connections += 1;
         let result = tokio::select! {
             biased;
@@ -356,6 +396,31 @@ fn protocol_version() -> i32 {
     1
 }
 
+/// Values 16..20 are an OpenUUYC datagram extension. Official peers ignore
+/// them rather than opening a TCP socket for a UDP request.
+#[derive(Clone, Copy, Debug, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub(crate) enum Protocol {
+    #[default]
+    Tcp,
+    Udp,
+}
+impl Protocol {
+    fn syn(self) -> i32 {
+        if self == Self::Tcp { 0 } else { 16 }
+    }
+    fn ack(self) -> i32 {
+        if self == Self::Tcp { 3 } else { 17 }
+    }
+    fn ready(self) -> i32 {
+        self.syn() + 4
+    }
+    fn fin(self) -> i32 {
+        if self == Self::Tcp { 1 } else { 19 }
+    }
+    pub(crate) fn label(self) -> &'static str {
+        if self == Self::Tcp { "TCP" } else { "UDP" }
+    }
+}
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub(crate) struct Rule {
     pub id: u64,
@@ -365,6 +430,8 @@ pub(crate) struct Rule {
     pub target: IpAddr,
     pub remote_port: u16,
     pub enabled: bool,
+    #[serde(default)]
+    pub protocol: Protocol,
 }
 impl Rule {
     pub(crate) fn validate(&self) -> Result<()> {
@@ -412,6 +479,10 @@ pub(crate) async fn run_rule(
     status: Arc<Mutex<RuleStatus>>,
     probe: Arc<Notify>,
 ) {
+    if rule.protocol == Protocol::Udp {
+        udp::run_rule(rule, transport, stop, status).await;
+        return;
+    }
     let result=async {
         rule.validate()?;
         let endpoint=SocketAddr::new(rule.local_addr,rule.local_port);
@@ -428,6 +499,7 @@ pub(crate) async fn run_rule(
                 Some(result)=streams.join_next(), if !streams.is_empty()=>{if let Err(error)=result {tracing::warn!(%error,"TCP forwarding task failed");}},
                 accepted=listener.accept()=>{
                     let (socket,_)=match accepted{Ok(value)=>value,Err(error)=>break Err(anyhow::Error::from(error))};
+                    if streams.len() >= 65 { drop(socket); continue; }
                     streams.spawn(Arc::clone(&transport).stream(rule.clone(),socket,stop.clone(),Arc::clone(&status)));
                 }
             }

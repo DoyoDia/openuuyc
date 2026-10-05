@@ -139,7 +139,7 @@ impl Rav1dPalDSPContext {
         }
     }
 
-    #[cfg(all(feature = "asm", any(target_arch = "x86", target_arch = "x86_64")))]
+    #[cfg(feature = "asm")]
     #[inline(always)]
     const fn init_x86(mut self, flags: CpuFlags) -> Self {
         if !flags.contains(CpuFlags::SSSE3) {
@@ -166,23 +166,12 @@ impl Rav1dPalDSPContext {
         self
     }
 
-    #[cfg(all(feature = "asm", any(target_arch = "arm", target_arch = "aarch64")))]
-    #[inline(always)]
-    const fn init_arm(self, _flags: CpuFlags) -> Self {
-        self
-    }
-
     #[inline(always)]
     const fn init(self, flags: CpuFlags) -> Self {
         #[cfg(feature = "asm")]
         {
-            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             {
                 return self.init_x86(flags);
-            }
-            #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
-            {
-                return self.init_arm(flags);
             }
         }
 

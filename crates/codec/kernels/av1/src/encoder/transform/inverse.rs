@@ -10,8 +10,6 @@
 cfg_if::cfg_if! {
   if #[cfg(nasm_x86_64)] {
     pub use crate::encoder::asm::x86::transform::inverse::*;
-  } else if #[cfg(asm_neon)] {
-    pub use crate::encoder::asm::aarch64::transform::inverse::*;
   } else {
     pub use self::rust::*;
   }
@@ -1629,7 +1627,7 @@ pub(crate) mod rust {
   use simd_helpers::cold_for_target_arch;
   use std::cmp;
 
-  #[cold_for_target_arch("x86_64", "aarch64")]
+  #[cold_for_target_arch("x86_64")]
   pub fn inverse_transform_add<T: Pixel>(
     input: &[T::Coeff], output: &mut PlaneRegionMut<'_, T>, _eob: u16,
     tx_size: TxSize, tx_type: TxType, bd: usize, _cpu: CpuFeatureLevel,

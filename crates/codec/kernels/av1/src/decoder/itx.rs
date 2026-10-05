@@ -6,19 +6,15 @@ use strum::EnumCount;
 use crate::decoder::cpu::CpuFlags;
 use crate::decoder::enum_map::DefaultValue;
 use crate::decoder::ffi_safe::FFISafe;
-#[cfg(all(
-    feature = "asm",
-    not(any(target_arch = "riscv64", target_arch = "riscv32"))
-))]
+#[cfg(feature = "asm")]
 use crate::decoder::include::common::bitdepth::bd_fn;
-#[cfg(all(feature = "asm", any(target_arch = "x86", target_arch = "x86_64")))]
+#[cfg(feature = "asm")]
 use crate::decoder::include::common::bitdepth::bpc_fn;
 use crate::decoder::include::common::bitdepth::{AsPrimitive, BitDepth, DynCoef, DynPixel};
 use crate::decoder::include::common::intops::iclip;
 use crate::decoder::include::dav1d::picture::{
     FFISafeRav1dPictureDataComponentOffset, Rav1dPictureDataComponentOffset,
 };
-#[cfg(not(all(feature = "asm", target_feature = "neon")))]
 use crate::decoder::itx_1d::rav1d_inv_wht4_1d_c;
 use crate::decoder::itx_1d::{
     rav1d_inv_adst16_1d_c, rav1d_inv_adst4_1d_c, rav1d_inv_adst8_1d_c, rav1d_inv_dct16_1d_c,
@@ -190,7 +186,6 @@ fn inv_txfm_add_rust<const W: usize, const H: usize, const TYPE: TxfmType, BD: B
         V_ADST => (Adst, Identity),
         V_FLIPADST => (FlipAdst, Identity),
 
-        #[cfg(not(all(feature = "asm", target_feature = "neon")))]
         WHT_WHT if (W, H) == (4, 4) => return inv_txfm_add_wht_wht_4x4_rust(dst, coeff, bd),
 
         _ => unreachable!(),
@@ -293,7 +288,6 @@ pub struct Rav1dInvTxfmDSPContext {
     pub itxfm_add: [[itxfm::Fn; N_TX_TYPES_PLUS_LL]; TxfmSize::COUNT],
 }
 
-#[cfg(not(all(feature = "asm", target_feature = "neon")))]
 fn inv_txfm_add_wht_wht_4x4_rust<BD: BitDepth>(
     dst: Rav1dPictureDataComponentOffset,
     coeff: &mut [BD::Coef],
@@ -328,10 +322,7 @@ fn inv_txfm_add_wht_wht_4x4_rust<BD: BitDepth>(
     }
 }
 
-#[cfg(all(
-    feature = "asm",
-    not(any(target_arch = "riscv64", target_arch = "riscv32"))
-))]
+#[cfg(feature = "asm")]
 macro_rules! assign_itx_fn {
     ($c:ident, $BD:ty, $w:literal, $h:literal, $type:ident, $type_enum:ident, $ext:ident) => {{
         use paste::paste;
@@ -345,7 +336,7 @@ macro_rules! assign_itx_fn {
     }};
 }
 
-#[cfg(all(feature = "asm", any(target_arch = "x86", target_arch = "x86_64")))]
+#[cfg(feature = "asm")]
 macro_rules! assign_itx_bpc_fn {
     ($c:ident, $w:literal, $h:literal, $type:ident, $type_enum:ident, $bpc:literal bpc, $ext:ident) => {{
         use paste::paste;
@@ -359,21 +350,14 @@ macro_rules! assign_itx_bpc_fn {
     }};
 }
 
-#[cfg(all(feature = "asm", any(target_arch = "x86", target_arch = "x86_64")))]
+#[cfg(feature = "asm")]
 macro_rules! assign_itx1_bpc_fn {
     ($c:ident, $w:literal, $h:literal, $bpc:literal bpc, $ext:ident) => {{
         assign_itx_bpc_fn!($c, $w, $h, dct_dct, DCT_DCT, $bpc bpc, $ext)
     }};
 }
 
-#[cfg(all(feature = "asm", any(target_arch = "arm", target_arch = "aarch64")))]
-macro_rules! assign_itx1_fn {
-    ($c:ident, $BD:ty, $w:literal, $h:literal, $ext:ident) => {{
-        assign_itx_fn!($c, BD, $w, $h, dct_dct, DCT_DCT, $ext)
-    }};
-}
-
-#[cfg(all(feature = "asm", any(target_arch = "x86", target_arch = "x86_64")))]
+#[cfg(feature = "asm")]
 macro_rules! assign_itx2_bpc_fn {
     ($c:ident, $w:literal, $h:literal, $bpc:literal bpc, $ext:ident) => {{
         assign_itx1_bpc_fn!($c, $w, $h, $bpc bpc, $ext);
@@ -381,15 +365,7 @@ macro_rules! assign_itx2_bpc_fn {
     }};
 }
 
-#[cfg(all(feature = "asm", any(target_arch = "arm", target_arch = "aarch64")))]
-macro_rules! assign_itx2_fn {
-    ($c:ident, $BD:ty, $w:literal, $h:literal, $ext:ident) => {{
-        assign_itx1_fn!($c, BD, $w, $h, $ext);
-        assign_itx_fn!($c, BD, $w, $h, identity_identity, IDTX, $ext)
-    }};
-}
-
-#[cfg(all(feature = "asm", any(target_arch = "x86", target_arch = "x86_64")))]
+#[cfg(feature = "asm")]
 macro_rules! assign_itx12_bpc_fn {
     ($c:ident, $w:literal, $h:literal, $bpc:literal bpc, $ext:ident) => {{
         assign_itx2_bpc_fn!($c, $w, $h, $bpc bpc, $ext);
@@ -406,24 +382,7 @@ macro_rules! assign_itx12_bpc_fn {
     }};
 }
 
-#[cfg(all(feature = "asm", any(target_arch = "arm", target_arch = "aarch64")))]
-macro_rules! assign_itx12_fn {
-    ($c:ident, $BD:ty, $w:literal, $h:literal, $ext:ident) => {{
-        assign_itx2_fn!($c, BD, $w, $h, $ext);
-        assign_itx_fn!($c, BD, $w, $h, dct_flipadst, FLIPADST_DCT, $ext);
-        assign_itx_fn!($c, BD, $w, $h, dct_adst, ADST_DCT, $ext);
-        assign_itx_fn!($c, BD, $w, $h, dct_identity, H_DCT, $ext);
-        assign_itx_fn!($c, BD, $w, $h, adst_dct, DCT_ADST, $ext);
-        assign_itx_fn!($c, BD, $w, $h, adst_adst, ADST_ADST, $ext);
-        assign_itx_fn!($c, BD, $w, $h, adst_flipadst, FLIPADST_ADST, $ext);
-        assign_itx_fn!($c, BD, $w, $h, flipadst_dct, DCT_FLIPADST, $ext);
-        assign_itx_fn!($c, BD, $w, $h, flipadst_adst, ADST_FLIPADST, $ext);
-        assign_itx_fn!($c, BD, $w, $h, flipadst_flipadst, FLIPADST_FLIPADST, $ext);
-        assign_itx_fn!($c, BD, $w, $h, identity_dct, V_DCT, $ext);
-    }};
-}
-
-#[cfg(all(feature = "asm", any(target_arch = "x86", target_arch = "x86_64")))]
+#[cfg(feature = "asm")]
 macro_rules! assign_itx16_bpc_fn {
     ($c:ident, $w:literal, $h:literal, $bpc:literal bpc, $ext:ident) => {{
         assign_itx12_bpc_fn!($c, $w, $h, $bpc bpc, $ext);
@@ -431,17 +390,6 @@ macro_rules! assign_itx16_bpc_fn {
         assign_itx_bpc_fn!($c, $w, $h, flipadst_identity, H_FLIPADST, $bpc bpc, $ext);
         assign_itx_bpc_fn!($c, $w, $h, identity_adst, V_ADST, $bpc bpc, $ext);
         assign_itx_bpc_fn!($c, $w, $h, identity_flipadst, V_FLIPADST, $bpc bpc, $ext);
-    }};
-}
-
-#[cfg(all(feature = "asm", any(target_arch = "arm", target_arch = "aarch64")))]
-macro_rules! assign_itx16_fn {
-    ($c:ident, $BD:ty, $w:literal, $h:literal, $ext:ident) => {{
-        assign_itx12_fn!($c, BD, $w, $h, $ext);
-        assign_itx_fn!($c, BD, $w, $h, adst_identity, H_ADST, $ext);
-        assign_itx_fn!($c, BD, $w, $h, flipadst_identity, H_FLIPADST, $ext);
-        assign_itx_fn!($c, BD, $w, $h, identity_adst, V_ADST, $ext);
-        assign_itx_fn!($c, BD, $w, $h, identity_flipadst, V_FLIPADST, $ext);
     }};
 }
 
@@ -523,7 +471,7 @@ impl Rav1dInvTxfmDSPContext {
         c
     }
 
-    #[cfg(all(feature = "asm", any(target_arch = "x86", target_arch = "x86_64")))]
+    #[cfg(feature = "asm")]
     #[inline(always)]
     const fn init_x86<BD: BitDepth>(mut self, flags: CpuFlags, bpc: u8) -> Self {
         if !flags.contains(CpuFlags::SSE2) {
@@ -615,27 +563,25 @@ impl Rav1dInvTxfmDSPContext {
                 assign_itx1_bpc_fn! (self, 64, 32, 8 bpc, avx2);
                 assign_itx1_bpc_fn! (self, 64, 64, 8 bpc, avx2);
             } else {
-
-                    assign_itx16_bpc_fn!(self,  4,  4, 10 bpc, avx2);
-                    assign_itx16_bpc_fn!(self,  4,  8, 10 bpc, avx2);
-                    assign_itx16_bpc_fn!(self,  4, 16, 10 bpc, avx2);
-                    assign_itx16_bpc_fn!(self,  8,  4, 10 bpc, avx2);
-                    assign_itx16_bpc_fn!(self,  8,  8, 10 bpc, avx2);
-                    assign_itx16_bpc_fn!(self,  8, 16, 10 bpc, avx2);
-                    assign_itx16_bpc_fn!(self, 16,  4, 10 bpc, avx2);
-                    assign_itx16_bpc_fn!(self, 16,  8, 10 bpc, avx2);
-                    assign_itx12_bpc_fn!(self, 16, 16, 10 bpc, avx2);
-                    assign_itx2_bpc_fn! (self,  8, 32, 10 bpc, avx2);
-                    assign_itx2_bpc_fn! (self, 16, 32, 10 bpc, avx2);
-                    assign_itx2_bpc_fn! (self, 32,  8, 10 bpc, avx2);
-                    assign_itx2_bpc_fn! (self, 32, 16, 10 bpc, avx2);
-                    assign_itx2_bpc_fn! (self, 32, 32, 10 bpc, avx2);
-                    assign_itx1_bpc_fn! (self, 16, 64, 10 bpc, avx2);
-                    assign_itx1_bpc_fn! (self, 32, 64, 10 bpc, avx2);
-                    assign_itx1_bpc_fn! (self, 64, 16, 10 bpc, avx2);
-                    assign_itx1_bpc_fn! (self, 64, 32, 10 bpc, avx2);
-                    assign_itx1_bpc_fn! (self, 64, 64, 10 bpc, avx2);
-
+                assign_itx16_bpc_fn!(self,  4,  4, 10 bpc, avx2);
+                assign_itx16_bpc_fn!(self,  4,  8, 10 bpc, avx2);
+                assign_itx16_bpc_fn!(self,  4, 16, 10 bpc, avx2);
+                assign_itx16_bpc_fn!(self,  8,  4, 10 bpc, avx2);
+                assign_itx16_bpc_fn!(self,  8,  8, 10 bpc, avx2);
+                assign_itx16_bpc_fn!(self,  8, 16, 10 bpc, avx2);
+                assign_itx16_bpc_fn!(self, 16,  4, 10 bpc, avx2);
+                assign_itx16_bpc_fn!(self, 16,  8, 10 bpc, avx2);
+                assign_itx12_bpc_fn!(self, 16, 16, 10 bpc, avx2);
+                assign_itx2_bpc_fn! (self,  8, 32, 10 bpc, avx2);
+                assign_itx2_bpc_fn! (self, 16, 32, 10 bpc, avx2);
+                assign_itx2_bpc_fn! (self, 32,  8, 10 bpc, avx2);
+                assign_itx2_bpc_fn! (self, 32, 16, 10 bpc, avx2);
+                assign_itx2_bpc_fn! (self, 32, 32, 10 bpc, avx2);
+                assign_itx1_bpc_fn! (self, 16, 64, 10 bpc, avx2);
+                assign_itx1_bpc_fn! (self, 32, 64, 10 bpc, avx2);
+                assign_itx1_bpc_fn! (self, 64, 16, 10 bpc, avx2);
+                assign_itx1_bpc_fn! (self, 64, 32, 10 bpc, avx2);
+                assign_itx1_bpc_fn! (self, 64, 64, 10 bpc, avx2);
             }
 
             if !flags.contains(CpuFlags::AVX512ICL) {
@@ -685,58 +631,12 @@ impl Rav1dInvTxfmDSPContext {
         self
     }
 
-    #[cfg(all(feature = "asm", any(target_arch = "arm", target_arch = "aarch64")))]
-    #[inline(always)]
-    const fn init_arm<BD: BitDepth>(mut self, flags: CpuFlags, bpc: u8) -> Self {
-        if !flags.contains(CpuFlags::NEON) {
-            return self;
-        }
-
-        assign_itx_fn!(self, BD, 4, 4, wht_wht, WHT_WHT, neon);
-
-        if BD::BITDEPTH == 16 && bpc != 10 {
-            return self;
-        }
-
-        #[rustfmt::skip]
-        const fn assign<BD: BitDepth>(mut c: Rav1dInvTxfmDSPContext) -> Rav1dInvTxfmDSPContext {
-            assign_itx16_fn!(c, BD,  4,  4, neon);
-            assign_itx16_fn!(c, BD,  4,  8, neon);
-            assign_itx16_fn!(c, BD,  4, 16, neon);
-            assign_itx16_fn!(c, BD,  8,  4, neon);
-            assign_itx16_fn!(c, BD,  8,  8, neon);
-            assign_itx16_fn!(c, BD,  8, 16, neon);
-            assign_itx16_fn!(c, BD, 16,  4, neon);
-            assign_itx16_fn!(c, BD, 16,  8, neon);
-            assign_itx12_fn!(c, BD, 16, 16, neon);
-            assign_itx2_fn! (c, BD,  8, 32, neon);
-            assign_itx2_fn! (c, BD, 16, 32, neon);
-            assign_itx2_fn! (c, BD, 32,  8, neon);
-            assign_itx2_fn! (c, BD, 32, 16, neon);
-            assign_itx2_fn! (c, BD, 32, 32, neon);
-            assign_itx1_fn! (c, BD, 16, 64, neon);
-            assign_itx1_fn! (c, BD, 32, 64, neon);
-            assign_itx1_fn! (c, BD, 64, 16, neon);
-            assign_itx1_fn! (c, BD, 64, 32, neon);
-            assign_itx1_fn! (c, BD, 64, 64, neon);
-
-            c
-        }
-
-        assign::<BD>(self)
-    }
-
     #[inline(always)]
     const fn init<BD: BitDepth>(self, flags: CpuFlags, bpc: u8) -> Self {
         #[cfg(feature = "asm")]
         {
-            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             {
                 return self.init_x86::<BD>(flags, bpc);
-            }
-            #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
-            {
-                return self.init_arm::<BD>(flags, bpc);
             }
         }
 

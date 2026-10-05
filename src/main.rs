@@ -36,6 +36,22 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     #[command(hide = true)]
+    WolConfigure {
+        #[arg(long)]
+        interface: String,
+        #[arg(long)]
+        mac: String,
+    },
+    /// 使用当前程序包更新已安装版本
+    Update {
+        /// 不显示更新窗口；需要管理员权限时仍请求 Windows UAC
+        #[arg(long)]
+        silent: bool,
+        /// 禁止请求提权，权限不足时返回 740（用于无人值守脚本）
+        #[arg(long, requires = "silent")]
+        no_elevate: bool,
+    },
+    #[command(hide = true)]
     Notification { uri: String },
     /// 打开卸载窗口，选择是否保留驱动和本机数据
     Uninstall {
@@ -56,6 +72,27 @@ enum Commands {
     },
     #[command(hide = true)]
     InputAgent {
+        #[arg(long)]
+        pipe: String,
+        #[arg(long)]
+        parent: u32,
+    },
+    #[command(hide = true)]
+    ClipboardAgent {
+        #[arg(long)]
+        pipe: String,
+        #[arg(long)]
+        parent: u32,
+    },
+    #[command(hide = true)]
+    AnnotationAgent {
+        #[arg(long)]
+        pipe: String,
+        #[arg(long)]
+        parent: u32,
+    },
+    #[command(hide = true)]
+    FileAgent {
         #[arg(long)]
         pipe: String,
         #[arg(long)]
@@ -155,6 +192,9 @@ fn main() -> Result<()> {
                     | Commands::DisplayAgent { .. }
                     | Commands::InputAgent { .. }
                     | Commands::CaptureAgent { .. }
+                    | Commands::ClipboardAgent { .. }
+                    | Commands::FileAgent { .. }
+                    | Commands::AnnotationAgent { .. }
             )
         )
     }) {
@@ -193,6 +233,30 @@ fn main() -> Result<()> {
     };
     tracing::info!(target: "openuuyc", version = env!("CARGO_PKG_VERSION"), "application started");
 
+    if let Commands::Update { silent, no_elevate } = command {
+        if !silent {
+            return openuuyc::application::update_application(false, false).map(|_| ());
+        }
+        let result = openuuyc::application::update_application(silent, no_elevate);
+        let code = match result {
+            Ok(false) => {
+                println!("更新完成");
+                0
+            }
+            Ok(true) => {
+                println!("更新完成，需要重启 Windows；未自动重启");
+                3010
+            }
+            Err(error) => {
+                tracing::error!(error=%format!("{error:#}"), "application update failed");
+                eprintln!("更新失败：{error:#}");
+                openuuyc::application::update_error_code(&error)
+            }
+        };
+        drop(_logging);
+        std::process::exit(code);
+    }
+
     if let Commands::Component {
         component,
         operation,
@@ -228,9 +292,20 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let result = match command {
+        Commands::WolConfigure { interface, mac } => {
+            openuuyc::application::configure_wol(interface, mac)
+        }
+        Commands::Update { .. } => unreachable!(),
         Commands::Uninstall { parent } => openuuyc::application::uninstall_application(parent),
         Commands::Component { .. } => unreachable!(),
         Commands::Service => openuuyc::application::host_service(),
+        Commands::ClipboardAgent { pipe, parent } => {
+            openuuyc::application::clipboard_agent(&pipe, parent)
+        }
+        Commands::AnnotationAgent { pipe, parent } => {
+            openuuyc::application::annotation_agent(&pipe, parent)
+        }
+        Commands::FileAgent { pipe, parent } => openuuyc::application::file_agent(&pipe, parent),
         Commands::HostResident { parent } => openuuyc::application::host_resident(parent),
         Commands::DisplayAgent { parent } => openuuyc::application::display_agent(parent),
         Commands::InputAgent { pipe, parent } => openuuyc::application::input_agent(&pipe, parent),

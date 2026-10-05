@@ -7,7 +7,7 @@ impl DeviceCenterApp {
         form_row(
             ui,
             "通知方式",
-            "申请连接与正在被控的提示；Windows 通知受系统通知和勿扰设置影响",
+            "连接与文件传输状态；Windows 通知受系统通知和勿扰设置影响",
             |ui| {
                 egui::ComboBox::from_id_salt("remote-notification-mode")
                     .width(238.)
@@ -54,6 +54,7 @@ impl DeviceCenterApp {
         ui.add_enabled_ui(!self.center_ui.components.busy(), |ui| {
             self.host_settings_controls(ui)
         });
+        self.wol_setup_dialog(ui.ctx());
     }
     fn host_settings_controls(&mut self, ui: &mut egui::Ui) {
         section(ui, "被控设置");
@@ -88,6 +89,89 @@ impl DeviceCenterApp {
                     .is_err()
             {
                 host.audio_devices_failed();
+            }
+            if !host.is_guest() {
+                self.wol_setup_entry(ui);
+                let mut wol = host.wol_allowed();
+                form_row(
+                    ui,
+                    "允许局域网唤醒协助",
+                    "本机在线时帮助唤醒同网设备；与允许本机被唤醒分别设置",
+                    |ui| {
+                        if crate::ui::controls::service_switch(ui, &mut wol).changed() {
+                            let _ = host.set_wol_allowed(wol);
+                            self.save_host_settings();
+                        }
+                    },
+                );
+                let mut power = host.power_allowed();
+                form_row(
+                    ui,
+                    "允许远程关机和重启",
+                    "允许账号设备管理中的电源操作；未保存程序可能阻止关闭",
+                    |ui| {
+                        if crate::ui::controls::service_switch(ui, &mut power).changed() {
+                            let _ = host.set_power_allowed(power);
+                            self.save_host_settings();
+                        }
+                    },
+                );
+                if let Some(message) = host.status().power_message {
+                    ui.label(egui::RichText::new(message).small().color(theme::MUTED));
+                }
+                let mut ports = host.port_mapping_allowed();
+                form_row(
+                    ui,
+                    "允许端口转发",
+                    "允许已授权的自有设备访问本机及本机可达的网络服务",
+                    |ui| {
+                        if crate::ui::controls::service_switch(ui, &mut ports).changed() {
+                            let _ = host.set_port_mapping_allowed(ports);
+                            self.save_host_settings();
+                        }
+                    },
+                );
+                let mut files = host.file_transfer_allowed();
+                form_row(
+                    ui,
+                    "允许文件传输",
+                    "允许已授权的自有设备浏览及传输本机文件",
+                    |ui| {
+                        if crate::ui::controls::service_switch(ui, &mut files).changed() {
+                            let _ = host.set_file_transfer_allowed(files);
+                            self.save_host_settings();
+                        }
+                    },
+                );
+            }
+            let mut clipboard = host.clipboard_settings();
+            let before = clipboard;
+            form_row(
+                ui,
+                "允许剪贴板同步",
+                "与已连接的主控双向复制文字、富文本和图片",
+                |ui| {
+                    crate::ui::controls::service_switch(ui, &mut clipboard.enabled);
+                },
+            );
+            form_row(
+                ui,
+                "允许文件复制",
+                "通过复制粘贴传输文件和文件夹",
+                |ui| {
+                    ui.add_enabled_ui(clipboard.enabled, |ui| {
+                        crate::ui::controls::service_switch(ui, &mut clipboard.files);
+                    });
+                },
+            );
+            if before != clipboard {
+                match host.set_clipboard_settings(clipboard) {
+                    Ok(()) => self.save_host_settings(),
+                    Err(e) => self.status = StatusMessage::error(e.to_string()),
+                }
+            }
+            if let Some(error) = host.status().clipboard.error {
+                ui.colored_label(RED, error);
             }
             let inventory = host.audio_devices();
             let mut quality = host.audio_quality();

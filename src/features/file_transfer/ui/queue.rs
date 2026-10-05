@@ -190,7 +190,7 @@ pub(super) fn show(
                         cols[0].left_center() + vec2(18., 0.),
                         vec2(18., 18.),
                     );
-                    controls::paint_file_icon(ui.painter(), icon, theme::MUTED, false);
+                    controls::file_icons::paint(ui.painter(), icon, name, if r.folder.is_empty() { 4 } else { 0 }, "");
                     let mut name_rect = cols[0].shrink2(vec2(10., 0.));
                     name_rect.min.x += 24.;
                     files::text(ui, name_rect, name, theme::TEXT, false);

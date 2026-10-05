@@ -1,11 +1,9 @@
 use super::*;
 use crate::diagnostics::logging::{self, Level, Settings};
-mod live_view;
 
 #[derive(Default)]
 pub(super) struct LogUi {
-    live_tab: bool,
-    live: live_view::LiveView,
+    pub(super) export: super::diagnostic_export::ExportUi,
     draft: Option<Settings>,
     baseline: Option<Settings>,
     search: String,
@@ -56,15 +54,9 @@ impl DeviceCenterApp {
             });
         });
         ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            ui.selectable_value(&mut state.live_tab, false, "级别设置");
-            ui.selectable_value(&mut state.live_tab, true, "实时日志");
-        });
+        self.diagnostic_export(ui);
         ui.add_space(8.0);
-        if state.live_tab {
-            logging::live::displaying(|| state.live.show(ui));
-            return;
-        }
+        let state = &mut self.center_ui.logs;
         ui.horizontal(|ui| {
             if ui.add(primary("保存")).clicked() {
                 match logging::apply(state.draft.as_ref().unwrap().clone()) {
