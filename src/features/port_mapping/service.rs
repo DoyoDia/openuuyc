@@ -312,6 +312,7 @@ async fn run(
                     || !rules.iter().any(|d| {
                         d.id == **id
                             && d.enabled
+                            && d.protocol == r.rule.protocol
                             && d.local_addr == r.rule.local_addr
                             && d.local_port == r.rule.local_port
                             && d.target == r.rule.target
@@ -425,7 +426,7 @@ async fn run(
                             rule.validate()?;
                             if let Some(index)=next.iter().position(|r|r.id==rule.id) {
                                 let old=&next[index];
-                                if old.enabled && (old.target!=rule.target || old.remote_port!=rule.remote_port || old.local_addr!=rule.local_addr || old.local_port!=rule.local_port) {rule.id=new_id();}
+                                if old.enabled && (old.protocol!=rule.protocol || old.target!=rule.target || old.remote_port!=rule.remote_port || old.local_addr!=rule.local_addr || old.local_port!=rule.local_port) {rule.id=new_id();}
                                 next[index]=rule;
                             } else {ensure!(next.len()<256,"规则过多");next.push(rule);}
                         },

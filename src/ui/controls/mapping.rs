@@ -24,6 +24,7 @@ pub(crate) struct MappingRow<'a> {
     pub reachable: Option<bool>,
     pub url: Option<&'a str>,
     pub probing: bool,
+    pub can_probe: bool,
 }
 fn columns(rect: Rect) -> [Rect; 7] {
     let rect = rect.shrink2(vec2(12.0, 0.0));
@@ -184,14 +185,18 @@ pub(crate) fn mapping_row(ui: &mut Ui, row: MappingRow<'_>, last: bool) -> Mappi
         ui,
         status_rect,
         RichText::new(row.status).color(row.color),
-        true,
+        row.can_probe,
     );
     let mut action = if response.clicked() {
         MappingRowAction::Probe
     } else {
         MappingRowAction::None
     };
-    response.on_hover_text(format!("{}\n点击重新探测", row.hint));
+    response.on_hover_text(if row.can_probe {
+        format!("{}\n点击重新探测", row.hint)
+    } else {
+        row.hint.to_owned()
+    });
     if !detail.is_empty() {
         line(
             ui,

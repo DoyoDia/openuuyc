@@ -12,6 +12,7 @@ enum Tab {
     #[cfg(windows)]
     Decoding,
     Sessions,
+    Wol,
 }
 #[derive(Default)]
 pub(super) struct ViewState {
@@ -20,15 +21,20 @@ pub(super) struct ViewState {
     decoder: usize,
     publication_refresh: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
     publication_error: Option<String>,
+    wol_refresh: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
+    wol_error: Option<String>,
 }
 
 impl DeviceCenterApp {
     pub(super) fn diagnostics_page(&mut self, ui: &mut egui::Ui) {
         ui.label(RichText::new("本机诊断").size(theme::TITLE).strong());
-        ui.add_space(18.0);
+        ui.add_space(8.0);
+        self.diagnostic_export(ui);
+        ui.add_space(12.0);
         crate::ui::controls::page_scroll("center-diagnostics-scroll").show(ui, |ui| {
             self.diagnostics_panel(ui);
         });
+        self.wol_setup_dialog(ui.ctx());
     }
 
     fn diagnostics_panel(&mut self, ui: &mut egui::Ui) {
@@ -42,6 +48,7 @@ impl DeviceCenterApp {
                     #[cfg(windows)]
                     (Tab::Decoding, "解码检查"),
                     (Tab::Sessions, "当前会话"),
+                    (Tab::Wol, "远程开机"),
                 ] {
                     ui.selectable_value(&mut self.center_ui.diagnostics.tab, tab, label);
                 }
@@ -65,10 +72,102 @@ impl DeviceCenterApp {
                         #[cfg(windows)]
                         Tab::Decoding => self.diagnostic_decoding(ui),
                         Tab::Sessions => self.diagnostic_sessions(ui),
+                        Tab::Wol => self.diagnostic_wol(ui),
                     }
                 },
             );
         });
+    }
+
+    fn diagnostic_wol(&mut self, ui: &mut egui::Ui) {
+        self.wol_setup_entry(ui);
+        ui.separator();
+        let state = &mut self.center_ui.diagnostics;
+        if let Some(rx) = &state.wol_refresh {
+            match rx.try_recv() {
+                Ok(result) => {
+                    state.wol_error = result.err();
+                    state.wol_refresh = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    state.wol_error = Some("刷新任务中断".into());
+                    state.wol_refresh = None;
+                }
+                Err(_) => {}
+            }
+        }
+        let Some(host) = self.host.clone() else {
+            diagnostics_empty(ui, "请先登录并开启被控");
+            return;
+        };
+        let wol = host.status().wol;
+        ui.horizontal(|ui| {
+            ui.label("局域网信息登记");
+            if ui
+                .add_enabled(
+                    host.allowed()
+                        && (host.wol_allowed() || host.status().wol_setup.enabled == Some(true))
+                        && !wol.reporting
+                        && state.wol_refresh.is_none(),
+                    egui::Button::new("刷新网络登记"),
+                )
+                .clicked()
+            {
+                let (tx, rx) = std::sync::mpsc::channel();
+                state.wol_refresh = Some(rx);
+                state.wol_error = None;
+                let ctx = ui.ctx().clone();
+                std::thread::spawn(move || {
+                    use crate::platform::host_service::resident;
+                    let result = if resident::managed() {
+                        resident::call(resident::Request::RefreshWol).map(|_| ())
+                    } else {
+                        host.wol.refresh();
+                        Ok(())
+                    };
+                    let _ = tx.send(result.map_err(|e| e.to_string()));
+                    ctx.request_repaint();
+                });
+            }
+        });
+        diagnostics_row(
+            ui,
+            "状态",
+            if wol.message.is_empty() {
+                "未开启局域网唤醒协助"
+            } else {
+                &wol.message
+            },
+        );
+        if let Some(name) = &wol.interface_name {
+            diagnostics_row(ui, "网卡", name);
+        }
+        if let Some(info) = &wol.network {
+            diagnostics_row(ui, "本机IPv4", &info.inner_ip);
+            diagnostics_row(ui, "子网掩码", &info.subnet_mask);
+            diagnostics_row(ui, "MAC", &info.mac);
+        }
+        let stamp = |v: Option<i64>| {
+            v.and_then(|t| chrono::DateTime::from_timestamp(t, 0))
+                .map(|t| {
+                    t.with_timezone(&chrono::Local)
+                        .format("%Y-%m-%d %H:%M:%S")
+                        .to_string()
+                })
+                .unwrap_or_else(|| "尚无记录".into())
+        };
+        diagnostics_row(ui, "最近登记", &stamp(wol.registered_at));
+        diagnostics_row(ui, "最近发包", &stamp(wol.last_sent_at));
+        diagnostics_row(ui, "已发送报文", &wol.packets_sent.to_string());
+        if let Some(error) = wol.error.as_ref().or(state.wol_error.as_ref()) {
+            ui.colored_label(theme::AMBER, error);
+        }
+        ui.add_space(8.0);
+        ui.label(
+            egui::RichText::new("报文发送不代表目标已开机；目标网卡和 BIOS 需启用 WoL。")
+                .small()
+                .color(theme::MUTED),
+        );
     }
 
     fn diagnostic_device(&self, ui: &mut egui::Ui) {
@@ -460,6 +559,45 @@ impl DeviceCenterApp {
                 "输入后端",
                 host.input_backend.as_deref().unwrap_or("等待控制"),
             );
+            diagnostics_row(
+                ui,
+                "剪贴板同步",
+                if host.clipboard.active {
+                    if host.clipboard.files {
+                        "文字、图片和文件"
+                    } else {
+                        "文字和图片"
+                    }
+                } else {
+                    "未启用或等待用户桌面"
+                },
+            );
+            diagnostics_row(
+                ui,
+                "端口转发",
+                &format!(
+                    "{} 个连接 · 发送 {} B / 接收 {} B",
+                    host.ports.connections, host.ports.sent, host.ports.received
+                ),
+            );
+            if let Some(error) = &host.ports.error {
+                diagnostics_row(ui, "转发状态", error);
+            }
+            diagnostics_row(
+                ui,
+                "独立文件传输",
+                if host.files.active {
+                    "用户权限执行"
+                } else {
+                    "未启用或等待连接"
+                },
+            );
+            if let Some(error) = &host.files.error {
+                diagnostics_row(ui, "文件传输状态", error);
+            }
+            if let Some(error) = &host.clipboard.error {
+                ui.colored_label(theme::RED, error);
+            }
             if let Some(error) = &host.input_error {
                 diagnostics_row(ui, "输入状态", error);
             }

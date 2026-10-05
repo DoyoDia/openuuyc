@@ -1,5 +1,5 @@
 //! Serial notification I/O, coalesced outside the UI and media threads.
-use super::{Action, Card, Mode, Verb};
+use super::{Action, Card, Mode};
 use crate::platform::notifications::{Native, Toast, ToastAction};
 use anyhow::{Context, Result};
 use std::sync::{Arc, Mutex, mpsc};
@@ -13,6 +13,7 @@ struct Latest {
     mode: Option<(Mode, u64)>,
     cards: Vec<Card>,
     closed: bool,
+    folder: Option<std::path::PathBuf>,
 }
 pub(super) struct Worker {
     latest: Arc<Mutex<Latest>>,
@@ -70,9 +71,14 @@ impl Worker {
             let mut initialization_error: Option<String> = None;
             let mut attempted_revision = 0;
             while rx.recv().is_ok() {
-                let ((wanted, revision), cards, closed) = {
-                    let s = super::lock(&state);
-                    (s.mode.unwrap_or((mode, 0)), s.cards.clone(), s.closed)
+                let ((wanted, revision), cards, closed, folder) = {
+                    let mut s = super::lock(&state);
+                    (
+                        s.mode.unwrap_or((mode, 0)),
+                        s.cards.clone(),
+                        s.closed,
+                        s.folder.take(),
+                    )
                 };
                 if closed {
                     break;
@@ -82,6 +88,19 @@ impl Worker {
                     attempted_revision = revision;
                 }
                 let result = (|| -> Result<()> {
+                    if let Some(folder) = folder {
+                        let text = folder.to_string_lossy();
+                        let bytes = text.as_bytes();
+                        anyhow::ensure!(
+                            folder.is_absolute()
+                                && bytes.len() > 2
+                                && bytes[0].is_ascii_alphabetic()
+                                && bytes[1] == b':'
+                                && folder.is_dir(),
+                            "文件所在目录已不可用"
+                        );
+                        crate::diagnostics::logging::open_folder(&folder)?;
+                    }
                     if wanted != mode {
                         save(wanted)?;
                         mode = wanted;
@@ -114,23 +133,17 @@ impl Worker {
                     let toasts = cards
                         .iter()
                         .map(|c| {
-                            let mut buttons = vec![ToastAction {
-                                label: "查看".into(),
-                                uri: Action::uri(&c.ticket, Verb::Open),
-                            }];
-                            if c.confirmation && !c.busy {
-                                buttons = vec![
-                                    ToastAction {
-                                        label: "允许本次".into(),
-                                        uri: Action::uri(&c.ticket, Verb::Allow),
-                                    },
-                                    ToastAction {
-                                        label: "拒绝".into(),
-                                        uri: Action::uri(&c.ticket, Verb::Reject),
-                                    },
-                                ];
-                            }
+                            let buttons = c
+                                .actions()
+                                .into_iter()
+                                .filter(|a| a.enabled)
+                                .map(|a| ToastAction {
+                                    label: a.label.into(),
+                                    uri: Action::uri(&c.ticket, a.verb),
+                                })
+                                .collect();
                             Toast {
+                                progress: c.transfer.as_ref().and_then(|t| t.progress),
                                 key: c.ticket.clone(),
                                 title: if c.connected {
                                     "远程连接已建立".into()
@@ -140,7 +153,7 @@ impl Worker {
                                 body: format!(
                                     "{}\n{}",
                                     c.body,
-                                    if c.expires_at == 0 {
+                                    if c.expires_at == 0 && c.transfer.is_none() {
                                         "打开控制中心查看当前连接状态。"
                                     } else {
                                         &c.detail
@@ -174,6 +187,10 @@ impl Worker {
             events,
             thread: Some(thread),
         }
+    }
+    pub fn open_folder(&self, folder: std::path::PathBuf) {
+        super::lock(&self.latest).folder = Some(folder);
+        let _ = self.wake.try_send(());
     }
     pub fn set_mode(&self, mode: Mode, revision: u64) {
         super::lock(&self.latest).mode = Some((mode, revision));

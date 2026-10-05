@@ -31,7 +31,7 @@ struct Route {
 #[derive(Clone)]
 pub(crate) struct NrdHttp {
     client: Client,
-    endpoints: [String; 2],
+    endpoints: Vec<String>,
     route: Arc<Mutex<Route>>,
 }
 
@@ -49,9 +49,17 @@ impl NrdHttp {
                 .user_agent(concat!("OpenUUYC/", env!("CARGO_PKG_VERSION")))
                 .build()
                 .context("build NRD HTTPS client")?,
-            endpoints: [PRIMARY.to_owned(), SECONDARY.to_owned()],
+            endpoints: vec![PRIMARY.to_owned(), SECONDARY.to_owned()],
             route: Arc::clone(ROUTE.get_or_init(Default::default)),
         })
+    }
+
+    pub(crate) fn ipv4_route(&self) -> Self {
+        Self {
+            client: self.client.clone(),
+            endpoints: vec!["https://api-ipv4.nrd.nie.163.com".into()],
+            route: Arc::new(Mutex::new(Route::default())),
+        }
     }
 
     pub(crate) async fn send(

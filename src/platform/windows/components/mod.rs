@@ -87,6 +87,24 @@ static MAINTENANCE: AtomicBool = AtomicBool::new(false);
 pub(crate) fn maintaining() -> bool {
     MAINTENANCE.load(Ordering::Acquire)
 }
+pub(crate) fn elevated() -> Result<bool> {
+    use windows::Win32::Security::*;
+    unsafe {
+        let mut token = HANDLE::default();
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token)?;
+        let token = super::host_service::pipe::Handle(token);
+        let mut elevation = TOKEN_ELEVATION::default();
+        let mut length = 0;
+        GetTokenInformation(
+            token.0,
+            TokenElevation,
+            Some((&mut elevation as *mut TOKEN_ELEVATION).cast()),
+            std::mem::size_of_val(&elevation) as u32,
+            &mut length,
+        )?;
+        Ok(elevation.TokenIsElevated != 0)
+    }
+}
 struct Maintenance;
 impl Drop for Maintenance {
     fn drop(&mut self) {
@@ -249,6 +267,24 @@ pub(crate) fn request(
     allow_sas: bool,
     removal: RemovalOptions,
 ) -> Result<bool> {
+    request_with_resume(kind, operation, allow_sas, removal, true)
+}
+pub(crate) fn request_update(resume: bool) -> Result<bool> {
+    request_with_resume(
+        Kind::Suite,
+        Operation::Install,
+        false,
+        Default::default(),
+        resume,
+    )
+}
+fn request_with_resume(
+    kind: Kind,
+    operation: Operation,
+    allow_sas: bool,
+    removal: RemovalOptions,
+    resume: bool,
+) -> Result<bool> {
     removal.validate(kind, operation)?;
     ensure!(
         MAINTENANCE
@@ -262,7 +298,7 @@ pub(crate) fn request(
         return application::request_uninstall(removal);
     }
     if kind == Kind::Suite {
-        return suite::request(operation, allow_sas, removal);
+        return suite::request(operation, allow_sas, removal, resume);
     }
     if kind == Kind::AudioDriver {
         return elevate(

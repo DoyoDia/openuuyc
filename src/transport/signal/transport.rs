@@ -548,7 +548,8 @@ impl Worker {
                 }
             }
             // BC3110 invokes the namespace listener, then sends its ACK list.
-            // Our read-only listeners do not populate that list (empty []).
+            // Observers queue domain work without filling this ACK list; business
+            // responses are sent separately by their owning feature.
             if let Some(id) = id {
                 let _ = writer.send(vec![Message::Text(format!("43{id}[]").into())]);
                 tracing::debug!(id, event, "queued server-event empty ACK");

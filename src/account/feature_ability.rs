@@ -15,6 +15,7 @@ const RELOAD_AFTER: Duration = Duration::from_secs(21_600);
 pub(crate) enum Feature {
     Microphone,
     PortMapping,
+    FileDrop,
     Annotation,
     ControlledUpdate,
     CustomBitrate,
@@ -32,6 +33,7 @@ impl Feature {
         match self {
             Self::Microphone => "device_microphone",
             Self::PortMapping => "port_mapping",
+            Self::FileDrop => "remote_clipboard_v5",
             Self::Annotation => "annotation_v2",
             Self::ControlledUpdate => "controlled_update",
             Self::CustomBitrate => "custom_bitrate",
@@ -73,7 +75,7 @@ fn feature_version(text: &str) -> Version {
     }
 }
 
-fn parse_map(value: &serde_json::Value) -> Map {
+fn parse_map(value: &serde_json::Value, controlling: bool) -> Map {
     let mut result = Map::new();
     for row in value.as_array().into_iter().flatten() {
         let Some(platform) = row
@@ -86,7 +88,7 @@ fn parse_map(value: &serde_json::Value) -> Map {
         let Some(abilities) = row.get("abilitys").and_then(|v| v.as_array()) else {
             continue;
         };
-        if !matches!(platform, 1 | 4) {
+        if !controlling && !matches!(platform, 1 | 4) {
             continue;
         }
         let mut entries = Map::new();
@@ -120,10 +122,15 @@ fn parse_map(value: &serde_json::Value) -> Map {
     result
 }
 
-fn embedded() -> Map {
+fn embedded(controlling: bool) -> Map {
     parse_map(
-        &serde_json::from_str(include_str!("official_features.json"))
-            .expect("embedded feature data"),
+        &serde_json::from_str(if controlling {
+            include_str!("official_controlling_features.json")
+        } else {
+            include_str!("official_features.json")
+        })
+        .expect("embedded feature data"),
+        controlling,
     )
 }
 
@@ -147,15 +154,22 @@ impl Drop for Job {
 
 #[derive(Clone)]
 pub(crate) struct FeatureCatalog {
+    controlling: bool,
     state: Arc<Mutex<State>>,
     job: Arc<Mutex<Job>>,
     stop: CancellationToken,
 }
 impl Default for FeatureCatalog {
     fn default() -> Self {
+        Self::new(false)
+    }
+}
+impl FeatureCatalog {
+    pub(crate) fn new(controlling: bool) -> Self {
         Self {
+            controlling,
             state: Arc::new(Mutex::new(State {
-                map: embedded(),
+                map: embedded(controlling),
                 online: false,
                 loaded_at: SystemTime::now(),
                 requested: false,
@@ -168,6 +182,20 @@ impl Default for FeatureCatalog {
     }
 }
 impl FeatureCatalog {
+    pub(crate) fn published(
+        &self,
+        platform: crate::protocol::peer_platform::PeerPlatform,
+        feature: Feature,
+    ) -> bool {
+        let Some(platform) = platform.account_code() else {
+            return false;
+        };
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .map
+            .contains_key(&(platform, feature.name().to_owned()))
+    }
     pub(crate) fn policy(&self, platform: i32, version: &str) -> FeaturePolicy {
         FeaturePolicy {
             catalog: self.clone(),
@@ -202,8 +230,14 @@ impl FeatureCatalog {
         };
         let shared = Arc::clone(&self.state);
         let stop = self.stop.clone();
+        let controlling = self.controlling;
+        let config = if controlling {
+            "controlling_ability_map"
+        } else {
+            CONFIG
+        };
         job.0 = Some(tokio::spawn(async move {
-            let versions = [(CONFIG.to_owned(), version)];
+            let versions = [(config.to_owned(), version)];
             let result = tokio::select! {
                 biased;
                 _ = stop.cancelled() => return,
@@ -215,7 +249,7 @@ impl FeatureCatalog {
             }
             let mut state = shared.lock().unwrap_or_else(|e| e.into_inner());
             let content = match result {
-                Ok(mut response) => match response.remove(CONFIG) {
+                Ok(mut response) => match response.remove(config) {
                     Some(entry) if entry.status == 0 => {
                         let value = entry.data.and_then(|value| match value {
                             serde_json::Value::String(text) => serde_json::from_str(&text).ok(),
@@ -234,12 +268,12 @@ impl FeatureCatalog {
                 }
             };
             if let Some(value) = content {
-                state.map = parse_map(&value);
+                state.map = parse_map(&value, controlling);
                 state.online = true;
                 state.loaded_at = SystemTime::now();
                 tracing::debug!("official runtime feature configuration applied");
             } else if state.online {
-                state.map = embedded();
+                state.map = embedded(controlling);
                 state.online = false;
                 state.loaded_at = SystemTime::now();
             }

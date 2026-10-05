@@ -107,6 +107,19 @@ pub(crate) async fn receive_session(
     let message = PbControlMessage::decode(bytes)?;
     if !control {
         if let Some(PbPayload::SimpleAction(action)) = &message.payload {
+            if action.action == 21 {
+                // 4.41 C140DB9A10 sends quitCapture when viewing ends while
+                // another business (files/ports) still owns the connection.
+                // S140560F60 -> S140452530 stops all capture without dropping
+                // the shared peer. Action 7 remains video-only (audio mode).
+                session.stop(-1).await?;
+                tracing::info!("host media stopped; shared business connection retained");
+                return Ok(Received {
+                    refresh_state: true,
+                    media_active: Some(false),
+                    ..Default::default()
+                });
+            }
             if matches!(action.action, 7 | 8) {
                 let args: serde_json::Value = if action.args.is_empty() {
                     serde_json::Value::Null
@@ -140,6 +153,7 @@ pub(crate) async fn receive_session(
                 }
                 return Ok(Received {
                     refresh_state: true,
+                    media_active: (action.action == 8).then_some(true),
                     ..Default::default()
                 });
             }

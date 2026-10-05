@@ -72,10 +72,12 @@ pub use block_unit::*;
 mod frame_header;
 
 #[derive(Debug, Default)]
+#[cfg(test)]
 pub struct FieldMap {
   map: Vec<(&'static str, usize, usize)>,
 }
 
+#[cfg(test)]
 impl FieldMap {
   /// Print the field the address belong to
   fn lookup(&self, addr: usize) {

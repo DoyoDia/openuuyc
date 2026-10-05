@@ -1,7 +1,7 @@
 //! Controlled desktop connection: session-scoped peer, capture owner and RTP sender.
 use super::{VideoConfig, capture, lock};
 use crate::transport::rtc::ConnectionCore;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::{
     sync::{
         Arc, Mutex,
@@ -69,8 +69,9 @@ struct Published {
     capture: String,
 }
 #[derive(Clone, Default)]
-struct ReportRoutes {
-    text: Option<std::sync::Weak<RTCDataChannel>>,
+pub(super) struct ReportRoutes {
+    pub(super) text: Option<std::sync::Weak<RTCDataChannel>>,
+    pub(super) clipboard: i32,
     control: Option<std::sync::Weak<RTCDataChannel>>,
     control_screens: bool,
     revision: u64,
@@ -81,19 +82,22 @@ impl ReportRoutes {
         &mut self,
         received: &crate::features::stream_control::publisher::Received,
     ) -> bool {
+        if let Some(level) = received.clipboard {
+            self.clipboard = level;
+        }
         let reroute = received
             .control_screen_reports
             .is_some_and(|v| v != self.control_screens);
         if let Some(value) = received.control_screen_reports {
             self.control_screens = value;
         }
-        if reroute || received.refresh_state {
+        if reroute || received.refresh_state || received.clipboard.is_some() {
             self.revision = self.revision.wrapping_add(1);
         }
         if received.refresh_secure {
             self.secure_revision = self.secure_revision.wrapping_add(1);
         }
-        reroute || received.refresh_state || received.refresh_secure
+        reroute || received.refresh_state || received.refresh_secure || received.clipboard.is_some()
     }
 }
 type ReportTarget = tokio::sync::watch::Sender<ReportRoutes>;
@@ -115,8 +119,15 @@ impl Peer {
         input_policy: super::input::wire::Policy,
         deferred: Option<screens::Deferred>,
         audio_control: bool,
+        annotation_extension: bool,
+        drag_extension: bool,
+        controlling_features: Option<crate::account::feature_ability::FeatureCatalog>,
+        clipboard_platform: crate::protocol::peer_platform::PeerPlatform,
+        clipboard_level: i32,
+        file_capabilities: crate::features::file_transfer::host::Capabilities,
+        data_only: bool,
     ) -> Result<Self> {
-        let audio_only = deferred.is_some();
+        let audio_only = deferred.is_some() && !data_only;
         let handle = owner.with_cancellation(cancel.clone());
         tracing::info!(?network, "host network switch policy");
         let initial_quality = if initial.quality == 5 {
@@ -399,6 +410,7 @@ impl Peer {
             transport.clone(),
         );
         audio.enable_quality_control(audio_control, audio_only);
+        audio.set_media_allowed(!data_only);
         let screen_pool = screens::Screens::new(
             connection.clone(),
             handle.clone(),
@@ -485,12 +497,40 @@ impl Peer {
         let state_input = input.receiver();
         let state_audio = audio.clone();
         let state_microphone = microphone.receiver();
+        let (ports, ports_input) =
+            crate::features::port_mapping::host::Receiver::new(handle.clone(), connected.clone());
+        let ports_worker = tokio::spawn(crate::features::port_mapping::host::run(
+            ports.clone(),
+            ports_input,
+            cancel.clone(),
+        ));
+        let annotation_reports = reports.clone();
+        let annotation_lease = handle.clone();
+        let annotation_connected = connected.clone();
+        let (annotation, annotation_worker) = super::annotation::Receiver::start(
+            !data_only && !audio_only,
+            annotation_extension,
+            move || super::annotation::Context {
+                allowed: annotation_lease.requested()
+                    && annotation_connected.load(Ordering::Acquire),
+                current: annotation_reports.current.load(Ordering::Acquire),
+                screens: lock(&annotation_reports.catalog)
+                    .iter()
+                    .map(|s| s.screen.clone())
+                    .collect(),
+            },
+            cancel.clone(),
+        );
+        let state_annotation = annotation.clone();
+        let state_ports = ports.clone();
         connection.on_peer_connection_state_change(Box::new(move |state| {
             tracing::info!(?state, "host peer connection state changed");
             state_transport.network(state == RTCPeerConnectionState::Connected);
             let was_ready =
                 ready.swap(state == RTCPeerConnectionState::Connected, Ordering::AcqRel);
             if was_ready && state != RTCPeerConnectionState::Connected {
+                state_ports.invalidate();
+                state_annotation.invalidate();
                 state_input.transport_lost();
                 state_audio.transport_lost();
                 state_microphone.transport_lost();
@@ -513,9 +553,11 @@ impl Peer {
                 stopped.cancel();
             }
             let dtls = state_dtls.clone();
+            let annotation = state_annotation.clone();
             let transport = state_transport.clone();
             Box::pin(async move {
                 if state == RTCPeerConnectionState::Connected {
+                    annotation.notify_hello().await;
                     if let Some(dtls) = dtls.upgrade() {
                         transport.srtp_overhead(dtls.rtp_authentication_overhead().await);
                     }
@@ -561,6 +603,7 @@ impl Peer {
         let kcp = core.control.clone();
         let (report_target, report_receiver) = tokio::sync::watch::channel(ReportRoutes {
             control_screens,
+            clipboard: clipboard_level,
             ..Default::default()
         });
         handle.set_update_notice(UpdateNotice::new(report_target.clone(), cancel.clone()));
@@ -570,6 +613,37 @@ impl Peer {
             cancel.clone(),
             handle.clone(),
             kcp.clone(),
+        ));
+        let clipboard_receiver = super::clipboard::Receiver::default();
+        clipboard_receiver.native(drag_extension && !data_only && !audio_only);
+        if !drag_extension && !data_only && !audio_only {
+            clipboard_receiver.official_drop(controlling_features);
+        }
+        let clipboard_screens = reports.clone();
+        let clipboard_worker = tokio::spawn(super::clipboard::run(
+            clipboard_receiver.clone(),
+            report_receiver.clone(),
+            handle.clone(),
+            connected.clone(),
+            cancel.clone(),
+            clipboard_platform,
+            input.receiver(),
+            move || {
+                lock(&clipboard_screens.catalog)
+                    .iter()
+                    .map(|s| s.screen.clone())
+                    .collect()
+            },
+        ));
+        let files = super::files::Receiver::default();
+        files.capabilities(file_capabilities);
+        let file_worker = tokio::spawn(super::files::run(
+            files.clone(),
+            handle.clone(),
+            connected.clone(),
+            cancel.clone(),
+            handle.file_scope(),
+            reports.sequence.clone(),
         ));
         let publisher = tokio::spawn(publish_state(
             screens.clone(),
@@ -583,118 +657,29 @@ impl Peer {
             audio.clone(),
             microphone.receiver().status(),
         ));
-        enum ControlWork {
-            Response(Vec<u8>),
-            CaptureSetting(Vec<u8>),
+        let (control_receiver, control_responses) = ingress::ControlIngress {
+            screen: screen.clone(),
+            config: config.clone(),
+            negotiated: negotiated.clone(),
+            input: input.receiver(),
+            files: files.clone(),
+            screens: screens.clone(),
+            report_target: report_target.clone(),
+            kcp: kcp.clone(),
+            cancel: cancel.clone(),
         }
-        let (control_tx, mut control_rx) = mpsc::unbounded_channel::<(u16, u64, ControlWork)>();
-        let control_screen = screen.clone();
-        let control_config = config.clone();
-        let control_stop = cancel.clone();
-        let control_negotiated = negotiated.clone();
-        let control_target = report_target.clone();
-        let control_input = input.receiver();
-        let control_receiver: crate::transport::uu_kcp::ControlReceiver =
-            Arc::new(move |stream_id, bytes| {
-                if control_stop.is_cancelled() {
-                    return Ok(());
-                }
-                let Some(generation) = control_input.generation(stream_id) else {
-                    return Ok(());
-                };
-                if control_input.receive(stream_id, bytes)? {
-                    return Ok(());
-                }
-                if crate::features::stream_control::publisher::is_capture_setting(bytes)? {
-                    // KCP delivery is synchronous. Reuse the response worker to
-                    // serialize display/settings work without blocking ACK/input
-                    // delivery or spawning an unordered task for each request.
-                    control_tx
-                        .send((
-                            stream_id,
-                            generation,
-                            ControlWork::CaptureSetting(bytes.to_vec()),
-                        ))
-                        .context("host CONTROL setting queue closed")?;
-                    return Ok(());
-                }
-                let responses = crate::features::stream_control::publisher::receive(
-                    bytes,
-                    true,
-                    control_screen.as_ref(),
-                    &mut lock(&control_config),
-                    &control_negotiated,
-                )?;
-                control_target.send_if_modified(|routes| routes.received(&responses));
-                for response in responses.messages {
-                    control_tx
-                        .send((stream_id, generation, ControlWork::Response(response)))
-                        .context("host CONTROL response queue closed")?;
-                }
-                Ok(())
-            });
-        let control_kcp = kcp.clone();
-        let control_stop = cancel.clone();
-        let response_input = input.receiver();
-        let control_screens = screens.clone();
-        let control_target = report_target.clone();
-        let control_responses = tokio::spawn(async move {
-            loop {
-                let item = tokio::select! { _=control_stop.cancelled()=>break, item=control_rx.recv()=>item };
-                let Some((id, generation, work)) = item else {
-                    break;
-                };
-                if !response_input.ready(id, generation).await {
-                    continue;
-                }
-                let (messages, setting_response) = match work {
-                    ControlWork::Response(bytes) => (vec![bytes], false),
-                    ControlWork::CaptureSetting(bytes) => {
-                        let mut state = tokio::select! {
-                            _ = control_stop.cancelled() => break,
-                            state = control_screens.lock() => state,
-                        };
-                        if response_input.generation(id) != Some(generation) {
-                            continue;
-                        }
-                        match crate::features::stream_control::publisher::receive_session(
-                            &mut state, &bytes, false,
-                        )
-                        .await
-                        {
-                            Ok(responses) => {
-                                control_target
-                                    .send_if_modified(|routes| routes.received(&responses));
-                                (responses.messages, true)
-                            }
-                            Err(error) => {
-                                tracing::warn!(%error, "host KCP capture setting failed");
-                                continue;
-                            }
-                        }
-                    }
-                };
-                for bytes in messages {
-                    if !response_input.ready(id, generation).await || control_stop.is_cancelled() {
-                        break;
-                    }
-                    let result = if setting_response {
-                        channels::send_setting_response(&control_target, bytes).await
-                    } else {
-                        tokio::select! { _=control_stop.cancelled()=>break, result=control_kcp.send(id, bytes)=>result }
-                    };
-                    if let Err(error) = result {
-                        tracing::warn!(%error,"host KCP CONTROL response failed");
-                    }
-                }
-            }
-        });
+        .start();
         let channel_screens = screens.clone();
         let channel_cancel = cancel.clone();
         let channel_kcp = kcp.clone();
         let channel_input = input.receiver();
         let channel_microphone = microphone.receiver();
         let channel_audio = audio.clone();
+        let channel_files = files.clone();
+        let channel_ports = ports.clone();
+        let channel_annotation = annotation.clone();
+        let channel_clipboard = clipboard_receiver.clone();
+        let channel_control = control_receiver.clone();
         connection.on_data_channel(Box::new(move |channel| {
             let screens = channel_screens.clone();
             let stop = channel_cancel.clone();
@@ -703,6 +688,11 @@ impl Peer {
             let input = channel_input.clone();
             let microphone = channel_microphone.clone();
             let audio = channel_audio.clone();
+            let clipboard = channel_clipboard.clone();
+            let files = channel_files.clone();
+            let ports = channel_ports.clone();
+            let annotation = channel_annotation.clone();
+            let control = channel_control.clone();
             Box::pin(async move {
                 bind_channel(
                     channel,
@@ -713,6 +703,11 @@ impl Peer {
                     input,
                     microphone,
                     audio,
+                    clipboard,
+                    files,
+                    ports,
+                    annotation,
+                    control,
                 )
                 .await;
             })
@@ -806,6 +801,10 @@ impl Peer {
                     control_responses,
                     publisher,
                     cursor,
+                    clipboard_worker,
+                    file_worker,
+                    ports_worker,
+                    annotation_worker,
                 ]);
                 stream_tasks
             },
@@ -1100,6 +1099,7 @@ fn video_timestamp(origin: u32, elapsed_100ns: u64) -> u32 {
 mod capture_worker;
 mod channels;
 mod cursor;
+mod ingress;
 mod media;
 pub(crate) mod screens;
 use channels::bind_channel;

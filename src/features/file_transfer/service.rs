@@ -893,17 +893,40 @@ fn pause_queued(repo: &Repository) -> Result<()> {
 
 pub(super) fn local_list(path: &str) -> Result<Vec<FileEntry>> {
     if path == ":/" {
-        return Ok(('A'..='Z')
+        #[cfg(windows)]
+        let mut entries: Vec<_> = ('A'..='Z')
             .filter_map(|c| {
                 let path = format!("{c}:\\");
                 PathBuf::from(&path).is_dir().then(|| FileEntry {
                     entry_type: 3,
-                    name: path.clone(),
+                    name: format!("({c}:)"),
                     full_path: path,
+                    icon_type: "disk".into(),
                     ..Default::default()
                 })
             })
-            .collect());
+            .collect();
+        // Unix has one tree; its root takes the place of the drive list.
+        #[cfg(not(windows))]
+        let mut entries = vec![FileEntry {
+            entry_type: 3,
+            name: "文件系统 (/)".into(),
+            full_path: "/".into(),
+            icon_type: "disk".into(),
+            ..Default::default()
+        }];
+        entries.extend(
+            crate::platform::file_locations::known_folders()
+                .into_iter()
+                .map(|(path, name, icon)| FileEntry {
+                    entry_type: 0,
+                    name: name.into(),
+                    full_path: path.to_string_lossy().into_owned(),
+                    icon_type: icon.into(),
+                    ..Default::default()
+                }),
+        );
+        return Ok(entries);
     }
     let root = storage::canonical_dir(std::path::Path::new(path))?;
     let mut entries = vec![];
@@ -923,7 +946,18 @@ pub(super) fn local_list(path: &str) -> Result<Vec<FileEntry>> {
             size: m.len(),
             modified_time: storage::modified(&m),
             full_path: e.path().to_string_lossy().into_owned(),
-            icon_type: String::new(),
+            // Official FileEntry carries the extension including its leading dot.
+            // Directories have no extension marker; special root locations above
+            // use the protocol's named icons instead.
+            icon_type: if m.is_dir() {
+                String::new()
+            } else {
+                e.path()
+                    .extension()
+                    .filter(|v| !v.is_empty())
+                    .map(|v| format!(".{}", v.to_string_lossy()))
+                    .unwrap_or_default()
+            },
         });
         ensure!(entries.len() <= storage::MAX_FILES, "目录项目过多");
     }

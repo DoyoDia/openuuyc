@@ -280,19 +280,31 @@ fn primary_mac() -> Result<String> {
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct WallpaperSource {
     pub path: PathBuf,
+    configured_path: PathBuf,
     pub modified: std::time::SystemTime,
     pub length: u64,
+}
+impl WallpaperSource {
+    pub(crate) fn cached(&self) -> bool {
+        self.path != self.configured_path
+    }
 }
 pub(crate) fn wallpaper_source() -> Result<WallpaperSource> {
     let user = WallpaperUser::enter()?;
     wallpaper_source_inner(&user)
 }
-struct WallpaperUser(Option<String>);
+struct WallpaperUser {
+    owner: Option<String>,
+    token: Option<super::host_service::pipe::Handle>,
+}
 impl WallpaperUser {
     fn enter() -> Result<Self> {
         use super::host_service::{pipe::Handle, process, vault};
         if vault::sid(std::process::id())? != "S-1-5-18" {
-            return Ok(Self(None));
+            return Ok(Self {
+                owner: None,
+                token: None,
+            });
         }
         let owner = vault::owner()?.context("壁纸用户未登记")?;
         let mut token = HANDLE::default();
@@ -311,12 +323,38 @@ impl WallpaperUser {
         unsafe {
             windows::Win32::Security::ImpersonateLoggedOnUser(token.0)?;
         }
-        Ok(Self(Some(owner)))
+        Ok(Self {
+            owner: Some(owner),
+            token: Some(token),
+        })
+    }
+
+    fn desktop_key(&self) -> (HKEY, String) {
+        match &self.owner {
+            Some(owner) => (HKEY_USERS, format!(r"{owner}\Control Panel\Desktop")),
+            None => (HKEY_CURRENT_USER, r"Control Panel\Desktop".into()),
+        }
+    }
+
+    fn cached_wallpaper(&self) -> Result<PathBuf> {
+        use windows::Win32::{System::Com::CoTaskMemFree, UI::Shell::*};
+        // Impersonation does not change SYSTEM's process environment or its
+        // known folders. Pass the verified enrollment user's token explicitly.
+        let path = unsafe {
+            SHGetKnownFolderPath(
+                &FOLDERID_RoamingAppData,
+                KF_FLAG_DEFAULT,
+                self.token.as_ref().map(|token| token.0),
+            )?
+        };
+        let value = unsafe { path.to_string() };
+        unsafe { CoTaskMemFree(Some(path.0.cast())) };
+        Ok(PathBuf::from(value?).join(r"Microsoft\Windows\Themes\TranscodedWallpaper"))
     }
 }
 impl Drop for WallpaperUser {
     fn drop(&mut self) {
-        if self.0.is_some() && unsafe { windows::Win32::Security::RevertToSelf() }.is_err() {
+        if self.owner.is_some() && unsafe { windows::Win32::Security::RevertToSelf() }.is_err() {
             std::process::abort();
         }
     }
@@ -324,17 +362,46 @@ impl Drop for WallpaperUser {
 fn wallpaper_source_inner(user: &WallpaperUser) -> Result<WallpaperSource> {
     // The resident runs as SYSTEM. Read only its explicitly enrolled user's
     // loaded desktop settings, never SYSTEM's wallpaper or another session's.
-    let path = if let Some(owner) = &user.0 {
-        registry_string(
-            HKEY_USERS,
-            &format!(r"{owner}\Control Panel\Desktop"),
-            "WallPaper",
-        )?
-    } else {
-        registry_string(HKEY_CURRENT_USER, r"Control Panel\Desktop", "WallPaper")?
-    };
+    let (root, key) = user.desktop_key();
+    let path = registry_string(root, &key, "WallPaper")?;
     ensure!(!path.is_empty(), "Windows 当前没有静态图片壁纸");
     let path = PathBuf::from(path);
+    resolve_wallpaper(path, || {
+        Ok((
+            user.cached_wallpaper()?,
+            wallpaper_cache_record(root, &key)?,
+        ))
+    })
+}
+
+fn resolve_wallpaper(
+    path: PathBuf,
+    cache: impl FnOnce() -> Result<(PathBuf, Vec<u8>)>,
+) -> Result<WallpaperSource> {
+    match wallpaper_file(path.clone(), path.clone()) {
+        Ok(source) => return Ok(source),
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            ()
+        }
+        Err(error) => return Err(error),
+    }
+    // Do not pick an arbitrary old thumbnail when the original was removed.
+    // The standard current cache must identify this exact configured image.
+    let (cached_path, bytes) =
+        cache().context("壁纸原文件不可用，无法核对 Windows 当前壁纸缓存")?;
+    let cached_from = transcoded_source(&bytes);
+    ensure!(
+        cached_from.as_ref() == Some(&path),
+        "壁纸原文件不可用，Windows 壁纸缓存与当前设置不一致，请重新选择壁纸"
+    );
+    wallpaper_file(cached_path, path).context("壁纸原文件不可用，Windows 当前壁纸缓存也不可用")
+}
+
+fn wallpaper_file(path: PathBuf, configured_path: PathBuf) -> Result<WallpaperSource> {
     ensure!(
         path.is_absolute() && !path.to_string_lossy().starts_with(r"\\"),
         "壁纸必须是本机文件"
@@ -346,9 +413,60 @@ fn wallpaper_source_inner(user: &WallpaperUser) -> Result<WallpaperSource> {
     );
     Ok(WallpaperSource {
         path,
+        configured_path,
         modified: metadata.modified()?,
         length: metadata.len(),
     })
+}
+
+fn wallpaper_cache_record(root: HKEY, key: &str) -> Result<Vec<u8>> {
+    let key: Vec<u16> = key.encode_utf16().chain(Some(0)).collect();
+    let name = windows::core::w!("TranscodedImageCache");
+    let mut size = 0;
+    unsafe {
+        RegGetValueW(
+            root,
+            PCWSTR(key.as_ptr()),
+            name,
+            RRF_RT_REG_BINARY | RRF_SUBKEY_WOW6464KEY,
+            None,
+            None,
+            Some(&mut size),
+        )
+        .ok()?;
+    }
+    ensure!((26..=65536).contains(&size), "Windows 壁纸缓存记录长度无效");
+    let mut bytes = vec![0u8; size as usize];
+    unsafe {
+        RegGetValueW(
+            root,
+            PCWSTR(key.as_ptr()),
+            name,
+            RRF_RT_REG_BINARY | RRF_SUBKEY_WOW6464KEY,
+            None,
+            Some(bytes.as_mut_ptr().cast()),
+            Some(&mut size),
+        )
+        .ok()?;
+    }
+    bytes.truncate(size as usize);
+    Ok(bytes)
+}
+
+fn transcoded_source(bytes: &[u8]) -> Option<PathBuf> {
+    // Windows' TranscodedImageCache stores a NUL-terminated UTF-16 source path
+    // after its 24-byte header. Unrecognized records must not authorize a cache.
+    let payload = bytes.get(24..)?;
+    if payload.len() % 2 != 0 {
+        return None;
+    }
+    let words: Vec<u16> = payload
+        .chunks_exact(2)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+        .collect();
+    let end = words.iter().position(|&word| word == 0)?;
+    let text = String::from_utf16(&words[..end]).ok()?;
+    (!text.is_empty()).then(|| PathBuf::from(text))
 }
 
 pub(crate) fn wallpaper_image(source: &WallpaperSource) -> Result<Vec<u8>> {

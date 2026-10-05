@@ -163,6 +163,19 @@ fn graphics() -> Result<Vec<String>> {
     Ok(names)
 }
 
+/// The `pci.ids` name of the PCI device at a sysfs device directory.
+pub(super) fn pci_device_name(device: &std::path::Path) -> Option<String> {
+    let hex = |name: &str| -> Option<u16> {
+        let text = read_trimmed(&device.join(name).to_string_lossy()).ok()?;
+        u16::from_str_radix(text.trim_start_matches("0x"), 16).ok()
+    };
+    let (vendor, id) = (hex("vendor")?, hex("device")?);
+    ["/usr/share/misc/pci.ids", "/usr/share/hwdata/pci.ids"]
+        .iter()
+        .find_map(|path| std::fs::read_to_string(path).ok())
+        .and_then(|database| pci_name(&database, vendor, id))
+}
+
 /// "NVIDIA RTX A6000" from "NVIDIA Corporation" and "GA102GL [RTX A6000]":
 /// the bracketed marketing name where `pci.ids` has one.
 fn pci_name(database: &str, vendor: u16, device: u16) -> Option<String> {
@@ -240,6 +253,13 @@ pub(crate) struct WallpaperSource {
     pub path: PathBuf,
     pub modified: std::time::SystemTime,
     pub length: u64,
+}
+impl WallpaperSource {
+    /// Windows may read a cached copy of the configured picture; Linux always
+    /// reads the configured file itself.
+    pub(crate) fn cached(&self) -> bool {
+        false
+    }
 }
 
 /// The static picture the desktop shows now: GNOME, Cinnamon and MATE keep it

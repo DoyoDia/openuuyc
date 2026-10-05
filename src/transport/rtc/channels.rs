@@ -53,6 +53,7 @@ impl DataChannels {
         let port_mapping = Arc::new(crate::features::port_mapping::Transport::default());
         for channel in &local_channels {
             stream_control.file_transfer().bind(channel);
+            stream_control.drag_drop().bind(channel);
             if channel.label() == "FILE_DATA_CHANNEL" {
                 port_mapping.bind(channel);
                 let binary = Arc::clone(channel);
@@ -186,6 +187,9 @@ impl DataChannels {
             if local_channel && matches!(label.as_str(), "TEXT_DATA_CHANNEL" | "FILE_DATA_CHANNEL")
             {
                 close_stream_control.file_transfer().close();
+                if let Some(channel) = closed_channel.upgrade() {
+                    close_stream_control.drag_drop().close(&channel);
+                }
             }
             if local_channel && label == "FILE_DATA_CHANNEL" {
                 close_mapping.close();
@@ -219,12 +223,20 @@ impl DataChannels {
 
         let label = channel.label().to_owned();
         let message_stream_control = stream_control;
+        let drag_channel = Arc::downgrade(channel);
         channel.on_message(Box::new(move |message| {
+            let drag_channel=drag_channel.clone();
             let mapping=Arc::clone(&port_mapping);
             let label = label.clone();
             let stream_control = message_stream_control.clone();
             Box::pin(async move {
-                if matches!(label.as_str(), "TEXT_DATA_CHANNEL" | "FILE_DATA_CHANNEL") && !message.data.starts_with(b"{")
+                if matches!(label.as_str(), "TEXT_DATA_CHANNEL" | "FILE_DATA_CHANNEL") && crate::protocol::drag_drop::is_packet(&message.data) {
+                    if local_channel && let Some(channel)=drag_channel.upgrade() {
+                        if let Err(error) = stream_control.drag_drop().receive(&channel, &message.data, label == "FILE_DATA_CHANNEL") { tracing::warn!(%error,"invalid native drag message"); }
+                    }
+                } else if label == "TEXT_DATA_CHANNEL" && crate::protocol::annotation::is_packet(&message.data) {
+                    if let Err(error)=stream_control.handle_native_annotation(&message.data) {tracing::warn!(%error,"invalid native annotation message");}
+                } else if matches!(label.as_str(), "TEXT_DATA_CHANNEL" | "FILE_DATA_CHANNEL") && !message.data.starts_with(b"{")
                     && stream_control.file_transfer().receive(&message.data).await.unwrap_or_else(|error| {
                         tracing::warn!(%error,"invalid file transfer message"); false
                     }) {
@@ -437,7 +449,9 @@ pub(super) async fn send_remote_input(
             )
         {
             keyboard_submission_seen = true;
-            tracing::debug!(target: "openuuyc::transport::rtc::input", "keyboard event submitted to CONTROL transport");
+            tracing::debug!(target: "openuuyc::transport::rtc::input",
+                down = matches!(event.event, crate::features::remote_input::InputEvent::Key { down: true, .. }),
+                "keyboard event submitted to CONTROL transport");
         }
         mouse.complete(&event, result);
     }

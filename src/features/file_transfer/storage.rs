@@ -50,39 +50,14 @@ pub(crate) fn known_folder(folder: KnownFolder) -> Option<PathBuf> {
     path.filter(|p| p.is_dir())
 }
 
-/// xdg-user-dirs records the localized names; the English defaults are the fallback.
 #[cfg(not(windows))]
 pub(crate) fn known_folder(folder: KnownFolder) -> Option<PathBuf> {
-    let home = PathBuf::from(std::env::var_os("HOME")?);
     let (key, default) = match folder {
         KnownFolder::Desktop => ("XDG_DESKTOP_DIR", "Desktop"),
         KnownFolder::Downloads => ("XDG_DOWNLOAD_DIR", "Downloads"),
         KnownFolder::Documents => ("XDG_DOCUMENTS_DIR", "Documents"),
     };
-    let configured = user_dirs_entry(&home, key);
-    configured
-        .into_iter()
-        .chain(Some(home.join(default)))
-        .find(|path| path.is_dir())
-}
-
-#[cfg(not(windows))]
-fn user_dirs_entry(home: &Path, key: &str) -> Option<PathBuf> {
-    let config = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".config"));
-    let text = std::fs::read_to_string(config.join("user-dirs.dirs")).ok()?;
-    let value = text.lines().rev().find_map(|line| {
-        line.trim()
-            .strip_prefix(key)?
-            .trim_start()
-            .strip_prefix('=')
-            .map(|value| value.trim().trim_matches('"').to_owned())
-    })?;
-    Some(match value.strip_prefix("$HOME/") {
-        Some(relative) => home.join(relative),
-        None => PathBuf::from(value),
-    })
+    crate::platform::file_locations::user_dir(key, default)
 }
 
 /// Windows reparse points and Unix symlinks both break out of a chosen root.
@@ -196,6 +171,79 @@ fn not_link(p: &Path) -> Result<std::fs::Metadata> {
         p.display()
     );
     Ok(m)
+}
+/// A protocol path from the remote peer as a local absolute path: a drive
+/// path on Windows, a `/` path on Unix (the form macOS hosts use). Every
+/// existing ancestor must be a plain directory, never a link.
+#[cfg(windows)]
+pub(super) fn local_path(value: &str) -> Result<PathBuf> {
+    let path = if value == ":/Default" {
+        known_folder(KnownFolder::Downloads).context("用户下载目录不可用")?
+    } else if value.len() == 2
+        && value.as_bytes()[0].is_ascii_alphabetic()
+        && value.as_bytes()[1] == b':'
+    {
+        // A drive item is a volume root in this protocol, never a process-relative drive cwd.
+        PathBuf::from(format!("{value}\\"))
+    } else {
+        PathBuf::from(value)
+    };
+    let text = path.to_str().context("文件路径无效")?;
+    let bytes = text.as_bytes();
+    ensure!(
+        bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'/' | b'\\'),
+        "仅支持本地磁盘的绝对路径"
+    );
+    let mut result = PathBuf::from(format!("{}:\\", bytes[0] as char));
+    let tail = text[3..].trim_end_matches(['\\', '/']);
+    if !tail.is_empty() {
+        result.push(safe_relative(tail)?);
+    }
+    // Every existing ancestor must stay a normal directory, not a junction or device path.
+    let mut current = PathBuf::new();
+    for part in result.components() {
+        current.push(part);
+        if !current.is_absolute() {
+            continue;
+        }
+        match std::fs::symlink_metadata(&current) {
+            Ok(m) => ensure!(
+                m.file_attributes() & 0x400 == 0,
+                "不允许通过重解析点访问文件"
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(result)
+}
+#[cfg(not(windows))]
+pub(super) fn local_path(value: &str) -> Result<PathBuf> {
+    let path = if value == ":/Default" {
+        known_folder(KnownFolder::Downloads).context("用户下载目录不可用")?
+    } else {
+        PathBuf::from(value)
+    };
+    let text = path.to_str().context("文件路径无效")?;
+    ensure!(text.starts_with('/'), "仅支持本地磁盘的绝对路径");
+    let mut result = PathBuf::from("/");
+    let tail = text.trim_matches('/');
+    if !tail.is_empty() {
+        result.push(safe_relative(tail)?);
+    }
+    let mut current = PathBuf::new();
+    for part in result.components() {
+        current.push(part);
+        match std::fs::symlink_metadata(&current) {
+            Ok(m) => ensure!(!is_link(&m), "不允许通过符号链接访问文件"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(result)
 }
 pub(super) fn canonical_dir(p: &Path) -> Result<PathBuf> {
     ensure!(p.is_absolute(), "请选择完整本地目录");
@@ -404,7 +452,7 @@ pub(super) fn prepare(
         _locks: locks,
     }))
 }
-fn temp_path(root: &Path, relative: &Path, key: &str) -> PathBuf {
+pub(super) fn temp_path(root: &Path, relative: &Path, key: &str) -> PathBuf {
     let mut p = root.join(relative);
     let name = p.file_name().unwrap_or_default().to_string_lossy();
     p.set_file_name(format!(".{name}.{key}.downloading"));
@@ -548,5 +596,19 @@ impl Store {
             let _ = std::fs::remove_file(temp);
         }
         result
+    }
+}
+
+#[cfg(all(test, not(windows)))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unix_protocol_paths() {
+        assert_eq!(local_path("/").unwrap(), PathBuf::from("/"));
+        assert_eq!(local_path("/tmp/").unwrap(), PathBuf::from("/tmp"));
+        assert!(local_path("relative/path").is_err());
+        assert!(local_path("C:\\Users").is_err());
+        assert!(local_path("/tmp/../etc").is_err());
     }
 }

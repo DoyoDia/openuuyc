@@ -38,6 +38,8 @@ mod windows_keyboard;
 
 #[cfg(windows)]
 mod windows_mouse;
+#[cfg(windows)]
+mod windows_drag;
 
 #[cfg(windows)]
 pub(crate) mod windows_presenter;

@@ -41,6 +41,8 @@ pub(crate) struct ToastAction {
 }
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct Toast {
+    /// File-transfer progress in per mille, updated in place.
+    pub progress: Option<u16>,
     pub key: String,
     pub title: String,
     pub body: String,
@@ -54,6 +56,13 @@ fn opened() -> &'static Mutex<HashMap<u32, String>> {
     OPENED.get_or_init(Mutex::default)
 }
 
+/// Notifications the user closed. A progress notice stays closed; its next
+/// update must not bring it back.
+fn dismissed() -> &'static Mutex<std::collections::HashSet<u32>> {
+    static DISMISSED: OnceLock<Mutex<std::collections::HashSet<u32>>> = OnceLock::new();
+    DISMISSED.get_or_init(Mutex::default)
+}
+
 /// One listener for the process: the signal stream blocks for good, so it is
 /// started once and outlives every `Native`.
 fn listen(connection: &Connection) -> Result<()> {
@@ -65,6 +74,23 @@ fn listen(connection: &Connection) -> Result<()> {
                 Proxy::new(&connection, SERVICE, PATH, SERVICE).map_err(|e| format!("{e:#}"))?;
             let signals = proxy
                 .receive_signal("ActionInvoked")
+                .map_err(|e| format!("{e:#}"))?;
+            let closed = proxy
+                .receive_signal("NotificationClosed")
+                .map_err(|e| format!("{e:#}"))?;
+            std::thread::Builder::new()
+                .name("desktop-notifications-closed".into())
+                .spawn(move || {
+                    for message in closed {
+                        // Reason 2: dismissed by the user.
+                        if let Ok((id, 2)) = message.body().deserialize::<(u32, u32)>() {
+                            dismissed()
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .insert(id);
+                        }
+                    }
+                })
                 .map_err(|e| format!("{e:#}"))?;
             std::thread::Builder::new()
                 .name("desktop-notifications".into())
@@ -139,6 +165,20 @@ impl Native {
             if previous.is_some_and(|(old, _)| old == item) {
                 continue;
             }
+            // A dismissed progress notice stays dismissed; the finished
+            // transfer has its own ticket and may notify once.
+            if item.progress.is_some()
+                && let Some((old, id)) = previous
+                && old.progress.is_some()
+                && dismissed()
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .contains(id)
+            {
+                let id = *id;
+                self.shown.insert(item.key.clone(), (item.clone(), id));
+                continue;
+            }
             anyhow::ensure!(
                 item.key.len() == 32 && item.key.bytes().all(|b| b.is_ascii_hexdigit()),
                 "无效的通知标识"
@@ -158,6 +198,10 @@ impl Native {
             }
             let mut hints = HashMap::<&str, Value<'_>>::new();
             hints.insert("suppress-sound", Value::from(true));
+            if let Some(progress) = item.progress {
+                // The standard progress hint, a percentage.
+                hints.insert("value", Value::from(i32::from(progress.min(1000) / 10)));
+            }
             let timeout = if item.expires_at > 0 {
                 let left = item.expires_at - chrono::Utc::now().timestamp();
                 i32::try_from(left.max(1).saturating_mul(1000)).unwrap_or(i32::MAX)
@@ -209,33 +253,60 @@ impl Native {
     }
 }
 
-/// The in-app notice window sits in the lower right corner of the primary
-/// monitor, above other windows. Wayland lets the compositor place windows,
-/// so the position request only takes effect on X11.
-pub(crate) fn place(window: &winit::window::Window, initial: bool) -> Result<()> {
-    let monitor = if initial {
-        window
+/// Keeps the in-app notice window in the lower right corner of its monitor,
+/// above other windows. Wayland lets the compositor place windows, so the
+/// position request only takes effect on X11.
+pub(crate) struct Placement {
+    failed: bool,
+}
+
+impl Placement {
+    pub(crate) fn new(window: &winit::window::Window) -> Result<Self> {
+        window.set_window_level(winit::window::WindowLevel::AlwaysOnTop);
+        let placement = Self { failed: false };
+        let monitor = window
             .primary_monitor()
             .or_else(|| window.current_monitor())
-    } else {
-        window
+            .context("找不到用于放置通知的显示器")?;
+        placement.move_to(window, &monitor);
+        Ok(placement)
+    }
+
+    /// Follows resolution changes of the monitor the window is on.
+    pub(crate) fn refresh(&mut self, window: &winit::window::Window) {
+        match window
             .current_monitor()
             .or_else(|| window.primary_monitor())
+        {
+            Some(monitor) => {
+                self.failed = false;
+                self.move_to(window, &monitor);
+            }
+            None => {
+                if !self.failed {
+                    tracing::warn!("notification placement unavailable");
+                }
+                self.failed = true;
+            }
+        }
     }
-    .context("找不到用于放置通知的显示器")?;
-    window.set_window_level(winit::window::WindowLevel::AlwaysOnTop);
-    let size = window.outer_size();
-    let margin =
-        (crate::ui::theme::NOTIFICATION_MARGIN * window.scale_factor() as f32).round() as i32;
-    let origin = monitor.position();
-    let area = monitor.size();
-    let right = origin.x + area.width as i32;
-    let bottom = origin.y + area.height as i32;
-    window.set_outer_position(winit::dpi::PhysicalPosition::new(
-        (right - size.width as i32 - margin).max(origin.x),
-        (bottom - size.height as i32 - margin).max(origin.y),
-    ));
-    Ok(())
+
+    fn move_to(&self, window: &winit::window::Window, monitor: &winit::monitor::MonitorHandle) {
+        let size = window.outer_size();
+        let margin =
+            (crate::ui::theme::NOTIFICATION_MARGIN * window.scale_factor() as f32).round() as i32;
+        let origin = monitor.position();
+        let area = monitor.size();
+        let right = origin.x + area.width as i32;
+        let bottom = origin.y + area.height as i32;
+        let position = winit::dpi::PhysicalPosition::new(
+            (right - size.width as i32 - margin).max(origin.x),
+            (bottom - size.height as i32 - margin).max(origin.y),
+        );
+        if window.outer_position().ok() != Some(position) {
+            window.set_outer_position(position);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -252,6 +323,7 @@ mod tests {
         let key = "0123456789abcdef0123456789abcdef".to_owned();
         native
             .synchronize(&[Toast {
+                progress: None,
                 key: key.clone(),
                 title: "OpenUUYC 通知测试".into(),
                 body: "这是一条测试通知，3 秒后自动关闭。".into(),

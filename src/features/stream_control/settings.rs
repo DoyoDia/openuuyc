@@ -786,7 +786,9 @@ pub(super) fn finish_request(
         }
         let settings_changed = state.confirmed_preferences.saved() != completed.preferences.saved();
         state.confirmed_preferences = completed.preferences;
-        if completed.persist && settings_changed {
+        // Reapplying a confirmed choice must repair a failed local save even
+        // when it equals the in-memory default restored after a read failure.
+        if completed.persist && (settings_changed || state.persistence_error.is_some()) {
             state
                 .preference_updates
                 .send_replace(Some(ViewingPreferenceUpdate::Settings(

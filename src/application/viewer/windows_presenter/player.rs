@@ -43,6 +43,7 @@ pub(in crate::application::viewer) fn viewer_shortcut(
 }
 
 pub(in crate::application::viewer) struct ThreadedWindowsApp {
+    drag: Option<crate::application::viewer::windows_drag::WindowDrag>,
     _shortcuts: crate::application::viewer_shortcuts::Watcher,
     pub(in crate::application::viewer) annotation:
         crate::application::viewer::annotation::AnnotationUi,
@@ -92,6 +93,11 @@ impl ThreadedWindowsApp {
         // child window; retire the old swap chain before attaching a new track.
         self.stream_control
             .cancel_display_change(self.bound_screen as u32 as i32);
+        self.drag.take();
+        self.drag = Some(crate::application::viewer::windows_drag::WindowDrag::new(
+            window,
+            &session.stream_control,
+        )?);
         self.annotation.bind(session.stream_control.clone());
         self.stream_control_ui = StreamControlUi::default();
         self.mouse.release(window);
@@ -144,6 +150,10 @@ impl ThreadedWindowsApp {
             Arc::clone(&cpu_device),
         )?;
         Ok(Self {
+            drag: Some(crate::application::viewer::windows_drag::WindowDrag::new(
+                window,
+                &stream_control,
+            )?),
             _shortcuts: crate::application::viewer_shortcuts::Watcher::new()?,
             annotation: crate::application::viewer::annotation::AnnotationUi::new(
                 stream_control.clone(),
@@ -195,6 +205,15 @@ impl ThreadedWindowsApp {
         if let WindowEvent::ModifiersChanged(modifiers) = event {
             self.modifiers = modifiers.state();
         }
+        if matches!(event, WindowEvent::KeyboardInput {event:key,..}
+            if key.state == winit::event::ElementState::Pressed
+                && key.physical_key == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::Escape))
+            && self.stream_control.drag_drop().interactive()
+        {
+            self.stream_control.drag_drop().cancel_gesture(false);
+            window.request_redraw();
+            return Ok(());
+        }
         if let WindowEvent::KeyboardInput {
             event: key,
             is_synthetic: false,
@@ -230,6 +249,7 @@ impl ThreadedWindowsApp {
             self.mouse.release(window);
         }
         if matches!(event, WindowEvent::Focused(false)) {
+            self.stream_control.drag_drop().cancel_gesture(true);
             self.modifiers = winit::keyboard::ModifiersState::empty();
             if let Ok(hwnd) = window_hwnd(window) {
                 crate::application::viewer_shortcuts::set_text_owner(hwnd.0 as u64, false);
@@ -365,9 +385,30 @@ impl ThreadedWindowsApp {
                 .stream_control
                 .pending_display_resolution(self._session.screen_id())
                 .is_some();
+        if let Some(drag) = &self.drag {
+            let available = !display_transition
+                && !self.stream_control_ui.open
+                && !self.plugin_menu_open
+                && !self.screen_tabs.is_pending()
+                && !window.is_minimized().unwrap_or(false);
+            drag.geometry(
+                available
+                    .then(|| {
+                        crate::application::viewer::windows_mouse::Target::for_window(
+                            window,
+                            &self.stream_control,
+                            &self.egui_context,
+                            self._session.track_index,
+                            &self.renderer.current_video_size,
+                        )
+                    })
+                    .flatten(),
+            );
+        }
         if window.has_focus()
             && !window.is_minimized().unwrap_or(false)
             && !display_transition
+            && !self.stream_control.drag_drop().interactive()
             && !self.stream_control_ui.open
             && !self.plugin_menu_open
             && !self.screen_tabs.is_pending()
@@ -529,6 +570,9 @@ impl ThreadedWindowsApp {
             );
             if let Some(upgrade) = self.stream_control.remote_upgrade() {
                 upgrade.show(&ctx, window.id(), &self.stream_control);
+            }
+            if let Some(drag) = &self.drag {
+                drag.show(&ctx);
             }
             crate::ui::controls::show_notices(&ctx);
             if window.has_focus() && !self.stream_control_ui.open && !self.plugin_menu_open {

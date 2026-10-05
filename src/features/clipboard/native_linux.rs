@@ -24,10 +24,82 @@ const POLL: Duration = Duration::from_millis(400);
 
 pub(super) enum Command {
     Activate(Weak<Inner>),
+    /// Never sent here: preparing dropped files already fails on Linux.
+    #[allow(dead_code, reason = "Shared code names it; Linux never builds one.")]
+    DropFiles(
+        Arc<super::drag::Submission>,
+        PreparedFiles,
+        ClipboardFormatListRequestKind,
+    ),
     Remove(u64),
-    Offer(Weak<Inner>, u64, Vec<ClipboardFormat>),
+    Offer(
+        Weak<Inner>,
+        u64,
+        Vec<ClipboardFormat>,
+        Option<ClipboardFormatListRequestKind>,
+    ),
     Request(Weak<Inner>, u64, i64, ClipboardRequestKind),
     Text(Weak<Inner>, u64, i64, String),
+    #[allow(
+        dead_code,
+        reason = "PreparedFiles is uninhabited on Linux, so no value is ever read"
+    )]
+    PublishFiles(
+        Weak<Inner>,
+        u64,
+        PreparedFiles,
+        tokio::sync::oneshot::Sender<Result<(), String>>,
+    ),
+}
+
+/// Native file drag and drop (OLE on Windows) has no Linux counterpart yet.
+const NO_DRAG: &str = "Linux 暂不支持拖放文件";
+
+/// Files picked for a drag or a drop, prepared before they are offered. No
+/// value exists on Linux: preparing them is refused.
+pub(super) enum PreparedFiles {}
+impl PreparedFiles {
+    pub fn summary(&self) -> FileSummary {
+        match *self {}
+    }
+}
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct FileSummary {
+    pub count: u32,
+    pub bytes: u64,
+    pub first_name: String,
+}
+pub(super) fn prepare_files(
+    _paths: Vec<PathBuf>,
+    _allowed: impl Fn() -> bool,
+) -> Result<PreparedFiles> {
+    bail!(NO_DRAG)
+}
+
+/// Files a peer offers for a native drag. Never received on Linux, which
+/// does not take part in native drags.
+#[derive(Clone)]
+pub(crate) enum FileOffer {}
+pub(crate) struct FileOfferStatus {
+    pub bytes_read: u64,
+    pub completed: Option<Result<(), String>>,
+}
+impl FileOffer {
+    pub fn prepare(&self) -> Result<FileSummary> {
+        match *self {}
+    }
+    pub fn object(&self) -> Result<std::convert::Infallible> {
+        match *self {}
+    }
+    pub fn dragging(&self, _value: bool) {
+        match *self {}
+    }
+    pub fn cancel(&self) {
+        match *self {}
+    }
+    pub fn status(&self) -> FileOfferStatus {
+        match *self {}
+    }
 }
 
 struct Worker {
@@ -383,9 +455,15 @@ fn process(state: &mut State, command: Command) {
             state.sessions.remove(&id);
             state.published.remove(&id);
         }
-        Command::Offer(weak, epoch, formats) => {
+        Command::Offer(weak, epoch, formats, drop) => {
             if let Some(session) = weak.upgrade().filter(|session| session.valid(epoch))
-                && let Err(error) = accept_offer(state, &session, epoch, formats)
+                && let Err(error) = if drop.is_some() {
+                    // A dropped or auto-saved file list is a native drag,
+                    // not a copy; leave the local clipboard alone.
+                    Err(anyhow!(NO_DRAG))
+                } else {
+                    accept_offer(state, &session, epoch, formats)
+                }
             {
                 // The notice shows the outermost line; the cause is only in
                 // the chain, and it is the part worth reading.
@@ -418,6 +496,8 @@ fn process(state: &mut State, command: Command) {
                 );
             }
         }
+        Command::DropFiles(_, files, _) => match files {},
+        Command::PublishFiles(_, _, files, _) => match files {},
         Command::Request(weak, epoch, id, kind) => {
             if let Some(session) = weak.upgrade().filter(|session| session.valid(epoch))
                 && let Err(error) = serve(state, &session, epoch, id, kind)

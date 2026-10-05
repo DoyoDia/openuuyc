@@ -77,6 +77,61 @@ pub(crate) mod resident {
     }
 }
 
+/// Login startup through an XDG autostart entry, the counterpart of the
+/// Windows per-user Run key.
+pub(crate) mod startup {
+    use super::*;
+
+    fn entry() -> Result<PathBuf> {
+        let config = std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+            .context("无法确定用户配置目录")?;
+        Ok(config.join("autostart/openuuyc.desktop"))
+    }
+
+    pub(crate) fn set_image(enabled: bool, path: &std::path::Path) -> Result<()> {
+        let entry = entry()?;
+        if !enabled {
+            return match std::fs::remove_file(&entry) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                    Err(error).context("无法删除本程序自启动设置")
+                }
+                _ => Ok(()),
+            };
+        }
+        anyhow::ensure!(path.is_file(), "尚未部署自启动程序");
+        let image = path.to_str().context("程序路径不是 UTF-8")?;
+        anyhow::ensure!(!image.contains(['\n', '\r']), "程序路径含换行");
+        // Desktop Entry quoting: reserved characters get a backslash inside the
+        // quoted argument, and the file's string escaping doubles every backslash.
+        let mut quoted = String::new();
+        for c in image.chars() {
+            match c {
+                '\\' => quoted.push_str(r"\\\\"),
+                '"' | '`' | '$' => {
+                    quoted.push_str(r"\\");
+                    quoted.push(c);
+                }
+                '%' => quoted.push_str("%%"),
+                _ => quoted.push(c),
+            }
+        }
+        if let Some(directory) = entry.parent() {
+            std::fs::create_dir_all(directory)?;
+        }
+        std::fs::write(
+            &entry,
+            format!(
+                "[Desktop Entry]\nType=Application\nName=OpenUUYC\n\
+                 Exec=\"{quoted}\" gui --background\nX-GNOME-Autostart-enabled=true\n"
+            ),
+        )
+        .with_context(|| format!("无法写入自启动设置 {}", entry.display()))
+    }
+}
+
 /// Holds the per-user lock that lets only one process keep a device's
 /// presence room; two owners would keep kicking each other off the server.
 pub(crate) struct PresenceReservation(#[allow(dead_code)] std::fs::File);

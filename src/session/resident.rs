@@ -20,6 +20,11 @@ pub(crate) enum Request {
         action: host::assist::Action,
     },
     RefreshPublication,
+    RefreshWol,
+    WolSetup {
+        account: String,
+        action: host::wol::setup::Action,
+    },
     Initialize {
         force: bool,
     },
@@ -36,9 +41,15 @@ pub(crate) enum Request {
         audio_defaults: host::audio::DefaultDevices,
         audio_quality: crate::media::audio::encoder::Quality,
         assistance: host::assist::Settings,
+        clipboard: host::clipboard::Settings,
+        file_transfer: bool,
+        port_mapping: bool,
+        remote_power: bool,
+        wol: bool,
     },
     Disconnect {
         account: String,
+        session: String,
     },
     Retry {
         account: String,
@@ -63,6 +74,16 @@ pub(crate) struct Snapshot {
     pub audio_defaults: host::audio::DefaultDevices,
     #[serde(default)]
     pub audio_quality: crate::media::audio::encoder::Quality,
+    #[serde(default)]
+    pub clipboard: host::clipboard::Settings,
+    #[serde(default)]
+    pub file_transfer: bool,
+    #[serde(default)]
+    pub port_mapping: bool,
+    #[serde(default)]
+    pub remote_power: bool,
+    #[serde(default)]
+    pub wol: bool,
     pub status: host::Status,
     pub capabilities: Option<host::desktop::Capabilities>,
 }

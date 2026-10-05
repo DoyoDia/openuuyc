@@ -37,6 +37,24 @@ struct Cli {
 enum Commands {
     #[cfg(windows)]
     #[command(hide = true)]
+    WolConfigure {
+        #[arg(long)]
+        interface: String,
+        #[arg(long)]
+        mac: String,
+    },
+    /// 使用当前程序包更新已安装版本
+    #[cfg(windows)]
+    Update {
+        /// 不显示更新窗口；需要管理员权限时仍请求 Windows UAC
+        #[arg(long)]
+        silent: bool,
+        /// 禁止请求提权，权限不足时返回 740（用于无人值守脚本）
+        #[arg(long, requires = "silent")]
+        no_elevate: bool,
+    },
+    #[cfg(windows)]
+    #[command(hide = true)]
     Notification { uri: String },
     /// 打开卸载窗口，选择是否保留驱动和本机数据
     #[cfg(windows)]
@@ -62,6 +80,30 @@ enum Commands {
     #[cfg(windows)]
     #[command(hide = true)]
     InputAgent {
+        #[arg(long)]
+        pipe: String,
+        #[arg(long)]
+        parent: u32,
+    },
+    #[cfg(windows)]
+    #[command(hide = true)]
+    ClipboardAgent {
+        #[arg(long)]
+        pipe: String,
+        #[arg(long)]
+        parent: u32,
+    },
+    #[cfg(windows)]
+    #[command(hide = true)]
+    AnnotationAgent {
+        #[arg(long)]
+        pipe: String,
+        #[arg(long)]
+        parent: u32,
+    },
+    #[cfg(windows)]
+    #[command(hide = true)]
+    FileAgent {
         #[arg(long)]
         pipe: String,
         #[arg(long)]
@@ -194,6 +236,31 @@ fn main() -> Result<()> {
     tracing::info!(target: "openuuyc", version = env!("CARGO_PKG_VERSION"), "application started");
 
     #[cfg(windows)]
+    if let Commands::Update { silent, no_elevate } = command {
+        if !silent {
+            return openuuyc::application::update_application(false, false).map(|_| ());
+        }
+        let result = openuuyc::application::update_application(silent, no_elevate);
+        let code = match result {
+            Ok(false) => {
+                println!("更新完成");
+                0
+            }
+            Ok(true) => {
+                println!("更新完成，需要重启 Windows；未自动重启");
+                3010
+            }
+            Err(error) => {
+                tracing::error!(error=%format!("{error:#}"), "application update failed");
+                eprintln!("更新失败：{error:#}");
+                openuuyc::application::update_error_code(&error)
+            }
+        };
+        drop(_logging);
+        std::process::exit(code);
+    }
+
+    #[cfg(windows)]
     if let Commands::Component {
         component,
         operation,
@@ -230,11 +297,27 @@ fn main() -> Result<()> {
     }
     let result = match command {
         #[cfg(windows)]
+        Commands::WolConfigure { interface, mac } => {
+            openuuyc::application::configure_wol(interface, mac)
+        }
+        #[cfg(windows)]
+        Commands::Update { .. } => unreachable!(),
+        #[cfg(windows)]
         Commands::Uninstall { parent } => openuuyc::application::uninstall_application(parent),
         #[cfg(windows)]
         Commands::Component { .. } => unreachable!(),
         #[cfg(windows)]
         Commands::Service => openuuyc::application::host_service(),
+        #[cfg(windows)]
+        Commands::ClipboardAgent { pipe, parent } => {
+            openuuyc::application::clipboard_agent(&pipe, parent)
+        }
+        #[cfg(windows)]
+        Commands::AnnotationAgent { pipe, parent } => {
+            openuuyc::application::annotation_agent(&pipe, parent)
+        }
+        #[cfg(windows)]
+        Commands::FileAgent { pipe, parent } => openuuyc::application::file_agent(&pipe, parent),
         #[cfg(windows)]
         Commands::HostResident { parent } => openuuyc::application::host_resident(parent),
         #[cfg(windows)]
@@ -317,6 +400,9 @@ fn internal_role(command: &Commands) -> bool {
         | Commands::DisplayRecovery { .. } => true,
         #[cfg(windows)]
         Commands::Notification { .. }
+        | Commands::ClipboardAgent { .. }
+        | Commands::FileAgent { .. }
+        | Commands::AnnotationAgent { .. }
         | Commands::Component { .. }
         | Commands::Service
         | Commands::HostResident { .. }

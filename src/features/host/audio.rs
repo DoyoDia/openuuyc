@@ -89,6 +89,7 @@ struct Shared {
     status: Mutex<Status>,
     generation: AtomicU64,
     active: AtomicBool,
+    media_allowed: AtomicBool,
     recover: AtomicBool,
     stopped: AtomicBool,
     frames: ArrayQueue<Frame>,
@@ -117,6 +118,7 @@ impl Audio {
             status: Mutex::default(),
             generation: AtomicU64::new(0),
             active: AtomicBool::new(false),
+            media_allowed: AtomicBool::new(true),
             recover: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
             frames: ArrayQueue::new(10),
@@ -205,8 +207,13 @@ impl Audio {
             tracing::info!(?encoding, "host desktop audio negotiated");
         }
     }
+    pub fn set_media_allowed(&self, allowed: bool) {
+        if self.0.media_allowed.swap(allowed, Ordering::AcqRel) != allowed {
+            self.invalidate();
+        }
+    }
     pub fn allowed(&self) -> bool {
-        self.0.lease.requested() && self.encoding().is_some() && !self.0.cancel.is_cancelled()
+        self.0.media_allowed.load(Ordering::Acquire) && self.0.lease.requested() && self.encoding().is_some() && !self.0.cancel.is_cancelled()
     }
     fn invalidate(&self) {
         self.0.active.store(false, Ordering::Release);

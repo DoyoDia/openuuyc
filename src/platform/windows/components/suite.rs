@@ -128,6 +128,7 @@ pub(crate) fn request(
     operation: Operation,
     allow_sas: bool,
     removal: super::RemovalOptions,
+    resume: bool,
 ) -> Result<bool> {
     if operation == Operation::Uninstall {
         crate::account::auth::restore_portable()?;
@@ -152,12 +153,25 @@ pub(crate) fn request(
         }
     );
     let args = format!("{args}{}", removal.arguments());
-    let reboot = super::elevate(&args, Kind::Suite)?;
+    let reboot = if super::elevated()? {
+        // A pre-elevated automation process must never invoke a second consent UI.
+        super::execute(
+            Kind::Suite,
+            operation,
+            allow_sas,
+            (operation == Operation::Install).then_some(owner.as_str()),
+            removal,
+        )?
+    } else {
+        super::elevate(&args, Kind::Suite)?
+    };
     if operation == Operation::Install {
         crate::account::auth::enroll_resident()?;
         host_service::startup::set(true)?;
         super::application::integrate_user()?;
-        let _ = host_service::resident::call(host_service::resident::Request::Resume)?;
+        if resume {
+            let _ = host_service::resident::call(host_service::resident::Request::Resume)?;
+        }
     } else {
         host_service::startup::set(false)?;
     }

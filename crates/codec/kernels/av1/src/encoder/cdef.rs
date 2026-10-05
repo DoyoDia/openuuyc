@@ -20,8 +20,6 @@ use std::cmp;
 cfg_if::cfg_if! {
   if #[cfg(nasm_x86_64)] {
     pub(crate) use crate::encoder::asm::x86::cdef::*;
-  } else if #[cfg(asm_neon)] {
-    pub(crate) use crate::encoder::asm::aarch64::cdef::*;
   } else {
     pub(crate) use self::rust::*;
   }

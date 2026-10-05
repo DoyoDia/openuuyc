@@ -30,6 +30,15 @@ pub const CONNECTION_WALLPAPER_DIM: u8 = 166;
 pub const CONNECTION_WALLPAPER_DETAIL_DIM: u8 = 212;
 
 pub const BODY: f32 = 14.0;
+// The file send target window exists on Windows only.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub const FILE_SEND_WIDTH: f32 = 380.0;
+#[cfg_attr(not(windows), allow(dead_code))]
+pub const FILE_SEND_HEIGHT: f32 = 78.0;
+#[cfg_attr(not(windows), allow(dead_code))]
+pub const FILE_SEND_ROW_HEIGHT: f32 = 26.0;
+#[cfg_attr(not(windows), allow(dead_code))]
+pub const FILE_SEND_VISIBLE_ROWS: usize = 5;
 pub const COMPACT_TEXT: f32 = 13.0;
 pub const SMALL: f32 = 12.0;
 pub const TINY: f32 = 11.0;
@@ -41,10 +50,14 @@ pub const INPUT_WARNING_WIDTH: f32 = 360.0;
 pub const INPUT_WARNING_MARGIN: f32 = 12.0;
 pub const NOTIFICATION_WIDTH: f32 = 380.0;
 pub const NOTIFICATION_MARGIN: f32 = 16.0;
-pub const NOTIFICATION_PADDING: egui::Margin = egui::Margin::symmetric(16, 12);
-pub const NOTIFICATION_GAP: f32 = 6.0;
-pub const NOTIFICATION_LINK_WIDTH: f32 = 80.0;
-pub const NOTIFICATION_MIN_HEIGHT: f32 = 100.0;
+pub const NOTIFICATION_PADDING: egui::Margin = egui::Margin::symmetric(12, 10);
+pub const NOTIFICATION_GAP: f32 = 4.0;
+pub const NOTIFICATION_HEADER_HEIGHT: f32 = 20.0;
+pub const NOTIFICATION_ACTION_HEIGHT: f32 = 26.0;
+pub const NOTIFICATION_ACTION_GAP: f32 = 8.0;
+pub const NOTIFICATION_PROGRESS_HEIGHT: f32 = 4.0;
+pub const NOTIFICATION_MIN_HEIGHT: f32 = 80.0;
+pub const NOTIFICATION_MAX_HEIGHT: f32 = 520.0;
 pub const MICRO: f32 = 10.0;
 pub const SECTION: f32 = 16.0;
 pub const DIALOG_TITLE: f32 = 21.0;

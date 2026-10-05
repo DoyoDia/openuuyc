@@ -9,9 +9,39 @@ use tokio::sync::Notify;
 pub(crate) mod polling;
 
 const MAX_EVENTS: usize = 512;
-const MOTION_INTERVAL: Duration = Duration::from_millis(1);
 const MOTION_JITTER: Duration = Duration::from_micros(100);
 pub(crate) const BUTTONS: [u32; 5] = [1, 2, 16, 32, 64];
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum MouseThrottleRate {
+    #[serde(rename = "125")]
+    Hz125,
+    #[serde(rename = "500")]
+    Hz500,
+    #[default]
+    #[serde(rename = "1000")]
+    Hz1000,
+}
+
+impl MouseThrottleRate {
+    pub(crate) const ALL: [Self; 3] = [Self::Hz125, Self::Hz500, Self::Hz1000];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Hz125 => "125 Hz",
+            Self::Hz500 => "500 Hz",
+            Self::Hz1000 => "1000 Hz",
+        }
+    }
+
+    fn interval(self) -> Duration {
+        Duration::from_millis(match self {
+            Self::Hz125 => 8,
+            Self::Hz500 => 2,
+            Self::Hz1000 => 1,
+        })
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MouseMode {
@@ -182,7 +212,7 @@ struct State {
     cancellation: tokio_util::sync::CancellationToken,
     error: Option<String>,
     recovering: bool,
-    throttle: bool,
+    throttle: Option<MouseThrottleRate>,
     next_motion_at: Option<Instant>,
     deadline_timer: Option<crate::platform::deadline::Timer>,
     polling_warning: Option<polling::Warning>,
@@ -205,18 +235,24 @@ impl RemoteInput {
         self.lock().accept_host_input
     }
 
-    pub fn set_throttle(&self, enabled: bool) -> Result<()> {
+    pub fn set_throttle(&self, enabled: bool, rate: MouseThrottleRate) -> Result<()> {
         let mut s = self.lock();
-        if s.throttle == enabled {
+        let throttle = enabled.then_some(rate);
+        if s.throttle == throttle {
             return Ok(());
         }
-        let timer = if enabled {
-            Some(crate::platform::deadline::Timer::new(self.wake.clone())?)
-        } else {
+        if enabled && s.deadline_timer.is_none() {
+            s.deadline_timer = Some(crate::platform::deadline::Timer::new(self.wake.clone())?);
+        }
+        if let Some(timer) = &mut s.deadline_timer {
+            timer.disarm();
+        }
+        let retired = if enabled {
             None
+        } else {
+            s.deadline_timer.take()
         };
-        let retired = std::mem::replace(&mut s.deadline_timer, timer);
-        s.throttle = enabled;
+        s.throttle = throttle;
         s.next_motion_at = None;
         if enabled {
             s.polling_warning = None;
@@ -232,7 +268,7 @@ impl RemoteInput {
 
     pub fn warn_high_polling(&self, hz: u32) {
         let mut s = self.lock();
-        if s.throttle || !s.ready || s.stopping || s.mode == MouseMode::View {
+        if s.throttle.is_some() || !s.ready || s.stopping || s.mode == MouseMode::View {
             return;
         }
         s.polling_warning = Some(polling::Warning {
@@ -245,8 +281,9 @@ impl RemoteInput {
 
     pub fn polling_warning(&self) -> Option<polling::Warning> {
         let s = self.lock();
-        s.polling_warning
-            .filter(|w| !s.throttle && s.mode != MouseMode::View && Instant::now() < w.until)
+        s.polling_warning.filter(|w| {
+            s.throttle.is_none() && s.mode != MouseMode::View && Instant::now() < w.until
+        })
     }
 
     pub fn set_keyboard_platform(&self, platform: i32) {
@@ -436,6 +473,10 @@ impl RemoteInput {
     }
     pub fn error(&self) -> Option<String> {
         self.lock().error.clone()
+    }
+    pub(crate) fn owner_holds_left(&self, owner: u64) -> bool {
+        let s = self.lock();
+        s.owner == Some(owner) && s.held[0]
     }
     pub fn owner_holds_buttons(&self, owner: u64) -> bool {
         let s = self.lock();
@@ -770,14 +811,15 @@ impl RemoteInput {
                 if deadline.is_none()
                     && let Some(event) = s.queue.pop_front()
                 {
-                    if s.throttle && event.movement() {
+                    if let Some(rate) = s.throttle.filter(|_| event.movement()) {
+                        let interval = rate.interval();
                         // Retain the cadence across small scheduling/send delays.
                         // Skip missed slots rather than accumulating catch-up work.
                         let slot = s
                             .next_motion_at
-                            .filter(|at| *at + MOTION_INTERVAL > now)
+                            .filter(|at| *at + interval > now)
                             .unwrap_or(now);
-                        s.next_motion_at = Some(slot + MOTION_INTERVAL);
+                        s.next_motion_at = Some(slot + interval);
                     }
                     s.in_flight = true;
                     s.in_flight_motion = matches!(
@@ -820,7 +862,8 @@ impl RemoteInput {
     }
 
     fn motion_deadline(s: &State, now: Instant) -> Option<Instant> {
-        if !s.throttle || !s.queue.front().is_some_and(InputEvent::movement) {
+        let interval = s.throttle?.interval();
+        if !s.queue.front().is_some_and(InputEvent::movement) {
             return None;
         }
         s.next_motion_at.and_then(|at| {
@@ -828,10 +871,10 @@ impl RemoteInput {
             // the edge ahead of its position. At most one slot can be borrowed;
             // advancing the same virtual clock automatically repays it.
             let at = if s.queue.get(1).is_some_and(InputEvent::input_boundary) {
-                at.checked_sub(MOTION_INTERVAL).unwrap_or(now)
+                at.checked_sub(interval).unwrap_or(now)
             } else {
                 // Accept a physical move near the tick instead of making a
-                // native 1000-Hz source wait for tiny scheduling differences.
+                // source at the selected rate wait for tiny scheduling differences.
                 // This allowance uses the same clock; it does not accumulate.
                 if matches!(
                     s.queue.front(),

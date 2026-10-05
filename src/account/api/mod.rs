@@ -39,6 +39,7 @@ mod assist;
 pub(crate) mod guest;
 mod host_assist;
 mod power;
+mod wol;
 pub(crate) mod wallpaper;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

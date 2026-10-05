@@ -1079,17 +1079,9 @@ pub static dav1d_dr_intra_derivative: [u16; 44] = [
     0, 57, 51, 0, 45, 0, 40, 35, 0, 31, 27, 0, 23, 19, 0, 15, 0, 11, 0, 7, 3,
 ];
 
-pub const FLT_INCR: usize = if cfg!(any(target_arch = "x86", target_arch = "x86_64")) {
-    2
-} else {
-    1
-};
+pub const FLT_INCR: usize = 2;
 
-const FILTER_INDICES: [usize; 7] = if cfg!(any(target_arch = "x86", target_arch = "x86_64")) {
-    [0, 1, 16, 17, 32, 33, 48]
-} else {
-    [0, 8, 16, 24, 32, 40, 48]
-};
+const FILTER_INDICES: [usize; 7] = [0, 1, 16, 17, 32, 33, 48];
 
 pub fn filter_fn(flt_ptr: &[i8], p: [i32; 7]) -> i32 {
     let flt_ptr = &flt_ptr[..48 + 1];
@@ -1181,5 +1173,3 @@ pub static dav1d_obmc_masks: Align16<[u8; 64]> = Align16([
     3, 0, 0, 0, 0, 31, 29, 28, 26, 24, 23, 21, 20, 19, 17, 16, 14, 13, 12, 11, 9, 8, 7, 6, 5, 4, 4,
     3, 2, 0, 0, 0, 0, 0, 0, 0, 0,
 ]);
-
-

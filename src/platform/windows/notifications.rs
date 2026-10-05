@@ -1,17 +1,17 @@
 //! Windows toast delivery, activation registration and notification placement.
 
 use anyhow::{Context, Result};
-use windows::Win32::{Graphics::Gdi::*, UI::WindowsAndMessaging::GetForegroundWindow};
-use winit::platform::windows::WindowExtWindows;
-
+mod placement;
 mod registration;
+pub(crate) use placement::Placement;
 pub(crate) use registration::{owns_shortcut, unregister};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock, mpsc};
 use windows::Data::Xml::Dom::XmlDocument;
 use windows::Foundation::{DateTime, IReference, PropertyValue};
 use windows::UI::Notifications::{
-    NotificationSetting, ToastNotification, ToastNotificationManager, ToastNotifier,
+    NotificationData, NotificationSetting, NotificationUpdateResult, ToastNotification,
+    ToastNotificationManager, ToastNotifier,
 };
 use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize, RoUninitialize};
 use windows::core::{HSTRING, Interface};
@@ -43,6 +43,7 @@ pub(crate) struct ToastAction {
 }
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct Toast {
+    pub progress: Option<u16>,
     pub key: String,
     pub title: String,
     pub body: String,
@@ -72,11 +73,26 @@ fn xml(toast: &Toast) -> String {
             )
         })
         .collect::<String>();
-    format!(
-        "<toast activationType=\"protocol\" launch=\"{}\" duration=\"long\"><visual><binding template=\"ToastGeneric\"><text>{}</text><text>{}</text></binding></visual><actions>{actions}</actions><audio silent=\"true\"/></toast>",
-        escape(&uri),
-        escape(&toast.title),
+    let progress = if toast.progress.is_some() {
+        r#"<progress value="{progress}" status="{status}"/>"#
+    } else {
+        ""
+    };
+    let title = if toast.progress.is_some() {
+        "{title}".to_owned()
+    } else {
+        escape(&toast.title)
+    };
+    let body = if toast.progress.is_some() {
+        "{body}".to_owned()
+    } else {
         escape(&toast.body)
+    };
+    format!(
+        "<toast activationType=\"protocol\" launch=\"{}\" duration=\"long\"><visual><binding template=\"ToastGeneric\"><text>{}</text><text>{}</text>{progress}</binding></visual><actions>{actions}</actions><audio silent=\"true\"/></toast>",
+        escape(&uri),
+        title,
+        body
     )
 }
 struct Apartment(std::marker::PhantomData<std::rc::Rc<()>>);
@@ -86,6 +102,7 @@ impl Drop for Apartment {
     }
 }
 pub(crate) struct Native {
+    sequence: u32,
     notifier: ToastNotifier,
     shown: HashMap<String, (Toast, ToastNotification)>,
     _apartment: Apartment,
@@ -101,6 +118,7 @@ impl Native {
             .context("创建 Windows 通知发送器失败")?;
 
         Ok(Self {
+            sequence: 0,
             notifier,
             shown: HashMap::new(),
             _apartment: apartment,
@@ -128,11 +146,45 @@ impl Native {
                 item.key.len() == 32 && item.key.bytes().all(|b| b.is_ascii_hexdigit()),
                 "无效的通知标识"
             );
+            if item.progress.is_some()
+                && self
+                    .shown
+                    .get(&item.key)
+                    .is_some_and(|(old, _)| old.progress.is_some())
+            {
+                let data = self.progress_data(item)?;
+                let result = self.notifier.UpdateWithTagAndGroup(
+                    &data,
+                    &HSTRING::from(&item.key[..16]),
+                    &HSTRING::from(GROUP),
+                )?;
+                anyhow::ensure!(
+                    result != NotificationUpdateResult::Failed,
+                    "更新 Windows 文件进度失败"
+                );
+                // A dismissed progress toast stays dismissed. The terminal state
+                // has a separate ticket and may notify once when it arrives.
+                let actions_changed = self
+                    .shown
+                    .get(&item.key)
+                    .is_some_and(|(old, _)| old.buttons != item.buttons);
+                if result == NotificationUpdateResult::NotificationNotFound || !actions_changed {
+                    if let Some((old, _)) = self.shown.get_mut(&item.key) {
+                        *old = item.clone();
+                    }
+                    continue;
+                }
+                // Data binding cannot change action buttons. Replace a still-present
+                // toast silently when its available actions change; never revive a dismissed one.
+            }
             let document = XmlDocument::new()?;
             document.LoadXml(&HSTRING::from(xml(item)))?;
             let notification = ToastNotification::CreateToastNotification(&document)?;
             notification.SetTag(&HSTRING::from(&item.key[..16]))?;
             notification.SetGroup(&HSTRING::from(GROUP))?;
+            if item.progress.is_some() {
+                notification.SetData(&self.progress_data(item)?)?;
+            }
             notification.SetSuppressPopup(self.shown.contains_key(&item.key))?;
             if item.expires_at > 0 {
                 let date = DateTime {
@@ -159,6 +211,23 @@ impl Native {
         }
         Ok(())
     }
+    fn progress_data(&mut self, item: &Toast) -> Result<NotificationData> {
+        self.sequence = self.sequence.wrapping_add(1).max(1);
+        let data = NotificationData::new()?;
+        data.SetSequenceNumber(self.sequence)?;
+        let values = data.Values()?;
+        values.Insert(&HSTRING::from("title"), &HSTRING::from(&item.title))?;
+        values.Insert(&HSTRING::from("body"), &HSTRING::from(&item.body))?;
+        values.Insert(
+            &HSTRING::from("progress"),
+            &HSTRING::from(format!(
+                "{:.3}",
+                f64::from(item.progress.unwrap_or(0).min(1000)) / 1000.
+            )),
+        )?;
+        values.Insert(&HSTRING::from("status"), &HSTRING::from("正在传输"))?;
+        Ok(data)
+    }
     fn remove(&mut self, key: &str) -> Result<()> {
         if let Some((_, notification)) = self.shown.get(key) {
             self.notifier.Hide(notification)?;
@@ -178,30 +247,4 @@ impl Native {
         }
         Ok(())
     }
-}
-
-pub(crate) fn place(window: &winit::window::Window, initial: bool) -> Result<()> {
-    let anchor = if initial {
-        unsafe { GetForegroundWindow() }
-    } else {
-        crate::platform::graphics::window_hwnd(window)?
-    };
-    let monitor = unsafe { MonitorFromWindow(anchor, MONITOR_DEFAULTTOPRIMARY) };
-    let mut info = MONITORINFO {
-        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-        ..Default::default()
-    };
-    unsafe {
-        GetMonitorInfoW(monitor, &mut info).ok()?;
-    }
-    window.set_skip_taskbar(true);
-    window.set_window_level(winit::window::WindowLevel::AlwaysOnTop);
-    let size = window.outer_size();
-    let margin =
-        (crate::ui::theme::NOTIFICATION_MARGIN * window.scale_factor() as f32).round() as i32;
-    window.set_outer_position(winit::dpi::PhysicalPosition::new(
-        (info.rcWork.right - size.width as i32 - margin).max(info.rcWork.left),
-        (info.rcWork.bottom - size.height as i32 - margin).max(info.rcWork.top),
-    ));
-    Ok(())
 }

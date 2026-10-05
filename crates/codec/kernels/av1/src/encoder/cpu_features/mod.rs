@@ -12,10 +12,6 @@ cfg_if::cfg_if! {
     #[macro_use]
     mod x86;
     pub use x86::*;
-  } else if #[cfg(asm_neon)] {
-    #[macro_use]
-    mod aarch64;
-    pub use aarch64::*;
   } else {
     mod rust;
     pub use rust::*;

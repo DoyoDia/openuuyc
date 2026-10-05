@@ -138,11 +138,6 @@ pub struct Config {
 
   /// The number of threads in the threadpool.
   pub(crate) threads: usize,
-  /// Shared thread pool
-  pub(crate) pool: Option<Arc<ThreadPool>>,
-  #[cfg(feature = "unstable")]
-  /// Number of parallel encoding slots
-  pub(crate) slots: usize,
 }
 
 impl Config {
@@ -174,21 +169,7 @@ impl Config {
     self
   }
 
-  #[cfg(feature = "unstable")]
-  /// Use the provided threadpool
-  ///
-  /// It takes priority over `with_threads()`
-  pub fn with_thread_pool(mut self, pool: Arc<ThreadPool>) -> Self {
-    self.pool = Some(pool);
-    self
-  }
 
-  #[cfg(feature = "unstable")]
-  /// Set the maximum number of GOPs to encode in parallel
-  pub const fn with_parallel_gops(mut self, slots: usize) -> Self {
-    self.slots = slots;
-    self
-  }
 }
 
 fn check_tile_log2(n: usize) -> bool {
@@ -239,9 +220,7 @@ impl Config {
   /// Create a new threadpool with this configuration if set,
   /// or return `None` if global threadpool should be used instead.
   pub(crate) fn new_thread_pool(&self) -> Option<Arc<ThreadPool>> {
-    if let Some(ref p) = self.pool {
-      Some(p.clone())
-    } else if self.threads != 0 {
+    if self.threads != 0 {
       let pool =
         ThreadPoolBuilder::new().num_threads(self.threads).build().unwrap();
       Some(Arc::new(pool))

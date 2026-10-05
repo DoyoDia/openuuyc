@@ -79,7 +79,7 @@ struct DesktopWindow {
     last_frame: Option<Instant>,
     interval: Duration,
     window: Arc<Window>,
-    notification: bool,
+    notification: Option<crate::platform::notifications::Placement>,
 }
 
 impl Drop for DesktopWindow {
@@ -132,9 +132,11 @@ impl Runner {
         )?);
         super::chrome::configure_dwm_window(&window);
         super::branding::set_taskbar_icon(&window);
-        if self.config.notification {
-            crate::platform::notifications::place(&window, true)?;
-        }
+        let notification = if self.config.notification {
+            Some(crate::platform::notifications::Placement::new(&window)?)
+        } else {
+            None
+        };
         if self.config.centered
             && let Some(monitor) = window.current_monitor()
         {
@@ -214,7 +216,7 @@ impl Runner {
             last_frame: None,
             interval: Duration::from_secs_f64(1000.0 / f64::from(refresh)),
             window,
-            notification: self.config.notification,
+            notification,
         });
         let state = self.state.as_mut().expect("created desktop state");
         state.render()?;
@@ -248,6 +250,9 @@ impl DesktopWindow {
     fn render(&mut self) -> Result<()> {
         self.next_repaint = None;
         self.last_frame = Some(Instant::now());
+        if let Some(placement) = &mut self.notification {
+            placement.refresh(&self.window);
+        }
         egui_winit::update_viewport_info(&mut self.viewport, &self.context, &self.window, false);
         let mut input = self.input.take_egui_input(&self.window);
         input
@@ -277,7 +282,7 @@ impl DesktopWindow {
                     None,
                 );
             });
-            if !self.notification && self.window.fullscreen().is_none() {
+            if self.notification.is_none() && self.window.fullscreen().is_none() {
                 let alert = self.app.0.title_bar_alert();
                 super::chrome::title_bar_panel_alert(
                     ui,
@@ -433,10 +438,16 @@ impl ApplicationHandler<Event> for Runner {
             }
             WindowEvent::Resized(size) => {
                 state.schedule(Instant::now());
-                if state.notification {
-                    let _ = crate::platform::notifications::place(&state.window, false);
+                if let Some(placement) = &mut state.notification {
+                    placement.refresh(&state.window);
                 }
                 state.presenter.resize(size)
+            }
+            WindowEvent::Moved(_) | WindowEvent::ScaleFactorChanged { .. }
+                if state.notification.is_some() =>
+            {
+                state.schedule(Instant::now());
+                Ok(())
             }
             WindowEvent::RedrawRequested => state.render(),
             _ => {

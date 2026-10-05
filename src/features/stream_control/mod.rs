@@ -140,7 +140,8 @@ impl StreamControlProtocol {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
+// Stored preferences may contain fields removed in a later release. Read the
+// supported choices without reviving those features; validate values on load.
 pub struct StreamControlSettings {
     #[serde(default)]
     pub hdr: bool,
@@ -347,6 +348,7 @@ pub struct StreamControlHandle {
     audio_quality: Arc<Mutex<audio_quality::State>>,
     microphone: crate::media::microphone::Microphone,
     clipboard: crate::features::clipboard::Clipboard,
+    drag_drop: crate::features::drag_drop::controller::Controller,
     files: Arc<crate::features::file_transfer::Transport>,
     mouse: crate::features::remote_input::RemoteInput,
     cursor: crate::features::remote_cursor::RemoteCursorState,
@@ -426,6 +428,7 @@ struct StreamControlState {
     clipboard_ready_reported: bool,
     remote_upgrade: Option<crate::features::remote_upgrade::RemoteUpgrade>,
     annotation: annotation::Annotation,
+    annotation_extension: Option<u64>,
     custom_bitrate_limit: u32,
     features: Option<crate::account::feature_ability::FeaturePolicy>,
     remote_notice: Option<(Instant, &'static str)>,
@@ -511,6 +514,7 @@ impl StreamControlHandle {
             clipboard_ready_reported: false,
             remote_upgrade: None,
             annotation: Default::default(),
+            annotation_extension: None,
             custom_bitrate_limit: MAX_CUSTOM_BITRATE_MBPS,
             features: None,
             device_preferences: Default::default(),
@@ -614,6 +618,7 @@ impl StreamControlHandle {
                 audio_quality: Arc::new(Mutex::new(audio_quality::State::new(profile.audio_only))),
                 microphone: crate::media::microphone::Microphone::new(),
                 clipboard: crate::features::clipboard::Clipboard::new(),
+                drag_drop: Default::default(),
                 files: Arc::new(crate::features::file_transfer::Transport::default()),
                 mouse,
                 cursor,
@@ -638,6 +643,29 @@ impl StreamControlHandle {
 
     pub(crate) fn clipboard(&self) -> &crate::features::clipboard::Clipboard {
         &self.clipboard
+    }
+    // Dropping files onto the remote screen is offered by the Windows viewer only.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) fn official_file_drop_available(&self) -> bool {
+        feature_supported(
+            &lock(&self.shared),
+            crate::account::feature_ability::Feature::FileDrop,
+        ) && self.clipboard.drop_available()
+    }
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) fn drop_files(
+        &self,
+        paths: Vec<std::path::PathBuf>,
+        point: crate::protocol::drag_drop::Point,
+    ) -> Result<Arc<crate::features::clipboard::drag::Submission>> {
+        anyhow::ensure!(
+            self.official_file_drop_available(),
+            "对端尚未开放文件拖放，或文件剪贴板未开启"
+        );
+        self.clipboard.drop_files(paths, point)
+    }
+    pub(crate) fn drag_drop(&self) -> &crate::features::drag_drop::controller::Controller {
+        &self.drag_drop
     }
 
     pub(crate) fn file_transfer(&self) -> &Arc<crate::features::file_transfer::Transport> {
@@ -819,7 +847,15 @@ impl StreamControlHandle {
     }
 
     pub(crate) fn set_persistence_error(&self, error: Option<String>) {
-        lock(&self.shared).persistence_error = error;
+        let changed = {
+            let mut state = lock(&self.shared);
+            let changed = state.persistence_error != error;
+            state.persistence_error = error.clone();
+            changed
+        };
+        if changed && let Some(error) = error {
+            tracing::warn!(%error, "viewing settings persistence failed");
+        }
     }
 
     pub(crate) fn set_audio_persistence_error(&self, error: Option<String>) {

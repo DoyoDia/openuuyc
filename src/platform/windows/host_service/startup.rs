@@ -5,6 +5,12 @@ use windows::{
     core::{PCWSTR, w},
 };
 pub(crate) fn set(enabled: bool) -> Result<()> {
+    set_image(
+        enabled,
+        &crate::platform::windows::components::application::image()?,
+    )
+}
+pub(crate) fn set_image(enabled: bool, path: &std::path::Path) -> Result<()> {
     let mut key = HKEY::default();
     unsafe {
         RegCreateKeyExW(
@@ -22,7 +28,6 @@ pub(crate) fn set(enabled: bool) -> Result<()> {
     }
     let result = (|| -> Result<()> {
         if enabled {
-            let path = crate::platform::windows::components::application::image()?;
             ensure!(path.is_file(), "尚未部署自启动程序");
             let command: Vec<u16> = format!("\"{}\" gui --background", path.display())
                 .encode_utf16()

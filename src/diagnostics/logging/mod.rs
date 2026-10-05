@@ -1,4 +1,4 @@
-//! Per-process diagnostic logs with live, shared module filters.
+//! Per-process diagnostic files with shared, reloadable module filters.
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -13,7 +13,6 @@ use std::{
 use tracing_appender::non_blocking::{ErrorCounter, WorkerGuard};
 use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, util::SubscriberInitExt};
 mod files;
-pub mod live;
 pub use files::{MAX_FILE_MIB, MAX_TOTAL_MIB, RETENTION_DAYS};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -72,7 +71,7 @@ modules! {
     ("auth", "登录与凭据", false, ["openuuyc::account::auth", "openuuyc::account::login", "openuuyc::account::session_restore"]),
     ("api", "账号接口", false, ["openuuyc::account::api", "openuuyc::account::client", "openuuyc::account::nrd_http", "openuuyc::account::assist"]),
     ("presence", "在线状态", false, ["openuuyc::session::presence", "openuuyc::session::device_session"]),
-    ("host", "本机被控", false, ["openuuyc::features::host", "openuuyc_codec::encoder", "openuuyc_av1::encoder", "openuuyc::platform::windows::software_encoder", "openuuyc::media::encoding", "openuuyc::platform::windows::capture", "openuuyc::platform::windows::encoder", "openuuyc::platform::windows::nvenc", "openuuyc::platform::windows::amf", "openuuyc::platform::windows::qsv", "openuuyc::platform::windows::gdi", "openuuyc::platform::windows::preprocess", "openuuyc::platform::windows::transfer", "openuuyc::platform::windows::gpu_conversion", "openuuyc::platform::windows::cursor"]),
+    ("host", "本机被控", false, ["openuuyc::features::host", "openuuyc_codec::encoder", "openuuyc_av1::encoder", "openuuyc::platform::windows::software_encoder", "openuuyc::media::encoding", "openuuyc::platform::windows::capture", "openuuyc::platform::windows::encoder", "openuuyc::platform::windows::nvenc", "openuuyc::platform::windows::amf", "openuuyc::platform::windows::qsv", "openuuyc::platform::windows::gdi", "openuuyc::platform::windows::preprocess", "openuuyc::platform::windows::transfer", "openuuyc::platform::windows::gpu_conversion", "openuuyc::platform::windows::cursor", "openuuyc::platform::windows::wol"]),
     ("signal", "信令与协商", false, ["openuuyc::transport::signal"]),
     ("rtc", "实时传输", false, ["openuuyc::transport::rtc", "openuuyc::transport::uu_kcp"]),
     ("recovery", "丢包恢复", false, ["openuuyc::transport::official_receiver", "openuuyc::nack_audit", "openuuyc::transport::rsfec", "openuuyc::transport::ulpfec", "openuuyc::transport::flexfec", "openuuyc::transport::xor_fec"]),
@@ -154,15 +153,12 @@ struct Runtime {
     explicit_file: Option<PathBuf>,
     files: Arc<Mutex<files::Status>>,
     dropped: ErrorCounter,
-    live: live::View,
 }
 static RUNTIME: OnceLock<Arc<Runtime>> = OnceLock::new();
 pub struct LoggingGuard {
     stop: mpsc::Sender<()>,
     watcher: Option<JoinHandle<()>>,
     _file_guard: WorkerGuard,
-    _live_guard: WorkerGuard,
-    _collector: Option<live::CollectorGuard>,
 }
 impl Drop for LoggingGuard {
     fn drop(&mut self) {
@@ -218,11 +214,6 @@ pub fn configure_child(command: &mut std::process::Command) {
     if let Some(r) = RUNTIME.get() {
         command.env("OPENUUYC_LOG_SESSION", &r.session);
         command.env("OPENUUYC_LOG_STEM", &r.stem);
-        if !r.live.endpoint.is_empty() {
-            command.env("OPENUUYC_LIVE_LOG_ENDPOINT", &r.live.endpoint);
-        } else {
-            command.env_remove("OPENUUYC_LIVE_LOG_ENDPOINT");
-        }
         let state = r.state.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(filter) = &state.override_filter {
             command.arg("--log-level").arg(filter);
@@ -231,16 +222,6 @@ pub fn configure_child(command: &mut std::process::Command) {
             command.arg("--log-file").arg(path);
         }
     }
-}
-pub fn live_read(after: u64) -> Option<live::Batch> {
-    RUNTIME.get()?.live.read(after)
-}
-pub fn set_live_capacity(capacity: live::Capacity) -> Result<()> {
-    RUNTIME
-        .get()
-        .context("日志系统尚未初始化")?
-        .live
-        .set_capacity(capacity)
 }
 pub fn open_directory() -> Result<()> {
     files::open_directory(&RUNTIME.get().context("日志系统尚未初始化")?.directory)
@@ -334,14 +315,6 @@ pub fn init(level: Option<&str>, path: Option<&Path>) -> Result<LoggingGuard> {
         .finish(sink);
     let dropped = writer.error_counter();
     let (filter_layer, filter) = tracing_subscriber::reload::Layer::new(filter);
-    let capture = live::start(config.parent().unwrap())
-        .unwrap_or_else(|error| live::unavailable(config.parent().unwrap(), error));
-    let capture_available = !capture.view.endpoint.is_empty();
-    let (live_writer, live_guard) = tracing_appender::non_blocking::NonBlockingBuilder::default()
-        .buffered_lines_limit(512)
-        .lossy(true)
-        .thread_name("live-log-writer")
-        .finish(capture.writer);
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::fmt::layer()
@@ -354,23 +327,6 @@ pub fn init(level: Option<&str>, path: Option<&Path>) -> Result<LoggingGuard> {
                     session.clone(),
                 ))
                 .with_filter(filter_layer),
-        )
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_writer(move || live::BoundedWriter(live_writer.clone()))
-                .with_ansi(false)
-                .event_format(ProcessEventFormat(
-                    tracing_subscriber::fmt::format()
-                        .with_target(true)
-                        .with_thread_ids(true),
-                    session.clone(),
-                ))
-                .with_filter(
-                    tracing_subscriber::filter::dynamic_filter_fn(move |_, _| {
-                        capture_available && live::capture_enabled()
-                    })
-                    .with_max_level_hint(tracing::level_filters::LevelFilter::TRACE),
-                ),
         )
         .try_init()
         .context("初始化日志系统")?;
@@ -389,7 +345,6 @@ pub fn init(level: Option<&str>, path: Option<&Path>) -> Result<LoggingGuard> {
         explicit_file,
         files,
         dropped,
-        live: capture.view,
     });
     RUNTIME
         .set(runtime.clone())
@@ -428,8 +383,6 @@ pub fn init(level: Option<&str>, path: Option<&Path>) -> Result<LoggingGuard> {
         stop,
         watcher: Some(watcher),
         _file_guard: guard,
-        _live_guard: live_guard,
-        _collector: capture.guard,
     })
 }
 struct ProcessEventFormat(tracing_subscriber::fmt::format::Format, String);
@@ -449,5 +402,16 @@ where
         // into a shared diagnostic file through --log-file.
         write!(writer, "session={} pid={} ", self.1, std::process::id())?;
         self.0.format_event(context, writer, event)
+    }
+}
+
+pub(crate) fn open_folder(path: &Path) -> Result<()> {
+    files::open_directory(path)
+}
+
+// Export worker only: sync bytes already consumed by the nonblocking writer.
+pub(crate) fn sync_written() {
+    if let Some(runtime) = RUNTIME.get() {
+        files::sync_pending(&runtime.files);
     }
 }

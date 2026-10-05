@@ -416,7 +416,7 @@ pub const fn valid_av1_transform(tx_size: TxSize, tx_type: TxType) -> bool {
   }
 }
 
-#[cfg(any(test, feature = "bench"))]
+#[cfg(test)]
 pub fn get_valid_txfm_types(tx_size: TxSize) -> &'static [TxType] {
   let size_sq = tx_size.sqr_up();
   use TxType::*;

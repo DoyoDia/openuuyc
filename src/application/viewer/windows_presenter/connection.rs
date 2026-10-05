@@ -20,6 +20,7 @@ use winit::dpi::LogicalSize;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::platform::windows::EventLoopBuilderExtWindows;
+use winit::platform::windows::WindowAttributesExtWindows;
 use winit::window::{Window, WindowAttributes, WindowId};
 
 pub(in crate::application::viewer) fn run(session: NativeViewerSession) -> Result<()> {
@@ -369,6 +370,7 @@ impl ConnectingWindowsRunner {
         Self {
             audio_restore_geometry: None,
             attributes: WindowAttributes::default()
+                .with_drag_and_drop(false)
                 .with_visible(false)
                 .with_title(format!("{}{}", crate::VIEWER_TITLE_PREFIX, config.alias))
                 .with_window_icon(Some(crate::ui::branding::window_icon()))

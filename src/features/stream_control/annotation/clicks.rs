@@ -29,7 +29,7 @@ pub(super) fn retire(a: &mut Annotation) {
             && !a
                 .pending
                 .values()
-                .any(|p| matches!(p, Pending::Click(id, _) if *id == pulse.stroke.id)))
+                .any(|p| matches!(p.effect, Pending::Click(id) if id == pulse.stroke.id)))
     });
 }
 fn update(pulse: &mut ClickPulse, now: Instant) -> bool {
@@ -116,13 +116,17 @@ impl StreamControlHandle {
         Ok(())
     }
     pub(super) fn drive_clicks(&self, s: &mut StreamControlState, now: Instant) {
+        if s.annotation.native_token.is_some() {
+            self.drive_native_clicks(s, now);
+            return;
+        }
         for index in 0..s.annotation.clicks.len() {
             let pulse = &s.annotation.clicks[index];
             let id = pulse.stroke.id;
             if s.annotation
                 .pending
                 .values()
-                .any(|p| matches!(p,Pending::Click(pending,_) if *pending==id))
+                .any(|p| matches!(p.effect,Pending::Click(pending) if pending==id))
             {
                 continue;
             }
@@ -144,17 +148,68 @@ impl StreamControlHandle {
             let draw =
                 (!pulse.cancelled).then(|| stroke_request(&pulse.stroke, &pulse.stroke.points));
             let shown = !pulse.cancelled;
-            for (request, kind) in clear
-                .into_iter()
-                .map(|r| (r, 2))
-                .chain(draw.into_iter().map(|r| (r, 1)))
-            {
-                if let Err(e) = self.send_draw(s, request, Pending::Click(id, kind)) {
+            for request in clear.into_iter().chain(draw) {
+                if let Err(e) = self.send_draw(s, request, Pending::Click(id)) {
                     s.annotation.uncertain(e.to_string());
                     return;
                 }
             }
             s.annotation.clicks[index].shown = shown;
+        }
+        retire(&mut s.annotation);
+    }
+    fn drive_native_clicks(&self, s: &mut StreamControlState, now: Instant) {
+        for i in 0..s.annotation.clicks.len() {
+            let pulse = &s.annotation.clicks[i];
+            let id = pulse.stroke.id;
+            if s.annotation
+                .pending
+                .values()
+                .any(|p| matches!(p.effect,Pending::Click(key) if key==id))
+            {
+                continue;
+            }
+            let expired = now.saturating_duration_since(pulse.started) >= LIFETIME;
+            let stopped = pulse.cancelled || !s.screens.iter().any(|v| v.id == pulse.stroke.screen);
+            let result = if stopped && pulse.shown && !expired {
+                self.send_draw(
+                    s,
+                    clear_request(2, id, Some(pulse.stroke.screen)),
+                    Pending::Click(id),
+                )
+                .map(|_| ())
+            } else if !stopped && !expired && !pulse.shown {
+                let click = crate::protocol::annotation::Click {
+                    id,
+                    screen: pulse.stroke.screen,
+                    center: Some(PbDrawPoint {
+                        x: pulse.center.x,
+                        y: pulse.center.y,
+                    }),
+                    radii: Some(PbDrawPoint {
+                        x: pulse.radii.x,
+                        y: pulse.radii.y,
+                    }),
+                    width: pulse.style.width,
+                    color: pulse.style.argb,
+                };
+                self.send_native_draw(
+                    s,
+                    crate::protocol::annotation::Command::new(
+                        crate::protocol::annotation::Operation::Click(click),
+                    ),
+                    Pending::Click(id),
+                )
+                .map(|_| ())
+            } else {
+                Ok(())
+            };
+            if let Err(error) = result {
+                s.annotation.uncertain(error.to_string());
+                return;
+            }
+            s.annotation.clicks[i].cancelled = stopped || expired;
+            s.annotation.clicks[i].shown = !stopped && !expired;
         }
         retire(&mut s.annotation);
     }

@@ -14,6 +14,7 @@ mod components;
 mod device_details;
 mod device_visuals;
 mod devices;
+mod diagnostic_export;
 mod diagnostics_panel;
 mod host_assist;
 mod host_settings;
@@ -21,6 +22,7 @@ mod logs;
 mod port_mapping;
 mod power;
 mod update_dialog;
+mod wol_setup;
 
 fn singleline_input(value: &mut String) -> egui::TextEdit<'_> {
     crate::ui::controls::singleline(value, crate::ui::controls::HEIGHT)
@@ -73,6 +75,7 @@ pub(super) struct CenterUi {
     legal_document: Option<about::LegalDocument>,
     logs: logs::LogUi,
     diagnostics: diagnostics_panel::ViewState,
+    wol_setup: wol_setup::ViewState,
     host_assist_password: Option<host_assist::PasswordEditor>,
     host_assist_settings_open: bool,
     host_assist_show_code: bool,

@@ -1,6 +1,6 @@
 [package]
 name = "openuuyc"
-version = "1.0.0-alpha.10"
+version = "1.0.0-beta.1"
 edition = "2024"
 description = "Third-party Rust client for UU Remote protocol interoperability"
 license-file = "LICENSE"
@@ -65,6 +65,8 @@ libloading = "0.8.9"
 openuuyc-codec = { path = "crates/codec" }
 egui-winit = { version = "0.36.1", default-features = false, features = ["clipboard", "links"] }
 winit = { version = "0.30.13", default-features = false, features = ["rwh_06"] }
+zip = { version = "8.6.0", default-features = false, features = ["zstd"] }
+regex = "1.13.1"
 
 [build-dependencies]
 cc = "1.2"
@@ -101,10 +103,12 @@ windows = { version = "0.62.2", default-features = false, features = [
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
+    "Win32_Graphics_GdiPlus",
     "Win32_System_Console",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Ole",
+    "Win32_System_SystemServices",
     "Win32_System_DataExchange",
     "Win32_System_Memory",
     "Win32_System_Performance",
@@ -115,6 +119,7 @@ windows = { version = "0.62.2", default-features = false, features = [
     "Win32_System_SystemInformation",
     "Win32_System_Registry",
     "Win32_System_JobObjects",
+    "Win32_System_Environment",
     "Win32_System_RemoteDesktop",
     "Win32_Storage_FileSystem",
     "Win32_System_LibraryLoader",
@@ -133,6 +138,7 @@ windows = { version = "0.62.2", default-features = false, features = [
     "Win32_UI_Shell",
     "Win32_UI_Shell_PropertiesSystem",
     "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Accessibility",
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]

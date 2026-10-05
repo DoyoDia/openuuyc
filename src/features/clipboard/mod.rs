@@ -1,4 +1,7 @@
 //! Device-scoped clipboard RPC with a process-wide platform adapter.
+// Receiving a dropped file list needs the Windows OLE drop source.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) mod drag;
 mod formats;
 #[cfg(not(windows))]
 #[path = "fuse_linux.rs"]
@@ -13,6 +16,7 @@ mod protocol;
 #[path = "x11_offer_linux.rs"]
 mod x11_offer;
 use anyhow::{Result, anyhow, bail, ensure};
+pub(crate) use native::{FileOffer, FileSummary};
 use prost::Message;
 use protocol::*;
 use std::{
@@ -78,6 +82,7 @@ pub(crate) struct Snapshot {
 }
 struct Inner {
     id: u64,
+    permitted: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     enabled: AtomicBool,
     files: AtomicBool,
     active: AtomicBool,
@@ -88,6 +93,13 @@ struct Inner {
     sender: Mutex<Option<mpsc::Sender<Queued>>>,
     pending: Mutex<HashMap<i64, Pending>>,
     error: Mutex<Option<String>>,
+    file_offers: Option<mpsc::Sender<FileOffer>>,
+    explicit_drop: AtomicU64,
+    auto_save: Mutex<Option<Arc<drag::Submission>>>,
+    #[cfg_attr(not(windows), allow(dead_code))]
+    incoming_drops: AtomicU32,
+    drop_pointer: AtomicU32,
+    host_role: AtomicBool,
 }
 static SEND_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 struct SendBudget(usize);
@@ -146,11 +158,59 @@ struct Pending {
     collect: Collect,
 }
 
+pub(crate) fn is_message(bytes: &[u8]) -> Result<bool> {
+    if bytes.first() == Some(&b'{') {
+        return Ok(false);
+    }
+    let e = Envelope::decode(bytes)?;
+    Ok(e.request
+        .is_some_and(|r| r.clip.is_some() || r.text.is_some())
+        || e.response
+            .is_some_and(|r| r.clip.is_some() || r.text.is_some()))
+}
+
+pub(crate) fn reject_request(bytes: &[u8]) -> Result<Option<Vec<u8>>> {
+    Ok(Envelope::decode(bytes)?
+        .request
+        .and_then(unavailable)
+        .map(|e| e.encode_to_vec()))
+}
+pub(crate) fn carries_file_bytes(bytes: &[u8]) -> Result<bool> {
+    Ok(matches!(
+        Envelope::decode(bytes)?
+            .response
+            .and_then(|r| r.clip)
+            .and_then(|c| c.which),
+        Some(ClipboardResponseKind::FileContentsResponse(_))
+    ))
+}
+
 impl Clipboard {
+    pub(crate) fn host_role(&self) {
+        self.0.host_role.store(true, Ordering::Release);
+    }
     pub fn new() -> Self {
+        Self::guarded(None)
+    }
+    pub(crate) fn guarded(permitted: Option<Arc<dyn Fn() -> bool + Send + Sync>>) -> Self {
+        Self::create(permitted, None)
+    }
+    /// File-only OLE exchange with its own lifetime and wire owner. Never reads
+    /// or writes the system clipboard and never observes ordinary copy events.
+    pub(crate) fn isolated_files(
+        permitted: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> (Self, mpsc::Receiver<FileOffer>) {
+        let (sender, receiver) = mpsc::channel(1);
+        (Self::create(Some(permitted), Some(sender)), receiver)
+    }
+    fn create(
+        permitted: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+        file_offers: Option<mpsc::Sender<FileOffer>>,
+    ) -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(1);
         Self(Arc::new(Inner {
             id: NEXT.fetch_add(1, Ordering::Relaxed),
+            permitted,
             enabled: AtomicBool::new(false),
             files: AtomicBool::new(true),
             active: AtomicBool::new(false),
@@ -161,7 +221,73 @@ impl Clipboard {
             sender: Mutex::new(None),
             pending: Mutex::new(HashMap::new()),
             error: Mutex::new(None),
+            file_offers,
+            explicit_drop: AtomicU64::new(0),
+            auto_save: Mutex::new(None),
+            incoming_drops: AtomicU32::new(0),
+            drop_pointer: AtomicU32::new(0),
+            host_role: AtomicBool::new(false),
         }))
+    }
+    pub(crate) async fn publish_files(
+        &self,
+        paths: Vec<std::path::PathBuf>,
+    ) -> Result<FileSummary> {
+        ensure!(self.0.file_offers.is_some(), "文件发布需要独立会话");
+        let epoch = self.epoch();
+        ensure!(
+            self.0.valid(epoch) && self.0.file_allowed(),
+            "拖放文件会话不可用"
+        );
+        let source = self.0.clone();
+        let prepared = tokio::task::spawn_blocking(move || {
+            native::prepare_files(paths, || source.valid(epoch))
+        })
+        .await??;
+        let summary = prepared.summary();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        native::post(native::Command::PublishFiles(
+            Arc::downgrade(&self.0),
+            epoch,
+            prepared,
+            sender,
+        ))?;
+        receiver
+            .await
+            .map_err(|_| anyhow!("文件发布已结束"))?
+            .map_err(anyhow::Error::msg)?;
+        Ok(summary)
+    }
+    pub(crate) fn epoch(&self) -> u64 {
+        self.0.epoch.load(Ordering::Acquire)
+    }
+    pub(crate) fn dragging(&self) -> bool {
+        self.0.active.load(Ordering::Acquire) && self.0.drop_pointer.load(Ordering::Acquire) != 0
+    }
+    pub(crate) fn delivery_allowed(&self, epoch: u64, bytes: &[u8]) -> bool {
+        if epoch != self.epoch() {
+            return false;
+        }
+        if self.0.valid(epoch) {
+            return true;
+        }
+        let Ok(e) = Envelope::decode(bytes) else {
+            return false;
+        };
+        let Some(r) = e.response else {
+            return false;
+        };
+        r.text.is_some_and(|r| r.err == 2)
+            || matches!(
+                r.clip.and_then(|c| c.which),
+                Some(ClipboardResponseKind::FormatDataConfirm(
+                    ClipboardFormatDataConfirm { err: 2, .. }
+                )) | Some(ClipboardResponseKind::FileDescListResponse(
+                    ClipboardFileDescriptorListResponse { err: 2, .. }
+                )) | Some(ClipboardResponseKind::FileContentsResponse(
+                    ClipboardFileContentsResponse { err: 2, .. }
+                ))
+            )
     }
     pub fn snapshot(&self) -> Snapshot {
         Snapshot {
@@ -211,61 +337,84 @@ impl Clipboard {
     pub fn suspend(&self) {
         if self.0.active.swap(false, Ordering::AcqRel) {
             self.0.epoch.fetch_add(1, Ordering::AcqRel);
+            self.0.explicit_drop.store(0, Ordering::Release);
+            lock(&self.0.auto_save).take();
             self.0.cancel_pending();
             let _ = native::post(native::Command::Remove(self.0.id));
         }
     }
     pub(crate) async fn run_sender(&self, channel: Arc<RTCDataChannel>) {
+        self.sender(move |_, data| {
+            let channel = channel.clone();
+            async move {
+                channel.send_text_bytes(&bytes::Bytes::from(data)).await?;
+                Ok(())
+            }
+        })
+        .await;
+    }
+    pub(crate) fn sender<F, Fut>(
+        &self,
+        mut send: F,
+    ) -> impl std::future::Future<Output = ()> + Send + 'static
+    where
+        F: FnMut(u64, Vec<u8>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<()>> + Send,
+    {
         let (tx, mut rx) = mpsc::channel(32);
         *lock(&self.0.sender) = Some(tx);
-        let mut streams =
-            std::collections::VecDeque::<(u64, String, Vec<u8>, usize, SendBudget)>::new();
-        let mut packets = std::collections::VecDeque::<(
-            u64,
-            std::collections::VecDeque<Envelope>,
-            SendBudget,
-        )>::new();
-        let mut tick = tokio::time::interval(Duration::from_millis(20));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            let result = tokio::select! {
-                biased;
-                queued=rx.recv()=> {
-                    let Some(Queued{item,budget})=queued else{break;};
-                    match item {
-                        Outbound::Message(epoch,_)|Outbound::Blocks(epoch,_,_,_)|Outbound::Packets(epoch,_) if !self.0.valid(epoch)=>Ok(()),
-                        Outbound::Cleanup(msg)=>channel.send_text_bytes(&bytes::Bytes::from(msg.encode_to_vec())).await.map(|_|()).map_err(Into::into),
-                        Outbound::Message(epoch,msg)=>self.0.send(&channel,epoch,msg).await,
-                        Outbound::Blocks(epoch,id,key,data)=> {
-                            let count=data.len().div_ceil(BLOCK) as i32;
-                            let result=self.0.send(&channel,epoch,response(id,ClipboardResponseKind::FormatDataConfirm(ClipboardFormatDataConfirm{err:1,block_key:key.clone(),block_count:count}))).await;
-                            if result.is_ok(){streams.push_back((epoch,key,data,0,budget));}
+        let owner = self.clone();
+        async move {
+            let this = &owner;
+            let mut streams =
+                std::collections::VecDeque::<(u64, String, Vec<u8>, usize, SendBudget)>::new();
+            let mut packets = std::collections::VecDeque::<(
+                u64,
+                std::collections::VecDeque<Envelope>,
+                SendBudget,
+            )>::new();
+            let mut tick = tokio::time::interval(Duration::from_millis(20));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                let result = tokio::select! {
+                    biased;
+                    queued=rx.recv()=> {
+                        let Some(Queued{item,budget})=queued else{break;};
+                        match item {
+                            Outbound::Message(epoch,_)|Outbound::Blocks(epoch,_,_,_)|Outbound::Packets(epoch,_) if !this.0.valid(epoch)=>Ok(()),
+                            Outbound::Cleanup(msg)=>send(this.0.epoch.load(Ordering::Acquire), msg.encode_to_vec()).await,
+                            Outbound::Message(epoch,msg)=>this.0.send(&mut send,epoch,msg).await,
+                            Outbound::Blocks(epoch,id,key,data)=> {
+                                let count=data.len().div_ceil(BLOCK) as i32;
+                                let result=this.0.send(&mut send,epoch,response(id,ClipboardResponseKind::FormatDataConfirm(ClipboardFormatDataConfirm{err:1,block_key:key.clone(),block_count:count}))).await;
+                                if result.is_ok(){streams.push_back((epoch,key,data,0,budget));}
+                                result
+                            },
+                            Outbound::Packets(epoch,messages)=>{packets.push_back((epoch,messages,budget));Ok(())},
+                        }
+                    },
+                    _=tick.tick(),if !streams.is_empty() || !packets.is_empty()=> {
+                        if let Some((epoch,mut messages,budget))=packets.pop_front() {
+                            if !this.0.valid(epoch){continue;}
+                            let msg=messages.pop_front().expect("nonempty packet series");
+                            let result=this.0.send(&mut send,epoch,msg).await;
+                            if result.is_ok() && !messages.is_empty(){packets.push_back((epoch,messages,budget));}
                             result
-                        },
-                        Outbound::Packets(epoch,messages)=>{packets.push_back((epoch,messages,budget));Ok(())},
+                        }else if let Some((epoch,key,data,offset,budget))=streams.pop_front() {
+                            if !this.0.valid(epoch){continue;}
+                            let end=(offset+BLOCK).min(data.len());
+                            let msg=request(this.0.next(),ClipboardRequestKind::DataBlock(ClipboardDataBlock{block_key:key.clone(),block_id:(offset/BLOCK+1) as i32,data:data[offset..end].to_vec()}));
+                            let result=this.0.send(&mut send,epoch,msg).await;
+                            if result.is_ok() && end<data.len(){streams.push_back((epoch,key,data,end,budget));}
+                            result
+                        }else{Ok(())}
+                    },
+                };
+                if let Err(error) = result {
+                    if this.0.active.load(Ordering::Acquire) {
+                        this.0.fail(error.to_string());
+                        this.0.cancel_pending();
                     }
-                },
-                _=tick.tick(),if !streams.is_empty() || !packets.is_empty()=> {
-                    if let Some((epoch,mut messages,budget))=packets.pop_front() {
-                        if !self.0.valid(epoch){continue;}
-                        let msg=messages.pop_front().expect("nonempty packet series");
-                        let result=self.0.send(&channel,epoch,msg).await;
-                        if result.is_ok() && !messages.is_empty(){packets.push_back((epoch,messages,budget));}
-                        result
-                    }else if let Some((epoch,key,data,offset,budget))=streams.pop_front() {
-                        if !self.0.valid(epoch){continue;}
-                        let end=(offset+BLOCK).min(data.len());
-                        let msg=request(self.0.next(),ClipboardRequestKind::DataBlock(ClipboardDataBlock{block_key:key.clone(),block_id:(offset/BLOCK+1) as i32,data:data[offset..end].to_vec()}));
-                        let result=self.0.send(&channel,epoch,msg).await;
-                        if result.is_ok() && end<data.len(){streams.push_back((epoch,key,data,end,budget));}
-                        result
-                    }else{Ok(())}
-                },
-            };
-            if let Err(error) = result {
-                if self.0.active.load(Ordering::Acquire) {
-                    self.0.fail(error.to_string());
-                    self.0.cancel_pending();
                 }
             }
         }
@@ -278,19 +427,68 @@ impl Clipboard {
                 return Ok(false);
             }
             ensure!(bytes.len() < 524288, "clipboard message too large");
-            if !self.0.active.load(Ordering::Acquire) {
+            if !self.0.valid(self.0.epoch.load(Ordering::Acquire)) {
+                if let Some(reply) = unavailable(req) {
+                    self.0.enqueue(Outbound::Cleanup(reply))?;
+                }
                 return Ok(true);
             }
             let id = req.header.map_or(0, |h| h.id);
             if let Some(kind) = req.clip.and_then(|v| v.which) {
+                if self.0.file_offers.is_some() {
+                    ensure!(
+                        matches!(
+                            &kind,
+                            ClipboardRequestKind::FormatList(_)
+                                | ClipboardRequestKind::FileDescListRequest(_)
+                                | ClipboardRequestKind::FileContentsRequest(_)
+                                | ClipboardRequestKind::CancelRequest(_)
+                                | ClipboardRequestKind::DescSegment(_)
+                        ),
+                        "独立文件会话收到其他剪贴板操作"
+                    );
+                }
                 match kind {
+                    ClipboardRequestKind::AutoSaveComplete(report) => {
+                        self.auto_save_complete(&report);
+                        self.0.emit(
+                            self.epoch(),
+                            response(
+                                id,
+                                ClipboardResponseKind::AutoSaveCompleteResponse(
+                                    DragDropAutoSaveCompleteResponse { err: 1 },
+                                ),
+                            ),
+                        )?;
+                    }
                     ClipboardRequestKind::DataBlock(block) => self.0.block(id, block)?,
                     ClipboardRequestKind::DescSegment(segment) => self.0.segment(id, segment)?,
                     ClipboardRequestKind::FormatList(list) => {
                         ensure!(
-                            list.has_action == 0 && list.drag_drop_action.is_none(),
-                            "file drag-and-drop is not enabled"
+                            matches!(
+                                (list.has_action, &list.drag_drop_action),
+                                (0, None) | (1, Some(_))
+                            ),
+                            "invalid file drop action"
                         );
+                        if list.has_action != 0 {
+                            ensure!(
+                                self.0.file_offers.is_none() && self.0.file_allowed(),
+                                "file drop is not permitted"
+                            );
+                            let host = self.0.host_role.load(Ordering::Acquire);
+                            ensure!(
+                                matches!(
+                                    (&list.drag_drop_action, host),
+                                    (Some(ClipboardFormatListRequestKind::OleDrop(_)), true)
+                                        | (
+                                            Some(ClipboardFormatListRequestKind::AutoSave(_)),
+                                            false
+                                        )
+                                ),
+                                "file drop action is invalid for this role"
+                            );
+                        }
                         ensure!(
                             list.formats.len() <= 256
                                 && list.formats.iter().all(|f| f.name.len() <= 1024),
@@ -300,6 +498,7 @@ impl Clipboard {
                             Arc::downgrade(&self.0),
                             self.0.epoch.load(Ordering::Acquire),
                             list.formats,
+                            list.drag_drop_action,
                         ))?;
                     }
                     kind => native::post(native::Command::Request(
@@ -310,6 +509,7 @@ impl Clipboard {
                     ))?,
                 }
             } else if let Some(text) = req.text {
+                ensure!(self.0.file_offers.is_none(), "独立文件会话不接收文本");
                 ensure!(text.data.len() <= MAX_DATA, "clipboard text too large");
                 native::post(native::Command::Text(
                     Arc::downgrade(&self.0),
@@ -338,7 +538,9 @@ impl Inner {
         self.serial.fetch_add(1, Ordering::Relaxed) as i64
     }
     fn valid(&self, epoch: u64) -> bool {
-        self.active.load(Ordering::Acquire) && self.epoch.load(Ordering::Acquire) == epoch
+        self.active.load(Ordering::Acquire)
+            && self.epoch.load(Ordering::Acquire) == epoch
+            && self.permitted.as_ref().is_none_or(|p| p())
     }
     fn file_allowed(&self) -> bool {
         self.allowed_files.load(Ordering::Acquire)
@@ -377,12 +579,16 @@ impl Inner {
         ensure!(self.valid(epoch), "剪贴板同步已暂停");
         self.enqueue(Outbound::Message(epoch, msg))
     }
-    async fn send(&self, channel: &RTCDataChannel, epoch: u64, msg: Envelope) -> Result<()> {
+    async fn send<F, Fut>(&self, send: &mut F, epoch: u64, msg: Envelope) -> Result<()>
+    where
+        F: FnMut(u64, Vec<u8>) -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+    {
         ensure!(self.valid(epoch), "剪贴板同步已暂停");
         let data = msg.encode_to_vec();
         ensure!(data.len() < 524288, "剪贴板消息过大");
         // A bounded producer plus the SCTP queue provides backpressure; no retry of an uncertain send.
-        channel.send_text_bytes(&bytes::Bytes::from(data)).await?;
+        send(epoch, data).await?;
         Ok(())
     }
     fn begin(
@@ -681,4 +887,43 @@ fn response(id: i64, kind: ClipboardResponseKind) -> Envelope {
             text: None,
         }),
     }
+}
+
+fn unavailable(req: Request) -> Option<Envelope> {
+    let id = req.header.map_or(0, |h| h.id);
+    if req.text.is_some() {
+        return Some(Envelope {
+            request: None,
+            response: Some(Response {
+                header: Some(Header { id }),
+                clip: None,
+                text: Some(ClipboardTextChangeResponse { err: 2 }),
+            }),
+        });
+    }
+    let kind = match req.clip?.which? {
+        ClipboardRequestKind::FormatDataAsk(v) => {
+            ClipboardResponseKind::FormatDataConfirm(ClipboardFormatDataConfirm {
+                err: 2,
+                block_key: v.block_key,
+                block_count: 0,
+            })
+        }
+        ClipboardRequestKind::FileDescListRequest(v) => {
+            ClipboardResponseKind::FileDescListResponse(ClipboardFileDescriptorListResponse {
+                task_id: v.task_id,
+                segment_count: 0,
+                err: 2,
+            })
+        }
+        ClipboardRequestKind::FileContentsRequest(v) => {
+            ClipboardResponseKind::FileContentsResponse(ClipboardFileContentsResponse {
+                task_id: v.task_id,
+                err: 2,
+                ..Default::default()
+            })
+        }
+        _ => return None,
+    };
+    Some(response(id, kind))
 }
