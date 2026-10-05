@@ -80,6 +80,7 @@ struct DesktopWindow {
     interval: Duration,
     window: Arc<Window>,
     notification: Option<crate::platform::notifications::Placement>,
+    floating: bool,
 }
 
 impl Drop for DesktopWindow {
@@ -110,7 +111,7 @@ impl Runner {
         // WindowConfig sizes describe page content; the shared caption occupies
         // client space now, so preserve the page's requested and minimum size.
         let mut viewport_builder = self.config.viewport.clone();
-        let caption_height = if self.config.notification {
+        let caption_height = if self.config.notification || self.config.floating {
             0.0
         } else {
             super::chrome::title_bar_height()
@@ -217,6 +218,7 @@ impl Runner {
             interval: Duration::from_secs_f64(1000.0 / f64::from(refresh)),
             window,
             notification,
+            floating: self.config.floating,
         });
         let state = self.state.as_mut().expect("created desktop state");
         state.render()?;
@@ -282,7 +284,7 @@ impl DesktopWindow {
                     None,
                 );
             });
-            if self.notification.is_none() && self.window.fullscreen().is_none() {
+            if self.notification.is_none() && !self.floating && self.window.fullscreen().is_none() {
                 let alert = self.app.0.title_bar_alert();
                 super::chrome::title_bar_panel_alert(
                     ui,

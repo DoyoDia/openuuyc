@@ -224,8 +224,6 @@ impl Clipboard {
 
 /// The official protocol provides a final drop action, not a live drag stream.
 /// Execute it in the interactive user, with the same scoped OLE file provider.
-/// Only the Windows clipboard receives offers it could drop.
-#[cfg(windows)]
 pub(super) fn receive(
     offer: native::FileOffer,
     action: ClipboardFormatListRequestKind,
@@ -281,7 +279,7 @@ pub(super) fn receive(
                 ClipboardFormatListRequestKind::OleDrop(action)=>{
                     let point=Point{screen:action.screen_id,x:action.target_x,y:action.target_y};
                     ensure!(point.valid(),"拖放落点无效");
-                    let screens=crate::platform::windows::capture::screens()?;
+                    let screens=crate::platform::capture::screens()?;
                     let screen=screens.iter().find(|s|s.id==point.screen && s.width>0 && s.height>0).ok_or_else(||anyhow!("拖放显示器已断开"))?;
                     let position=crate::platform::drag_drop::Position {
                         x:i32::try_from(i64::from(screen.left)+(point.x*f64::from(screen.width)).round().clamp(0.,f64::from(screen.width-1)) as i64)?,

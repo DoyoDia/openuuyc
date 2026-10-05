@@ -434,6 +434,13 @@ impl Drop for Mount {
     }
 }
 
+/// A fresh name for a mount's directory, so a new offer never reuses a path a
+/// file manager may still have open.
+pub(super) fn generation() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Where this process mounts clipboard offers. Under the runtime directory, so
 /// it is per-user, on tmpfs, and removed when the session ends.
 pub(super) fn mount_parent() -> Result<PathBuf> {

@@ -70,6 +70,7 @@ pub fn run(options: GuiOptions) -> Result<()> {
             viewport,
             centered: true,
             notification: false,
+            floating: false,
         },
         Box::new(move |ctx, graphics| {
             configure_visuals(ctx);

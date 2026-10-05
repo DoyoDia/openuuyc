@@ -32,6 +32,8 @@ mod polling_warning;
 mod windows_cursor;
 
 #[cfg(not(windows))]
+mod linux_drag;
+#[cfg(not(windows))]
 pub(crate) mod linux_keyboard;
 #[cfg(windows)]
 mod windows_keyboard;

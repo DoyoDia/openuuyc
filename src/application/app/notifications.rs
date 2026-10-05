@@ -546,6 +546,7 @@ impl Center {
                             .with_visible(true),
                         centered: false,
                         notification: true,
+                        floating: false,
                     },
                     factory: Box::new(move |ctx, _| {
                         theme::configure(ctx);

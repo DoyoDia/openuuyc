@@ -4,8 +4,6 @@ pub(crate) mod protocol;
 pub(crate) use contract::Payload;
 use contract::{Correlation, Owner};
 pub(crate) mod host;
-// Saves files dropped by an official controller; Linux does not receive drops.
-#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) mod import;
 mod storage;
 pub(crate) use storage::Store;

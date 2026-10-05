@@ -1,6 +1,4 @@
 //! Device-scoped clipboard RPC with a process-wide platform adapter.
-// Receiving a dropped file list needs the Windows OLE drop source.
-#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) mod drag;
 mod formats;
 #[cfg(not(windows))]
@@ -96,7 +94,6 @@ struct Inner {
     file_offers: Option<mpsc::Sender<FileOffer>>,
     explicit_drop: AtomicU64,
     auto_save: Mutex<Option<Arc<drag::Submission>>>,
-    #[cfg_attr(not(windows), allow(dead_code))]
     incoming_drops: AtomicU32,
     drop_pointer: AtomicU32,
     host_role: AtomicBool,

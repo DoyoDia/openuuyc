@@ -699,6 +699,8 @@ struct Player {
     diagnostics_at: [Option<Instant>; 2],
     /// When the remote first said its pointer was hidden, for [`CURSOR_HIDE_GRACE`].
     hidden_since: Option<Instant>,
+    /// Files dropped on the window, and drags carried out of it.
+    drag: super::linux_drag::WindowDrag,
 }
 
 impl Player {
@@ -710,7 +712,9 @@ impl Player {
         session.ensure_running()?;
         let owner = u64::from(window.id());
         let wake = FrameWakeBridge::install(&session, proxy, window.id())?;
+        let drag = super::linux_drag::WindowDrag::new(owner, &session.stream_control);
         Ok(Self {
+            drag,
             _shortcuts: crate::application::viewer_shortcuts::Watcher::new()?,
             session,
             wake,
@@ -882,6 +886,11 @@ impl Player {
                 ui.available_rect_before_wrap(),
             );
         }
+        let available = !self.stream_control_ui.open && window.is_minimized() != Some(true);
+        let map = self.point_mapper(ui.ctx());
+        self.drag
+            .tick(window, ui.ctx(), available, |position| map(position, false));
+        self.drag.show(ui.ctx());
         self.update_pointer_lock(window);
         self.draw_remote_cursor(ui, window);
         placement
@@ -1196,6 +1205,11 @@ impl Player {
 
     fn on_focus_changed(&mut self, window: &Arc<Window>, focused: bool) {
         self.focused = focused;
+        if !focused && self.control().drag_drop().handoff_pending() {
+            // A drag being handed out of the window keeps its button state;
+            // the handoff releases remote input itself.
+            return;
+        }
         if !focused {
             // Reports resume from a fresh window after focus returns.
             self.polling.interrupt();
@@ -1206,6 +1220,7 @@ impl Player {
             self.physical_buttons = 0;
             self.modifiers = winit::keyboard::ModifiersState::empty();
             self.input().pause_owner(self.owner);
+            self.control().drag_drop().cancel_gesture(true);
         }
     }
 
@@ -1217,6 +1232,21 @@ impl Player {
         event: &WindowEvent,
         consumed_by_ui: bool,
     ) -> bool {
+        if self.drag.event(event) {
+            return false;
+        }
+        // While a file drag owns the pointer, nothing reaches the remote; Escape
+        // calls the drag off.
+        let dragging = self.control().drag_drop().interactive();
+        if dragging
+            && let WindowEvent::KeyboardInput { event: key, .. } = event
+            && key.state == ElementState::Pressed
+            && key.physical_key
+                == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::Escape)
+        {
+            self.control().drag_drop().cancel_gesture(false);
+            return true;
+        }
         match event {
             WindowEvent::ModifiersChanged(modifiers) => {
                 self.modifiers = modifiers.state();
@@ -1263,6 +1293,9 @@ impl Player {
             WindowEvent::CursorMoved { position, .. } => {
                 self.last_position = Some(*position);
                 self.pointer_in_video = self.hit_video(context, *position);
+                if dragging || self.reverse_drag(window, context, *position) {
+                    return false;
+                }
                 self.send_position(*position);
                 false
             }
@@ -1287,7 +1320,7 @@ impl Player {
                     relative = self.input().relative_mode(),
                     neutral_wait = self.input().waiting_for_neutral(),
                     "mouse button");
-                if consumed_by_ui || self.input().mode() == MouseMode::View {
+                if consumed_by_ui || dragging || self.input().mode() == MouseMode::View {
                     return false;
                 }
                 if !self.pointer_in_video && *state == ElementState::Pressed {
@@ -1301,7 +1334,7 @@ impl Player {
                 true
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                if consumed_by_ui || !self.pointer_in_video {
+                if consumed_by_ui || dragging || !self.pointer_in_video {
                     return false;
                 }
                 let (horizontal, amount) = match delta {
@@ -1408,6 +1441,77 @@ impl Player {
             && context
                 .layer_id_at(point)
                 .is_none_or(|layer| layer.order == egui::Order::Background)
+    }
+
+    /// Maps a window position onto the remote screen the way pointer input
+    /// does; `dragging` keeps a point off the video at the nearest edge
+    /// instead of giving none.
+    fn point_mapper(
+        &self,
+        context: &egui::Context,
+    ) -> impl Fn(PhysicalPosition<f64>, bool) -> Option<crate::protocol::drag_drop::Point> + use<>
+    {
+        let context = context.clone();
+        let rect = self.video_rect;
+        let screen = self.control().mouse_screen(self.session.track_index);
+        move |position, dragging| {
+            let rect = rect?;
+            let (screen, remote_width, remote_height) = screen?;
+            let scale = f64::from(context.pixels_per_point().max(0.1));
+            let logical = egui::pos2((position.x / scale) as f32, (position.y / scale) as f32);
+            if !dragging
+                && !(rect.contains(logical)
+                    && context
+                        .layer_id_at(logical)
+                        .is_none_or(|layer| layer.order == egui::Order::Background))
+            {
+                return None;
+            }
+            let width = f64::from(rect.width());
+            let height = f64::from(rect.height());
+            if width <= 0.0 || height <= 0.0 {
+                return None;
+            }
+            let local_x = f64::from(logical.x - rect.min.x);
+            let local_y = f64::from(logical.y - rect.min.y);
+            Some(crate::protocol::drag_drop::Point {
+                screen,
+                x: (local_x.clamp(0.0, width - 1.0) / width)
+                    .min(1.0 - 1.0 / f64::from(remote_width.max(1))),
+                y: (local_y.clamp(0.0, height - 1.0) / height)
+                    .min(1.0 - 1.0 / f64::from(remote_height.max(1))),
+            })
+        }
+    }
+
+    /// A remote drag carried out of the window becomes a file drag here, if
+    /// the peer can hand one over.
+    fn reverse_drag(
+        &self,
+        window: &Arc<Window>,
+        context: &egui::Context,
+        position: PhysicalPosition<f64>,
+    ) -> bool {
+        let input = self.input();
+        if input.relative_mode() || !input.owner_holds_left(self.owner) {
+            return false;
+        }
+        let size = window.inner_size();
+        if position.x >= 0.0
+            && position.y >= 0.0
+            && position.x < f64::from(size.width)
+            && position.y < f64::from(size.height)
+        {
+            return false;
+        }
+        let drag = self.control().drag_drop();
+        if !drag.available() {
+            return false;
+        }
+        let Some(point) = self.point_mapper(context)(position, true) else {
+            return false;
+        };
+        drag.probe(self.owner, point, input.clone()).is_ok()
     }
 
     fn send_position(&mut self, position: PhysicalPosition<f64>) {
