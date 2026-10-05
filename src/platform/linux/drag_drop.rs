@@ -66,6 +66,14 @@ const TICK: Duration = Duration::from_millis(8);
 /// How long a target may take to answer a position before it counts as
 /// refusing, and to confirm a drop it took.
 const STATUS_WAIT: Duration = Duration::from_secs(2);
+/// Many targets refuse the first position while they fetch the offer to look
+/// at it, and accept the next one; a refusal only counts once it has held
+/// this long, with the position asked again meanwhile.
+const REFUSE_GRACE: Duration = Duration::from_millis(700);
+const ASK_AGAIN: Duration = Duration::from_millis(50);
+/// Positions are repeated now and then even when accepted, as a moving
+/// pointer would, so a target that changes its mind is heard.
+const KEEPALIVE: Duration = Duration::from_millis(500);
 const FINISH_WAIT: Duration = Duration::from_secs(30);
 
 struct Shared {
@@ -251,6 +259,9 @@ struct Source<'a> {
     /// When the position now awaiting a status was sent.
     awaiting: Option<Instant>,
     sent: Option<Position>,
+    sent_at: Option<Instant>,
+    /// Since when the current target has kept refusing.
+    refusing: Option<Instant>,
     finished: Option<bool>,
 }
 impl Source<'_> {
@@ -271,6 +282,8 @@ impl Source<'_> {
         self.accepted = false;
         self.awaiting = None;
         self.sent = None;
+        self.sent_at = None;
+        self.refusing = None;
         Ok(())
     }
     /// Point the drag at whatever takes drops under `point`.
@@ -302,7 +315,11 @@ impl Source<'_> {
         let Some(target) = self.current else {
             return Ok(());
         };
-        if self.sent == Some(point) || self.awaiting.is_some() {
+        if self.awaiting.is_some() {
+            return Ok(());
+        }
+        let again = if self.accepted { KEEPALIVE } else { ASK_AGAIN };
+        if self.sent == Some(point) && self.sent_at.is_some_and(|at| at.elapsed() < again) {
             return Ok(());
         }
         let x = point.x.clamp(0, 0x7fff) as u32;
@@ -319,6 +336,7 @@ impl Source<'_> {
             ],
         )?;
         self.sent = Some(point);
+        self.sent_at = Some(Instant::now());
         self.awaiting = Some(Instant::now());
         Ok(())
     }
@@ -331,8 +349,32 @@ impl Source<'_> {
         {
             self.awaiting = None;
             self.accepted = false;
+            self.refusing.get_or_insert_with(Instant::now);
         }
         self.awaiting.is_none()
+    }
+    /// The effect to report, once it is settled: a copy as soon as the target
+    /// takes it, a refusal only after it has held.
+    fn effect(&self) -> Option<u32> {
+        if self.current.is_none() {
+            Some(0)
+        } else if self.accepted {
+            Some(COPY)
+        } else if self
+            .refusing
+            .is_some_and(|since| since.elapsed() >= REFUSE_GRACE)
+        {
+            Some(0)
+        } else {
+            None
+        }
+    }
+    /// Whether the target takes `action`. Only a copy is offered; a target
+    /// that answers with a move or a private action still just reads the
+    /// files, which sit on a read-only mount, but a link or a question to
+    /// the user is not a copy.
+    fn takes(&self, action: u32) -> bool {
+        action != self.atoms.XdndActionLink && action != self.atoms.XdndActionAsk
     }
     fn events(&mut self) -> Result<()> {
         while let Some(event) = self.connection.poll_for_event()? {
@@ -342,17 +384,17 @@ impl Source<'_> {
                     let from_current = self.current.is_some_and(|t| t.window == data[0]);
                     if message.type_ == self.atoms.XdndStatus && from_current {
                         self.awaiting = None;
-                        // A version 2+ target names the action it will take;
-                        // only a copy is offered, and only a copy counts.
-                        self.accepted = data[1] & 1 != 0
-                            && (data[4] == self.atoms.XdndActionCopy || data[4] == 0);
+                        // A version 2+ target names the action it will take.
+                        self.accepted = data[1] & 1 != 0 && self.takes(data[4]);
+                        if self.accepted {
+                            self.refusing = None;
+                        } else {
+                            self.refusing.get_or_insert_with(Instant::now);
+                        }
                     } else if message.type_ == self.atoms.XdndFinished && from_current {
                         let version = self.current.map_or(0, |t| t.version);
-                        self.finished = Some(
-                            version < 5
-                                || (data[1] & 1 != 0
-                                    && (data[2] == self.atoms.XdndActionCopy || data[2] == 0)),
-                        );
+                        self.finished =
+                            Some(version < 5 || (data[1] & 1 != 0 && self.takes(data[2])));
                     }
                 }
                 XEvent::SelectionRequest(request)
@@ -519,6 +561,8 @@ fn run(shared: &Shared, object: impl FnOnce() -> Result<Files>) -> Result<bool> 
         accepted: false,
         awaiting: None,
         sent: None,
+        sent_at: None,
+        refusing: None,
         finished: None,
     };
     let mut moved: Option<Position> = None;
@@ -582,21 +626,16 @@ fn run(shared: &Shared, object: impl FnOnce() -> Result<Files>) -> Result<bool> 
         }
         source.position(point)?;
         let settled = source.settled();
-        if settled {
-            shared.feedback(if source.current.is_some() && source.accepted {
-                COPY
-            } else {
-                0
-            });
+        let effect = source.effect().filter(|_| settled);
+        if let Some(effect) = effect {
+            shared.feedback(effect);
         }
         connection.flush()?;
         if phase == Phase::Drop {
             // Drop only on an answer about the point it lands on.
             let since = *drop_since.get_or_insert_with(Instant::now);
-            if source.current.is_some()
-                && !(settled && source.sent == Some(point))
-                && since.elapsed() < STATUS_WAIT
-            {
+            let decided = settled && source.sent == Some(point) && effect.is_some();
+            if source.current.is_some() && !decided && since.elapsed() < STATUS_WAIT {
                 std::thread::sleep(TICK);
                 continue;
             }

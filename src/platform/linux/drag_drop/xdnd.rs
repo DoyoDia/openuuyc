@@ -26,6 +26,8 @@ x11rb::atom_manager! {
         XdndFinished,
         XdndTypeList,
         XdndActionCopy,
+        XdndActionLink,
+        XdndActionAsk,
         TARGETS,
         UTF8_STRING,
         URI_LIST: b"text/uri-list",
