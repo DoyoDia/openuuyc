@@ -3,6 +3,15 @@ use super::*;
 use egui::{Align2, FontId, Rect, Sense, pos2};
 
 pub(crate) fn metric_pair(ui: &mut egui::Ui, label: &str, value: impl Into<String>) {
+    metric_pair_colored(ui, label, value, TEXT);
+}
+
+pub(crate) fn metric_pair_colored(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: impl Into<String>,
+    color: Color32,
+) {
     let value = value.into();
     ui.horizontal_top(|ui| {
         ui.allocate_ui_with_layout(
@@ -13,7 +22,7 @@ pub(crate) fn metric_pair(ui: &mut egui::Ui, label: &str, value: impl Into<Strin
                 ui.label(RichText::new(label).size(theme::SMALL).color(MUTED));
             },
         );
-        ui.add(egui::Label::new(RichText::new(&value).size(theme::SMALL).color(TEXT)).wrap());
+        ui.add(egui::Label::new(RichText::new(&value).size(theme::SMALL).color(color)).wrap());
     });
 }
 
@@ -70,6 +79,7 @@ pub(crate) fn performance_header(ui: &mut egui::Ui) {
 }
 
 pub(crate) struct PerformanceTrace<'a> {
+    pub current_color: Color32,
     pub label: &'a str,
     pub unit: &'a str,
     pub current: Option<f64>,
@@ -126,7 +136,11 @@ pub(crate) fn performance_trace(ui: &mut egui::Ui, now: f64, trace: PerformanceT
             Align2::RIGHT_CENTER,
             format_value(value),
             FontId::monospace(theme::SMALL),
-            if index == 0 { TEXT } else { MUTED },
+            if index == 0 {
+                trace.current_color
+            } else {
+                MUTED
+            },
         );
     }
     let maximum = peak.unwrap_or_default().max(trace.minimum_scale).max(0.001);

@@ -941,7 +941,7 @@ crate::ui::controls::observe_notice(ui.ctx(), "audio-output-disconnected", "音�
                                             (
                                                 super::PerformancePanelMode::Alerts,
                                                 "异常时",
-                                                "平时不显示；丢包、延迟、抖动、卡顿、丢帧等任一指标异常时，只显示异常的那几项",
+                                                "持续异常时显示，恢复后短暂保留",
                                             ),
                                         ] {
                                             if ui

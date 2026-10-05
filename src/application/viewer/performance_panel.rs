@@ -1,8 +1,10 @@
 //! Bounded, per-viewer UI history. Does not alter receiver sampling or scheduling.
 use super::hud::format_resolution;
 use super::hud::format_uptime;
+use super::hud::health_color;
 use crate::diagnostics::performance::PerformanceMonitor;
 use crate::diagnostics::performance::PerformanceSnapshot;
+use crate::diagnostics::performance::health::Metric;
 use crate::ui::{controls, theme};
 use egui::{RichText, Ui};
 use std::{collections::VecDeque, time::Duration};
@@ -43,8 +45,12 @@ impl Panel {
         }
         self.samples.push_back(Sample {
             at,
-            values: [Some(s.actual_fps), s.current_delay_ms, Some(s.bitrate_mbps)]
-                .map(|value| value.filter(|value| value.is_finite() && *value >= 0.0)),
+            values: [
+                Some(s.actual_fps),
+                s.health.value(Metric::Rtt),
+                Some(s.bitrate_mbps),
+            ]
+            .map(|value| value.filter(|value| value.is_finite() && *value >= 0.0)),
         });
         while self
             .samples
@@ -66,6 +72,7 @@ impl Panel {
         decimals: usize,
         hint: &str,
         current: Option<f64>,
+        current_color: egui::Color32,
         now: f64,
     ) {
         let points: Vec<_> = self
@@ -77,6 +84,7 @@ impl Panel {
             ui,
             now,
             controls::PerformanceTrace {
+                current_color,
                 label,
                 unit,
                 current,
@@ -150,6 +158,7 @@ pub(super) fn show(
                         1,
                         "仅统计实际呈现的新画面；静态桌面时可以低于设定帧率。",
                         Some(s.actual_fps),
+                        super::hud::frame_rate_color(s),
                         now,
                     );
                     panel.trace(
@@ -159,8 +168,9 @@ pub(super) fn show(
                         "ms",
                         5.0,
                         2,
-                        "媒体链路往返时间 RTT，不是单向网络延迟。",
-                        s.current_delay_ms,
+                        "优先媒体 RTCP RTT，缺少时使用当前 ICE 链路 RTT；不是单向网络延迟。",
+                        s.health.value(Metric::Rtt),
+                        health_color(s.health.level(Metric::Rtt)),
                         now,
                     );
                     panel.trace(
@@ -172,29 +182,20 @@ pub(super) fn show(
                         2,
                         "实际收到的视频 RTP 码率，不是配置的码率上限。",
                         Some(s.bitrate_mbps),
+                        theme::TEXT,
                         now,
                     );
                     ui.add_space(theme::MENU_GROUP_GAP);
                     ui.columns(2, |columns| {
-                        controls::metric_pair(
-                            &mut columns[0],
-                            "本地单帧",
-                            ms(Some(s.local_frame_delay_ms)),
-                        );
-                        controls::metric_pair(
-                            &mut columns[0],
-                            "RTP 抖动",
-                            ms(Some(s.rtp_jitter_ms)),
-                        );
+                        health_metric(&mut columns[0], s, Metric::LocalDelay);
+                        health_metric(&mut columns[0], s, Metric::Jitter);
+                        health_metric(&mut columns[1], s, Metric::Loss);
                         controls::metric_pair(
                             &mut columns[1],
-                            "最终丢包",
-                            format!("{:.2}%", s.packet_loss_percent),
-                        );
-                        controls::metric_pair(
-                            &mut columns[1],
-                            "呈现丢帧",
-                            format!("{:.2}%", s.presentation_drop_percent),
+                            "近期呈现丢帧",
+                            s.health
+                                .recent_drop_percent
+                                .map_or_else(|| "—".into(), |v| format!("{v:.2}%")),
                         );
                     });
                     ui.add_space(theme::MENU_GROUP_GAP);
@@ -214,6 +215,16 @@ pub(super) fn show(
 
 fn ms(value: Option<f64>) -> String {
     value.map_or_else(|| "—".into(), |v| format!("{v:.2} ms"))
+}
+fn health_metric(ui: &mut Ui, s: &PerformanceSnapshot, metric: Metric) {
+    controls::metric_pair_colored(
+        ui,
+        metric.label(),
+        s.health
+            .value(metric)
+            .map_or_else(|| "—".into(), |v| metric.format(v)),
+        health_color(s.health.level(metric)),
+    );
 }
 fn heading(ui: &mut Ui, title: &str) {
     ui.add_space(theme::MENU_GROUP_GAP);
@@ -286,8 +297,9 @@ fn playback(ui: &mut Ui, s: &PerformanceSnapshot) {
             s.receive_fps, s.decode_fps, s.render_fps
         ),
     );
-    controls::metric_pair(ui, "估算帧延迟", ms(s.frame_delay_ms.map(|v| v as f64)));
-    heading(ui, "本地单帧 · ms");
+    health_metric(ui, s, Metric::FrameDelay);
+    health_metric(ui, s, Metric::PresentationStall);
+    heading(ui, "最近一帧 · 首包接收到呈现提交 · ms");
     for (label, value) in [
         ("组帧 / 恢复", s.assembly_delay_ms),
         ("输入排队", s.input_queue_delay_ms),
@@ -346,6 +358,11 @@ fn playback(ui: &mut Ui, s: &PerformanceSnapshot) {
             "解码前 {} / 呈现 {} 帧",
             s.predecode_dropped_frames, s.dropped_present_frames
         ),
+    );
+    controls::metric_pair(
+        ui,
+        "累计呈现丢帧",
+        format!("{:.2}%", s.presentation_drop_percent),
     );
     controls::metric_pair(
         ui,
