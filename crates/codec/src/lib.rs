@@ -1,4 +1,4 @@
-//! Platform-independent low-delay video coding for OpenUUYC.
+//! Low-delay video coding for OpenUUYC; AV1 software kernels require x86/x86_64.
 //! One software session API; codec-specific syntax is shared with GPU adapters.
 #![forbid(unsafe_code)]
 

@@ -38,7 +38,10 @@ pub(super) fn file_format(id: u32, name: &str) -> bool {
         .any(|s| s.eq_ignore_ascii_case(name))
 }
 pub(super) fn supported(id: u32, name: &str, files: bool) -> bool {
-    if name.eq_ignore_ascii_case("DataObject") || name.eq_ignore_ascii_case("Ole Private Data") {
+    if name.eq_ignore_ascii_case("OpenUUYC.Clipboard.Remote")
+        || name.eq_ignore_ascii_case("DataObject")
+        || name.eq_ignore_ascii_case("Ole Private Data")
+    {
         return false;
     }
     if file_format(id, name) {

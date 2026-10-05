@@ -1100,9 +1100,25 @@ crate::ui::controls::observe_notice(ui.ctx(), "clipboard-error", "剪贴板同�
                             ui.add_space(7.0);
                         }
                         separator(ui);
-                        let mut throttle = handle.device_preferences().mouse_throttle;
-                        if switch_row(ui, "鼠标发送节流 · 1000 Hz", &mut throttle).changed() {
-                            state.local_error = handle.set_mouse_throttle(throttle).err().map(|e|format!("{e:#}"));
+                        let preferences = handle.device_preferences();
+                        let mut throttle = preferences.mouse_throttle;
+                        let mut rate = preferences.mouse_throttle_rate;
+                        let mut changed = switch_row(ui, "鼠标发送节流", &mut throttle).changed();
+                        ui.add_enabled_ui(throttle, |ui| {
+                            ui.horizontal(|ui| {
+                                for choice in crate::features::remote_input::MouseThrottleRate::ALL {
+                                    if ui.add_sized(
+                                        [(WIDTH - 12.0) / 3.0, ROW_HEIGHT],
+                                        egui::Button::new(choice.label()).selected(rate == choice),
+                                    ).clicked() {
+                                        changed |= rate != choice;
+                                        rate = choice;
+                                    }
+                                }
+                            });
+                        });
+                        if changed {
+                            state.local_error = handle.set_mouse_throttle(throttle, rate).err().map(|e|format!("{e:#}"));
                         }
                         ui.add(egui::Label::new(RichText::new(
                             "降低高回报率鼠标的输入负担。开启鼠标加速度时，手感可能变化。"

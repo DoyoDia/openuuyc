@@ -68,6 +68,7 @@ impl AuthenticatedClient {
         sync.task = Some(tokio::spawn(async move {
             let job = async {
                 let mut source_seen = None;
+                let mut source_error = None;
                 let mut attempted_digest = String::new();
                 let mut explicit = false;
                 let mut readback_needed = true;
@@ -114,8 +115,15 @@ impl AuthenticatedClient {
                     }
                     let source =
                         tokio::task::spawn_blocking(device_profile::wallpaper_source).await?;
+                    if source.is_ok() {
+                        source_error = None;
+                    }
                     match source {
                         Ok(source) if explicit || source_seen.as_ref() != Some(&source) => {
+                            tracing::info!(
+                                cached = source.cached(),
+                                "device wallpaper source resolved"
+                            );
                             let capture = source.clone();
                             let result = async {
                                 reporting::update(|s| {
@@ -162,7 +170,12 @@ impl AuthenticatedClient {
                         }
                         Err(error) => {
                             source_seen = None;
-                            reporting::update(|s| s.wallpaper = format!("不可用：{error:#}"));
+                            let error = format!("{error:#}");
+                            if source_error.as_ref() != Some(&error) {
+                                tracing::warn!(%error, "device wallpaper source unavailable");
+                                source_error = Some(error.clone());
+                            }
+                            reporting::update(|s| s.wallpaper = format!("不可用：{error}"));
                         }
                         _ => {}
                     }

@@ -1,5 +1,4 @@
-//! Controller-side Draw RPC. The official host owns rendering and desktop overlays.
-use super::wire::PbRpcRequestPayload;
+//! Shared annotation editor. Protocol adapters submit commands and complete effects.
 use super::*;
 use board::{Board, BoardEdit};
 use clicks::ClickPulse;
@@ -7,9 +6,15 @@ use laser::LaserTrail;
 use std::collections::{BTreeSet, HashMap};
 use std::time::Duration;
 
+pub(crate) mod wire;
+pub(crate) use wire::*;
+
 mod board;
 mod clicks;
 mod laser;
+mod native;
+mod transport;
+use transport::{InFlight, Outcome, Reply};
 
 const MAX_POINTS: usize = 32_768;
 const MAX_STROKES: usize = 256;
@@ -106,13 +111,14 @@ struct LiveShape {
     laser: Option<LaserTrail>,
     pointer: bool,
 }
+#[derive(Clone, Copy)]
 enum Pending {
-    Toggle(bool, Instant),
+    Toggle(bool),
     Stroke(u32),
-    Edit(u8),
-    Shape(u8),
-    Click(u32, u8),
-    Board(u8),
+    Edit,
+    Shape,
+    Click(u32),
+    Board,
 }
 
 pub(super) struct Annotation {
@@ -120,7 +126,8 @@ pub(super) struct Annotation {
     generation: u64,
     next_id: u32,
     pub(super) enabled: bool,
-    pending: HashMap<i64, Pending>,
+    pending: HashMap<i64, InFlight>,
+    native_token: Option<u64>,
     drawing: Option<Drawing>,
     live_shape: Option<LiveShape>,
     clicks: Vec<ClickPulse>,
@@ -142,6 +149,7 @@ impl Default for Annotation {
             next_id: BOARD_IDS + 1,
             enabled: false,
             pending: HashMap::new(),
+            native_token: None,
             drawing: None,
             live_shape: None,
             clicks: Vec::new(),
@@ -159,6 +167,8 @@ impl Default for Annotation {
 }
 impl Annotation {
     pub(super) fn disconnect(&mut self) {
+        self.next_id = BOARD_IDS + 1;
+        self.native_token = None;
         self.generation = self.generation.wrapping_add(1);
         self.enabled = false;
         self.pending.clear();
@@ -178,7 +188,7 @@ impl Annotation {
     pub(super) fn toggling(&self) -> bool {
         self.pending
             .values()
-            .any(|p| matches!(p, Pending::Toggle(..)))
+            .any(|p| matches!(p.effect, Pending::Toggle(..)))
     }
     fn busy(&self) -> bool {
         self.drawing.is_some()
@@ -209,7 +219,7 @@ impl Annotation {
             !self
                 .pending
                 .values()
-                .any(|p| matches!(p, Pending::Stroke(id) if *id == stroke.id))
+                .any(|p| matches!(p.effect, Pending::Stroke(id) if id == stroke.id))
         }) {
             let stroke = self.finishing.pop_front().unwrap();
             self.push_history(Edit::Add(stroke.clone()));
@@ -220,7 +230,7 @@ impl Annotation {
         if self
             .pending
             .values()
-            .any(|p| matches!(p, Pending::Shape(_)))
+            .any(|p| matches!(p.effect, Pending::Shape))
         {
             return;
         }
@@ -272,51 +282,35 @@ impl Annotation {
         }
         self.strokes.sort_by_key(|s| s.id);
     }
-    pub(super) fn response(&mut self, seq: i64, response: PbDrawResponse) {
-        let Some(payload) = response.payload else {
+    fn complete(&mut self, seq: i64, outcome: Outcome) {
+        let Some(request) = self.pending.remove(&seq) else {
             return;
         };
-        let (kind, code) = match payload {
-            PbDrawResponseKind::Stroke(r) => (1, r.error_code),
-            PbDrawResponseKind::Clear(r) => (2, r.error_code),
-            PbDrawResponseKind::Toggle(r) => (3, r.error_code),
-        };
-        let matches = self.pending.get(&seq).is_some_and(|p| match p {
-            Pending::Toggle(..) => kind == 3,
-            Pending::Stroke(_) => kind == 1,
-            Pending::Edit(expected)
-            | Pending::Shape(expected)
-            | Pending::Click(_, expected)
-            | Pending::Board(expected) => kind == *expected,
-        });
-        if !matches {
-            return;
-        }
-        let p = self.pending.remove(&seq).unwrap();
-        if let Pending::Toggle(enable, _) = p {
-            if code == 0 {
+        let p = request.effect;
+        if let Pending::Toggle(enable) = p {
+            if outcome == Outcome::Applied {
                 self.enabled = enable;
                 self.error = None;
                 self.uncertain = false;
             } else {
-                self.enabled = !enable && code != 2;
-                self.uncertain(error_text(code));
+                self.enabled = !enable && outcome != Outcome::NotLoggedIn;
+                self.uncertain(outcome.message());
             }
             return;
         }
-        if code != 0 {
-            if code == 2 {
+        if outcome != Outcome::Applied {
+            if outcome == Outcome::NotLoggedIn {
                 self.enabled = false;
             }
-            self.uncertain(error_text(code));
+            self.uncertain(outcome.message());
             return;
         }
         match p {
-            Pending::Board(_) => board::complete(self),
+            Pending::Board => board::complete(self),
             Pending::Stroke(_) => self.commit_drawing(),
-            Pending::Shape(_) => self.finish_live_shape(),
+            Pending::Shape => self.finish_live_shape(),
             Pending::Click(..) => clicks::retire(self),
-            Pending::Edit(_) => {
+            Pending::Edit => {
                 if let Some(edit) = &mut self.editing {
                     edit.remaining = edit.remaining.saturating_sub(1);
                     if edit.remaining == 0 {
@@ -343,14 +337,6 @@ impl Annotation {
             }
             Pending::Toggle(..) => unreachable!(),
         }
-    }
-}
-fn error_text(code: i32) -> String {
-    match code {
-        2 => "被控端未登录，批注已关闭".into(),
-        3 => "被控端已锁定，请解锁后清空或重新开启批注".into(),
-        4 => "远端未完成批注操作，请清空或重新开启批注".into(),
-        _ => format!("批注操作未完成（{code}），请清空或重新开启"),
     }
 }
 pub(crate) struct Snapshot {
@@ -444,52 +430,22 @@ impl StreamControlHandle {
         if enable && !annotation_supported(s) {
             bail!("当前设备不支持批注，或能力配置尚未就绪");
         }
+        let native_token = if enable {
+            s.annotation_extension
+        } else {
+            s.annotation.native_token
+        };
         s.annotation.disconnect();
+        s.annotation.native_token = native_token;
         s.annotation.enabled = enable;
         self.send_draw(
             s,
             PbDrawRequest {
                 payload: Some(PbDrawRequestKind::Toggle(PbDrawToggle { enable })),
             },
-            Pending::Toggle(enable, Instant::now()),
+            Pending::Toggle(enable),
         )?;
         Ok(())
-    }
-    fn send_draw(
-        &self,
-        s: &mut StreamControlState,
-        request: PbDrawRequest,
-        pending: Pending,
-    ) -> Result<i64> {
-        ensure_ready(s)?;
-        if s.annotation.pending.len() >= MAX_PENDING {
-            bail!("批注回执仍在等待，请稍后再试");
-        }
-        let seq = s.next_sequence;
-        s.next_sequence = seq.wrapping_add(1);
-        let payload = encode_envelope(
-            seq,
-            PbPayload::RpcRequest(
-                PbRpcRequest {
-                    request_header: Some(PbRequestHeader { request_id: seq }),
-                    payload: Some(PbRpcRequestPayload::Draw(request)),
-                }
-                .encode_to_vec(),
-            ),
-        );
-        s.annotation.pending.insert(seq, pending);
-        let outgoing = OutgoingControlMessage {
-            sequence: seq,
-            payload,
-            protocol: protocol(s),
-            completion: None,
-            annotation_generation: Some(s.annotation.generation),
-        };
-        if self.outgoing.send(outgoing).is_err() {
-            s.annotation.uncertain("批注发送任务已停止".into());
-            bail!("批注发送任务已停止");
-        }
-        Ok(seq)
     }
     pub(crate) fn annotation_message_current(&self, seq: i64, generation: u64) -> bool {
         let s = lock(&self.shared);
@@ -498,7 +454,7 @@ impl StreamControlHandle {
     pub(crate) fn annotation_send_failed(&self, seq: i64, error: &str) {
         let mut s = lock(&self.shared);
         if let Some(p) = s.annotation.pending.remove(&seq) {
-            if let Pending::Toggle(enable, _) = p {
+            if let Pending::Toggle(enable) = p.effect {
                 s.annotation.enabled = !enable;
             }
             s.annotation.uncertain(format!("批注发送未完成：{error}"));
@@ -758,11 +714,14 @@ impl StreamControlHandle {
         }
         // Refresh the desired laser snapshot even while the previous replace is
         // in flight. Only the latest short trail is sent when that batch finishes.
-        laser::update(&mut s.annotation, Instant::now());
+        let native = s.annotation.native_token.is_some();
+        laser::update(&mut s.annotation, Instant::now(), native);
         if s.annotation
             .pending
             .values()
-            .any(|p| matches!(p, Pending::Shape(_)))
+            .filter(|p| matches!(p.effect, Pending::Shape))
+            .count()
+            >= if native { 4 } else { 1 }
         {
             return;
         }
@@ -770,6 +729,55 @@ impl StreamControlHandle {
             return;
         };
         let cancel = shape.finish == Some(false);
+        if s.annotation.native_token.is_some() {
+            let pending = s.annotation.pending.len();
+            if (cancel || shape.sent_revision != shape.revision) && pending < MAX_PENDING {
+                let stroke = shape.stroke.clone();
+                let transient = shape.pointer || shape.laser.is_some();
+                let laser = shape
+                    .laser
+                    .as_ref()
+                    .map(|laser| laser.native(stroke.id, stroke.screen));
+                let shown = shape.shown;
+                let result = if cancel {
+                    if shown {
+                        self.send_draw(
+                            s,
+                            clear_request(2, stroke.id, Some(stroke.screen)),
+                            Pending::Shape,
+                        )
+                        .map(|_| ())
+                    } else {
+                        Ok(())
+                    }
+                } else if let Some(laser) = laser {
+                    self.send_native_draw(
+                        s,
+                        crate::protocol::annotation::Command::new(
+                            crate::protocol::annotation::Operation::Laser(laser),
+                        ),
+                        Pending::Shape,
+                    )
+                    .map(|_| ())
+                } else {
+                    self.native_replace(s, &stroke, transient, Pending::Shape)
+                        .map(|_| ())
+                };
+                if let Err(error) = result {
+                    s.annotation.uncertain(error.to_string());
+                    return;
+                }
+                if let Some(shape) = &mut s.annotation.live_shape {
+                    shape.shown = !cancel;
+                    shape.sent_revision = shape.revision;
+                    if shape.finish.is_none() {
+                        shape.preview_submissions = shape.preview_submissions.saturating_add(1);
+                    }
+                }
+            }
+            s.annotation.finish_live_shape();
+            return;
+        }
         if cancel || shape.sent_revision != shape.revision {
             let count = usize::from(shape.shown) + usize::from(!cancel);
             if count > MAX_PENDING.saturating_sub(s.annotation.pending.len()) {
@@ -777,17 +785,14 @@ impl StreamControlHandle {
             }
             let mut requests = Vec::new();
             if shape.shown {
-                requests.push((
-                    clear_request(2, shape.stroke.id, Some(shape.stroke.screen)),
-                    2,
-                ));
+                requests.push(clear_request(2, shape.stroke.id, Some(shape.stroke.screen)));
             }
             if !cancel {
-                requests.push((stroke_request(&shape.stroke, &shape.stroke.points), 1));
+                requests.push(stroke_request(&shape.stroke, &shape.stroke.points));
             }
             // Keep one replacement in flight; later pointer updates replace the desired geometry.
-            for (request, kind) in requests {
-                if let Err(error) = self.send_draw(s, request, Pending::Shape(kind)) {
+            for request in requests {
+                if let Err(error) = self.send_draw(s, request, Pending::Shape) {
                     s.annotation.uncertain(error.to_string());
                     return;
                 }
@@ -864,17 +869,16 @@ impl StreamControlHandle {
     }
     pub(crate) fn annotation_tick(&self) {
         let mut s = lock(&self.shared);
-        let timed_out = s.annotation.pending.iter().find_map(|(id, p)| match p {
-            Pending::Toggle(enable, at) if at.elapsed() >= Duration::from_secs(3) => {
-                Some((*id, *enable))
-            }
-            _ => None,
+        let timed_out = s.annotation.pending.values().find(|p| {
+            (p.reply == Reply::Native || matches!(p.effect, Pending::Toggle(_)))
+                && p.sent.elapsed() >= Duration::from_secs(3)
         });
-        if let Some((id, enable)) = timed_out {
-            s.annotation.pending.remove(&id);
-            s.annotation.enabled = !enable;
+        if let Some(request) = timed_out {
+            if let Pending::Toggle(enable) = request.effect {
+                s.annotation.enabled = !enable;
+            }
             s.annotation
-                .uncertain("批注切换未收到确认，请重新操作".into());
+                .uncertain("批注操作未收到确认，请关闭后重新开启".into());
         }
         self.flush_annotation(&mut s);
         self.drive_live_shape(&mut s);
@@ -940,6 +944,9 @@ impl StreamControlHandle {
         if !s.annotation.enabled || s.annotation.busy() {
             bail!("请等待当前批注操作完成");
         }
+        if s.annotation.native_token.is_some() {
+            return self.edit_native(s, edit, direction);
+        }
         let reverse = matches!(direction, Direction::Undo);
         let mut requests = Vec::new();
         match (&edit, reverse) {
@@ -970,6 +977,7 @@ impl StreamControlHandle {
                 }
             }
         }
+
         if requests.is_empty() {
             return Ok(());
         }
@@ -984,17 +992,7 @@ impl StreamControlHandle {
         });
         s.annotation.error = None;
         for request in requests {
-            if let Err(e) = self.send_draw(
-                s,
-                request.clone(),
-                Pending::Edit(
-                    if matches!(request.payload, Some(PbDrawRequestKind::Stroke(_))) {
-                        1
-                    } else {
-                        2
-                    },
-                ),
-            ) {
+            if let Err(e) = self.send_draw(s, request, Pending::Edit) {
                 s.annotation.uncertain(e.to_string());
                 return Err(e);
             }
@@ -1003,23 +1001,28 @@ impl StreamControlHandle {
     }
 }
 fn annotation_supported(s: &StreamControlState) -> bool {
-    s.features.as_ref().is_some_and(|f| {
-        f.is_windows() && f.supports(crate::account::feature_ability::Feature::Annotation)
-    }) && protocol(s) == StreamControlProtocol::CaptureSetting
+    (s.annotation_extension.is_some()
+        || s.features.as_ref().is_some_and(|f| {
+            f.is_windows() && f.supports(crate::account::feature_ability::Feature::Annotation)
+        }))
+        && protocol(s) == StreamControlProtocol::CaptureSetting
         && s.text_channel_open
+}
+fn encoded_stroke(stroke: &Stroke, points: &[Point]) -> PbDrawStroke {
+    PbDrawStroke {
+        stroke_id: stroke.id,
+        points: points
+            .iter()
+            .map(|p| PbDrawPoint { x: p.x, y: p.y })
+            .collect(),
+        screen_id: Some(stroke.screen),
+        line_width: Some(stroke.style.width),
+        color: Some(stroke.style.argb),
+    }
 }
 fn stroke_request(stroke: &Stroke, points: &[Point]) -> PbDrawRequest {
     PbDrawRequest {
-        payload: Some(PbDrawRequestKind::Stroke(PbDrawStroke {
-            stroke_id: stroke.id,
-            points: points
-                .iter()
-                .map(|p| PbDrawPoint { x: p.x, y: p.y })
-                .collect(),
-            screen_id: Some(stroke.screen),
-            line_width: Some(stroke.style.width),
-            color: Some(stroke.style.argb),
-        })),
+        payload: Some(PbDrawRequestKind::Stroke(encoded_stroke(stroke, points))),
     }
 }
 fn clear_request(clear_type: i32, stroke_id: u32, screen_id: Option<i32>) -> PbDrawRequest {
@@ -1030,71 +1033,4 @@ fn clear_request(clear_type: i32, stroke_id: u32, screen_id: Option<i32>) -> PbD
             screen_id,
         })),
     }
-}
-#[derive(Clone, PartialEq, prost::Message)]
-pub(super) struct PbDrawRequest {
-    #[prost(oneof = "PbDrawRequestKind", tags = "1,2,3")]
-    payload: Option<PbDrawRequestKind>,
-}
-#[derive(Clone, PartialEq, prost::Oneof)]
-enum PbDrawRequestKind {
-    #[prost(message, tag = "1")]
-    Stroke(PbDrawStroke),
-    #[prost(message, tag = "2")]
-    Clear(PbDrawClear),
-    #[prost(message, tag = "3")]
-    Toggle(PbDrawToggle),
-}
-#[derive(Clone, PartialEq, prost::Message)]
-struct PbDrawPoint {
-    #[prost(float, tag = "1")]
-    x: f32,
-    #[prost(float, tag = "2")]
-    y: f32,
-}
-#[derive(Clone, PartialEq, prost::Message)]
-struct PbDrawStroke {
-    #[prost(uint32, tag = "1")]
-    stroke_id: u32,
-    #[prost(message, repeated, tag = "2")]
-    points: Vec<PbDrawPoint>,
-    #[prost(int32, optional, tag = "3")]
-    screen_id: Option<i32>,
-    #[prost(float, optional, tag = "4")]
-    line_width: Option<f32>,
-    #[prost(uint32, optional, tag = "5")]
-    color: Option<u32>,
-}
-#[derive(Clone, PartialEq, prost::Message)]
-struct PbDrawClear {
-    #[prost(int32, tag = "1")]
-    clear_type: i32,
-    #[prost(uint32, tag = "2")]
-    stroke_id: u32,
-    #[prost(int32, optional, tag = "3")]
-    screen_id: Option<i32>,
-}
-#[derive(Clone, PartialEq, prost::Message)]
-struct PbDrawToggle {
-    #[prost(bool, tag = "1")]
-    enable: bool,
-}
-#[derive(Clone, PartialEq, prost::Message)]
-pub(super) struct PbDrawResponse {
-    #[prost(oneof = "PbDrawResponseKind", tags = "1,2,3")]
-    payload: Option<PbDrawResponseKind>,
-}
-#[derive(Clone, PartialEq, prost::Oneof)]
-enum PbDrawResponseKind {
-    #[prost(message, tag = "1")]
-    Stroke(PbDrawResult),
-    #[prost(message, tag = "2")]
-    Clear(PbDrawResult),
-    #[prost(message, tag = "3")]
-    Toggle(PbDrawResult),
-}
-#[derive(Clone, PartialEq, prost::Message)]
-struct PbDrawResult {
-    #[prost(int32, tag = "1")]
-    error_code: i32,
 }

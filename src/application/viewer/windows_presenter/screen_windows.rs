@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use windows::Win32::Foundation::POINT;
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+use winit::platform::windows::WindowAttributesExtWindows;
 
 #[derive(Clone, Copy)]
 enum TabCommand {
@@ -547,6 +548,7 @@ impl ScreenWindows {
         let target = {
             let window = event_loop.create_window(
                 WindowAttributes::default()
+                    .with_drag_and_drop(false)
                     .with_visible(false)
                     .with_title(source.window.title())
                     .with_window_icon(Some(crate::ui::branding::window_icon()))

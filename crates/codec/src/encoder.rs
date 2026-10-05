@@ -1,25 +1,32 @@
 //! Immediate-output software encoding; no input queue or future-frame lookahead.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 mod av1;
 mod h264;
 use crate::{Codec, Format, PixelFormat};
-use anyhow::{Result, ensure};
+use anyhow::{ensure, Result};
 use std::sync::{
-    Arc,
     atomic::{AtomicBool, Ordering},
+    Arc,
 };
 
 /// Software streaming limits, also used by capability negotiation.
 pub const fn maximum_size(codec: Codec) -> (u32, u32) {
     match codec {
         Codec::H264 => (3840, 2160),
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         Codec::Av1 => (1920, 1080),
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+        Codec::Av1 => (0, 0),
         Codec::H265 => (0, 0),
     }
 }
 pub const fn maximum_fps(codec: Codec) -> u32 {
     match codec {
         Codec::H264 => 144,
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         Codec::Av1 => 30,
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+        Codec::Av1 => 0,
         Codec::H265 => 0,
     }
 }
@@ -67,6 +74,7 @@ pub struct Packet {
 }
 enum Kernel {
     H264(h264::Encoder),
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     Av1(av1::Encoder),
 }
 pub struct Encoder {
@@ -90,7 +98,10 @@ impl Encoder {
     fn create(config: Config) -> Result<Kernel> {
         match config.format.codec {
             Codec::H264 => Ok(Kernel::H264(h264::Encoder::new(config)?)),
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             Codec::Av1 => Ok(Kernel::Av1(av1::Encoder::new(config)?)),
+            #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+            Codec::Av1 => anyhow::bail!("software AV1 encoding requires x86 or x86_64"),
             Codec::H265 => anyhow::bail!("software HEVC encoding is unavailable"),
         }
     }
@@ -114,6 +125,7 @@ impl Encoder {
         } else {
             match &mut self.kernel {
                 Kernel::H264(e) => e.configure(fps, bitrate)?,
+                #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
                 Kernel::Av1(e) => e.configure(fps, bitrate)?,
             }
         }
@@ -134,6 +146,7 @@ impl Encoder {
         }
         match &mut self.kernel {
             Kernel::H264(e) => e.prepare(data, pitch)?,
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             Kernel::Av1(e) => e.prepare(data, pitch, cancel)?,
         }
         ensure!(
@@ -160,6 +173,7 @@ impl Encoder {
         );
         let result = match &mut self.kernel {
             Kernel::H264(e) => e.encode(timestamp, self.key_requested),
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             Kernel::Av1(e) => e.encode(timestamp, self.key_requested, cancel),
         };
         if result.is_err() || cancel.load(Ordering::Acquire) {

@@ -70,10 +70,13 @@ struct Router {
     shortcut: Option<(u64, super::windows_presenter::ViewerShortcut)>,
     target: Option<Target>,
     physical: [bool; 256],
+    // DOWN inherited from an activation snapshot, not from our event stream.
+    sampled: [bool; 256],
     blocked: [bool; 256],
     consumed: [bool; 256],
     lock_releases: Vec<(u64, u16, u64)>,
     diagnostic_seen: u64,
+    neutral_wait_since: std::time::Instant,
     configuration: u64,
     observed: [bool; 256],
     routes: [Route; 256],
@@ -89,10 +92,12 @@ impl Default for Router {
             shortcut: None,
             target: None,
             physical: [false; 256],
+            sampled: [false; 256],
             blocked: [false; 256],
             consumed: [false; 256],
             lock_releases: Vec::new(),
             diagnostic_seen: 0,
+            neutral_wait_since: std::time::Instant::now(),
             configuration: crate::application::viewer_shortcuts::revision(),
             observed: [false; 256],
             routes: [Route::Local; 256],
@@ -123,6 +128,17 @@ fn blocked_modifiers(blocked: &[bool; 256]) -> bool {
 
 fn windows_state_key(key: u16) -> bool {
     matches!(key, 16..=18 | 20 | 144..=145 | 160..=165)
+}
+
+fn keyboard_key(key: u16) -> bool {
+    // Canonical keyboard VKs (left/right modifiers have already been resolved).
+    // Do not wait for releases of reserved, gamepad, IME process/packet or
+    // intermediate values. Keep international, IME On/Off and OEM keyboard keys.
+    matches!(key,
+        0x08 | 0x09 | 0x0c | 0x0d | 0x13..=0x19 |
+        0x1a..=0x39 | 0x41..=0x5d | 0x5f..=0x87 | 0x90..=0x96 |
+        0xa0..=0xb7 | 0xba..=0xc0 | 0xdb..=0xdf | 0xe1..=0xe4 |
+        0xe6 | 0xe9..=0xfb | 0xfd..=0xfe)
 }
 
 fn intercept_key(key: u16, held: &[bool; 256], intercept_shortcuts: bool) -> bool {
@@ -248,6 +264,9 @@ pub(super) fn message(pointer: *const std::ffi::c_void) -> bool {
             return false;
         }
         let key = normalize_key(virtual_key, scan, flags & (1 << 24) != 0);
+        if !keyboard_key(key) {
+            return false;
+        }
         let down = matches!(msg.message, WM_KEYDOWN | WM_SYSKEYDOWN);
         let count = if down { (flags & 0xffff).max(1) } else { 1 };
         if count > MAX_PENDING_KEYS as u32 {
@@ -365,6 +384,61 @@ impl Drop for KeyboardHook {
 }
 
 impl Router {
+    fn snapshot_keys(&mut self, mut down: impl FnMut(u16) -> bool) -> (usize, usize) {
+        let mut ignored = 0;
+        let mut intercepted = 0;
+        for i in 8..255 {
+            let canonical = keyboard_key(i as u16);
+            let sampled = down(i as u16);
+            ignored += usize::from(sampled && !canonical);
+            // An intercepted DOWN may never enter Windows' async state. Its
+            // live hook route, not a stale local-consumption obligation, owns it.
+            let hook_held =
+                canonical && self.observed[i] && matches!(self.routes[i], Route::Hook(_));
+            intercepted += usize::from(hook_held);
+            self.physical[i] = canonical && (sampled || hook_held);
+            self.sampled[i] = canonical && sampled && !hook_held;
+            self.blocked[i] = self.physical[i];
+            self.observed[i] = self.physical[i];
+        }
+        for i in [1, 2, 4, 5, 6] {
+            self.physical[i] = down(i as u16);
+            self.sampled[i] = self.physical[i];
+        }
+        (ignored, intercepted)
+    }
+
+    fn reconcile_sampled_keys(&mut self, mut down: impl FnMut(u16) -> bool) {
+        // Called on the foreground GUI thread, never from the low-level hook
+        // (whose callback precedes the async-state update). Do not overtake
+        // ordered key edges, synthesize input, or clear a hook-owned hold.
+        if !self.pending.is_empty()
+            || !self
+                .target
+                .as_ref()
+                .is_some_and(|t| t.input.waiting_for_neutral())
+        {
+            return;
+        }
+        let mut released = 0;
+        for i in 0..256 {
+            if self.sampled[i] && !down(i as u16) {
+                self.sampled[i] = false;
+                self.physical[i] = false;
+                self.observed[i] = false;
+                self.blocked[i] = false;
+                released += 1;
+            }
+        }
+        if released != 0 {
+            tracing::debug!(
+                released_count = released,
+                "activation input snapshot releases reconciled"
+            );
+        }
+        self.finish_neutral();
+    }
+
     /// Return whether this edge belonged to the blocked activation, including
     /// the final UP. Only a later edge may be sent after both devices are neutral.
     fn finish_neutral(&self) -> bool {
@@ -376,6 +450,12 @@ impl Router {
         }
         if !self.physical.iter().any(|down| *down) {
             target.input.confirm_neutral(target.activation);
+            if !target.input.waiting_for_neutral() {
+                tracing::info!(
+                    elapsed_ms = self.neutral_wait_since.elapsed().as_millis() as u64,
+                    "keyboard and mouse activation wait cleared"
+                );
+            }
         }
         true
     }
@@ -392,6 +472,7 @@ impl Router {
         }
         self.clear();
         self.physical = [false; 256];
+        self.sampled = [false; 256];
         self.observed = [false; 256];
         self.blocked = [false; 256];
         self.consumed = [false; 256];
@@ -399,7 +480,7 @@ impl Router {
         self.window_owned = [None; 256];
         tracing::debug!("local desktop transition revoked remote input");
     }
-    // One observation per stage/source/activation. Never record keys or text.
+    // One observation per stage/source/activation. No per-event keys or text.
     fn diagnostic(&mut self, stage: u8, injected: bool, reason: &'static str) {
         if self.target.is_none() {
             return;
@@ -455,6 +536,7 @@ impl Router {
                 crate::plugins::hotkeys::key_event(0, edge.key, edge.down);
                 let i = usize::from(edge.key);
                 self.physical[i] = edge.down;
+                self.sampled[i] = false;
                 self.blocked[i] = edge.down;
                 if !edge.down {
                     self.consumed[i] = false;
@@ -468,6 +550,7 @@ impl Router {
 
     fn observe_hook(&mut self, edge: KeyEdge) -> bool {
         let i = usize::from(edge.key);
+        self.sampled[i] = false;
         let was_down = self.observed[i];
         self.observed[i] = edge.down;
         if edge.down && !was_down {
@@ -612,12 +695,13 @@ impl Router {
         self.diagnostic(0, injected, "window_dispatch_received");
         let index = usize::from(vk);
         // VK_PACKET is committed Unicode input, not a physical VK event.
-        if !(8..=254).contains(&vk) || vk == 231 {
+        if !keyboard_key(vk) {
             self.diagnostic(1, injected, "not_physical_key");
             return false;
         }
         let previously_down = self.physical[index];
         self.physical[index] = down;
+        self.sampled[index] = false;
         let was_consumed = self.consumed[index];
         if !down {
             self.consumed[index] = false;
@@ -700,7 +784,7 @@ impl Router {
         }
         if self.finish_neutral() {
             self.blocked[index] = down;
-            self.diagnostic(6, injected, "waiting_for_keyboard_mouse_neutral");
+            self.diagnostic(8, injected, "waiting_for_keyboard_mouse_neutral");
             return was_consumed;
         }
         if self.blocked[index] {
@@ -762,23 +846,26 @@ pub(super) fn set_target(owner: u64, input: &RemoteInput, intercept_shortcuts: b
                 && t.input.same_session(input)
                 && t.intercept_shortcuts == intercept_shortcuts
         }) {
+            if unsafe { GetForegroundWindow() } == HWND(owner as _) {
+                r.reconcile_sampled_keys(|key| unsafe { GetAsyncKeyState(i32::from(key)) } < 0);
+            }
             return;
         }
         r.clear();
         r.diagnostic_seen = 0;
+        r.neutral_wait_since = std::time::Instant::now();
         // Keys held before activation belong to the previous local surface.
-        for i in 8..255 {
-            r.physical[i] = r.consumed[i]
-                || (!matches!(i, 16..=18) && unsafe { GetAsyncKeyState(i as i32) } < 0);
-            r.blocked[i] = r.physical[i];
-            r.observed[i] = r.physical[i];
-        }
-        for i in [1, 2, 4, 5, 6] {
-            r.physical[i] = unsafe { GetAsyncKeyState(i as i32) } < 0;
-        }
+        let (ignored_snapshot_states, intercepted_keys) =
+            r.snapshot_keys(|key| unsafe { GetAsyncKeyState(i32::from(key)) } < 0);
         tracing::debug!(
-            quarantined_keys = r.blocked.iter().filter(|key| **key).count(),
+            quarantined_keys = (8..255).filter(|i| r.blocked[*i]).count(),
             held_modifiers = blocked_modifiers(&r.blocked),
+            ignored_snapshot_states,
+            intercepted_keys,
+            held_mouse_buttons = [1, 2, 4, 5, 6]
+                .into_iter()
+                .filter(|i| r.physical[*i])
+                .count(),
             "keyboard input owner activated"
         );
         r.target = Some(Target {
@@ -800,9 +887,11 @@ pub(super) fn observe_mouse_buttons(owner: u64, flags: u16) -> bool {
         for (index, key) in [1, 2, 4, 5, 6].into_iter().enumerate() {
             if flags & (1 << (2 * index)) != 0 {
                 r.physical[key] = true;
+                r.sampled[key] = false;
             }
             if flags & (2 << (2 * index)) != 0 {
                 r.physical[key] = false;
+                r.sampled[key] = false;
             }
         }
         r.finish_neutral()
@@ -845,8 +934,7 @@ unsafe extern "system" fn keyboard_proc(code: i32, message: WPARAM, data: LPARAM
             } else {
                 event.scanCode
             };
-            if (8..=254).contains(&vk)
-                && vk != 231
+            if keyboard_key(vk as u16)
                 && with_router(|r| {
                     r.observe_hook(KeyEdge {
                         key: vk as u16,

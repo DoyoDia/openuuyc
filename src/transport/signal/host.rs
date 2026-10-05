@@ -10,6 +10,7 @@ pub(crate) enum Event {
     Candidate(RTCIceCandidateInit),
     Poll,
     Prepared(Result<PreparedPeer>),
+    Power(crate::features::host::power::Event),
 }
 pub(crate) struct PreparedPeer {
     peer: Peer,
@@ -25,6 +26,7 @@ impl Drop for PendingPeer {
     }
 }
 pub(crate) struct Session {
+    power: crate::features::host::power::Inbox,
     client: crate::session::host_client::HostClient,
     desired: tokio::sync::watch::Receiver<Option<crate::features::host::AccessRequest>>,
     active_displays: Option<Vec<crate::protocol::capability::DisplayCapability>>,
@@ -42,6 +44,7 @@ pub(crate) struct Session {
 impl Session {
     pub(crate) fn new(client: crate::session::host_client::HostClient) -> Self {
         Self {
+            power: client.host.power.bind(),
             desired: client.host.subscribe(),
             client,
             active_displays: None,
@@ -63,6 +66,7 @@ impl Session {
             return Event::Change;
         }
         tokio::select! {
+            event=self.power.next()=>Event::Power(event),
             _=self.desired.changed()=>Event::Change,
             result=async { match &mut self.preparing { Some(p)=>(&mut p.task).await, None=>pending().await } }=>Event::Prepared(result.context("被控准备任务中断").and_then(|r|r)),
             candidate=async {match &mut self.peer {Some(peer)=>peer.candidates.recv().await,None=>pending().await}}=>{
@@ -73,6 +77,39 @@ impl Session {
     }
     pub(crate) async fn apply(&mut self, event: Event, signal: &mut SignalSession) -> Result<()> {
         match event {
+            Event::Power(crate::features::host::power::Event::Prepare(request)) => {
+                self.power.prepare(request, self.client.clone());
+            }
+            Event::Power(crate::features::host::power::Event::Ready(result)) => {
+                let operation = async {
+                    let request = result?;
+                    anyhow::ensure!(request.valid() && self.client.is_active(), "电源请求已取消");
+                    self.client.host.begin_power()?;
+                    self.end_control(signal).await;
+                    // Keep the room's access lease: Windows may cancel shutdown for
+                    // unsaved applications, and the owner must still be reconnectable.
+                    let client = self.client.clone();
+                    let action = request.action();
+                    let (completed, result) = tokio::sync::oneshot::channel();
+                    // Thread-scoped privileges cannot leak into a reused runtime worker.
+                    std::thread::Builder::new()
+                        .name("host-power".into())
+                        .spawn(move || {
+                            let _ = completed.send(request.execute(&client));
+                        })
+                        .context("无法启动电源执行线程")?;
+                    result.await.context("电源执行任务中断")??;
+                    tracing::info!(?action, "Windows accepted remote power request");
+                    Ok::<(), anyhow::Error>(())
+                }
+                .await;
+                if let Err(error) = &operation {
+                    tracing::warn!(%error,"host power request was not completed");
+                }
+                self.client
+                    .host
+                    .power_result(operation.map_err(|e| e.to_string()));
+            }
             Event::Prepared(result) => {
                 if let Some(mut pending) = self.preparing.take() {
                     pending.cancel = tokio_util::sync::CancellationToken::new();
@@ -302,7 +339,14 @@ impl Session {
                         .context("缺少ConnectOptions二进制内容")?
                         .as_slice(),
                 )?;
-                let streamer = value.get("streamer_data").context("缺少主控能力参数")?;
+                let file_only = options.kind == 5;
+                let ports_only = options.kind == 9;
+                let data_only = file_only || ports_only;
+                let default_streamer = serde_json::json!({});
+                let streamer = value
+                    .get("streamer_data")
+                    .or_else(|| data_only.then_some(&default_streamer))
+                    .context("缺少主控能力参数")?;
                 let streamer = if let Some(text) = streamer.as_str() {
                     serde_json::from_str::<Value>(text)?
                 } else {
@@ -312,6 +356,7 @@ impl Session {
                     streamer
                         .get("device_capability")
                         .cloned()
+                        .or_else(|| data_only.then(|| serde_json::json!({})))
                         .context("缺少主控解码能力")?,
                 )?;
                 // OpenUUYC extension; the ordinary UU connection type stays desktop.
@@ -319,6 +364,10 @@ impl Session {
                     .get("openuuyc_audio_control")
                     .and_then(Value::as_u64)
                     == Some(1);
+                let annotation_extension =
+                    streamer.get("openuuyc_annotation").and_then(Value::as_u64) == Some(1);
+                let drag_extension =
+                    streamer.get("openuuyc_drag_drop").and_then(Value::as_u64) == Some(1);
                 let audio_only = streamer
                     .get("openuuyc_audio_only")
                     .and_then(Value::as_bool)
@@ -327,11 +376,15 @@ impl Session {
                     decoders=?options.decoders,formats=?remote.video_codec_capability,
                     "host incoming media capabilities");
                 anyhow::ensure!(
-                    options.kind == 1 && matches!(options.connect_type, 1 | 2),
+                    matches!(options.kind, 1 | 5 | 9)
+                        && matches!(options.connect_type, 1 | 2)
+                        && (!data_only || options.connect_type == 1),
                     "不支持的被控连接类型"
                 );
                 anyhow::ensure!(
-                    !remote.video_codec_capability.is_empty() && !options.decoders.is_empty(),
+                    data_only
+                        || (!remote.video_codec_capability.is_empty()
+                            && !options.decoders.is_empty()),
                     "主控解码能力为空"
                 );
                 let servers: Vec<ControlIceServer> = serde_json::from_value(
@@ -358,6 +411,14 @@ impl Session {
                 } else {
                     authorization
                 };
+                anyhow::ensure!(
+                    !file_only || authorization.file_access(),
+                    "本机未允许文件传输"
+                );
+                anyhow::ensure!(
+                    !ports_only || authorization.port_policy().0,
+                    "本机未允许端口转发"
+                );
                 self.cancel_preparation().await;
                 if let Some(peer) = self.peer.take() {
                     peer.close().await;
@@ -379,7 +440,9 @@ impl Session {
                 let configuration_client = self.client.clone();
                 let task = tokio::spawn(async move {
                     let result = async {
-                        let (screen, config, negotiated, capabilities, deferred) = if audio_only {
+                        let (screen, config, negotiated, capabilities, deferred) = if audio_only
+                            || data_only
+                        {
                             (
                                 None,
                                 crate::features::host::VideoConfig {
@@ -390,7 +453,11 @@ impl Session {
                                 Arc::new(crate::features::host::format::Negotiated::deferred()),
                                 Vec::new(),
                                 Some(crate::features::host::peer::screens::Deferred {
-                                    options: options.clone(),
+                                    options: {
+                                        let mut media = options.clone();
+                                        media.kind = 1;
+                                        media
+                                    },
                                     remote,
                                     encoding: encoding_settings,
                                 }),
@@ -426,6 +493,15 @@ impl Session {
                             ),
                             deferred,
                             audio_control,
+                            annotation_extension,
+                            drag_extension,
+                            configuration_client.controlling_features(),
+                            crate::protocol::peer_platform::PeerPlatform::from_connect_client_type(
+                                options.client_type,
+                            ),
+                            options.clipboard_level(),
+                            options.file_capabilities(),
+                            data_only,
                         )
                         .await?;
                         peer.load_input_configuration(configuration_client);

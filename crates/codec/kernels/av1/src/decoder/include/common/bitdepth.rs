@@ -237,8 +237,6 @@ impl BitDepth for BitDepth8 {
 
     type Coef = i16;
 
-
-
     type BitDepthMax = ();
 
     type DisplayPixel = DisplayPixel8;
@@ -283,14 +281,15 @@ impl BitDepth for BitDepth16 {
 
     type Coef = i32;
 
-
-
     type BitDepthMax = Self::Pixel;
 
     type DisplayPixel = DisplayPixel16;
 
     fn new(bitdepth_max: Self::BitDepthMax) -> Self {
-        assert_eq!(bitdepth_max, 1023, "only 10-bit high-depth streams are supported");
+        assert_eq!(
+            bitdepth_max, 1023,
+            "only 10-bit high-depth streams are supported"
+        );
         Self
     }
 
@@ -310,7 +309,9 @@ impl BitDepth for BitDepth16 {
         1023
     }
 
-    fn get_intermediate_bits(&self) -> u8 { 4 }
+    fn get_intermediate_bits(&self) -> u8 {
+        4
+    }
 
     /// Output in interval `[-20588, 36956]` (10-bit), `[-20602, 36983]` (12-bit)
     /// Subtract a bias to ensure the output fits in [`i16`].
@@ -382,8 +383,6 @@ pub type LeftPixelRow2px<Pixel> = [Pixel; 2];
 ///     * `x86_64`:
 ///         * [`avx2`]
 ///         * [`avx512icl`]
-///     * `arm`, `aarch64`:
-///         * [`neon`]
 ///
 /// [`wrap_fn_ptr!`]: crate::decoder::wrap_fn_ptr::wrap_fn_ptr
 /// [`CpuFlags`]: crate::decoder::cpu::CpuFlags
@@ -392,11 +391,7 @@ pub type LeftPixelRow2px<Pixel> = [Pixel; 2];
 /// [`ssse3`]: crate::decoder::cpu::CpuFlags::SSSE3
 /// [`avx2`]: crate::decoder::cpu::CpuFlags::AVX2
 /// [`avx512icl`]: crate::decoder::cpu::CpuFlags::AVX512ICL
-/// [`neon`]: crate::decoder::cpu::CpuFlags::NEON
-#[cfg(all(
-    feature = "asm",
-    not(any(target_arch = "riscv64", target_arch = "riscv32"))
-))]
+#[cfg(feature = "asm")]
 macro_rules! bd_fn {
     ($decl_fn:path, $BD:ty, $name:ident, $asm:ident) => {{
         use paste::paste;
@@ -421,10 +416,7 @@ macro_rules! bd_fn {
 ///
 /// Similar to [`bd_fn!`] except that it selects which [`BitDepth`] `fn`
 /// based on `$bpc:literal bpc` instead of `$BD:ty`.
-#[cfg(all(
-    feature = "asm",
-    any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")
-))]
+#[cfg(all(feature = "asm", any(target_arch = "x86", target_arch = "x86_64")))]
 macro_rules! bpc_fn {
     ($bpc:literal bpc, $name:ident, $asm:ident) => {{
         use $crate::decoder::include::common::bitdepth::fn_identity;
@@ -448,15 +440,9 @@ macro_rules! fn_identity {
     };
 }
 
-#[cfg(all(
-    feature = "asm",
-    not(any(target_arch = "riscv64", target_arch = "riscv32"))
-))]
+#[cfg(feature = "asm")]
 pub(crate) use bd_fn;
-#[cfg(all(
-    feature = "asm",
-    any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")
-))]
+#[cfg(all(feature = "asm", any(target_arch = "x86", target_arch = "x86_64")))]
 pub(crate) use bpc_fn;
 #[allow(unused)]
 pub(crate) use fn_identity;

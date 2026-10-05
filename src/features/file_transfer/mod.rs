@@ -1,5 +1,10 @@
 //! Solicited file management and transfer over the authenticated UU session.
+mod contract;
 pub(crate) mod protocol;
+pub(crate) use contract::Payload;
+use contract::{Correlation, Owner};
+pub(crate) mod host;
+pub(crate) mod import;
 mod storage;
 pub(crate) use storage::Store;
 pub(crate) mod service;
@@ -27,16 +32,14 @@ pub(crate) fn lock<T>(v: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 pub(crate) const BLOCK: usize = 204_800;
 const WIRE: usize = 524_288;
-pub(crate) enum Payload {
-    Request(Req),
-    Response(Res),
-}
 pub(crate) struct Incoming {
+    header: Correlation,
     pub payload: Payload,
     _permit: OwnedSemaphorePermit,
 }
 #[derive(Clone)]
 struct Route {
+    owner: Owner,
     sender: mpsc::Sender<Incoming>,
     fault: Arc<Mutex<Option<String>>>,
     stop: CancellationToken,
@@ -123,6 +126,7 @@ impl Transport {
         self: &Arc<Self>,
         stop: CancellationToken,
         fault: Arc<Mutex<Option<String>>>,
+        owner: Owner,
     ) -> Result<(i32, mpsc::Receiver<Incoming>, RouteGuard)> {
         ensure!(self.supported(), "被控端尚未就绪或不支持当前文件传输协议");
         ensure!(self.allowed(), "被控端已关闭连接权限");
@@ -138,6 +142,7 @@ impl Transport {
         routes.insert(
             id,
             Route {
+                owner,
                 sender,
                 fault,
                 stop,
@@ -153,33 +158,41 @@ impl Transport {
         ))
     }
     pub(crate) async fn receive(&self, bytes: &Bytes) -> Result<bool> {
-        ensure!(bytes.len() < WIRE, "文件通道消息过大");
-        let envelope = Envelope::decode(bytes.clone())?;
-        let (id, payload) = match envelope.which {
-            Some(EnvelopeKind::Request(r)) => match r.which {
-                Some(RequestKind::File(f)) => {
-                    (r.header.map_or(0, |h| h.id), f.which.map(Payload::Request))
-                }
-                _ => return Ok(false),
-            },
-            Some(EnvelopeKind::Response(r)) => match r.which {
-                Some(ResponseKind::File(f)) => {
-                    (r.header.map_or(0, |h| h.id), f.which.map(Payload::Response))
-                }
-                _ => return Ok(false),
-            },
-            _ => return Ok(false),
+        let Some(message) = contract::Message::decode(bytes)? else {
+            return Ok(false);
         };
-        // Never create tasks, browse local paths or write files from unsolicited messages.
-        let route = i32::try_from(id)
-            .ok()
-            .and_then(|id| lock(&self.routes).get(&id).cloned());
+        // A transfer is owned by its body TaskId; one-shot management replies
+        // are owned by their RPC correlation. Never fall back from a mismatched
+        // transfer task to a route merely because its RPC number happens to match.
+        let route = {
+            let routes = lock(&self.routes);
+            message
+                .payload
+                .task()
+                .and_then(|id| routes.get(&id.task_id))
+                .filter(|route| route.owner == Owner::Transfer)
+                .cloned()
+                .or_else(|| {
+                    if !matches!(&message.payload, Payload::Response(_))
+                        || (message.payload.kind() != contract::Kind::Operation
+                            && !matches!(&message.payload, Payload::Response(Res::Result(_))))
+                    {
+                        return None;
+                    }
+                    let id = i32::try_from(message.header.assigned()?).ok()?;
+                    routes
+                        .get(&id)
+                        .filter(|route| route.owner == Owner::Operation)
+                        .cloned()
+                })
+        };
         let Some(r) = route else {
+            tracing::debug!(request=?message.header, task=?message.payload.task(),
+                "file message has no active owner");
             return Ok(true);
         };
-        let Some(payload) = payload else {
-            return Ok(true);
-        };
+        let header = message.header;
+        let payload = message.payload;
         if matches!(&payload, Payload::Response(Res::Result(_))) && r.stop.is_cancelled() {
             let budget = self
                 .budget
@@ -187,6 +200,7 @@ impl Transport {
             if let Ok(permit) = Arc::clone(budget).try_acquire_many_owned(bytes.len().max(1) as u32)
             {
                 let _ = r.sender.try_send(Incoming {
+                    header,
                     payload,
                     _permit: permit,
                 });
@@ -197,36 +211,15 @@ impl Transport {
             .budget
             .get_or_init(|| Arc::new(Semaphore::new(32 * 1024 * 1024)));
         let permit = tokio::select! {biased;_=r.stop.cancelled()=>return Ok(true),v=Arc::clone(budget).acquire_many_owned(bytes.len().max(1)as u32)=>v?};
-        tokio::select! {biased;_=r.stop.cancelled()=>{},_=r.sender.send(Incoming{payload,_permit:permit})=>{}}
+        tokio::select! {biased;_=r.stop.cancelled()=>{},_=r.sender.send(Incoming{header,payload,_permit:permit})=>{}}
         Ok(true)
     }
     pub(crate) async fn request(&self, id: i32, which: Req, file: bool) -> Result<()> {
-        self.send(
-            Envelope {
-                which: Some(EnvelopeKind::Request(Request {
-                    header: Some(Header { id: id.into() }),
-                    which: Some(RequestKind::File(FileTransferFtpRequest {
-                        which: Some(which),
-                    })),
-                })),
-            },
-            file,
-        )
-        .await
+        self.send(contract::request(Correlation::new(id.into()), which), file)
+            .await
     }
-    pub(crate) async fn response(&self, id: i32, which: Res) -> Result<()> {
-        self.send(
-            Envelope {
-                which: Some(EnvelopeKind::Response(Response {
-                    header: Some(Header { id: id.into() }),
-                    which: Some(ResponseKind::File(FileTransferFtpResponse {
-                        which: Some(which),
-                    })),
-                })),
-            },
-            false,
-        )
-        .await
+    pub(crate) async fn response(&self, header: Correlation, which: Res) -> Result<()> {
+        self.send(contract::response(header, which), false).await
     }
     async fn send(&self, message: Envelope, file: bool) -> Result<()> {
         let bytes = Bytes::from(message.encode_to_vec());

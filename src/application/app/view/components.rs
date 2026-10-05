@@ -121,7 +121,8 @@ impl Manager {
             .is_some_and(|s| !s.installed || !s.ready);
         let response = ui.add_enabled(
             actionable && !active && !self.reboot && self.pending.is_none(),
-            egui::Button::new(label).min_size(vec2(ui.available_width(), 30.0)),
+            crate::ui::controls::centered_primary(label)
+                .min_size(vec2(ui.available_width(), 30.0)),
         );
         if response.clicked() {
             self.confirm = Some(Operation::Install);

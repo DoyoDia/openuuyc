@@ -38,6 +38,7 @@ pub(crate) struct DevicePreferences {
     pub mouse_mode: crate::features::remote_input::MouseMode,
     pub intercept_shortcuts: bool,
     pub mouse_throttle: bool,
+    pub mouse_throttle_rate: crate::features::remote_input::MouseThrottleRate,
     pub performance_mode: PerformancePanelMode,
 }
 impl Default for DevicePreferences {
@@ -49,6 +50,7 @@ impl Default for DevicePreferences {
             mouse_mode: crate::features::remote_input::MouseMode::Smart,
             intercept_shortcuts: true,
             mouse_throttle: false,
+            mouse_throttle_rate: Default::default(),
             performance_mode: PerformancePanelMode::Compact,
         }
     }
@@ -83,6 +85,27 @@ struct Record {
     settings: Option<StreamControlSettings>,
     #[serde(default = "crate::features::stream_control::default_auto_quality")]
     auto_frame_quality: i32,
+}
+
+impl Record {
+    fn decode(bytes: &[u8]) -> Result<Self> {
+        let record: Self = serde_json::from_slice(bytes).map_err(|error| {
+            anyhow::anyhow!("已保存的画面设置格式无效，请重新应用画质设置：{error}")
+        })?;
+        record.validate()?;
+        Ok(record)
+    }
+
+    fn validate(&self) -> Result<()> {
+        anyhow::ensure!(self.schema == 1, "画面设置版本不受支持，请重新应用画质设置");
+        anyhow::ensure!(
+            self.settings.is_none_or(|settings| {
+                (1..=MAX_CUSTOM_BITRATE_MBPS).contains(&settings.custom_bitrate_mbps)
+            }) && (1..=6).contains(&self.auto_frame_quality),
+            "已保存的画面设置数值无效，请重新应用画质设置"
+        );
+        Ok(())
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -145,16 +168,7 @@ impl ViewingSettingsStore {
                 Err(Error::NoEntry) => return Ok(None),
                 Err(_) => bail!("无法读取此设备的画面设置"),
             };
-            let record: Record = serde_json::from_slice(&bytes)
-                .map_err(|_| anyhow::anyhow!("已保存的画面设置格式无效"))?;
-            if record.schema != 1
-                || record.settings.is_some_and(|settings| {
-                    !(1..=MAX_CUSTOM_BITRATE_MBPS).contains(&settings.custom_bitrate_mbps)
-                })
-                || !(1..=6).contains(&record.auto_frame_quality)
-            {
-                bail!("已保存的画面设置无效");
-            }
+            let record = Record::decode(&bytes)?;
             Ok(Some(LoadedStreamControl {
                 settings: record.settings,
                 auto_frame_quality: record.auto_frame_quality,
@@ -167,11 +181,13 @@ impl ViewingSettingsStore {
     async fn save(&self, saved: SavedStreamControl) -> Result<()> {
         let entry = Arc::clone(&self.viewing);
         tokio::task::spawn_blocking(move || {
-            let bytes = serde_json::to_vec(&Record {
+            let record = Record {
                 schema: 1,
                 settings: Some(saved.settings),
                 auto_frame_quality: saved.auto_frame_quality,
-            })?;
+            };
+            record.validate()?;
+            let bytes = serde_json::to_vec(&record)?;
             entry
                 .set_secret(&bytes)
                 .map_err(|_| anyhow::anyhow!("无法保存此设备的画面设置"))
@@ -403,9 +419,7 @@ impl ViewingSettingsStore {
         let entry = Arc::clone(&self.viewing);
         tokio::task::spawn_blocking(move || {
             let mut record = match entry.get_secret() {
-                Ok(bytes) => {
-                    serde_json::from_slice::<Record>(&bytes).context("读取画面设置失败")?
-                }
+                Ok(bytes) => Record::decode(&bytes)?,
                 Err(Error::NoEntry) => Record {
                     schema: 1,
                     settings: None,
@@ -413,10 +427,7 @@ impl ViewingSettingsStore {
                 },
                 Err(_) => bail!("无法读取此设备的画面设置"),
             };
-            anyhow::ensure!(
-                record.schema == 1 && (1..=6).contains(&quality),
-                "自动画质状态无效"
-            );
+            anyhow::ensure!((1..=6).contains(&quality), "自动画质状态无效");
             record.auto_frame_quality = quality;
             entry
                 .set_secret(&serde_json::to_vec(&record)?)

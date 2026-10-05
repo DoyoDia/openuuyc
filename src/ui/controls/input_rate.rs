@@ -18,8 +18,10 @@ pub(crate) fn input_rate_warning(ctx: &egui::Context, hz: u32, bounds: egui::Rec
         width - margin * 2.0,
     );
     let body = painter.layout(
-        "高回报率可能增加 CPU 负担和远程输入延迟。可在“高级设置 → 鼠标模式”中开启 1000 Hz 发送节流。".into(),
-        egui::FontId::proportional(theme::COMPACT_TEXT), theme::TEXT, width - margin * 2.0,
+        "高回报率可能增加 CPU 负担和远程输入延迟。可在“高级设置 → 鼠标模式”中开启发送节流。".into(),
+        egui::FontId::proportional(theme::COMPACT_TEXT),
+        theme::TEXT,
+        width - margin * 2.0,
     );
     let height = margin * 2.0 + title.size().y + 6.0 + body.size().y;
     let rect = egui::Rect::from_min_size(

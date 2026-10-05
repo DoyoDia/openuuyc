@@ -124,6 +124,8 @@ async fn run_presence(
         tokio::select! { _ = task_cancel.cancelled() => return Ok(()), _ = tokio::time::sleep(Duration::from_millis(100)) => () }
     };
     let _assistance = crate::features::host::assist::Running::start(client.clone());
+    let _wol = crate::features::host::wol::Running::start(client.clone());
+    let _wol_setup = crate::features::host::wol::setup::Running::start(client.clone());
     let mut policy = HostRoomRetry::default();
     let mut initial_requests = 0;
     let mut backoff = false;
@@ -190,6 +192,15 @@ async fn run_presence(
             if push_client.is_guest() {
                 return;
             }
+            if push.get("type").and_then(|v| v.as_str()) == Some("wake_on_lan") {
+                if push_client.host.wol_permitted() {
+                    push_client.host.wol.push(push, &push_cancel);
+                }
+                return;
+            }
+            if push_client.host.power.push(push) {
+                return;
+            }
             let change = match DeviceChange::parse(push) {
                 Ok(Some(change)) => change,
                 Ok(None) => return,
@@ -212,6 +223,7 @@ async fn run_presence(
                 .await;
         let result = match session {
             Ok(session) => {
+                client.host.wol.online(true);
                 let _ = events.send(PresenceEvent::State(PresenceState::Online));
                 let mut socket_state = session.socket_state();
                 let mut state_open = true;
@@ -224,7 +236,9 @@ async fn run_presence(
                         _ = task_cancel.cancelled() => { let _ = shutdown.send(()); break alive.await; }
                         state = socket_state.changed(), if state_open => {
                             if state.is_err() { state_open = false; continue; }
-                            let presence = match *socket_state.borrow_and_update() {
+                            let socket=*socket_state.borrow_and_update();
+                            client.host.wol.online(socket==SocketState::Connected);
+                            let presence = match socket {
                                 SocketState::Connected => PresenceState::Online,
                                 SocketState::Connecting | SocketState::Reconnecting => PresenceState::Reconnecting,
                                 SocketState::Closed => PresenceState::Offline,
@@ -237,6 +251,7 @@ async fn run_presence(
             Err(error) => Err(error),
         };
         room_cancel.cancel();
+        client.host.wol.online(false);
         if task_cancel.is_cancelled() {
             return Ok(());
         }
@@ -334,15 +349,15 @@ async fn run_remote(
             client.retire();
             break;
         }
-        if let Some(retry) = client.host.take_remote_action() {
-            let action = if retry {
-                Request::Retry {
+        if let Some(action) = client.host.take_remote_action() {
+            let action = match action {
+                crate::features::host::RemoteAction::Retry => Request::Retry {
                     account: client.generation(),
-                }
-            } else {
-                Request::Disconnect {
+                },
+                crate::features::host::RemoteAction::Disconnect(session) => Request::Disconnect {
                     account: client.generation(),
-                }
+                    session,
+                },
             };
             if let Err(e) = resident::request(action).await {
                 let _ = events.send(PresenceEvent::Warning(format!("后台操作失败：{e:#}")));

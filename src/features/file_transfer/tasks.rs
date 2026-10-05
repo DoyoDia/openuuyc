@@ -2,14 +2,12 @@ use super::{
     service::{Direction, PartialFile, Record, Repository, TaskState},
     storage, *,
 };
-use std::{
-    collections::{HashMap, HashSet},
-    path::PathBuf,
-};
+use std::{collections::HashSet, path::PathBuf};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 pub(super) struct Rpc {
     pub id: i32,
+    reply: Correlation,
     pub wire: Arc<Transport>,
     rx: mpsc::Receiver<Incoming>,
     _route: RouteGuard,
@@ -17,11 +15,12 @@ pub(super) struct Rpc {
     fault: Arc<Mutex<Option<String>>>,
 }
 impl Rpc {
-    pub fn new(wire: Arc<Transport>, stop: CancellationToken) -> Result<Self> {
+    pub fn new(wire: Arc<Transport>, stop: CancellationToken, owner: Owner) -> Result<Self> {
         let fault = Arc::new(Mutex::new(None));
-        let (id, rx, route) = wire.register(stop.clone(), Arc::clone(&fault))?;
+        let (id, rx, route) = wire.register(stop.clone(), Arc::clone(&fault), owner)?;
         Ok(Self {
             id,
+            reply: Correlation::new(id.into()),
             wire,
             rx,
             _route: route,
@@ -36,12 +35,10 @@ impl Rpc {
         })
     }
     pub fn check(&self, id: &Option<TaskId>, index: Option<i32>) -> Result<i32> {
-        let id = id.as_ref().context("文件消息缺少任务编号")?;
-        ensure!(
-            id.task_id == self.id && index.is_none_or(|v| v == id.file_index),
-            "文件任务或文件序号不匹配"
-        );
-        Ok(id.file_index)
+        contract::file_id(id, self.id, index, false)
+    }
+    fn check_confirmation(&self, id: &Option<TaskId>, index: i32) -> Result<()> {
+        contract::file_id(id, self.id, Some(index), true).map(|_| ())
     }
     pub async fn req(&self, v: Req, file: bool) -> Result<()> {
         ensure!(!self.stop.is_cancelled(), "{}", self.failure());
@@ -58,7 +55,7 @@ impl Rpc {
         tokio::select! {
             biased;
             _ = self.stop.cancelled() => anyhow::bail!(self.failure()),
-            result = self.wire.response(self.id, v) => result,
+            result = self.wire.response(self.reply, v) => result,
         }
     }
     fn failure(&self) -> String {
@@ -67,7 +64,20 @@ impl Rpc {
             .unwrap_or_else(|| "任务已暂停".into())
     }
     pub async fn next(&mut self) -> Result<Incoming> {
-        tokio::select! {biased;_=self.stop.cancelled()=>anyhow::bail!(self.failure()),r=tokio::time::timeout(Duration::from_secs(60),self.rx.recv())=>r.context("远端未响应，操作结果未确认")?.context("文件连接已结束")}
+        let incoming = tokio::select! {biased;_=self.stop.cancelled()=>anyhow::bail!(self.failure()),r=tokio::time::timeout(Duration::from_secs(60),self.rx.recv())=>r.context("远端未响应，操作结果未确认")?.context("文件连接已结束")}?;
+        if matches!(&incoming.payload, Payload::Request(_)) {
+            self.reply = incoming.header;
+        }
+        if let Payload::Response(Res::Result(result)) = &incoming.payload
+            && result
+                .id
+                .as_ref()
+                .is_some_and(|id| id.task_id == self.id && id.file_index == -1)
+            && result.file_error != 1
+        {
+            success(result.file_error)?;
+        }
+        Ok(incoming)
     }
     async fn complete(&self, index: i32, error: i32) -> Result<()> {
         self.req(
@@ -82,7 +92,7 @@ impl Rpc {
     async fn result(&mut self, index: i32) -> Result<()> {
         match self.next().await?.payload {
             Payload::Response(Res::Result(v)) => {
-                self.check(&v.id, Some(index))?;
+                self.check_confirmation(&v.id, index)?;
                 success(v.file_error)
             }
             _ => anyhow::bail!("文件完成响应类型不匹配"),
@@ -94,7 +104,7 @@ pub(super) async fn directory(
     path: String,
     stop: CancellationToken,
 ) -> Result<Vec<FileEntry>> {
-    let mut rpc = Rpc::new(wire, stop)?;
+    let mut rpc = Rpc::new(wire, stop, Owner::Operation)?;
     rpc.req(
         Req::ReadDir(ReadDir {
             id: rpc.task(-1),
@@ -133,7 +143,7 @@ pub(super) async fn operation(
     req: Req,
     stop: CancellationToken,
 ) -> Result<String> {
-    let mut rpc = Rpc::new(wire, stop)?;
+    let mut rpc = Rpc::new(wire, stop, Owner::Operation)?;
     let req = match req {
         Req::RemoveDir(mut v) => {
             v.id = rpc.task(-1);
@@ -161,7 +171,7 @@ async fn exists(
     name: String,
     stop: CancellationToken,
 ) -> Result<(bool, bool)> {
-    let mut rpc = Rpc::new(wire, stop)?;
+    let mut rpc = Rpc::new(wire, stop, Owner::Operation)?;
     rpc.req(
         Req::FileExist(FileExist {
             path,
@@ -237,7 +247,7 @@ pub(super) async fn run(
     stop: CancellationToken,
 ) {
     let outcome = async {
-        let mut rpc = Rpc::new(wire.clone(), stop.clone())?;
+        let mut rpc = Rpc::new(wire.clone(), stop.clone(), Owner::Transfer)?;
         record.state = TaskState::Running;
         record.error = None;
         repo.save(&record)?;
@@ -419,7 +429,7 @@ async fn upload(rpc: &mut Rpc, r: &mut Record, repo: &Repository) -> Result<()> 
             Payload::Response(Res::FileConfirm(v)) => v,
             _ => anyhow::bail!("文件准备响应类型不匹配"),
         };
-        rpc.check(&confirm.id, Some(index as i32 + 1))?;
+        rpc.check_confirmation(&confirm.id, index as i32 + 1)?;
         if confirm.skip {
             success(confirm.err)?;
             done += info.size;
@@ -448,7 +458,7 @@ async fn upload(rpc: &mut Rpc, r: &mut Record, repo: &Repository) -> Result<()> 
         let mut pos = confirm.resume_point;
         let mut accepted = confirm.resume_point;
         let mut block = 0i32;
-        let mut pending = HashMap::<i32, usize>::new();
+        let mut pending = contract::PendingBlocks::default();
         while pos < info.size || !pending.is_empty() {
             if pos < info.size && pending.len() < 16 {
                 let size = BLOCK.min((info.size - pos) as usize);
@@ -464,7 +474,7 @@ async fn upload(rpc: &mut Rpc, r: &mut Record, repo: &Repository) -> Result<()> 
                     true,
                 )
                 .await?;
-                pending.insert(block, size);
+                pending.insert(block, size)?;
                 pos += size as u64;
                 if pending.len() < 16 && pos < info.size {
                     continue;
@@ -472,15 +482,8 @@ async fn upload(rpc: &mut Rpc, r: &mut Record, repo: &Repository) -> Result<()> 
             }
             match rpc.next().await.context("等待文件块确认")?.payload {
                 Payload::Response(Res::BlockConfirm(v)) => {
-                    rpc.check(&v.id, Some(index as i32 + 1))?;
-                    success(v.err)?;
-                    let len = pending
-                        .remove(&v.block_id)
-                        .context("收到重复或未知的文件块确认")?;
-                    ensure!(
-                        v.block_len >= 0 && v.block_len as usize == len,
-                        "文件块确认长度不符"
-                    );
+                    rpc.check_confirmation(&v.id, index as i32 + 1)?;
+                    let len = pending.confirm(&v)?;
                     accepted += len as u64;
                     repo.progress(&r.key, done + accepted, false);
                 }
@@ -616,7 +619,7 @@ async fn download(rpc: &mut Rpc, r: &mut Record, repo: &Repository) -> Result<()
     r.started = true;
     repo.save(r)?;
     // A zero-file directory is created locally; the server still completes its task.
-    let mut open: Option<(i32, storage::Receiving, i32)> = None;
+    let mut open: Option<(i32, storage::Receiving)> = None;
     let mut completed = HashSet::<i32>::new();
     loop {
         let incoming = rpc.next().await?;
@@ -633,10 +636,7 @@ async fn download(rpc: &mut Rpc, r: &mut Record, repo: &Repository) -> Result<()
                     .get((index - 1) as usize)
                     .context("远端文件序号越界")?
                     .clone();
-                ensure!(
-                    info.size == v.file_size && info.modified_time == v.last_modified,
-                    "远端文件在传输前已变化"
-                );
+                contract::metadata(&info, &v)?;
                 let old = r
                     .partial
                     .iter()
@@ -668,7 +668,7 @@ async fn download(rpc: &mut Rpc, r: &mut Record, repo: &Repository) -> Result<()
                 repo.save(r)?;
                 if let Some(mut p) = prepared {
                     p.file.seek(std::io::SeekFrom::Start(offset)).await?;
-                    open = Some((index, p, 0));
+                    open = Some((index, p));
                 }
                 if skip {
                     completed.insert(index);
@@ -682,22 +682,11 @@ async fn download(rpc: &mut Rpc, r: &mut Record, repo: &Repository) -> Result<()
                 .await?;
             }
             Payload::Request(Req::FileBlock(v)) => {
-                let (index, p, last) = open.as_mut().context("尚未准备接收文件")?;
+                let (index, p) = open.as_mut().context("尚未准备接收文件")?;
                 rpc.check(&v.id, Some(*index))?;
-                ensure!(
-                    v.data.len() < WIRE
-                        && v.block_id == last.checked_add(1).context("文件块编号溢出")?,
-                    "文件块顺序或长度无效"
-                );
-                ensure!(
-                    p.position
-                        .checked_add(v.data.len() as u64)
-                        .is_some_and(|n| n <= p.partial.info.size),
-                    "文件数据超出声明长度"
-                );
+                let end = contract::received_bytes(p.position, v.data.len(), p.partial.info.size)?;
                 p.file.write_all(&v.data).await?;
-                p.position += v.data.len() as u64;
-                *last = v.block_id;
+                p.position = end;
                 repo.progress(&r.key, r.completed_bytes() + p.position, false);
                 rpc.res(Res::BlockConfirm(FileTransferBlockConfirm {
                     id: rpc.task(*index),
@@ -725,7 +714,7 @@ async fn download(rpc: &mut Rpc, r: &mut Record, repo: &Repository) -> Result<()
                     .await?;
                     return Ok(());
                 }
-                let (active, file, _) = open.take().context("远端完成了未打开的文件")?;
+                let (active, file) = open.take().context("远端完成了未打开的文件")?;
                 ensure!(index == active, "完成文件序号不符");
                 let partial = storage::finish(file, &root, &r.key, r.policy).await?;
                 upsert(r, partial);

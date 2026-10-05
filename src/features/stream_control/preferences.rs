@@ -32,7 +32,10 @@ impl StreamControlHandle {
         state.device_preferences = preferences;
         state.device_preferences_loaded = true;
         state.restore_input_pending = preferences.control_enabled;
-        if let Err(error) = state.mouse.set_throttle(preferences.mouse_throttle) {
+        if let Err(error) = state
+            .mouse
+            .set_throttle(preferences.mouse_throttle, preferences.mouse_throttle_rate)
+        {
             state.device_persistence_error = Some(format!("鼠标节流未启用：{error:#}"));
         }
         self.clipboard.set_files(preferences.clipboard_files);
@@ -69,11 +72,18 @@ impl StreamControlHandle {
             self.publish_device_preferences(&mut state);
         }
     }
-    pub(crate) fn set_mouse_throttle(&self, enabled: bool) -> Result<()> {
+    pub(crate) fn set_mouse_throttle(
+        &self,
+        enabled: bool,
+        rate: crate::features::remote_input::MouseThrottleRate,
+    ) -> Result<()> {
         let mut state = lock(&self.shared);
-        state.mouse.set_throttle(enabled)?;
-        if state.device_preferences.mouse_throttle != enabled {
+        state.mouse.set_throttle(enabled, rate)?;
+        if state.device_preferences.mouse_throttle != enabled
+            || state.device_preferences.mouse_throttle_rate != rate
+        {
             state.device_preferences.mouse_throttle = enabled;
+            state.device_preferences.mouse_throttle_rate = rate;
             self.publish_device_preferences(&mut state);
         }
         Ok(())

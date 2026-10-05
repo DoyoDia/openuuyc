@@ -16,8 +16,13 @@ const SHUTDOWN: Contract = Contract {
     ..WAKE
 };
 
+const RESPONSE: Contract = Contract {
+    path: "/api/v1/transport/rpc/response",
+    ..WAKE
+};
+
 pub(super) fn is_write(contract: Contract) -> bool {
-    matches!(contract, WAKE | REBOOT | SHUTDOWN)
+    matches!(contract, WAKE | REBOOT | SHUTDOWN | RESPONSE)
 }
 
 impl NrdApi {
@@ -49,6 +54,26 @@ impl NrdApi {
             code: response.code,
             msg: response.msg,
             data: Some(receipt),
+        })
+    }
+}
+
+impl NrdApi {
+    pub(crate) async fn host_power_response(
+        &self,
+        call_id: String,
+        code: i32,
+        message: String,
+    ) -> Result<ApiEnvelope<()>> {
+        let body = serde_json::to_vec(
+            &serde_json::json!({"call_id":call_id,"code":code,"msg":message,"data":{"shutdown_state":code==0}}),
+        )?;
+        let response: ApiEnvelope<serde_json::Value> =
+            self.send(RESPONSE, RESPONSE.path, body).await?;
+        Ok(ApiEnvelope {
+            code: response.code,
+            msg: response.msg,
+            data: Some(()),
         })
     }
 }

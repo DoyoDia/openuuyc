@@ -17,24 +17,37 @@ pub(super) async fn bind_channel(
     input: crate::features::host::input::Receiver,
     microphone: crate::features::host::microphone::Receiver,
     audio: crate::features::host::audio::Audio,
+    clipboard: crate::features::host::clipboard::Receiver,
+    files: crate::features::host::files::Receiver,
+    ports: crate::features::port_mapping::host::Receiver,
+    annotation: crate::features::host::annotation::Receiver,
+    control_ingress: crate::transport::uu_kcp::ControlReceiver,
 ) {
     let control = channel.label() == "CONTROL_DATA_CHANNEL";
     let text = channel.label() == "TEXT_DATA_CHANNEL";
-    if !control && !text {
+    let file = channel.label() == "FILE_DATA_CHANNEL";
+    if !control && !text && !file {
         return;
     }
+    if text {
+        annotation.bind(&channel);
+    }
+    if text || file {
+        files.bind(&channel);
+    }
+    if file {
+        ports.bind(&channel).await;
+        clipboard.bind_file(&channel);
+    }
+    let clipboard_generation = if text {
+        Some(clipboard.bind(channel.id()))
+    } else {
+        None
+    };
     let input_generation = if control {
         Some(input.bind(channel.id()))
     } else {
         None
-    };
-    let (handshake_source, handshake_config, handshake_caps) = {
-        let state = screens.lock().await;
-        (
-            state.handshake_source(),
-            state.slots[0].config.clone(),
-            state.slots[0].negotiated.clone(),
-        )
     };
     tracing::info!(
         channel = channel.label(),
@@ -52,7 +65,21 @@ pub(super) async fn bind_channel(
     let closing_target = report_target.clone();
     let closing_input = input.clone();
     let closing_microphone = microphone.clone();
+    let closing_files = files.clone();
+    let closing_clipboard = clipboard.clone();
+    let closing_ports = ports.clone();
+    let closing_annotation = annotation.clone();
     channel.on_close(Box::new(move || {
+        if let Some(channel) = close_channel.upgrade() {
+            closing_files.close(&channel);
+            if text {
+                closing_annotation.close(&channel);
+            }
+            if file {
+                closing_ports.close(&channel);
+                closing_clipboard.close_file(&channel);
+            }
+        }
         if control {
             if let Some(channel) = close_channel.upgrade() {
                 if closing_input.close(channel.id(), input_generation.unwrap()) {
@@ -83,6 +110,7 @@ pub(super) async fn bind_channel(
         Box::pin(async {})
     }));
     let opening_target = report_target.clone();
+    let opening_annotation = annotation.clone();
     let opening_input = input.clone();
     channel.on_open(Box::new(move || {
         Box::pin(async move {
@@ -95,6 +123,9 @@ pub(super) async fn bind_channel(
             if control && opening_input.generation(channel.id()) != input_generation {
                 return;
             }
+            if file {
+                return;
+            }
             opening_target.send_modify(|routes| {
                 if control {
                     routes.control = Some(Arc::downgrade(&channel));
@@ -104,6 +135,14 @@ pub(super) async fn bind_channel(
                 routes.revision = routes.revision.wrapping_add(1);
             });
             if text {
+                if let Some(hello) = opening_annotation.hello(&channel) {
+                    if let Err(error) = channel.send_text_bytes(&Bytes::from(hello)).await {
+                        tracing::debug!(%error,"annotation capability send failed");
+                    }
+                }
+                return;
+            }
+            if file {
                 return;
             }
             if !opening_input
@@ -124,17 +163,79 @@ pub(super) async fn bind_channel(
     let weak = Arc::downgrade(&channel);
     channel.on_message(Box::new(move |message| {
         let weak = weak.clone();
+        let control_ingress = control_ingress.clone();
         let screens = screens.clone();
-        let handshake_source = handshake_source.clone();
-        let handshake_config = handshake_config.clone();
-        let handshake_caps = handshake_caps.clone();
         let cancel = cancel.clone();
-        let kcp = kcp.clone();
         let report_target = report_target.clone();
         let input = input.clone();
         let microphone = microphone.clone();
         let audio = audio.clone();
+        let files = files.clone();
+        let ports = ports.clone();
+        let annotation = annotation.clone();
+        let clipboard = clipboard.clone();
         Box::pin(async move {
+            if cancel.is_cancelled() {
+                return;
+            }
+            let Some(channel) = weak.upgrade() else {
+                return;
+            };
+            if control {
+                if input.generation(channel.id()) == input_generation {
+                    if let Err(error) = control_ingress(channel.id(), &message.data) {
+                        tracing::warn!(%error, "host CONTROL message rejected");
+                    }
+                }
+                return;
+            }
+            if (text || file) && crate::protocol::drag_drop::is_packet(&message.data) {
+                let result = if file {
+                    clipboard.receive_file(&channel, &message.data)
+                } else {
+                    clipboard
+                        .receive(clipboard_generation.unwrap(), &message.data)
+                        .map(|_| ())
+                };
+                if let Err(error) = result {
+                    tracing::warn!(%error,"native drag packet rejected");
+                }
+                return;
+            }
+            if text && crate::protocol::annotation::is_packet(&message.data) {
+                if let Some(channel) = weak.upgrade() {
+                    if let Err(error) = annotation.receive(&channel, &message.data).await {
+                        tracing::warn!(%error,"native annotation packet rejected");
+                    }
+                }
+                return;
+            }
+            if text || file {
+                if let Some(channel) = weak.upgrade() {
+                    if file {
+                        match ports.receive(&channel, &message.data).await {
+                            Ok(true) => return,
+                            Ok(false) => {}
+                            Err(error) => {
+                                tracing::warn!(%error, "host port message rejected");
+                                return;
+                            }
+                        }
+                    }
+                    match files.receive(&channel, &message.data).await {
+                        Ok(true) => return,
+                        Ok(false) => {}
+                        Err(error) => {
+                            tracing::warn!(%error, "host file message rejected");
+                            return;
+                        }
+                    }
+                }
+                if file {
+                    return;
+                }
+            }
+
             if cancel.is_cancelled() {
                 return;
             }
@@ -150,20 +251,23 @@ pub(super) async fn bind_channel(
             {
                 return;
             }
-            if control {
-                if input.generation(channel.id()) != input_generation {
-                    return;
-                }
-                match input.receive(channel.id(), &message.data) {
+            if text {
+                match annotation.receive(&channel, &message.data).await {
                     Ok(true) => return,
                     Ok(false) => {}
                     Err(error) => {
-                        tracing::warn!(%error,"rejected malformed host input envelope");
+                        tracing::warn!(%error, "host annotation request rejected");
                         return;
                     }
                 }
-            }
-            if text {
+                match clipboard.receive(clipboard_generation.unwrap(), &message.data) {
+                    Ok(true) => return,
+                    Ok(false) => {}
+                    Err(error) => {
+                        tracing::warn!(%error, "rejected host clipboard message");
+                        return;
+                    }
+                }
                 match audio.quality_request(&message.data) {
                     Ok(Some(response)) => {
                         let _ = channel.send_text_bytes(&Bytes::from(response)).await;
@@ -220,43 +324,28 @@ pub(super) async fn bind_channel(
                 tag = message.data.first().copied(),
                 "host business message received"
             );
-            // Route only the verified setting RPC through the same screen owner
-            // as TEXT. CONTROL's remaining messages keep their original scope.
-            let screen_setting = control
-                && crate::features::stream_control::publisher::is_capture_setting(&message.data)
-                    .unwrap_or(false);
-            let responses = if control && !screen_setting {
-                crate::features::stream_control::publisher::receive(
-                    &message.data,
-                    true,
-                    handshake_source.as_ref(),
-                    &mut lock(&handshake_config),
-                    &handshake_caps,
-                )
-            } else {
-                crate::features::stream_control::publisher::receive_session(
-                    &mut *screens.lock().await,
-                    &message.data,
-                    false,
-                )
-                .await
-            };
+            let responses = crate::features::stream_control::publisher::receive_session(
+                &mut *screens.lock().await,
+                &message.data,
+                false,
+            )
+            .await;
             match responses {
                 Ok(responses) => {
+                    if let Some(caps) = responses.files {
+                        files.capabilities(caps);
+                    }
+                    if let Some(active) = responses.media_active {
+                        audio.set_media_allowed(active);
+                        annotation.viewing(active);
+                    }
                     report_target.send_if_modified(|routes| routes.received(&responses));
                     if let Some(channel) = weak.upgrade() {
-                        if control && !input.ready(channel.id(), input_generation.unwrap()).await {
-                            return;
-                        }
                         for response in responses.messages {
                             if cancel.is_cancelled() {
                                 break;
                             }
-                            let result = if screen_setting {
-                                send_setting_response(&report_target, response).await
-                            } else {
-                                send_business(&channel, control, &kcp, response).await
-                            };
+                            let result = channel.send_text_bytes(&Bytes::from(response)).await;
                             if let Err(error) = result {
                                 tracing::warn!(%error,control,"host business response failed");
                             }

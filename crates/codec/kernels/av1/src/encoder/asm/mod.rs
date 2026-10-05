@@ -10,8 +10,5 @@
 #[cfg(nasm_x86_64)]
 pub mod x86;
 
-#[cfg(asm_neon)]
-pub mod aarch64;
-
-#[cfg(any(nasm_x86_64, asm_neon))]
+#[cfg(nasm_x86_64)]
 pub mod shared;

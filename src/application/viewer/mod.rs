@@ -32,6 +32,7 @@ mod windows_cursor;
 mod windows_keyboard;
 
 mod windows_mouse;
+mod windows_drag;
 
 pub(crate) mod windows_presenter;
 pub(crate) struct DesktopInputHook {

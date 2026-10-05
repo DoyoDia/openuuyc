@@ -29,7 +29,10 @@ impl Format {
         matches!(self.chroma, 1 | 3)
             && match self.codec {
                 Codec::H264 => self.depth == 8,
-                Codec::Av1 => matches!(self.depth, 8 | 10),
+                Codec::Av1 => {
+                    cfg!(any(target_arch = "x86", target_arch = "x86_64"))
+                        && matches!(self.depth, 8 | 10)
+                }
                 Codec::H265 => false,
             }
     }

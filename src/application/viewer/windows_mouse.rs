@@ -25,7 +25,7 @@ use crate::features::remote_input::{BUTTONS, MouseMode, RemoteInput};
 use crate::features::stream_control::StreamControlHandle;
 
 #[derive(Clone)]
-struct Target {
+pub(super) struct Target {
     hwnd: isize,
     control: StreamControlHandle,
     context: egui::Context,
@@ -52,6 +52,27 @@ fn raw_belongs_to_activation(
 }
 
 impl Target {
+    pub(super) fn for_window(
+        window: &Window,
+        control: &StreamControlHandle,
+        context: &egui::Context,
+        track: i32,
+        video_size: &VideoSize,
+    ) -> Option<Self> {
+        let hwnd = crate::platform::graphics::window_hwnd(window).ok()?;
+        let size = window.inner_size();
+        Some(Self {
+            hwnd: hwnd.0 as isize,
+            control: control.clone(),
+            context: context.clone(),
+            track,
+            video_size: video_size.clone(),
+            output: [size.width, size.height],
+            top: title_bar_height_pixels(window),
+            resize_edges: !window.is_maximized() && window.fullscreen().is_none(),
+            raw_since: 0,
+        })
+    }
     fn owner(&self) -> u64 {
         self.hwnd as u64
     }
@@ -59,7 +80,38 @@ impl Target {
         unsafe { GetForegroundWindow().0 as isize == self.hwnd }
     }
 
-    fn position(&self, mut point: POINT, dragging: bool) -> Option<(i32, f64, f64)> {
+    fn reverse_drag(&self, point: POINT) -> bool {
+        let input = self.control.mouse();
+        if input.relative_mode() || !input.owner_holds_left(self.owner()) {
+            return false;
+        }
+        let mut local = point;
+        if !unsafe { ScreenToClient(HWND(self.hwnd as _), &mut local).as_bool() } {
+            return false;
+        }
+        if local.x >= 0
+            && local.y >= 0
+            && local.x < self.output[0] as i32
+            && local.y < self.output[1] as i32
+        {
+            return false;
+        }
+        if !self.control.drag_drop().available() {
+            return false;
+        }
+        let Some((screen, x, y)) = self.position(point, true) else {
+            return false;
+        };
+        self.control
+            .drag_drop()
+            .probe(
+                self.owner(),
+                crate::protocol::drag_drop::Point { screen, x, y },
+                input.clone(),
+            )
+            .is_ok()
+    }
+    pub(super) fn position(&self, mut point: POINT, dragging: bool) -> Option<(i32, f64, f64)> {
         let (width, height, rotation) =
             (*self.video_size.lock().unwrap_or_else(|p| p.into_inner()))?;
         let (width, height) = if matches!(rotation, 90 | 270) {
@@ -145,7 +197,8 @@ impl RawRouter {
         let Some(target) = self.0.lock().unwrap_or_else(|p| p.into_inner()).clone() else {
             return false;
         };
-        if target.owner() != owner || !target.focused() {
+        if target.owner() != owner || !target.focused() || target.control.drag_drop().interactive()
+        {
             return false;
         }
         if target.top == 0 || target.control.mouse().relative_mode() {
@@ -180,7 +233,8 @@ impl RawRouter {
         let Some(target) = self.0.lock().unwrap_or_else(|p| p.into_inner()).clone() else {
             return;
         };
-        if target.owner() != owner || !target.focused() {
+        if target.owner() != owner || !target.focused() || target.control.drag_drop().interactive()
+        {
             return;
         }
         // Windows winit emits LineDelta from signed WM_MOUSE[H]WHEEL / 120,
@@ -269,6 +323,9 @@ impl RawRouter {
         let Some(target) = self.0.lock().unwrap_or_else(|p| p.into_inner()).clone() else {
             return false;
         };
+        if target.control.drag_drop().interactive() {
+            return false;
+        }
         if !target.focused() {
             // A message can observe loss of foreground before winit delivers
             // Focused(false). Retire the native target too, so regaining focus
@@ -361,6 +418,9 @@ impl RawRouter {
             return false;
         }
         let held = input.owner_holds_buttons(target.owner());
+        if held && target.reverse_drag(msg.pt) {
+            return false;
+        }
         let relative = input.relative_mode();
         // Captured relative input is already accepted independently of pointer
         // position. Avoid contending with egui/layout on every high-rate report.
@@ -423,6 +483,7 @@ impl RawRouter {
         };
         let input = target.control.mouse();
         if !target.focused()
+            || target.control.drag_drop().interactive()
             || !input.accepts_host_input()
             || !raw_belongs_to_activation(
                 msg.time,
@@ -438,6 +499,9 @@ impl RawRouter {
         if super::windows_keyboard::observe_mouse_buttons(target.owner(), flags)
             || input.waiting_for_neutral()
         {
+            return;
+        }
+        if target.reverse_drag(msg.pt) {
             return;
         }
         let relative = input.relative_mode();
@@ -511,6 +575,7 @@ fn button_edges(flags: u16) -> impl Iterator<Item = (u32, bool)> {
 }
 
 pub(super) struct WindowMouse {
+    drag: crate::features::drag_drop::controller::Controller,
     owner: u64,
     _session_notifications: super::windows_keyboard::SessionNotifications,
     input: RemoteInput,
@@ -532,6 +597,7 @@ impl WindowMouse {
         let owner = crate::platform::graphics::window_hwnd(window).map_or(0, |hwnd| hwnd.0 as u64);
         let ctx = context.clone();
         Self {
+            drag: control.drag_drop().clone(),
             owner,
             _session_notifications: super::windows_keyboard::SessionNotifications::new(
                 owner, control,
@@ -552,6 +618,9 @@ impl WindowMouse {
     }
 
     pub fn release(&mut self, window: &Window) {
+        if self.drag.handoff_pending() {
+            return;
+        }
         super::windows_keyboard::clear(self.owner);
         if let Some(cursor) = &self.system_cursor {
             cursor.set_active(false);
@@ -608,6 +677,7 @@ impl WindowMouse {
         if !window.has_focus()
             || window.is_minimized().unwrap_or(false)
             || mode == MouseMode::View
+            || control.drag_drop().interactive()
             || menu_open
             || context.any_popup_open()
             || context.memory(|m| m.top_modal_layer().is_some())

@@ -8,6 +8,58 @@ use anyhow::Context as _;
 mod displays;
 pub(crate) use displays::{receive_session, screen_states};
 
+pub(crate) struct DrawRequest {
+    pub command: super::annotation::wire::PbDrawRequestKind,
+    sequence: i64,
+    timestamp: i64,
+    request: i64,
+}
+pub(crate) fn draw_request(bytes: &[u8]) -> Result<Option<DrawRequest>> {
+    if bytes.first() == Some(&b'{') {
+        return Ok(None);
+    }
+    let message = PbControlMessage::decode(bytes)?;
+    let Some(PbPayload::RpcRequest(bytes)) = message.payload else {
+        return Ok(None);
+    };
+    let request = PbRpcRequest::decode(bytes.as_slice())?;
+    let Some(PbRpcRequestPayload::Draw(draw)) = request.payload else {
+        return Ok(None);
+    };
+    let command = draw.payload.context("批注请求缺少操作")?;
+    let header = request.request_header.context("批注请求缺少标识")?;
+    Ok(Some(DrawRequest {
+        command,
+        sequence: message.seq,
+        timestamp: message.timestamp,
+        request: header.request_id,
+    }))
+}
+impl DrawRequest {
+    pub fn response(&self, error_code: i32) -> Vec<u8> {
+        use super::annotation::wire::*;
+        let result = PbDrawResult { error_code };
+        let payload = match self.command {
+            PbDrawRequestKind::Stroke(_) => PbDrawResponseKind::Stroke(result),
+            PbDrawRequestKind::Clear(_) => PbDrawResponseKind::Clear(result),
+            PbDrawRequestKind::Toggle(_) => PbDrawResponseKind::Toggle(result),
+        };
+        PbControlMessage {
+            seq: self.sequence,
+            timestamp: self.timestamp,
+            payload: Some(PbPayload::RpcResponse(PbRpcResponse {
+                response_header: Some(PbResponseHeader {
+                    request_id: self.request,
+                }),
+                payload: Some(PbRpcResponsePayload::DrawResp(PbDrawResponse {
+                    payload: Some(payload),
+                })),
+            })),
+        }
+        .encode_to_vec()
+    }
+}
+
 /// CaptureSetting has the same RPC contract on TEXT and CONTROL. Current iOS
 /// sends it on CONTROL (including mixed KCP); channel choice is not permission
 /// to execute any of the other TEXT-only operations.
@@ -130,6 +182,17 @@ pub(crate) struct VirtualMode {
     pub vsync: i32,
 }
 impl ConnectOptions {
+    pub fn file_capabilities(&self) -> crate::features::file_transfer::host::Capabilities {
+        self.features.as_ref().map_or(Default::default(), |f| {
+            crate::features::file_transfer::host::Capabilities::from_levels(
+                f.file_transfer_ftp,
+                f.file_transfer_ftp2,
+            )
+        })
+    }
+    pub fn clipboard_level(&self) -> i32 {
+        self.features.as_ref().map_or(0, |f| f.clipboard)
+    }
     pub fn control_screen_reports(&self) -> bool {
         self.features
             .as_ref()
@@ -199,6 +262,10 @@ pub(crate) struct CaptureParams {
 fn flags() -> PbFeatureFlag {
     PbFeatureFlag {
         capture_setting: 6,
+        clipboard: 3,
+        system_metrics: 1,
+        file_transfer_ftp: 2,
+        file_transfer_ftp2: 2,
         qos_stat: 1,
         // Current Windows input protocol generation, not an installed/active
         // driver assertion. RpcRequest 11 retains its no-install support reply.
@@ -320,6 +387,9 @@ pub(crate) struct Received {
     pub control_screen_reports: Option<bool>,
     pub refresh_state: bool,
     pub refresh_secure: bool,
+    pub clipboard: Option<i32>,
+    pub files: Option<crate::features::file_transfer::host::Capabilities>,
+    pub media_active: Option<bool>,
 }
 impl From<Vec<Vec<u8>>> for Received {
     fn from(messages: Vec<Vec<u8>>) -> Self {
@@ -493,6 +563,19 @@ pub(crate) fn receive(
                     vec![echo(msg.seq, msg.timestamp, false)]
                 } else {
                     Vec::new()
+                },
+                clipboard: match &action.params {
+                    Some(PbSimpleActionParams::FeatureFlag(flags)) => Some(flags.clipboard),
+                    _ => None,
+                },
+                files: match &action.params {
+                    Some(PbSimpleActionParams::FeatureFlag(flags)) => Some(
+                        crate::features::file_transfer::host::Capabilities::from_levels(
+                            flags.file_transfer_ftp,
+                            flags.file_transfer_ftp2,
+                        ),
+                    ),
+                    _ => None,
                 },
                 control_screen_reports: match action.params {
                     Some(PbSimpleActionParams::FeatureFlag(flags)) => {
@@ -734,6 +817,19 @@ pub(crate) fn cursor_report(state: Vec<u8>) -> Vec<u8> {
     // generic PB dispatch. TEXT and signal callbacks do not update its cursor.
     PbControlMessage {
         payload: Some(PbPayload::SystemStateChange(state)),
+        ..Default::default()
+    }
+    .encode_to_vec()
+}
+
+pub(crate) fn clipboard_permission(enabled: bool) -> Vec<u8> {
+    PbControlMessage {
+        payload: Some(PbPayload::SystemStateChange(
+            super::wire::ClipboardPermissionState {
+                files: Some(super::wire::ClipboardPermission { enabled }),
+            }
+            .encode_to_vec(),
+        )),
         ..Default::default()
     }
     .encode_to_vec()

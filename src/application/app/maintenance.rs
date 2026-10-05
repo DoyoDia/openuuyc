@@ -21,9 +21,72 @@ pub(crate) fn route_gui() -> Result<bool> {
     {
         deployment::start_installed(std::env::args_os().skip(1))?;
     } else {
-        run(false)?;
+        run(false, std::env::args_os().skip(1).collect())?;
     }
     Ok(true)
+}
+
+#[derive(Debug)]
+struct UpdateExit {
+    code: i32,
+    message: String,
+}
+impl std::fmt::Display for UpdateExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+impl std::error::Error for UpdateExit {}
+pub(crate) fn update_error_code(error: &anyhow::Error) -> i32 {
+    error
+        .downcast_ref::<UpdateExit>()
+        .map(|e| e.code)
+        .or_else(|| crate::application::component_error_code(error))
+        .unwrap_or(1)
+}
+
+/// CLI update uses the same notification, quiescence and rollback transaction
+/// as the GUI. No account restoration or UI startup happens on this entry path.
+pub(crate) fn update(silent: bool, no_elevate: bool) -> Result<bool> {
+    if !silent {
+        // The update command is a maintenance operation, not the launch target.
+        // Never pass it on to the replacement process after successful install.
+        run(false, vec!["gui".into()])?;
+        return Ok(false);
+    }
+    if no_elevate && !components::elevated()? {
+        return Err(UpdateExit {
+            code: 740,
+            message:
+                "静默更新需要管理员权限；请在管理员终端运行，或移除 --no-elevate 以请求 UAC 授权"
+                    .into(),
+        }
+        .into());
+    }
+    let installed = deployment::image()?;
+    if !installed.is_file() {
+        return Err(UpdateExit {
+            code: 1605,
+            message: "尚未安装 OpenUUYC；update 仅更新已有安装".into(),
+        }
+        .into());
+    }
+    deployment::verify_directory(installed.parent().context("安装路径无效")?)?;
+    ensure!(
+        host_service::vault::owner()?.as_deref()
+            == Some(host_service::vault::sid(std::process::id())?.as_str()),
+        "请由安装此程序的 Windows 用户执行更新"
+    );
+    let _installer = super::instance::reserve_installer().map_err(|error| UpdateExit {
+        code: 170,
+        message: error.to_string(),
+    })?;
+    if host_service::process::image_hash(&installed)?
+        == host_service::process::image_hash(&std::env::current_exe()?)?
+    {
+        return Ok(false);
+    }
+    update_running(true)
 }
 pub(crate) fn uninstall(parent: Option<u32>) -> Result<()> {
     if let Some(parent) = parent {
@@ -73,7 +136,7 @@ pub(crate) fn uninstall(parent: Option<u32>) -> Result<()> {
             .context("启动卸载程序失败")?;
         return Ok(());
     }
-    run(true)?;
+    run(true, Vec::new())?;
     Ok(())
 }
 pub(crate) fn report_error(error: &anyhow::Error) {
@@ -115,7 +178,7 @@ fn cleanup_helpers() {
         }
     }
 }
-fn run(uninstall: bool) -> Result<()> {
+fn run(uninstall: bool, launch_arguments: Vec<std::ffi::OsString>) -> Result<()> {
     let _installer = super::instance::reserve_installer()?;
     let _instance = if uninstall {
         Some(super::instance::reserve_maintenance()?)
@@ -144,6 +207,7 @@ fn run(uninstall: bool) -> Result<()> {
             super::view::configure_visuals(ctx);
             Box::new(Maintenance {
                 uninstall,
+                launch_arguments,
                 removal: Default::default(),
                 pending: None,
                 error: None,
@@ -156,6 +220,7 @@ fn run(uninstall: bool) -> Result<()> {
 }
 struct Maintenance {
     uninstall: bool,
+    launch_arguments: Vec<std::ffi::OsString>,
     removal: components::RemovalOptions,
     pending: Option<Receiver<Result<bool, String>>>,
     error: Option<String>,
@@ -309,7 +374,7 @@ impl Maintenance {
     fn open_installed(&mut self, ctx: &egui::Context) {
         // Start before destroying the foreground installer, otherwise Windows
         // restores another app first and the replacement opens behind it.
-        match deployment::start_installed(std::env::args_os().skip(1)) {
+        match deployment::start_installed(self.launch_arguments.iter().cloned()) {
             Ok(()) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             Err(error) => {
                 self.finished = false;
@@ -326,7 +391,7 @@ impl Maintenance {
         let removal = self.removal;
         std::thread::spawn(move || {
             let result = if !uninstall {
-                update_running()
+                update_running(false)
             } else {
                 components::request(Kind::Application, Operation::Uninstall, false, removal)
             }
@@ -337,8 +402,11 @@ impl Maintenance {
     }
 }
 
-fn update_running() -> Result<bool> {
-    let gate = super::instance::reserve_update()?;
+fn update_running(preserve_pause: bool) -> Result<bool> {
+    let gate = super::instance::reserve_update().map_err(|error| UpdateExit {
+        code: 170,
+        message: error.to_string(),
+    })?;
     let running = super::instance::running_installed()?;
     let mut had_window = running.is_some();
     let background = host_service::resident::managed() && host_service::install::running()?;
@@ -374,7 +442,7 @@ fn update_running() -> Result<bool> {
                 None => anyhow::bail!("运行版本仍在退出，尚未开始替换文件"),
             }
         };
-        components::request(Kind::Suite, Operation::Install, false, Default::default())
+        components::request_update(!preserve_pause || !background || resume)
     })();
     drop(gate);
     if let Err(error) = result {

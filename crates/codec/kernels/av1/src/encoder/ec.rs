@@ -118,9 +118,6 @@ pub struct WriterBase<S> {
   rng: u16,
   /// The number of bits of data in the current value.
   cnt: i16,
-  #[cfg(feature = "desync_finder")]
-  /// Debug enable flag
-  debug: bool,
   /// Extra offset added to `tell()` and `tell_frac()` to approximate costs
   /// of actually coding a symbol
   fake_bits_frac: u32,
@@ -313,22 +310,10 @@ impl<S> WriterBase<S> {
   /// Internal constructor called by the subtypes that implement the
   /// actual encoder and Recorder.
   #[inline]
-  #[cfg(not(feature = "desync_finder"))]
   const fn new(storage: S) -> Self {
     WriterBase { rng: 0x8000, cnt: -9, fake_bits_frac: 0, s: storage }
   }
 
-  #[inline]
-  #[cfg(feature = "desync_finder")]
-  fn new(storage: S) -> Self {
-    WriterBase {
-      rng: 0x8000,
-      cnt: -9,
-      debug: std::env::var_os("RAV1E_DEBUG").is_some(),
-      fake_bits_frac: 0,
-      s: storage,
-    }
-  }
 
   /// Compute low and range values from token cdf values and local state
   const fn lr_compute(&self, fl: u16, fh: u16, nms: u16) -> (ec_window, u16) {
@@ -388,26 +373,6 @@ impl<S> WriterBase<S> {
     }
   }
 
-  #[cfg(feature = "desync_finder")]
-  fn print_backtrace(&self, s: u32) {
-    let mut depth = 3;
-    backtrace::trace(|frame| {
-      let ip = frame.ip();
-
-      depth -= 1;
-
-      if depth == 0 {
-        backtrace::resolve(ip, |symbol| {
-          if let Some(name) = symbol.name() {
-            println!("Writing symbol {} from {}", s, name);
-          }
-        });
-        false
-      } else {
-        true
-      }
-    });
-  }
 }
 
 /// Replay implementation specific to the Recorder
@@ -549,12 +514,6 @@ where
     &mut self, s: u32, cdf: CDFOffset<CDF_LEN>, log: &mut CDFContextLog,
     fc: &mut CDFContext,
   ) {
-    #[cfg(feature = "desync_finder")]
-    {
-      if self.debug {
-        self.print_backtrace(s);
-      }
-    }
     let cdf = log.push(fc, cdf);
     self.symbol(s, cdf);
 

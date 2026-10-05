@@ -1,5 +1,5 @@
 //! File browser and transfer table primitives share the application's visual language.
-use super::{paint_file_icon, theme};
+use super::theme;
 use egui::{Align2, Color32, FontId, Rect, Response, Sense, Stroke, Ui, pos2, vec2};
 
 #[derive(Clone, Copy)]
@@ -283,7 +283,8 @@ pub(crate) fn file_row(
     name: &str,
     modified: &str,
     size: &str,
-    folder: bool,
+    entry_type: i32,
+    icon_type: &str,
     selected: bool,
 ) -> Response {
     let (r, response) = ui.allocate_exact_size(
@@ -303,40 +304,7 @@ pub(crate) fn file_row(
     }
     let cols = file_columns(r);
     let ir = Rect::from_center_size(r.left_center() + vec2(15., 0.), vec2(18., 18.));
-    paint_file_icon(
-        ui.painter(),
-        ir,
-        if folder { theme::AMBER } else { theme::MUTED },
-        folder,
-    );
-    // Small in-document marks distinguish common file groups without importing OS thumbnails.
-    if !folder {
-        let extension = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
-        let p = ui.painter();
-        let c = ir.center();
-        let s = Stroke::new(1., theme::MUTED);
-        if matches!(
-            extension.as_str(),
-            "png" | "jpg" | "jpeg" | "bmp" | "webp" | "gif"
-        ) {
-            p.add(egui::Shape::line(
-                vec![c + vec2(-3., 4.), c + vec2(-1., 1.), c + vec2(2., 4.)],
-                s,
-            ));
-        } else if matches!(
-            extension.as_str(),
-            "mp4" | "mkv" | "mov" | "avi" | "mp3" | "wav" | "flac"
-        ) {
-            p.add(egui::Shape::closed_line(
-                vec![c + vec2(-2., -2.), c + vec2(3., 1.), c + vec2(-2., 4.)],
-                s,
-            ));
-        } else {
-            for y in [0., 3.] {
-                p.line_segment([c + vec2(-3., y), c + vec2(3., y)], s);
-            }
-        }
-    }
+    super::file_icons::paint(ui.painter(), ir, name, entry_type, icon_type);
     let mut name_rect = cols[0];
     name_rect.min.x += 32.;
     name_rect.max.x -= 8.;
