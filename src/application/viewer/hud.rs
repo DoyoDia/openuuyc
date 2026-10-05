@@ -1,5 +1,6 @@
 //! Performance overlay formatting and presentation modes.
 use super::{COMPACT_COLUMN_GAP, COMPACT_HUD_WIDTH, COMPACT_METER_WIDTH, performance_panel};
+use crate::diagnostics::performance::health::{Level, Metric};
 use crate::diagnostics::performance::{PerformanceMonitor, PerformanceSnapshot};
 use std::time::Duration;
 
@@ -17,6 +18,7 @@ pub(in crate::application) fn show_performance_overlay(
         PerformancePanelMode::Detailed => {
             performance_panel::show(ctx, performance, &stats, grid_id)
         }
+        PerformancePanelMode::Alerts => super::performance_alerts::show(ctx, &stats, grid_id),
     }
 }
 
@@ -53,7 +55,7 @@ pub(super) fn show_compact_performance(
                     compact_hud_line(ui, &stats.connection, connection_color(&stats.connection));
                     compact_hud_line(
                         ui,
-                        &format!("{:.0} fps", stats.actual_fps.max(1.0)),
+                        &format!("{:.0} fps", stats.actual_fps),
                         frame_rate_color(stats),
                     );
                     compact_hud_line(
@@ -63,25 +65,24 @@ pub(super) fn show_compact_performance(
                     );
                     compact_hud_line(
                         ui,
-                        &format_optional_ms(stats.current_delay_ms),
-                        threshold_color(stats.current_delay_ms.unwrap_or_default(), 20.0, 50.0),
+                        &format_optional_ms(stats.health.value(Metric::Rtt)),
+                        health_color(stats.health.level(Metric::Rtt)),
                     );
                     compact_hud_line(
                         ui,
-                        &stats.frame_delay_ms.map_or_else(
+                        &stats.health.value(Metric::FrameDelay).map_or_else(
                             || "— ms frm.".to_owned(),
-                            |value| format!("{value} ms frm."),
+                            |value| format!("{value:.0} ms frm."),
                         ),
-                        threshold_color(
-                            stats.frame_delay_ms.unwrap_or_default() as f64,
-                            30.0,
-                            60.0,
-                        ),
+                        health_color(stats.health.level(Metric::FrameDelay)),
                     );
                     compact_hud_line(
                         ui,
-                        &format!("{:.1}% loss", stats.packet_loss_percent),
-                        threshold_color(stats.packet_loss_percent, 0.1, 1.0),
+                        &stats
+                            .health
+                            .value(Metric::Loss)
+                            .map_or_else(|| "— loss".into(), |v| format!("{v:.2}% loss")),
+                        health_color(stats.health.level(Metric::Loss)),
                     );
                     compact_hud_line(ui, &stats.quality, egui::Color32::WHITE);
                 });
@@ -224,18 +225,8 @@ pub(super) fn connection_color(connection: &str) -> egui::Color32 {
 }
 
 pub(super) fn frame_rate_color(stats: &PerformanceSnapshot) -> egui::Color32 {
-    let frame_ratio = if stats.receive_fps <= 1.0 {
-        1.0
-    } else {
-        stats.render_fps / stats.receive_fps
-    };
-    if frame_ratio >= 0.98 {
-        good_color()
-    } else if frame_ratio >= 0.9 {
-        warning_color()
-    } else {
-        bad_color()
-    }
+    // Receiving more frames than can be presented is not itself a failure.
+    health_color(stats.health.level(Metric::PresentationStall))
 }
 
 pub(super) fn format_uptime(value: Duration) -> String {
@@ -257,13 +248,12 @@ pub(super) fn format_resolution(value: Option<(u32, u32)>) -> String {
     )
 }
 
-pub(super) fn threshold_color(value: f64, good_max: f64, warning_max: f64) -> egui::Color32 {
-    if value <= good_max {
-        good_color()
-    } else if value <= warning_max {
-        warning_color()
-    } else {
-        bad_color()
+pub(super) fn health_color(level: Option<Level>) -> egui::Color32 {
+    match level {
+        Some(Level::Normal) => good_color(),
+        Some(Level::Warning) => warning_color(),
+        Some(Level::Bad) => bad_color(),
+        None => crate::ui::theme::MUTED,
     }
 }
 

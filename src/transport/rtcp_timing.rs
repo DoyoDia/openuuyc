@@ -93,8 +93,9 @@ struct StreamTiming {
     rrtr_enabled: bool,
     local_ssrc: Option<u32>,
     received_rrtr: VecDeque<ReceivedRrtr>,
-    pending_rtt_ms: Option<u64>,
+    pending_rtt_ms: Option<(u64, Instant)>,
     published_rtt_ms: Option<u64>,
+    published_rtt_at: Option<Instant>,
     sender_report: Option<SenderClockSample>,
 }
 
@@ -151,8 +152,9 @@ impl RtcpTiming {
     pub(crate) fn publish_rtt(&self) -> Option<Duration> {
         let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
         for (&ssrc, stream) in &mut state.streams {
-            if let Some(ms) = stream.pending_rtt_ms.take() {
+            if let Some((ms, at)) = stream.pending_rtt_ms.take() {
                 stream.published_rtt_ms = Some(ms);
+                stream.published_rtt_at = Some(at);
                 tracing::debug!(
                     media_ssrc = ssrc,
                     rtt_ms = ms,
@@ -179,6 +181,21 @@ impl RtcpTiming {
             return None;
         }
         Some((sample, Duration::from_millis(stream.published_rtt_ms?)))
+    }
+
+    /// Diagnostics freshness only; does not change the protocol's retained RTT.
+    pub(crate) fn published_rtt_at(&self) -> Option<Instant> {
+        let state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        state.streams.get(&state.selected_video?)?.published_rtt_at
+    }
+
+    pub(crate) fn rtt_observed_at_for(&self, ssrc: u32) -> Option<Instant> {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .streams
+            .get(&ssrc)?
+            .published_rtt_at
     }
 
     fn observe(&self, packet: &(dyn Packet + Send + Sync), received_at: Instant) {
@@ -279,7 +296,7 @@ impl RtcpTiming {
                         } else {
                             ((u64::from(compact) * 1_000_000 + 0x8000) >> 16).max(1_000)
                         };
-                        stream.pending_rtt_ms = Some((micros + 500) / 1_000);
+                        stream.pending_rtt_ms = Some(((micros + 500) / 1_000, received_at));
                         tracing::debug!(
                             sender_ssrc = xr.sender_ssrc,
                             receiver_ssrc = report.ssrc,
@@ -626,6 +643,7 @@ impl Interceptor for RtcpTiming {
                     received_rrtr: VecDeque::new(),
                     pending_rtt_ms: None,
                     published_rtt_ms: None,
+                    published_rtt_at: None,
                     sender_report: None,
                 });
             tracing::debug!(
