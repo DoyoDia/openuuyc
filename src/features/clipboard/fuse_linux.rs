@@ -441,14 +441,18 @@ pub(super) fn generation() -> u64 {
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// The directory mounts go under, without creating it.
+pub(super) fn mount_root() -> Option<PathBuf> {
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .map(|base| base.join("openuuyc").join("clipboard"))
+}
+
 /// Where this process mounts clipboard offers. Under the runtime directory, so
 /// it is per-user, on tmpfs, and removed when the session ends.
 pub(super) fn mount_parent() -> Result<PathBuf> {
-    let base = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .context("XDG_RUNTIME_DIR 未设置，无法挂载剪贴板文件")?;
-    let parent = base.join("openuuyc").join("clipboard");
+    let parent = mount_root().context("XDG_RUNTIME_DIR 未设置，无法挂载剪贴板文件")?;
     std::fs::create_dir_all(&parent).with_context(|| format!("创建 {} 失败", parent.display()))?;
     static CLEANED: std::sync::Once = std::sync::Once::new();
     CLEANED.call_once(|| retire_stale(&parent));

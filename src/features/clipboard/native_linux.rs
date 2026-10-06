@@ -1089,23 +1089,23 @@ fn poll_local(state: &mut State) -> Result<()> {
     }
     // A file manager puts the paths on the clipboard as `text/uri-list` and a
     // plain-text copy of the same names, so files are looked for first.
-    let sources = clipboard
+    let files = clipboard
         .get()
         .file_list()
         .unwrap_or_default()
         .into_iter()
         .map(trim_uri_path)
         .filter(|path| path.is_absolute())
-        // A copy the remote sent is published as paths into this process's own
-        // filesystem. Offering those back would ask the remote for the files it
-        // just gave us, over and over.
-        .filter(|path| {
-            !state
-                .mounted
-                .as_ref()
-                .is_some_and(|m| path.starts_with(m.root()))
-        })
         .collect::<Vec<_>>();
+    // A copy the remote sent is published as paths into this process's own
+    // filesystem, and under plain-text targets too. While it is still what the
+    // clipboard holds, nothing changed here: offering the paths back would
+    // ask the remote for the files it just gave us, and offering their text
+    // would replace the remote's copy with a path that only exists here.
+    if own_copy(&files) {
+        return Ok(());
+    }
+    let sources = files;
     let snapshot = if !sources.is_empty() {
         LocalSnapshot {
             sources,
@@ -1343,6 +1343,17 @@ fn serve(
         }
         _ => Ok(()),
     }
+}
+
+/// Whether every path is one this process mounted for a remote copy.
+fn own_copy(paths: &[PathBuf]) -> bool {
+    let Some(parent) = super::fuse::mount_root() else {
+        return false;
+    };
+    own_paths(paths, &parent)
+}
+fn own_paths(paths: &[PathBuf], parent: &Path) -> bool {
+    !paths.is_empty() && paths.iter().all(|path| path.starts_with(parent))
 }
 
 /// The file list a drag or drop handed this session, if it has one. A drop's
@@ -1642,5 +1653,24 @@ mod tests {
             "{:?}",
             host.snapshot().error
         );
+    }
+
+    #[test]
+    fn remote_copies_are_not_offered_back() {
+        let parent = Path::new("/run/user/1000/openuuyc/clipboard");
+        assert!(own_paths(&[parent.join("4/a.png")], parent));
+        assert!(own_paths(
+            &[parent.join("4/a.png"), parent.join("4/b")],
+            parent
+        ));
+        assert!(!own_paths(
+            &[parent.join("4/a.png"), PathBuf::from("/home/a/b")],
+            parent
+        ));
+        assert!(!own_paths(&[], parent));
+        assert!(!own_paths(
+            &[PathBuf::from("/run/user/1000/openuuyc/clipboard-other/x")],
+            parent
+        ));
     }
 }
