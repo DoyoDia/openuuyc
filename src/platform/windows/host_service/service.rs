@@ -96,7 +96,8 @@ unsafe extern "system" fn main(_argc: u32, _argv: *mut PWSTR) {
 }
 fn serve() -> Result<()> {
     std::thread::scope(|scope| {
-        let displays = scope.spawn(|| super::displays::supervise(|| !STOP.load(Ordering::Acquire)));
+        let users =
+            scope.spawn(|| super::user_backend::supervise(|| !STOP.load(Ordering::Acquire)));
         let residents = scope.spawn(|| {
             let result = super::resident::supervise(|| !STOP.load(Ordering::Acquire));
             if result.is_err() {
@@ -119,13 +120,14 @@ fn serve() -> Result<()> {
         let resident_result = residents
             .join()
             .map_err(|_| anyhow::anyhow!("后台服务线程异常"))?;
-        let display_result = displays
-            .join()
-            .map_err(|_| anyhow::anyhow!("显示守护线程异常"))?;
         result
+            .and(
+                users
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("用户后台守护线程异常"))?,
+            )
             .and(capture_result)
             .and(resident_result)
-            .and(display_result)
     })
 }
 fn serve_input() -> Result<()> {

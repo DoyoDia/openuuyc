@@ -66,17 +66,12 @@ impl DeviceCenterApp {
             None => "尚未检查",
         };
         let mut open = false;
-        form_row(
-            ui,
-            "允许本机远程开机",
-            "配置网卡、确认 BIOS 并设置本设备的远程开机许可",
-            |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(text);
-                    open = ui.button("设置…").clicked();
-                });
-            },
-        );
+        form_row(ui, "远程开机", "设置本机的网络唤醒", |ui| {
+            ui.horizontal(|ui| {
+                ui.label(text);
+                open = ui.button("设置…").clicked();
+            });
+        });
         if open {
             self.center_ui.wol_setup = ViewState {
                 open: true,

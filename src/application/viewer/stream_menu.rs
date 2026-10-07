@@ -63,6 +63,7 @@ pub(super) struct StreamControlUi {
 
 pub(super) struct LocalViewSettings {
     pub performance_mode: super::PerformancePanelMode,
+    pub performance_always_visible: bool,
     pub intercept_shortcuts: bool,
     pub send_ctrl_alt_del: bool,
 }
@@ -908,56 +909,21 @@ crate::ui::controls::observe_notice(ui.ctx(), "audio-output-disconnected", "音�
                                         "仅本次连接生效；关闭后恢复自动选路，不保证一定直连",
                                     ),
                                 );
-                                let mut monitoring =
-                                    view.performance_mode != super::PerformancePanelMode::Hidden;
-                                if switch_row(ui, "性能监控", &mut monitoring)
-                                    .on_hover_text(format!(
-                                        "为此设备保存，同一设备的播放窗口共用；切换快捷键：{}",
-                                        crate::application::viewer_shortcuts::label(
-                                            crate::application::viewer_shortcuts::Action::Performance
-                                        )
-                                    ))
-                                    .changed()
-                                {
-                                    view.performance_mode = if monitoring {
-                                        super::PerformancePanelMode::Compact
-                                    } else {
-                                        super::PerformancePanelMode::Hidden
-                                    };
-                                }
-                                if monitoring {
-                                    ui.horizontal(|ui| {
-                                        for (mode, label, hint) in [
-                                            (
-                                                super::PerformancePanelMode::Compact,
-                                                "简洁",
-                                                "常驻显示主要指标",
-                                            ),
-                                            (
-                                                super::PerformancePanelMode::Detailed,
-                                                "详细",
-                                                "常驻显示趋势图和全部指标",
-                                            ),
-                                            (
-                                                super::PerformancePanelMode::Alerts,
-                                                "异常时",
-                                                "持续异常时显示，恢复后短暂保留",
-                                            ),
-                                        ] {
-                                            if ui
-                                                .add_sized(
-                                                    [(WIDTH - 12.0) / 3.0, ROW_HEIGHT],
-                                                    egui::Button::new(label)
-                                                        .selected(view.performance_mode == mode),
-                                                )
-                                                .on_hover_text(hint)
-                                                .clicked()
-                                            {
-                                                view.performance_mode = mode;
-                                            }
+                                switch_row(ui, "性能监控常驻", &mut view.performance_always_visible)
+                                    .on_hover_text("关闭后仅在异常时临时显示");
+                                ui.horizontal(|ui| {
+                                    for (mode, label) in [
+                                        (super::PerformancePanelMode::Compact, "精简"),
+                                        (super::PerformancePanelMode::Detailed, "详细"),
+                                    ] {
+                                        if ui.add_sized(
+                                            [(WIDTH - 6.0) / 2.0, ROW_HEIGHT],
+                                            egui::Button::new(label).selected(view.performance_mode == mode),
+                                        ).clicked() {
+                                            view.performance_mode = mode;
                                         }
-                                    });
-                                }
+                                    }
+                                });
                                 let mode_label = match snapshot.mouse_preference {
                                     MouseMode::Smart | MouseMode::View => "智能鼠标",
                                     MouseMode::Remote => "被控端鼠标",

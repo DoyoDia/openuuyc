@@ -12,14 +12,14 @@ use std::{
 
 struct Options {
     build_directory: Option<PathBuf>,
-    upx: bool,
+    native: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
         Self {
             build_directory: None,
-            upx: true,
+            native: false,
         }
     }
 }
@@ -29,7 +29,7 @@ fn main() -> Result<()> {
     let mut args = std::env::args_os().skip(1);
     while let Some(arg) = args.next() {
         match arg.to_str() {
-            Some("--no-upx") => options.upx = false,
+            Some("--native") => options.native = true,
             Some("--build-directory") => {
                 options.build_directory = Some(
                     args.next()
@@ -39,9 +39,9 @@ fn main() -> Result<()> {
             }
             Some("--help" | "-h") => {
                 println!(
-                    "cargo dist [--build-directory PATH] [--no-upx]\n\
-                    Builds, UPX-compresses and checks the Windows release in target/dist.\n\
-                    Requires UPX on PATH. --no-upx writes an uncompressed development build to target/dist/uncompressed."
+                    "cargo dist [--build-directory PATH] [--native]\n\
+                    Builds and verifies a single-file self-extracting Windows release in target/dist.\n\
+                    --native writes only the native executable to target/dist/native."
                 );
                 return Ok(());
             }
@@ -57,17 +57,6 @@ fn main() -> Result<()> {
             .parent()
             .context("xtask must be inside the project")?,
     )?;
-    if options.upx {
-        ensure!(
-            command("upx")
-                .arg("--version")
-                .stdout(Stdio::null())
-                .status()
-                .context("UPX must be installed and available on PATH")?
-                .success(),
-            "UPX is unavailable"
-        );
-    }
     let (source, version) = build(&root, options.build_directory)?;
     ensure!(
         source.is_file()
@@ -80,6 +69,7 @@ fn main() -> Result<()> {
     let original_bytes = source.metadata()?.len();
     let architecture = pe_architecture(&source)?;
     let file_name = format!("OpenUUYC-v{version}-windows-{architecture}.exe");
+    check_manifest(&source, &root)?;
     check_startup(&source, &root, &version)?;
 
     let target = root.join("target");
@@ -95,36 +85,42 @@ fn main() -> Result<()> {
         "invalid staging directory"
     );
     let candidate = stage.path().join(&file_name);
-    if options.upx {
-        ensure!(
-            command("upx")
-                // D3D12.dll queries the EXE's D3D12SDKVersion export in DllMain,
-                // before UPX runs. Keep exports readable during loader initialization.
-                .args(["--best", "--compress-exports=0", "--overlay=copy", "-o"])
-                .arg(&candidate)
-                .arg(&source)
-                .status()
-                .context("compress executable")?
-                .success(),
-            "UPX compression failed; original build retained"
-        );
-        ensure!(
-            command("upx").arg("-t").arg(&candidate).status()?.success(),
-            "UPX integrity check failed"
-        );
-    } else {
+    if options.native {
         fs::copy(&source, &candidate)?;
+    } else {
+        ensure!(
+            architecture == "x86_64",
+            "the launcher currently supports Windows x86_64 only"
+        );
+        let cargo = std::env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
+        ensure!(
+            command(cargo)
+                .current_dir(&root)
+                .args(["build", "--release", "--locked", "--manifest-path"])
+                .arg(root.join("packaging/Cargo.toml"))
+                .arg("--target-dir")
+                .arg(target.join("launcher"))
+                .env("OPENUUYC_PAYLOAD", &source)
+                .status()?
+                .success(),
+            "launcher build failed; native image retained"
+        );
+        fs::copy(
+            target.join("launcher/release/OpenUUYC-launcher.exe"),
+            &candidate,
+        )?;
     }
+    check_manifest(&candidate, &root)?;
     check_startup(&candidate, &root, &version)?;
     ensure!(
         file_hash(&source)? == original_hash,
         "original build changed during packaging"
     );
 
-    let destination = if options.upx {
+    let destination = if !options.native {
         target.join("dist")
     } else {
-        target.join("dist").join("uncompressed")
+        target.join("dist").join("native")
     };
     fs::create_dir_all(&destination)?;
     let published = destination.join(file_name);
@@ -139,6 +135,65 @@ fn main() -> Result<()> {
     // Only this freshly created directory is removed; build and published files remain.
     stage.close()?;
     Ok(())
+}
+
+// Verify the PE resource, not just the source XML or a successful RC build.
+// A missing native manifest makes maintenance look like a legacy installer.
+#[cfg(windows)]
+fn check_manifest(image: &Path, root: &Path) -> Result<()> {
+    use std::{ffi::c_void, os::windows::ffi::OsStrExt};
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn LoadLibraryExW(path: *const u16, file: *mut c_void, flags: u32) -> *mut c_void;
+        fn FindResourceW(module: *mut c_void, name: *const u16, kind: *const u16) -> *mut c_void;
+        fn LoadResource(module: *mut c_void, resource: *mut c_void) -> *mut c_void;
+        fn SizeofResource(module: *mut c_void, resource: *mut c_void) -> u32;
+        fn LockResource(resource: *mut c_void) -> *const c_void;
+        fn FreeLibrary(module: *mut c_void) -> i32;
+    }
+    struct Module(*mut c_void);
+    impl Drop for Module {
+        fn drop(&mut self) {
+            unsafe {
+                FreeLibrary(self.0);
+            }
+        }
+    }
+    let path: Vec<u16> = image.as_os_str().encode_wide().chain(Some(0)).collect();
+    // DATAFILE | IMAGE_RESOURCE maps resources without executing the image.
+    let module = Module(unsafe { LoadLibraryExW(path.as_ptr(), std::ptr::null_mut(), 0x22) });
+    ensure!(
+        !module.0.is_null(),
+        "cannot inspect manifest: {}",
+        image.display()
+    );
+    let resource = unsafe { FindResourceW(module.0, 1usize as *const u16, 24usize as *const u16) };
+    ensure!(
+        !resource.is_null(),
+        "application manifest missing: {}",
+        image.display()
+    );
+    let size = unsafe { SizeofResource(module.0, resource) } as usize;
+    ensure!(
+        size > 0 && size < 65536,
+        "invalid application manifest size"
+    );
+    let loaded = unsafe { LoadResource(module.0, resource) };
+    ensure!(!loaded.is_null(), "cannot load application manifest");
+    let bytes = unsafe { LockResource(loaded) }.cast::<u8>();
+    ensure!(!bytes.is_null(), "cannot read application manifest");
+    let expected = fs::read(root.join("assets/windows.manifest"))?;
+    ensure!(
+        unsafe { std::slice::from_raw_parts(bytes, size) } == expected,
+        "embedded application manifest differs from shared source: {}",
+        image.display()
+    );
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn check_manifest(_: &Path, _: &Path) -> Result<()> {
+    bail!("Windows manifest verification requires Windows")
 }
 
 fn command(program: impl AsRef<OsStr>) -> Command {
@@ -223,7 +278,7 @@ fn build(root: &Path, directory: Option<PathBuf>) -> Result<(PathBuf, String)> {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+')),
         "package version is not a valid filename component"
     );
-    // UPX does not accept Rust's Windows verbatim-path prefix on ordinary paths.
+    // Keep artifact paths usable by the Windows packaging toolchain.
     Ok((
         dunce::canonicalize(path).context("resolve built executable")?,
         version,

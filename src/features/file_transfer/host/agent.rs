@@ -54,7 +54,9 @@ impl Backend {
         let cancel = stop.clone();
         let notices = notices::Journal::default();
         let updates = notices.clone();
+        let activity = crate::platform::windows::host_service::activity::Work::new();
         let worker = tokio::task::spawn_blocking(move || {
+            let _activity = activity;
             if let Err(e) = worker(scope, rx, tx, settings, available, cancel, updates) {
                 tracing::warn!(error=%format!("{e:#}"), "host file executor stopped");
                 *super::super::lock(&status) = Some(e.to_string());
@@ -192,7 +194,7 @@ impl Drop for Local {
 
 struct Remote {
     pipe: Pipe,
-    agent: process::Agent,
+    agent: crate::platform::windows::host_service::user_backend::Lease,
     session: u32,
 }
 impl Remote {
@@ -200,7 +202,12 @@ impl Remote {
         let session = process::active_session();
         let name = format!("{PREFIX}{}", uuid::Uuid::new_v4().simple());
         let pipe = Pipe::server(&name, true)?;
-        let agent = process::Agent::start_files(session, &name)?;
+        let agent = crate::platform::windows::host_service::user_backend::Lease::connect(
+            crate::platform::windows::host_service::user_backend::Role::Files,
+            &name,
+            session,
+            || !stop.is_cancelled(),
+        )?;
         let until = Instant::now() + Duration::from_secs(10);
         pipe.accept(|| !stop.is_cancelled() && agent.alive() && Instant::now() < until)?;
         ensure!(
@@ -331,13 +338,23 @@ fn worker(
             packets: Vec::new(),
             close: true,
         };
-        if let Ok(reply) = remote.exchange(&close, &CancellationToken::new()) {
-            for notice in reply.notices {
-                updates.publish(notice);
+        // A cancelled exchange may have written only a frame prefix, or read
+        // only part of a reply. Never append another request to that stream.
+        // It would become the missing payload of the previous frame and leave
+        // the user backend waiting for its ten-second receive timeout.
+        if result.is_ok() {
+            if let Ok(reply) = remote.exchange(&close, &CancellationToken::new()) {
+                for notice in reply.notices {
+                    updates.publish(notice);
+                }
             }
         }
-        unsafe {
-            windows::Win32::System::Threading::WaitForSingleObject(remote.agent.process.0, 2000);
+        let Remote { pipe, agent, .. } = remote;
+        // EOF cancels the private job even when the close exchange failed.
+        // Its separate control pipe still confirms real resource teardown.
+        drop(pipe);
+        if let Err(error) = agent.finish() {
+            tracing::debug!(%error, "file user job ended without a clean finish reply");
         }
     }
     if let Some(local) = &mut local {
@@ -366,7 +383,11 @@ pub(crate) fn run(name: &str, parent: u32) -> Result<()> {
         pipe.peer_pid(false)? == parent && pipe.peer_session(false)? == session,
         "文件代理父进程不符"
     );
-    let permitted = || process::active_session() == session && pipe.queued_bytes().is_ok();
+    let permitted = || {
+        crate::platform::windows::host_service::user_backend::permitted()
+            && process::active_session() == session
+            && pipe.queued_bytes().is_ok()
+    };
     let mut local: Option<Local> = None;
     while permitted() {
         let request = Request::decode(

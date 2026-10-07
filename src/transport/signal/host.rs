@@ -427,6 +427,14 @@ impl Session {
                 owner.controller(&options.device_id, &client_id);
                 let cancel = tokio_util::sync::CancellationToken::new();
                 let lease = owner.with_cancellation(cancel.clone());
+                let update_resume = (!audio_only && !data_only)
+                    .then(|| {
+                        crate::features::host::update_resume::Context::new(
+                            lease.display_scope(),
+                            &options,
+                        )
+                    })
+                    .flatten();
                 let displays = crate::features::host::displays::Session::new(
                     lease.clone(),
                     &options.device_id,
@@ -439,7 +447,10 @@ impl Session {
                 let network = crate::features::host::network::Policy::from_signal(value);
                 let configuration_client = self.client.clone();
                 let task = tokio::spawn(async move {
+                    let preparation_started = std::time::Instant::now();
                     let result = async {
+                        let mut display_ms = 0;
+                        let mut media_ms = 0;
                         let (screen, config, negotiated, capabilities, deferred) = if audio_only
                             || data_only
                         {
@@ -464,11 +475,33 @@ impl Session {
                             )
                         } else {
                             let screen = displays.prepare(options.clone()).await?;
+                            display_ms = preparation_started.elapsed().as_millis();
+                            let media_started = std::time::Instant::now();
                             let media = lease.prepare_media(screen.clone()).await?;
+                            media_ms = media_started.elapsed().as_millis();
                             anyhow::ensure!(lease.requested(), "本次被控许可已失效");
                             let capabilities = encoding_settings.select(&media.codecs)?;
-                            let prepared =
-                                desktop::Prepared::new(&options, screen, &capabilities, &remote)?;
+                            let restored = if let Some(context) = update_resume.clone() {
+                                let original = options.clone();
+                                match tokio::task::spawn_blocking(move || context.take(&original)).await? {
+                                    Ok(value) => value,
+                                    Err(error) => {
+                                        tracing::warn!(%error, "update media handoff unavailable");
+                                        None
+                                    }
+                                }
+                            } else { None };
+                            let prepared = if let Some(restored) = restored {
+                                match desktop::Prepared::new(&restored, screen.clone(), &capabilities, &remote) {
+                                    Ok(prepared) => prepared,
+                                    Err(error) => {
+                                        tracing::warn!(%error, "update media intent no longer supported by current capabilities");
+                                        desktop::Prepared::new(&options, screen, &capabilities, &remote)?
+                                    }
+                                }
+                            } else {
+                                desktop::Prepared::new(&options, screen, &capabilities, &remote)?
+                            };
                             (
                                 Some(prepared.screen),
                                 prepared.config,
@@ -477,6 +510,7 @@ impl Session {
                                 None,
                             )
                         };
+                        let peer_started = std::time::Instant::now();
                         let mut peer = Peer::new(
                             screen,
                             owner,
@@ -502,8 +536,13 @@ impl Session {
                             options.clipboard_level(),
                             options.file_capabilities(),
                             data_only,
+                            update_resume,
                         )
                         .await?;
+                        tracing::info!(display_ms, media_ms,
+                            peer_ms=peer_started.elapsed().as_millis(),
+                            total_ms=preparation_started.elapsed().as_millis(),
+                            "host connection preparation completed");
                         peer.load_input_configuration(configuration_client);
                         Ok(PreparedPeer { peer, capabilities })
                     }

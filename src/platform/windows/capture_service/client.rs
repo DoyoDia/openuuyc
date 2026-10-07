@@ -29,6 +29,7 @@ pub(crate) struct Client {
 }
 impl Client {
     pub fn connect(selected: &Screen) -> Result<Option<Self>> {
+        let opened_at = Instant::now();
         let Some(pipe) = Pipe::client(NAME)? else {
             return Ok(None);
         };
@@ -38,6 +39,7 @@ impl Client {
             }
             return Err(error);
         }
+        let verified_ms = opened_at.elapsed().as_millis();
         pipe.send(
             &Request::Open {
                 screen: selected.clone(),
@@ -45,7 +47,15 @@ impl Client {
             },
             &|| true,
         )?;
+        // The source adapter is already selected and verified by the session.
+        // Once Open is sent, the service can launch its agent concurrently with
+        // this process's D3D device creation. The reply must still confirm the
+        // exact source and adapter before this device becomes usable.
+        let device_started = Instant::now();
+        let (device, context) = capture::create_device(selected.adapter)?;
+        let device_ms = device_started.elapsed().as_millis();
         let reply: Reply = pipe.receive_timeout(Duration::from_secs(10), &|| true)?;
+        let ready_ms = opened_at.elapsed().as_millis();
         if let Some(error) = reply.error {
             anyhow::bail!(error)
         }
@@ -53,7 +63,8 @@ impl Client {
             reply.screen.identity == selected.identity && reply.screen.adapter == selected.adapter,
             "服务采集源身份不匹配"
         );
-        let (device, context) = capture::create_device(reply.screen.adapter)?;
+        tracing::info!(verified_ms, device_ms, agent_ready_ms=ready_ms,
+            total_ms=opened_at.elapsed().as_millis(), "capture service preparation completed");
         Ok(Some(Self {
             pipe,
             device,

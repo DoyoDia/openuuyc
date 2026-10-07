@@ -3214,7 +3214,7 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
 name = "openuuyc"
-version = "1.0.0-beta.1"
+version = "1.0.0-beta.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3244,6 +3244,7 @@ dependencies = [
  "libloading",
  "object",
  "openuuyc-amf-sys",
+ "openuuyc-bootstrap",
  "openuuyc-codec",
  "openuuyc-nvenc-sys",
  "openuuyc-plugin-api",
@@ -3318,6 +3319,18 @@ dependencies = [
  "to_method",
  "v_frame",
  "zerocopy 0.7.35",
+]
+
+[[package]]
+name = "openuuyc-bootstrap"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dunce",
+ "serde",
+ "serde_json",
+ "sha2",
+ "windows",
 ]
 
 [[package]]

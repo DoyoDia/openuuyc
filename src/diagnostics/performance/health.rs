@@ -73,10 +73,10 @@ pub(crate) enum Level {
 #[derive(Clone, Debug)]
 pub(crate) struct Alert {
     pub metric: Metric,
-    pub level: Level,
     pub value: f64,
     /// A held historical observation; never paint it as a current measurement.
     pub historical: bool,
+    pub expires_at: Instant,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -203,9 +203,9 @@ impl Health {
                 if now.saturating_duration_since(at) < HOLD {
                     result.alerts.push(Alert {
                         metric,
-                        level,
                         value,
                         historical: observation.is_none_or(|o| metric.level(o.value) != level),
+                        expires_at: at + HOLD,
                     });
                 } else {
                     slot.held = None;

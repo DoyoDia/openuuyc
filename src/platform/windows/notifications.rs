@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 mod placement;
 mod registration;
 pub(crate) use placement::Placement;
-pub(crate) use registration::{owns_shortcut, unregister};
+pub(crate) use registration::{owns_shortcut, unregister, retarget_installed};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock, mpsc};
 use windows::Data::Xml::Dom::XmlDocument;

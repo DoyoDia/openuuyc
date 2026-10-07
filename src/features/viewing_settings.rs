@@ -13,19 +13,15 @@ use crate::features::stream_control::{
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum PerformancePanelMode {
-    Hidden,
+    #[serde(alias = "Hidden", alias = "Alerts")]
     Compact,
     Detailed,
-    /// Nothing until a metric turns abnormal, then only that metric.
-    Alerts,
 }
 impl PerformancePanelMode {
     pub(crate) fn next(self) -> Self {
         match self {
             Self::Compact => Self::Detailed,
-            Self::Detailed => Self::Alerts,
-            Self::Alerts => Self::Hidden,
-            Self::Hidden => Self::Compact,
+            Self::Detailed => Self::Compact,
         }
     }
 }
@@ -43,6 +39,11 @@ pub(crate) struct DevicePreferences {
     pub mouse_throttle: bool,
     pub mouse_throttle_rate: crate::features::remote_input::MouseThrottleRate,
     pub performance_mode: PerformancePanelMode,
+    #[serde(skip_serializing_if = "is_true")]
+    pub performance_always_visible: bool,
+}
+fn is_true(value: &bool) -> bool {
+    *value
 }
 impl Default for DevicePreferences {
     fn default() -> Self {
@@ -55,6 +56,7 @@ impl Default for DevicePreferences {
             mouse_throttle: false,
             mouse_throttle_rate: Default::default(),
             performance_mode: PerformancePanelMode::Compact,
+            performance_always_visible: true,
         }
     }
 }
@@ -271,8 +273,17 @@ impl ViewingSettingsStore {
                 Err(Error::NoEntry) => return Ok(DevicePreferences::default()),
                 Err(_) => bail!("无法读取此设备的控制偏好"),
             };
-            let record: DeviceRecord =
+            let saved: serde_json::Value =
                 serde_json::from_slice(&bytes).context("设备偏好格式无效")?;
+            let temporary = matches!(
+                saved["preferences"]["performance_mode"].as_str(),
+                Some("Hidden" | "Alerts")
+            );
+            let mut record: DeviceRecord =
+                serde_json::from_value(saved).context("设备偏好格式无效")?;
+            if temporary {
+                record.preferences.performance_always_visible = false;
+            }
             anyhow::ensure!(record.schema == 1, "设备偏好版本无效");
             record.preferences.validate()
         })

@@ -265,6 +265,20 @@ impl Package {
         }
         Ok(result)
     }
+    /// Automatic application upgrades replace an outdated owned package. A
+    /// current package rejected by this Windows boot is not a package update.
+    pub fn needs_package_update(&self) -> Result<bool> {
+        let (set, nodes) = self.nodes()?;
+        ensure!(nodes.len() <= 1, "存在多个{}设备", self.kind.label());
+        let Some(device) = nodes.first() else {
+            return Ok(false);
+        };
+        let bound = bound_package(&set, device)?;
+        if !self.matches_inf(&inf_directory()?.join(&bound))? {
+            return Ok(false);
+        }
+        Ok(!self.current_package(&bound)?)
+    }
     pub fn status(&self) -> Result<Status> {
         let (set, nodes) = self.nodes()?;
         ensure!(nodes.len() <= 1, "存在多个{}设备", self.kind.label());

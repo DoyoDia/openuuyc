@@ -5,6 +5,7 @@ fn main() {
         "OpenUUYC currently supports Windows only; other platform backends were removed"
     );
     println!("cargo:rerun-if-changed=assets/windows.rc");
+    println!("cargo:rerun-if-changed=assets/windows.manifest");
     println!("cargo:rerun-if-changed=assets/icon.ico");
     embed_resource::compile_for("assets/windows.rc", ["OpenUUYC"], embed_resource::NONE)
         .manifest_required()

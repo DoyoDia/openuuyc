@@ -26,29 +26,20 @@ pub(crate) fn directory() -> Result<PathBuf> {
     Ok(folder(&FOLDERID_ProgramFiles)?.join("OpenUUYC"))
 }
 pub(crate) fn legacy_directory() -> Result<PathBuf> {
-    Ok(folder(&FOLDERID_ProgramFiles)?.join("OpenUUYCInputService"))
+    super::migration::legacy_directory()
 }
 pub(crate) fn active_directory() -> Result<PathBuf> {
-    let current = directory()?;
-    if current.join("owner.txt").exists() || !legacy_directory()?.join("owner.txt").exists() {
-        Ok(current)
-    } else {
-        legacy_directory()
-    }
+    super::migration::active_directory(&directory()?)
 }
 pub(crate) fn image() -> Result<PathBuf> {
     image_in(&active_directory()?)
 }
 pub(crate) fn image_in(directory: &Path) -> Result<PathBuf> {
-    Ok(directory.join(if directory == legacy_directory()? {
-        "OpenUUYCHost.exe"
-    } else {
-        "OpenUUYC.exe"
-    }))
+    super::migration::image_in(directory)
 }
 pub(crate) fn verify_directory(directory: &Path) -> Result<()> {
     ensure!(
-        directory == self::directory()? || directory == legacy_directory()?,
+        super::migration::known_directory(directory)?,
         "安装目录无效"
     );
     reject_reparse(directory.parent().context("安装目录无效")?)?;
@@ -148,7 +139,6 @@ impl Deployment {
     }
     pub(crate) fn commit(mut self) {
         self.committed = true;
-        let _ = cleanup_retired(&self.directory);
     }
 }
 impl Drop for Deployment {
@@ -345,6 +335,8 @@ fn remove_directory(directory: &Path) -> Result<()> {
         "resident.pid",
         "suite.json",
         "sas-policy.json",
+        "migration-v1.json",
+        "migration-v1.partial",
     ] {
         let file = directory.join(name);
         reject_reparse(&file)?;
@@ -356,13 +348,6 @@ fn remove_directory(directory: &Path) -> Result<()> {
     std::fs::remove_file(directory.join("owner.txt"))?;
     if std::fs::read_dir(directory)?.next().is_none() {
         std::fs::remove_dir(directory)?;
-    }
-    Ok(())
-}
-pub(crate) fn cleanup_legacy() -> Result<()> {
-    let legacy = legacy_directory()?;
-    if directory()?.join("owner.txt").is_file() && legacy.join("owner.txt").is_file() {
-        remove_directory(&legacy)?;
     }
     Ok(())
 }

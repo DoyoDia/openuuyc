@@ -166,7 +166,14 @@ pub(super) fn register(aumid: &str) -> Result<()> {
     let file: IPersistFile = link.cast()?;
     if path.exists() {
         unsafe {
-            file.Load(PCWSTR(wide(&path.to_string_lossy()).as_ptr()), STGM_READ)?;
+            // Updating an existing shortcut also writes its property store.
+            // STGM_READ makes SetValue/Commit fail with STG_E_ACCESSDENIED,
+            // even when the user has full filesystem access to the shortcut.
+            file.Load(
+                PCWSTR(wide(&path.to_string_lossy()).as_ptr()),
+                STGM_READWRITE,
+            )
+            .context("以读写方式打开通知快捷方式")?;
         }
         let mut target = [0u16; 32768];
         unsafe {
@@ -202,10 +209,15 @@ pub(super) fn register(aumid: &str) -> Result<()> {
     let activator = unsafe { InitPropVariantFromCLSID(&ACTIVATOR)? };
     std::fs::create_dir_all(path.parent().context("快捷方式目录无效")?)?;
     unsafe {
-        properties.SetValue(&APP_KEY, &app)?;
-        properties.SetValue(&TOAST_KEY, &activator)?;
-        properties.Commit()?;
-        file.Save(PCWSTR(wide(&path.to_string_lossy()).as_ptr()), true)?;
+        properties
+            .SetValue(&APP_KEY, &app)
+            .context("写入通知应用标识")?;
+        properties
+            .SetValue(&TOAST_KEY, &activator)
+            .context("写入通知激活标识")?;
+        properties.Commit().context("提交通知快捷方式属性")?;
+        file.Save(PCWSTR(wide(&path.to_string_lossy()).as_ptr()), true)
+            .context("保存通知快捷方式")?;
     }
     let root = key(SCHEME)?;
     set(root.0, "", "URL:OpenUUYC notification")?;
@@ -233,4 +245,14 @@ pub(crate) fn unregister(image: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+/// Installation already updated owned shortcuts; retarget an existing toast
+/// protocol even when Windows notifications are currently disabled in the UI.
+pub(crate) fn retarget_installed() -> Result<()> {
+    if !owned_registration() {
+        return Ok(());
+    }
+    let image = crate::platform::windows::components::application::image()?;
+    let open = key(&format!(r"{SCHEME}\shell\open\command"))?;
+    set(open.0, "", &command(&image))
 }

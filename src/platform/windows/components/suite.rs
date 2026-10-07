@@ -61,24 +61,34 @@ pub(crate) fn execute(
             super::super::display::install::preflight(Operation::Install)?;
             vault::create(owner)?;
             let mut reboot = host_service::install::install(allow_sas)?;
-            save(&record)?;
-            let input = super::super::input::install::status()?;
-            if !input.ready {
-                reboot |= super::super::input::install::install()?;
+            let configured = (|| -> Result<bool> {
+                save(&record)?;
+                let input = super::super::input::install::status()?;
+                if !input.ready {
+                    reboot |= super::super::input::install::install()?;
+                }
+                let display = super::super::display::install::status()?;
+                if !display.ready {
+                    reboot |= super::super::display::install::install()?;
+                }
+                if super::super::virtual_audio::install::needs_package_update()? {
+                    reboot |= super::super::virtual_audio::install::execute(Operation::Install)?;
+                }
+                super::migration::begin()?;
+                Ok(reboot)
+            })();
+            // The deployed service is already committed. A later component
+            // error must not strand it stopped; the caller can resume its
+            // previous account intent and report the specific component error.
+            let started = host_service::install::start_installed();
+            match (configured, started) {
+                (Ok(reboot), Ok(())) => Ok(reboot),
+                (Err(error), Ok(())) => Err(error),
+                (Ok(_), Err(error)) => Err(error.context("启动已安装被控服务失败")),
+                (Err(error), Err(recovery)) => {
+                    Err(anyhow::anyhow!("{error:#}；恢复被控服务失败：{recovery:#}"))
+                }
             }
-            let display = super::super::display::install::status()?;
-            if !display.ready {
-                reboot |= super::super::display::install::install()?;
-            }
-            let audio = super::super::virtual_audio::install::status()?;
-            if audio.installed && !audio.ready {
-                reboot |= super::super::virtual_audio::install::execute(Operation::Install)?;
-            }
-            host_service::install::start_installed()?;
-            if let Err(error) = super::application::cleanup_legacy() {
-                tracing::warn!(%error, "previous installation remains in use; retained for later cleanup");
-            }
-            Ok(reboot)
         }
         Operation::Uninstall => {
             let record = receipt()?.context("没有本程序的服务安装记录")?;
@@ -171,6 +181,9 @@ pub(crate) fn request(
         super::application::integrate_user()?;
         if resume {
             let _ = host_service::resident::call(host_service::resident::Request::Resume)?;
+        }
+        if let Err(error) = super::migration::finish_user() {
+            tracing::warn!(%error,"installation succeeded; legacy cleanup pending");
         }
     } else {
         host_service::startup::set(false)?;

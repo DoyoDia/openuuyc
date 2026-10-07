@@ -9,19 +9,48 @@ pub(crate) struct UpdateNotice {
     routes: ReportTarget,
     cancel: CancellationToken,
     completed: tokio::sync::Mutex<bool>,
+    resume: Option<crate::features::host::update_resume::Context>,
+    screens: Arc<tokio::sync::Mutex<super::screens::Screens>>,
 }
 impl UpdateNotice {
-    pub(super) fn new(routes: ReportTarget, cancel: CancellationToken) -> Arc<Self> {
+    pub(super) fn new(
+        routes: ReportTarget,
+        cancel: CancellationToken,
+        resume: Option<crate::features::host::update_resume::Context>,
+        screens: Arc<tokio::sync::Mutex<super::screens::Screens>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             routes,
             cancel,
             completed: tokio::sync::Mutex::new(false),
+            resume,
+            screens,
         })
     }
     pub(crate) async fn send(&self) -> Result<()> {
         let mut completed = self.completed.lock().await;
         if *completed {
             return Ok(());
+        }
+        if let Some(resume) = self.resume.clone() {
+            let (config, lease) = {
+                let screens = self.screens.lock().await;
+                (screens.update_media_intent(), screens.authorization())
+            };
+            let saved = tokio::task::spawn_blocking(move || {
+                if !lease.requested() {
+                    return Ok(());
+                }
+                resume.save(config)?;
+                if !lease.requested() {
+                    crate::features::host::update_resume::clear(lease.display_scope())?;
+                }
+                Ok::<_, anyhow::Error>(())
+            })
+            .await;
+            if !matches!(&saved, Ok(Ok(()))) {
+                tracing::warn!(error=?saved, "update media handoff could not be saved");
+            }
         }
         let operation = async {
             ensure!(!self.cancel.is_cancelled(), "被控连接已结束");
@@ -75,12 +104,22 @@ impl UpdateNotice {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         };
-        let delivered = tokio::select! {
+        tokio::pin!(operation);
+        let result = tokio::select! {
             biased;
-            _=self.cancel.cancelled()=>false,
-            result=tokio::time::timeout(Duration::from_secs(3),operation)=>result.context("更新通知发送超时，尚未退出旧版本")??,
+            _=self.cancel.cancelled()=>Ok(false),
+            result=&mut operation=>result,
+            _=tokio::time::sleep(Duration::from_secs(3))=>Err(anyhow::anyhow!("更新通知未在限定时间内确认")),
         };
+        // A timed-out enqueue may have submitted SCTP fragments. Retire this
+        // connection before dropping that future; never resume/retry a partial
+        // reliable message on the same stream. The installer still waits for
+        // actual host/process shutdown before replacing any files.
+        if result.is_err() {
+            self.cancel.cancel();
+        }
         *completed = true;
+        let delivered = result?;
         if delivered {
             tracing::info!("local update start delivered to controller");
         } else {

@@ -6,6 +6,7 @@ use std::thread::JoinHandle;
 use anyhow::{Context, Result};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::SystemInformation::GetTickCount64;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, GetKeyState};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -48,12 +49,71 @@ enum Route {
     Hook(u64),
 }
 
+/// Latest native observation. GUI snapshots/dispatch never rewrite this table.
+/// Scope identifies the acquisition of control, not merely a reusable HWND.
+#[derive(Clone, Copy)]
+struct NativeKey {
+    down: bool,
+    route: Route,
+    scope: u64,
+    time: u32,
+    seen: bool,
+    window_owner: Option<u64>,
+    own: bool,
+}
+impl Default for NativeKey {
+    fn default() -> Self {
+        Self {
+            down: false,
+            route: Route::Local,
+            scope: 0,
+            time: 0,
+            seen: false,
+            window_owner: None,
+            own: false,
+        }
+    }
+}
+struct NativeKeys([NativeKey; 256]);
+impl Default for NativeKeys {
+    fn default() -> Self {
+        Self([NativeKey::default(); 256])
+    }
+}
+impl NativeKeys {
+    fn held(&self) -> [bool; 256] {
+        self.0.map(|key| key.down)
+    }
+    fn older(&self, edge: KeyEdge) -> bool {
+        let key = self.0[usize::from(edge.key)];
+        key.seen && (edge.time.wrapping_sub(key.time) as i32) < 0
+    }
+    fn observe(&mut self, edge: KeyEdge, route: Route, scope: u64) {
+        self.0[usize::from(edge.key)] = NativeKey {
+            down: edge.down,
+            route: if edge.down { route } else { Route::Local },
+            scope,
+            time: edge.time,
+            seen: true,
+            own: edge.own,
+            window_owner: match route {
+                Route::Window(owner) => Some(owner),
+                _ => None,
+            },
+        };
+    }
+}
+
 #[derive(Clone, Copy)]
 struct KeyEdge {
     key: u16,
     scan: u32,
     down: bool,
     injected: bool,
+    time: u32,
+    fresh: bool,
+    coalesced: bool,
+    own: bool,
 }
 
 struct PendingKey {
@@ -61,6 +121,7 @@ struct PendingKey {
     route: Route,
     owner: u64,
     ready: bool,
+    scope: u64,
 }
 
 const MAX_PENDING_KEYS: usize = 512;
@@ -69,18 +130,22 @@ struct Router {
     installed: bool,
     shortcut: Option<(u64, super::windows_presenter::ViewerShortcut)>,
     target: Option<Target>,
-    physical: [bool; 256],
+    // Ordered consumer state, seeded on acquisition; not physical-device truth.
+    dispatch_down: [bool; 256],
     // DOWN inherited from an activation snapshot, not from our event stream.
     sampled: [bool; 256],
+    // An old intercepted ordinary key has no authoritative async state. Keep
+    // it quarantined until UP, without making it a global activation barrier.
+    isolated: [bool; 256],
     blocked: [bool; 256],
     consumed: [bool; 256],
     lock_releases: Vec<(u64, u16, u64)>,
     diagnostic_seen: u64,
     neutral_wait_since: std::time::Instant,
     configuration: u64,
-    observed: [bool; 256],
-    routes: [Route; 256],
-    window_owned: [Option<u64>; 256],
+    native: NativeKeys,
+    scope: u64,
+    scope_started: u32,
     pending: VecDeque<PendingKey>,
     windows: BTreeMap<u64, crate::features::stream_control::StreamControlHandle>,
 }
@@ -91,17 +156,18 @@ impl Default for Router {
             installed: false,
             shortcut: None,
             target: None,
-            physical: [false; 256],
+            dispatch_down: [false; 256],
             sampled: [false; 256],
+            isolated: [false; 256],
             blocked: [false; 256],
             consumed: [false; 256],
             lock_releases: Vec::new(),
             diagnostic_seen: 0,
             neutral_wait_since: std::time::Instant::now(),
             configuration: crate::application::viewer_shortcuts::revision(),
-            observed: [false; 256],
-            routes: [Route::Local; 256],
-            window_owned: [None; 256],
+            native: NativeKeys::default(),
+            scope: 1,
+            scope_started: unsafe { GetTickCount64() } as u32,
             pending: VecDeque::new(),
             windows: BTreeMap::new(),
         }
@@ -124,6 +190,10 @@ fn blocked_modifiers(blocked: &[bool; 256]) -> bool {
     [91, 92, 160, 161, 162, 163, 164, 165]
         .into_iter()
         .any(|key| blocked[key])
+}
+
+fn activation_modifier(key: u16) -> bool {
+    matches!(key, 16..=18 | 91..=92 | 160..=165)
 }
 
 fn windows_state_key(key: u16) -> bool {
@@ -242,15 +312,10 @@ pub(super) fn message(pointer: *const std::ffi::c_void) -> bool {
             r.drain_keys();
             return false;
         }
-        if (crate::platform::windows::input::system::own_message()
-            && r.target
-                .as_ref()
-                .is_none_or(|t| !t.input.accepts_host_input()))
-            || !(8..=254).contains(&msg.wParam.0)
-            || msg.wParam.0 == 231
-        {
+        if !(8..=254).contains(&msg.wParam.0) || msg.wParam.0 == 231 {
             return false;
         }
+        let own = crate::platform::windows::input::system::own_message();
         let flags = msg.lParam.0 as u32;
         let scan = (flags >> 16) & 0xff;
         let virtual_key = if msg.wParam.0 == 229 {
@@ -263,18 +328,33 @@ pub(super) fn message(pointer: *const std::ffi::c_void) -> bool {
         if !(8..=254).contains(&virtual_key) || virtual_key == 231 {
             return false;
         }
-        let key = normalize_key(virtual_key, scan, flags & (1 << 24) != 0);
+        let down = matches!(msg.message, WM_KEYDOWN | WM_SYSKEYDOWN);
+        let mut key = normalize_key(virtual_key, scan, flags & (1 << 24) != 0);
+        if scan == 0 && matches!(virtual_key, 16..=18) {
+            // SendInput without a scan code can leave a generic modifier in
+            // WM_KEY*. Its associated hook edge still identifies the side.
+            let left = 160 + 2 * (virtual_key as u16 - 16);
+            if let Some(pending) = r.pending.iter().find(|p| {
+                p.owner == msg.hwnd.0 as u64
+                    && p.scope == r.scope
+                    && !p.ready
+                    && p.edge.time == msg.time
+                    && p.edge.down == down
+                    && (p.edge.key == left || p.edge.key == left + 1)
+            }) {
+                key = pending.edge.key;
+            }
+        }
         if !keyboard_key(key) {
             return false;
         }
-        let down = matches!(msg.message, WM_KEYDOWN | WM_SYSKEYDOWN);
         let count = if down { (flags & 0xffff).max(1) } else { 1 };
         if count > MAX_PENDING_KEYS as u32 {
             r.stop_ordering();
             return true;
         }
         let mut consumed = false;
-        for _ in 0..count {
+        for repeat in 0..count {
             consumed |= r.window_edge(
                 msg.hwnd.0 as u64,
                 KeyEdge {
@@ -282,6 +362,10 @@ pub(super) fn message(pointer: *const std::ffi::c_void) -> bool {
                     scan,
                     down,
                     injected: false,
+                    time: msg.time,
+                    fresh: down && flags & (1 << 30) == 0 && repeat == 0,
+                    coalesced: count > 1,
+                    own,
                 },
             );
         }
@@ -393,17 +477,25 @@ impl Router {
             ignored += usize::from(sampled && !canonical);
             // An intercepted DOWN may never enter Windows' async state. Its
             // live hook route, not a stale local-consumption obligation, owns it.
-            let hook_held =
-                canonical && self.observed[i] && matches!(self.routes[i], Route::Hook(_));
+            let hook_held = canonical
+                && self.native.0[i].down
+                && matches!(self.native.0[i].route, Route::Hook(_));
             intercepted += usize::from(hook_held);
-            self.physical[i] = canonical && (sampled || hook_held);
+            self.dispatch_down[i] = canonical && (sampled || hook_held);
             self.sampled[i] = canonical && sampled && !hook_held;
-            self.blocked[i] = self.physical[i];
-            self.observed[i] = self.physical[i];
+            self.isolated[i] = hook_held && !sampled && !activation_modifier(i as u16);
+            self.blocked[i] = self.dispatch_down[i];
         }
         for i in [1, 2, 4, 5, 6] {
-            self.physical[i] = down(i as u16);
-            self.sampled[i] = self.physical[i];
+            self.dispatch_down[i] = down(i as u16);
+            self.sampled[i] = self.dispatch_down[i];
+        }
+        let isolated = self.isolated.iter().filter(|held| **held).count();
+        if isolated != 0 {
+            tracing::debug!(
+                isolated_keys = isolated,
+                "inherited hook keys quarantined separately from activation"
+            );
         }
         (ignored, intercepted)
     }
@@ -424,8 +516,7 @@ impl Router {
         for i in 0..256 {
             if self.sampled[i] && !down(i as u16) {
                 self.sampled[i] = false;
-                self.physical[i] = false;
-                self.observed[i] = false;
+                self.dispatch_down[i] = false;
                 self.blocked[i] = false;
                 released += 1;
             }
@@ -448,7 +539,12 @@ impl Router {
         if !target.input.waiting_for_neutral() {
             return false;
         }
-        if !self.physical.iter().any(|down| *down) {
+        if !self
+            .dispatch_down
+            .iter()
+            .zip(self.isolated)
+            .any(|(down, isolated)| *down && !isolated)
+        {
             target.input.confirm_neutral(target.activation);
             if !target.input.waiting_for_neutral() {
                 tracing::info!(
@@ -471,13 +567,12 @@ impl Router {
             control.mouse().reconcile_keyboard_releases();
         }
         self.clear();
-        self.physical = [false; 256];
+        self.dispatch_down = [false; 256];
         self.sampled = [false; 256];
-        self.observed = [false; 256];
+        self.isolated = [false; 256];
+        self.native = NativeKeys::default();
         self.blocked = [false; 256];
         self.consumed = [false; 256];
-        self.routes = [Route::Local; 256];
-        self.window_owned = [None; 256];
         tracing::debug!("local desktop transition revoked remote input");
     }
     // One observation per stage/source/activation. No per-event keys or text.
@@ -492,13 +587,15 @@ impl Router {
         }
     }
     fn clear(&mut self) {
+        self.scope = self.scope.wrapping_add(1);
+        self.scope_started = unsafe { GetTickCount64() } as u32;
         self.shortcut = None;
         self.lock_releases.clear();
         self.pending.clear();
         if let Some(target) = self.target.take() {
             target.input.pause_owner(target.owner);
         }
-        for (blocked, down) in self.blocked.iter_mut().zip(self.physical) {
+        for (blocked, down) in self.blocked.iter_mut().zip(self.dispatch_down) {
             *blocked |= down;
         }
     }
@@ -525,21 +622,36 @@ impl Router {
                 Route::Local => self.target.as_ref().map_or(0, |t| t.owner),
             },
             ready: matches!(route, Route::Hook(_)),
+            scope: self.scope,
         });
     }
 
     fn drain_keys(&mut self) {
+        if self
+            .target
+            .as_ref()
+            .is_some_and(|t| t.activation != t.input.activation_generation())
+        {
+            // Transport/UI reactivation can precede set_target on the next
+            // frame. Queued edges still belong to the previous acquisition.
+            self.clear();
+            return;
+        }
         while self.pending.front().is_some_and(|key| key.ready) {
             let key = self.pending.pop_front().unwrap();
+            if key.scope != self.scope {
+                continue;
+            }
             let edge = key.edge;
             if key.route == Route::Local {
                 crate::plugins::hotkeys::key_event(0, edge.key, edge.down);
                 let i = usize::from(edge.key);
-                self.physical[i] = edge.down;
+                self.dispatch_down[i] = edge.down;
                 self.sampled[i] = false;
                 self.blocked[i] = edge.down;
                 if !edge.down {
                     self.consumed[i] = false;
+                    self.isolated[i] = false;
                 }
                 self.finish_neutral();
             } else {
@@ -549,11 +661,17 @@ impl Router {
     }
 
     fn observe_hook(&mut self, edge: KeyEdge) -> bool {
+        if self.filter_own_input(edge) {
+            return false;
+        }
         let i = usize::from(edge.key);
         self.sampled[i] = false;
-        let was_down = self.observed[i];
-        self.observed[i] = edge.down;
-        if edge.down && !was_down {
+        let previous = self.native.0[i];
+        let continuing = previous.down
+            && (previous.scope == self.scope
+                || matches!(previous.route, Route::Hook(_))
+                || self.dispatch_down[i]);
+        let (route, scope) = if edge.down && !continuing {
             let owner = self
                 .target
                 .as_ref()
@@ -564,10 +682,17 @@ impl Router {
                         && super::windows_mouse::router().keyboard_allowed(t.owner)
                 })
                 .map(|t| t.owner);
-            self.routes[i] = if let Some(owner) = owner {
+            let mut held = self.native.held();
+            for key in [91, 92, 160, 161, 162, 163, 164, 165] {
+                if self.sampled[key] {
+                    held[key] = self.dispatch_down[key];
+                }
+            }
+            held[i] = edge.down;
+            let route = if let Some(owner) = owner {
                 if self.target.as_ref().is_some_and(|t| {
                     t.input.keyboard_supported()
-                        && intercept_key(edge.key, &self.observed, t.intercept_shortcuts)
+                        && intercept_key(edge.key, &held, t.intercept_shortcuts)
                 }) {
                     Route::Hook(owner)
                 } else {
@@ -576,48 +701,39 @@ impl Router {
             } else {
                 Route::Local
             };
-        }
-        let route = self.routes[i];
-        if !edge.down {
-            self.routes[i] = Route::Local;
-        }
-        match route {
-            Route::Local => {
-                // No remote ownership; keep release/quarantine bookkeeping up
-                // to date without synthesizing a remote event.
-                if self
+            (route, self.scope)
+        } else {
+            (previous.route, previous.scope)
+        };
+        self.native.observe(edge, route, scope);
+        let current = scope == self.scope
+            && match route {
+                Route::Local => self
                     .target
                     .as_ref()
-                    .is_some_and(|t| unsafe { GetForegroundWindow() } == HWND(t.owner as _))
-                {
-                    self.push_edge(edge, route);
-                } else if !edge.down {
-                    self.physical[i] = false;
-                    self.blocked[i] = false;
-                    self.consumed[i] = false;
+                    .is_some_and(|t| unsafe { GetForegroundWindow() } == HWND(t.owner as _)),
+                Route::Window(owner) | Route::Hook(owner) => {
+                    self.target.as_ref().is_some_and(|t| t.owner == owner)
                 }
-                false
+            };
+        if current {
+            self.push_edge(edge, route);
+            if let Route::Hook(owner) = route {
+                super::windows_mouse::router().wake_keyboard(owner);
             }
-            Route::Window(owner) | Route::Hook(owner) => {
-                if matches!(route, Route::Window(_)) && edge.down {
-                    self.window_owned[i] = Some(owner);
-                }
-                if self.target.as_ref().is_some_and(|t| t.owner == owner) {
-                    self.push_edge(edge, route);
-                    if matches!(route, Route::Hook(_)) {
-                        super::windows_mouse::router().wake_keyboard(owner);
-                    }
-                } else if !edge.down {
-                    self.physical[i] = false;
-                    self.blocked[i] = false;
-                    self.consumed[i] = false;
-                }
-                matches!(route, Route::Hook(_))
-            }
+        } else if !edge.down {
+            // Observed release retires the old press even if its GUI owner was
+            // revoked. It must never be dispatched into the new acquisition.
+            self.retire_key(i);
+            self.finish_neutral();
         }
+        matches!(route, Route::Hook(_))
     }
 
     fn window_edge(&mut self, owner: u64, edge: KeyEdge) -> bool {
+        if self.filter_own_input(edge) {
+            return false;
+        }
         let i = usize::from(edge.key);
         let position = self.pending.iter().position(|p| {
             p.owner == owner
@@ -625,8 +741,10 @@ impl Router {
                 && !p.ready
                 && p.edge.key == edge.key
                 && p.edge.down == edge.down
+                && (p.edge.time == edge.time || edge.coalesced)
+                && p.scope == self.scope
         });
-        let mut owned = self.window_owned[i] == Some(owner);
+        let mut owned = self.native.0[i].window_owner == Some(owner);
         if let Some(mut position) = position {
             // A missing earlier window event cannot be bypassed by a later
             // intercepted key, except an unclaimed ordinary key: interception
@@ -653,36 +771,111 @@ impl Router {
                 owned = matches!(self.pending[position].route, Route::Window(_));
                 self.drain_keys();
             }
+        } else if self.native.older(edge) || (edge.time.wrapping_sub(self.scope_started) as i32) < 0
+        {
+            // A delayed window message must not overwrite a later hook edge.
+            return owned || matches!(self.native.0[i].route, Route::Hook(id) if id == owner);
         } else if self.target.as_ref().is_some_and(|t| t.owner == owner) {
             // Window input continues to work even if the hook wasn't called.
             // No timer-based duplicate detection or duplicate fallback sends.
-            if self.pending.iter().any(|p| !p.ready) {
+            if self
+                .pending
+                .iter()
+                .any(|p| !p.ready || p.edge.key == edge.key)
+            {
+                // An unmatched window edge cannot be ordered against a queued
+                // hook edge of the same key. Revoke rather than release a newer
+                // press, or replay an old press after its release.
                 self.stop_ordering();
             } else {
                 self.drain_keys();
+                if !edge.down {
+                    owned |= self.release_window_route(owner, edge);
+                }
+                let event_scope = self.scope;
+                if edge.down && edge.fresh {
+                    // WM_KEYDOWN bit 30 proves this is a new press, not an
+                    // inherited repeat. Retire an unbalanced old press first.
+                    if let Some(target) = &self.target {
+                        target.input.key(owner, edge.key, false, None);
+                    }
+                    self.retire_key(i);
+                }
                 owned |= self.event(edge.key, edge.scan, edge.down, edge.injected);
                 if edge.down
                     && self.target.as_ref().is_some_and(|t| {
                         t.input.owner_holds_key(owner, edge.key) || self.consumed[i]
                     })
                 {
-                    self.routes[i] = Route::Window(owner);
-                    self.observed[i] = true;
-                    self.window_owned[i] = Some(owner);
-                } else if !edge.down && self.routes[i] == Route::Window(owner) {
-                    self.routes[i] = Route::Local;
-                    self.observed[i] = false;
+                    self.native.observe(edge, Route::Window(owner), event_scope);
+                } else {
+                    // Observation is independent of permission to forward. A
+                    // rejected native edge still supersedes an older record.
+                    self.native.observe(edge, Route::Local, event_scope);
                 }
             }
+        } else if !edge.down && !self.pending.iter().any(|p| p.edge.key == edge.key) {
+            // UP can arrive after the viewer lost focus or closed its target.
+            // Retire only that window's old route, never another owner's hold.
+            owned |= self.release_window_route(owner, edge);
         }
         if !edge.down {
-            self.window_owned[i] = None;
+            if !self.native.0[i].down && !self.native.older(edge) {
+                self.native.0[i].window_owner = None;
+            }
         }
         owned && !matches!(edge.key, 16..=18 | 20 | 144..=145 | 160..=165)
     }
 
+    fn filter_own_input(&mut self, edge: KeyEdge) -> bool {
+        if !edge.own
+            || self
+                .target
+                .as_ref()
+                .is_some_and(|t| t.input.accepts_host_input())
+        {
+            return false;
+        }
+        let i = usize::from(edge.key);
+        let previous = self.native.0[i];
+        if !edge.down && previous.own && previous.down && !self.native.older(edge) {
+            // Permission can change between an accepted injected DOWN and UP.
+            // Reject new injection, but keep the old release obligation intact.
+            if previous.scope == self.scope {
+                if let Some(target) = &self.target {
+                    target.input.key(target.owner, edge.key, false, None);
+                }
+            }
+            self.native.observe(edge, previous.route, previous.scope);
+            self.retire_key(i);
+            self.finish_neutral();
+        }
+        true
+    }
+
+    fn retire_key(&mut self, i: usize) {
+        self.dispatch_down[i] = false;
+        self.sampled[i] = false;
+        self.isolated[i] = false;
+        self.blocked[i] = false;
+        self.consumed[i] = false;
+    }
+
+    fn release_window_route(&mut self, owner: u64, edge: KeyEdge) -> bool {
+        let i = usize::from(edge.key);
+        let route = self.native.0[i].route;
+        if self.native.older(edge)
+            || !matches!(route, Route::Hook(id) | Route::Window(id) if id == owner || self.native.0[i].scope != self.scope)
+        {
+            return false;
+        }
+        self.native.observe(edge, route, self.native.0[i].scope);
+        self.retire_key(i);
+        matches!(route, Route::Hook(_))
+    }
+
     fn modifiers(&self) -> (bool, bool, bool, bool) {
-        let p = &self.physical;
+        let p = &self.dispatch_down;
         (
             p[17] || p[162] || p[163],
             p[16] || p[160] || p[161],
@@ -699,12 +892,21 @@ impl Router {
             self.diagnostic(1, injected, "not_physical_key");
             return false;
         }
-        let previously_down = self.physical[index];
-        self.physical[index] = down;
+        let previously_down = self.dispatch_down[index];
+        let was_isolated = self.isolated[index];
+        self.dispatch_down[index] = down;
         self.sampled[index] = false;
         let was_consumed = self.consumed[index];
         if !down {
             self.consumed[index] = false;
+            self.isolated[index] = false;
+        }
+        if was_isolated {
+            // Repeats inherited from the previous owner must not execute a
+            // newly bound local shortcut/plugin either. UP only ends quarantine.
+            self.blocked[index] = down;
+            self.finish_neutral();
+            return was_consumed;
         }
         let Some(target) = &mut self.target else {
             if !down {
@@ -728,7 +930,7 @@ impl Router {
             self.configuration = configuration;
             target.input.pause_owner(target.owner);
             target.generation = target.input.keyboard_generation();
-            for (blocked, physical) in self.blocked.iter_mut().zip(self.physical) {
+            for (blocked, physical) in self.blocked.iter_mut().zip(self.dispatch_down) {
                 *blocked |= physical;
             }
             if !previously_down {
@@ -742,7 +944,7 @@ impl Router {
         let generation = target.input.keyboard_generation();
         if generation != target.generation {
             target.generation = generation;
-            for (blocked, physical) in self.blocked.iter_mut().zip(self.physical) {
+            for (blocked, physical) in self.blocked.iter_mut().zip(self.dispatch_down) {
                 *blocked |= physical;
             }
             // This new edge belongs to the resumed owner, not to the old
@@ -767,7 +969,7 @@ impl Router {
                         super::windows_mouse::router().wake_keyboard(t.owner);
                     }
                 }
-                for (blocked, physical) in self.blocked.iter_mut().zip(self.physical) {
+                for (blocked, physical) in self.blocked.iter_mut().zip(self.dispatch_down) {
                     *blocked |= physical;
                 }
                 self.consumed[index] = true;
@@ -864,7 +1066,7 @@ pub(super) fn set_target(owner: u64, input: &RemoteInput, intercept_shortcuts: b
             intercepted_keys,
             held_mouse_buttons = [1, 2, 4, 5, 6]
                 .into_iter()
-                .filter(|i| r.physical[*i])
+                .filter(|i| r.dispatch_down[*i])
                 .count(),
             "keyboard input owner activated"
         );
@@ -886,11 +1088,11 @@ pub(super) fn observe_mouse_buttons(owner: u64, flags: u16) -> bool {
         }
         for (index, key) in [1, 2, 4, 5, 6].into_iter().enumerate() {
             if flags & (1 << (2 * index)) != 0 {
-                r.physical[key] = true;
+                r.dispatch_down[key] = true;
                 r.sampled[key] = false;
             }
             if flags & (2 << (2 * index)) != 0 {
-                r.physical[key] = false;
+                r.dispatch_down[key] = false;
                 r.sampled[key] = false;
             }
         }
@@ -912,15 +1114,6 @@ unsafe extern "system" fn keyboard_proc(code: i32, message: WPARAM, data: LPARAM
         let down = matches!(message.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
         if down || matches!(message.0 as u32, WM_KEYUP | WM_SYSKEYUP) {
             let event = unsafe { &*(data.0 as *const KBDLLHOOKSTRUCT) };
-            if event.dwExtraInfo == crate::platform::windows::input::system::INPUT_MARKER
-                && with_router(|r| {
-                    r.target
-                        .as_ref()
-                        .is_none_or(|t| !t.input.accepts_host_input())
-                })
-            {
-                return unsafe { CallNextHookEx(None, code, message, data) };
-            }
             let vk = u32::from(normalize_key(
                 event.vkCode,
                 event.scanCode,
@@ -941,6 +1134,11 @@ unsafe extern "system" fn keyboard_proc(code: i32, message: WPARAM, data: LPARAM
                         scan,
                         down,
                         injected: event.flags.0 & 0x10 != 0,
+                        time: event.time,
+                        fresh: false,
+                        coalesced: false,
+                        own: event.dwExtraInfo
+                            == crate::platform::windows::input::system::INPUT_MARKER,
                     })
                 })
             {

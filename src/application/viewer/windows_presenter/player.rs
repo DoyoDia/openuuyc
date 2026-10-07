@@ -456,6 +456,10 @@ impl ThreadedWindowsApp {
         let input = self.egui_winit.take_egui_input(window);
         let mut view = crate::application::viewer::stream_menu::LocalViewSettings {
             performance_mode: self.performance_mode,
+            performance_always_visible: self
+                .stream_control
+                .device_preferences()
+                .performance_always_visible,
             intercept_shortcuts: self.intercept_shortcuts,
             send_ctrl_alt_del: false,
         };
@@ -566,6 +570,8 @@ impl ThreadedWindowsApp {
                 &self.performance,
                 &self.stream_control.audio(),
                 view.performance_mode,
+                view.performance_always_visible,
+                annotation_rect.unwrap_or_else(|| ui.available_rect_before_wrap()),
                 "performance-grid-d3d11",
             );
             if let Some(upgrade) = self.stream_control.remote_upgrade() {
@@ -588,6 +594,8 @@ impl ThreadedWindowsApp {
                 .set_performance_mode(view.performance_mode);
             self.performance_mode = view.performance_mode;
         }
+        self.stream_control
+            .set_performance_always_visible(view.performance_always_visible);
         if self.intercept_shortcuts != view.intercept_shortcuts {
             self.mouse.release(window);
             self.intercept_shortcuts = view.intercept_shortcuts;
@@ -638,7 +646,7 @@ impl ThreadedWindowsApp {
                 layout_elapsed,
                 started.elapsed().saturating_sub(layout_elapsed),
                 immediate,
-                presented,
+                presented.presented(),
             );
         }
         if let Some(size) = self.window_resize.requested_render_size.take() {

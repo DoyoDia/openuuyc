@@ -57,7 +57,8 @@ pub(super) struct Journal {
 }
 
 pub(super) fn root() -> Result<PathBuf> {
-    if crate::platform::windows::host_service::vault::applies()? {
+    if crate::platform::windows::host_service::resident::is_owner()
+        || crate::platform::windows::host_service::vault::applies()? {
         return Ok(crate::platform::windows::host_service::vault::root()?.join("displays"));
     }
     portable_root()

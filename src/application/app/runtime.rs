@@ -514,12 +514,9 @@ pub(super) async fn gui_worker_loop(
                 GuiCommand::PrepareExit => {
                     let update_exit = super::instance::take_update_exit();
                     let result = if crate::platform::windows::host_service::resident::managed() {
-                        crate::platform::windows::host_service::resident::request(
-                            crate::platform::windows::host_service::resident::Request::Pause,
-                        )
-                        .await
-                        .map(|_| ())
-                        .map_err(|e| format!("{e:#}"))
+                        crate::platform::windows::host_service::resident::pause_for_exit()
+                            .await
+                            .map_err(|e| format!("{e:#}"))
                     } else if update_exit && let Some(current) = &client {
                         current
                             .host

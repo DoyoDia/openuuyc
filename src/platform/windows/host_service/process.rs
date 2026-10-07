@@ -134,26 +134,17 @@ pub(crate) struct Agent {
     stop: Option<Handle>,
 }
 impl Agent {
+    pub fn start_user(session: u32) -> Result<Self> {
+        Self::start_role(session, "", "user-background")
+    }
     pub fn start(session: u32, pipe: &str) -> Result<Self> {
         Self::start_role(session, pipe, "input-agent")
     }
     pub fn start_capture(session: u32, pipe: &str) -> Result<Self> {
         Self::start_role(session, pipe, "capture-agent")
     }
-    pub fn start_clipboard(session: u32, pipe: &str) -> Result<Self> {
-        Self::start_role(session, pipe, "clipboard-agent")
-    }
-    pub fn start_annotation(session: u32, pipe: &str) -> Result<Self> {
-        Self::start_role(session, pipe, "annotation-agent")
-    }
-    pub fn start_files(session: u32, pipe: &str) -> Result<Self> {
-        Self::start_role(session, pipe, "file-agent")
-    }
     pub fn start_resident(session: u32) -> Result<Self> {
         Self::start_role(session, "", "host-resident")
-    }
-    pub fn start_display(session: u32) -> Result<Self> {
-        Self::start_role(session, "", "display-agent")
     }
     pub fn stop_gracefully(self) {
         if let Some(stop) = &self.stop {
@@ -168,7 +159,7 @@ impl Agent {
         privilege(w!("SeTcbPrivilege"))?;
         privilege(w!("SeAssignPrimaryTokenPrivilege"))?;
         privilege(w!("SeIncreaseQuotaPrivilege"))?;
-        let primary = if matches!(role, "clipboard-agent" | "file-agent" | "annotation-agent") {
+        let primary = if role == "user-background" {
             let mut token = HANDLE::default();
             unsafe {
                 WTSQueryUserToken(session, &mut token)?;
@@ -208,7 +199,11 @@ impl Agent {
         };
         let job = Handle(unsafe { CreateJobObjectW(None, None)? });
         let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        limits.BasicLimitInformation.LimitFlags = if role == "user-background" {
+            JOB_OBJECT_LIMIT(0)
+        } else {
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        };
         unsafe {
             SetInformationJobObject(
                 job.0,
@@ -245,10 +240,14 @@ impl Agent {
         } else {
             format!(" --pipe \"{pipe}\"")
         };
-        let mut command: Vec<u16> = format!(
-            "\"{exe}\" {role}{arguments} --parent {}",
-            std::process::id()
-        )
+        let mut command: Vec<u16> = if role == "user-background" {
+            format!("\"{exe}\" gui --background")
+        } else {
+            format!(
+                "\"{exe}\" {role}{arguments} --parent {}",
+                std::process::id()
+            )
+        }
         .encode_utf16()
         .chain(Some(0))
         .collect();
@@ -271,7 +270,7 @@ impl Agent {
             }
         }
         let mut environment = Environment(std::ptr::null_mut());
-        if matches!(role, "clipboard-agent" | "file-agent" | "annotation-agent") {
+        if role == "user-background" {
             unsafe {
                 windows::Win32::System::Environment::CreateEnvironmentBlock(
                     &mut environment.0,

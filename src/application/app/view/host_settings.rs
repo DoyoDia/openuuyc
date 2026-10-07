@@ -56,6 +56,95 @@ impl DeviceCenterApp {
         });
         self.wol_setup_dialog(ui.ctx());
     }
+    fn host_access_settings(&mut self, ui: &mut egui::Ui, host: &crate::features::host::Handle) {
+        let guest = host.is_guest();
+        let mut files = host.file_transfer_allowed();
+        let mut ports = host.port_mapping_allowed();
+        let mut power = host.power_allowed();
+        let mut wol = host.wol_allowed();
+        let mut clipboard = host.clipboard_settings();
+        let before = (files, ports, power, wol, clipboard);
+        let enabled = usize::from(clipboard.enabled)
+            + usize::from(clipboard.enabled && clipboard.files)
+            + if guest {
+                0
+            } else {
+                [files, ports, power, wol]
+                    .into_iter()
+                    .filter(|v| *v)
+                    .count()
+            };
+        let total = if guest { 2 } else { 6 };
+        let id = egui::Id::new(("host-access-settings", self.login_generation));
+        let mut open = ui.data(|data| data.get_temp::<bool>(id).unwrap_or(false));
+        form_row(
+            ui,
+            "访问权限",
+            &format!("已开启 {enabled} / {total} 项"),
+            |ui| {
+                if ui
+                    .add(crate::ui::controls::secondary(if open {
+                        "收起"
+                    } else {
+                        "展开"
+                    }))
+                    .clicked()
+                {
+                    open = !open;
+                }
+            },
+        );
+        ui.data_mut(|data| data.insert_temp(id, open));
+        if open {
+            crate::ui::controls::section_frame()
+                .inner_margin(theme::DIALOG_MARGIN)
+                .show(ui, |ui| {
+                    ui.columns(if guest { 1 } else { 2 }, |columns| {
+                        let ui = &mut columns[0];
+                        ui.label(RichText::new("文件与剪贴板").strong());
+                        if !guest {
+                            ui.checkbox(&mut files, "文件浏览与传输");
+                        }
+                        ui.checkbox(&mut clipboard.enabled, "剪贴板同步");
+                        ui.add_enabled_ui(clipboard.enabled, |ui| {
+                            ui.checkbox(&mut clipboard.files, "文件复制粘贴");
+                        });
+                        if !guest {
+                            let ui = &mut columns[1];
+                            ui.label(RichText::new("系统与网络").strong());
+                            ui.checkbox(&mut power, "关机和重启");
+                            ui.checkbox(&mut ports, "端口转发");
+                            ui.checkbox(&mut wol, "局域网唤醒协助");
+                        }
+                    });
+                });
+            ui.add_space(theme::MENU_GROUP_GAP);
+        }
+        let results = [
+            (files != before.0).then(|| host.set_file_transfer_allowed(files)),
+            (ports != before.1).then(|| host.set_port_mapping_allowed(ports)),
+            (power != before.2).then(|| host.set_power_allowed(power)),
+            (wol != before.3).then(|| host.set_wol_allowed(wol)),
+            (clipboard != before.4).then(|| host.set_clipboard_settings(clipboard)),
+        ];
+        let mut changed = false;
+        for result in results.into_iter().flatten() {
+            match result {
+                Ok(()) => changed = true,
+                Err(error) => self.status = StatusMessage::error(error.to_string()),
+            }
+        }
+        if changed {
+            self.save_host_settings();
+        }
+        let status = host.status();
+        if let Some(error) = status.clipboard.error {
+            ui.colored_label(RED, error);
+        }
+        if let Some(message) = status.power_message {
+            ui.label(RichText::new(message).small().color(MUTED));
+        }
+    }
     fn host_settings_controls(&mut self, ui: &mut egui::Ui) {
         section(ui, "被控设置");
         let host = self.host.clone();
@@ -90,89 +179,11 @@ impl DeviceCenterApp {
             {
                 host.audio_devices_failed();
             }
+            self.host_access_settings(ui, host);
             if !host.is_guest() {
                 self.wol_setup_entry(ui);
-                let mut wol = host.wol_allowed();
-                form_row(
-                    ui,
-                    "允许局域网唤醒协助",
-                    "本机在线时帮助唤醒同网设备；与允许本机被唤醒分别设置",
-                    |ui| {
-                        if crate::ui::controls::service_switch(ui, &mut wol).changed() {
-                            let _ = host.set_wol_allowed(wol);
-                            self.save_host_settings();
-                        }
-                    },
-                );
-                let mut power = host.power_allowed();
-                form_row(
-                    ui,
-                    "允许远程关机和重启",
-                    "允许账号设备管理中的电源操作；未保存程序可能阻止关闭",
-                    |ui| {
-                        if crate::ui::controls::service_switch(ui, &mut power).changed() {
-                            let _ = host.set_power_allowed(power);
-                            self.save_host_settings();
-                        }
-                    },
-                );
-                if let Some(message) = host.status().power_message {
-                    ui.label(egui::RichText::new(message).small().color(theme::MUTED));
-                }
-                let mut ports = host.port_mapping_allowed();
-                form_row(
-                    ui,
-                    "允许端口转发",
-                    "允许已授权的自有设备访问本机及本机可达的网络服务",
-                    |ui| {
-                        if crate::ui::controls::service_switch(ui, &mut ports).changed() {
-                            let _ = host.set_port_mapping_allowed(ports);
-                            self.save_host_settings();
-                        }
-                    },
-                );
-                let mut files = host.file_transfer_allowed();
-                form_row(
-                    ui,
-                    "允许文件传输",
-                    "允许已授权的自有设备浏览及传输本机文件",
-                    |ui| {
-                        if crate::ui::controls::service_switch(ui, &mut files).changed() {
-                            let _ = host.set_file_transfer_allowed(files);
-                            self.save_host_settings();
-                        }
-                    },
-                );
             }
-            let mut clipboard = host.clipboard_settings();
-            let before = clipboard;
-            form_row(
-                ui,
-                "允许剪贴板同步",
-                "与已连接的主控双向复制文字、富文本和图片",
-                |ui| {
-                    crate::ui::controls::service_switch(ui, &mut clipboard.enabled);
-                },
-            );
-            form_row(
-                ui,
-                "允许文件复制",
-                "通过复制粘贴传输文件和文件夹",
-                |ui| {
-                    ui.add_enabled_ui(clipboard.enabled, |ui| {
-                        crate::ui::controls::service_switch(ui, &mut clipboard.files);
-                    });
-                },
-            );
-            if before != clipboard {
-                match host.set_clipboard_settings(clipboard) {
-                    Ok(()) => self.save_host_settings(),
-                    Err(e) => self.status = StatusMessage::error(e.to_string()),
-                }
-            }
-            if let Some(error) = host.status().clipboard.error {
-                ui.colored_label(RED, error);
-            }
+            section(ui, "画面与声音");
             let inventory = host.audio_devices();
             let mut quality = host.audio_quality();
             let mut quality_changed = false;

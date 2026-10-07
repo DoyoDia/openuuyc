@@ -76,8 +76,9 @@ pub(crate) fn probe(
             ));
         }
     }
-    let mut cached = None::<super::capture::Frame>;
-    let mut cached_hdr = None;
+    // Capability verification needs an input sample, not a new desktop present
+    // for every candidate. Keep one owned converted sample per input format.
+    let mut samples = [None::<super::capture::Frame>, None];
     let mut result = Vec::new();
     let mut last_failure = None;
     let mut acquired_frame = false;
@@ -86,23 +87,17 @@ pub(crate) fn probe(
             anyhow::bail!("被控准备已取消");
         }
         let probe = (|| -> Result<Capability> {
-            if cached_hdr != Some(format.hdr()) {
-                cached = None;
-            }
-            for _ in 0..20 {
+            let cached = &mut samples[usize::from(format.hdr())];
+            for _ in 0..if cached.is_none() { 20 } else { 0 } {
                 if !is_active() {
                     anyhow::bail!("被控准备已取消");
                 }
                 if let Some(frame) = desktop.next(50, 1, false, format.hdr(), (1280, 720))? {
                     acquired_frame = true;
-                    cached = Some(frame);
-                    break;
-                }
-                if cached.is_some() {
+                    *cached = Some(frame);
                     break;
                 }
             }
-            cached_hdr = Some(format.hdr());
             let frame = cached.as_ref().context("尚未取得所选桌面画面")?;
             let rate = Rate {
                 target: 2_000_000,
@@ -114,9 +109,10 @@ pub(crate) fn probe(
                     fps: 30,
                 },
             };
-            let mut transfer = if device != desktop.device {
+            let sample_device: ID3D11Device = unsafe { frame.texture.GetDevice()? };
+            let mut transfer = if device != sample_device {
                 Some(super::transfer::Transfer::new(
-                    &desktop.device,
+                    &sample_device,
                     &device,
                     frame,
                 )?)

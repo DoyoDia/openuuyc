@@ -11,6 +11,26 @@ use winit::dpi::PhysicalSize;
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::Window;
 
+mod content;
+mod readiness;
+mod visibility;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UiFrame {
+    Presented,
+    Unchanged,
+    Pending,
+    Deferred,
+}
+impl UiFrame {
+    pub fn ready(self) -> bool {
+        matches!(self, Self::Presented | Self::Unchanged)
+    }
+    pub fn presented(self) -> bool {
+        self == Self::Presented
+    }
+}
+
 pub(crate) struct UiPresenter {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
@@ -19,6 +39,9 @@ pub(crate) struct UiPresenter {
     backbuffer: Option<ID3D11Texture2D>,
     renderer: egui_directx11::Renderer,
     size: PhysicalSize<u32>,
+    requested_size: PhysicalSize<u32>,
+    window: HWND,
+    deferred: bool,
     // Keep the entire composition tree alive until its swap chain is released.
     composition: IDCompositionDevice,
     composition_target: IDCompositionTarget,
@@ -26,6 +49,8 @@ pub(crate) struct UiPresenter {
     pending_output: Option<egui_directx11::RendererOutput>,
     pending_present: bool,
     attached: bool,
+    content: Option<content::Content>,
+    readiness: readiness::Readiness,
 }
 
 impl UiPresenter {
@@ -51,11 +76,13 @@ impl UiPresenter {
             Scaling: DXGI_SCALING_STRETCH,
             SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
             AlphaMode: DXGI_ALPHA_MODE_PREMULTIPLIED,
+            Flags: DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0 as u32,
             ..Default::default()
         };
         let swap_chain =
             unsafe { factory.CreateSwapChainForComposition(&device, &desc, None::<&IDXGIOutput>) }
                 .context("create independent UI composition swap chain")?;
+        let readiness = readiness::Readiness::new(&swap_chain)?;
         let composition: IDCompositionDevice = unsafe { DCompositionCreateDevice(&dxgi) }?;
         let composition_target =
             unsafe { composition.CreateTargetForHwnd(window_hwnd(window)?, true) }?;
@@ -73,19 +100,29 @@ impl UiPresenter {
             backbuffer: Some(backbuffer),
             renderer,
             size,
+            requested_size: size,
+            window: window_hwnd(window)?,
+            deferred: false,
             composition,
             composition_target,
             visual,
             pending_output: None,
             pending_present: false,
             attached: false,
+            content: None,
+            readiness,
         })
     }
 
     pub(crate) fn resize(&mut self, size: PhysicalSize<u32>) -> Result<()> {
-        if size.width == 0 || size.height == 0 || size == self.size {
-            return Ok(());
+        if size.width > 0 && size.height > 0 {
+            self.requested_size = size;
         }
+        Ok(())
+    }
+
+    fn resize_ready(&mut self) -> Result<()> {
+        let size = self.requested_size;
         unsafe {
             self.context.ClearState();
             self.context.Flush();
@@ -93,13 +130,14 @@ impl UiPresenter {
         self.target.take();
         self.backbuffer.take();
         self.pending_present = false;
+        self.content = None;
         unsafe {
             self.swap_chain.ResizeBuffers(
                 2,
                 size.width,
                 size.height,
                 DXGI_FORMAT_B8G8R8A8_UNORM,
-                DXGI_SWAP_CHAIN_FLAG(0),
+                DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT,
             )
         }
         .context("resize UI composition swap chain")?;
@@ -115,13 +153,53 @@ impl UiPresenter {
         context: &egui::Context,
         output: egui_directx11::RendererOutput,
         transparent: bool,
-    ) -> Result<bool> {
+    ) -> Result<UiFrame> {
         self.defer_output(output);
-        if self.pending_present && !self.try_present()? {
-            context.request_repaint();
-            return Ok(false);
+        let deferred = self.attached && !visibility::drawable(self.window);
+        if deferred != self.deferred {
+            self.deferred = deferred;
+            tracing::debug!(deferred, "UI presentation visibility changed");
+        }
+        if deferred {
+            return Ok(UiFrame::Deferred);
+        }
+        let resized = self.requested_size != self.size;
+        if resized {
+            // A frame not yet submitted at the old size is obsolete. Keep the
+            // acquired readiness permit and every pending texture delta.
+            self.pending_present = false;
+        }
+        let mut presented = false;
+        if self.pending_present {
+            if !self.try_present()? {
+                context.request_repaint_after(Duration::from_millis(8));
+                return Ok(UiFrame::Pending);
+            }
+            presented = true;
+        }
+        let output = self.pending_output.as_ref().expect("queued UI output");
+        if !resized
+            && self
+                .content
+                .as_ref()
+                .is_some_and(|last| last.matches(output, context.zoom_factor(), transparent))
+        {
+            self.pending_output = None;
+            return Ok(if presented {
+                UiFrame::Presented
+            } else {
+                UiFrame::Unchanged
+            });
+        }
+        if !self.readiness.ready()? {
+            context.request_repaint_after(Duration::from_millis(8));
+            return Ok(UiFrame::Pending);
+        }
+        if resized {
+            self.resize_ready()?;
         }
         let output = self.pending_output.take().expect("queued UI output");
+        let content = content::Content::new(&output, context.zoom_factor(), transparent);
         let target = self
             .target
             .as_ref()
@@ -134,12 +212,17 @@ impl UiPresenter {
         self.renderer
             .render(&self.context, target, context, output)
             .context("draw UI layer")?;
+        self.content = Some(content);
         self.pending_present = true;
         let presented = self.try_present()?;
         if !presented {
-            context.request_repaint();
+            context.request_repaint_after(Duration::from_millis(8));
         }
-        Ok(presented)
+        Ok(if presented {
+            UiFrame::Presented
+        } else {
+            UiFrame::Pending
+        })
     }
 
     pub(crate) fn defer_output(&mut self, output: egui_directx11::RendererOutput) {
@@ -147,9 +230,7 @@ impl UiPresenter {
         // but all required texture/font changes. This is UI output, not a
         // video-frame queue. Keep processing input while DXGI is occupied.
         if let Some(pending) = &mut self.pending_output {
-            pending.textures_delta.append(output.textures_delta);
-            pending.shapes = output.shapes;
-            pending.pixels_per_point = output.pixels_per_point;
+            content::merge(pending, output);
         } else {
             self.pending_output = Some(output);
         }
@@ -182,6 +263,7 @@ impl UiPresenter {
             self.attached = true;
         }
         self.pending_present = false;
+        self.readiness.presented();
         Ok(true)
     }
 }

@@ -17,6 +17,9 @@ const PACKAGE: Package = Package {
 pub(crate) fn status() -> Result<Status> {
     PACKAGE.status()
 }
+pub(crate) fn needs_package_update() -> Result<bool> {
+    PACKAGE.needs_package_update()
+}
 fn idle() -> Result<()> {
     if status()?.installed {
         // If another process owns the bridge, open fails and the mutation is

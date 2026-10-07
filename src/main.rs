@@ -23,6 +23,8 @@ use openuuyc::session::controller;
     about = "OpenUUYC — 第三方 UU 远程协议兼容客户端"
 )]
 struct Cli {
+    #[arg(long, hide = true)]
+    bootstrap_version: bool,
     /// 日志过滤器，例如 info、debug、trace 或 openuuyc=trace
     #[arg(long, global = true)]
     log_level: Option<String>,
@@ -66,33 +68,7 @@ enum Commands {
         parent: u32,
     },
     #[command(hide = true)]
-    DisplayAgent {
-        #[arg(long)]
-        parent: u32,
-    },
-    #[command(hide = true)]
     InputAgent {
-        #[arg(long)]
-        pipe: String,
-        #[arg(long)]
-        parent: u32,
-    },
-    #[command(hide = true)]
-    ClipboardAgent {
-        #[arg(long)]
-        pipe: String,
-        #[arg(long)]
-        parent: u32,
-    },
-    #[command(hide = true)]
-    AnnotationAgent {
-        #[arg(long)]
-        pipe: String,
-        #[arg(long)]
-        parent: u32,
-    },
-    #[command(hide = true)]
-    FileAgent {
         #[arg(long)]
         pipe: String,
         #[arg(long)]
@@ -176,6 +152,7 @@ enum Commands {
 }
 
 fn main() -> Result<()> {
+    openuuyc::application::bootstrap::initialize()?;
     let parsed = Cli::try_parse();
 
     if !parsed.as_ref().is_ok_and(|cli| {
@@ -189,18 +166,15 @@ fn main() -> Result<()> {
                     | Commands::Component { .. }
                     | Commands::Service
                     | Commands::HostResident { .. }
-                    | Commands::DisplayAgent { .. }
                     | Commands::InputAgent { .. }
                     | Commands::CaptureAgent { .. }
-                    | Commands::ClipboardAgent { .. }
-                    | Commands::FileAgent { .. }
-                    | Commands::AnnotationAgent { .. }
             )
         )
     }) {
         attach_parent_console();
     }
     let cli = parsed.unwrap_or_else(|error| error.exit());
+    if cli.bootstrap_version {println!("1");return Ok(())}
     let command = cli.command.unwrap_or(Commands::Gui {
         background: false,
         fps: media::FrameRateChoice::Auto,
@@ -213,12 +187,15 @@ fn main() -> Result<()> {
         return app::notification_activation(uri);
     }
     if matches!(command, Commands::Gui { .. }) && openuuyc::application::route_installed_gui()? {
+        openuuyc::application::bootstrap::handoff();
         return Ok(());
     }
     let _instance = if matches!(command, Commands::Gui { .. }) {
-        match app::instance::acquire()? {
+        match if matches!(command, Commands::Gui { background:true, .. }) {
+            app::instance::acquire_background()?
+        } else { app::instance::acquire()? } {
             Some(instance) => Some(instance),
-            None => return Ok(()),
+            None => {openuuyc::application::bootstrap::handoff();return Ok(())},
         }
     } else {
         None
@@ -299,15 +276,7 @@ fn main() -> Result<()> {
         Commands::Uninstall { parent } => openuuyc::application::uninstall_application(parent),
         Commands::Component { .. } => unreachable!(),
         Commands::Service => openuuyc::application::host_service(),
-        Commands::ClipboardAgent { pipe, parent } => {
-            openuuyc::application::clipboard_agent(&pipe, parent)
-        }
-        Commands::AnnotationAgent { pipe, parent } => {
-            openuuyc::application::annotation_agent(&pipe, parent)
-        }
-        Commands::FileAgent { pipe, parent } => openuuyc::application::file_agent(&pipe, parent),
         Commands::HostResident { parent } => openuuyc::application::host_resident(parent),
-        Commands::DisplayAgent { parent } => openuuyc::application::display_agent(parent),
         Commands::InputAgent { pipe, parent } => openuuyc::application::input_agent(&pipe, parent),
         Commands::CaptureAgent { pipe, parent } => {
             openuuyc::application::capture_agent(&pipe, parent)

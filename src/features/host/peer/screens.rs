@@ -56,6 +56,7 @@ pub(crate) struct ScreenInfo {
     pub resolution_type: i32,
 }
 pub(super) struct Reports {
+    pub media_ready: Arc<AtomicBool>,
     pub capabilities: Mutex<Option<Vec<crate::features::host::format::Capability>>>,
     pub catalog: Mutex<Vec<ScreenInfo>>,
     pub current: AtomicI32,
@@ -115,6 +116,9 @@ pub(crate) struct Deferred {
     pub encoding: crate::features::host::EncodingSettings,
 }
 impl Screens {
+    pub(super) fn update_media_intent(&self) -> VideoConfig {
+        self.base
+    }
     pub(crate) async fn resume_capture(&mut self) -> Result<()> {
         if let Some(id) = self.prepare_video().await? {
             return self.start(id).await;
@@ -237,6 +241,7 @@ impl Screens {
         deferred: Option<Deferred>,
     ) -> Result<Self> {
         let reports = Arc::new(Reports {
+            media_ready: Arc::new(AtomicBool::new(false)),
             capabilities: Mutex::new(None),
             catalog: Mutex::default(),
             current: AtomicI32::new(selected.as_ref().map_or(-1, |s| s.id)),
@@ -465,7 +470,10 @@ impl Screens {
         self.source_generation = self.source_generation.wrapping_add(1);
         let (tx, mut rx) = watch::channel(Published {
             screen: screen.clone(),
-            capturing: false,
+            // The slot already owns this source. Native preparation is not a
+            // stopped stream: publishing track=-1/CaptureChange=99 here races
+            // the controller's initial setting restoration.
+            capturing: true,
             visible: false,
             quality: 0,
             fps: config.fps,
@@ -487,6 +495,7 @@ impl Screens {
             lease.clone(),
             cancel.clone(),
             self.connected.clone(),
+            self.reports.media_ready.clone(),
             slot.config.clone(),
             slot.negotiated.clone(),
             slot.transport.clone(),

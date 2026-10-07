@@ -297,6 +297,22 @@ pub(crate) async fn receive_session(
                 }
                 Some(PbRpcRequestPayload::CaptureSetting(mut setting)) => {
                     tracing::info!(?setting, "host capture setting received");
+                    if session.authorization().updating() {
+                        // PrepareUpdate snapshots under this same screen owner
+                        // lock. Do not acknowledge newer settings that cannot
+                        // survive the already-started update transaction.
+                        return Ok(response(
+                            &message,
+                            header,
+                            PbRpcResponsePayload::CaptureSetting(PbCaptureSettingResponse {
+                                errors: vec![PbError {
+                                    error_code: -2,
+                                    error_message: "正在更新，暂时无法修改画面设置".into(),
+                                    ..Default::default()
+                                }],
+                            }),
+                        ));
+                    }
                     session.refresh()?;
                     // S456070 -> S456550: a single desktop track accepts -1
                     // for its current source. Android uses this for ordinary

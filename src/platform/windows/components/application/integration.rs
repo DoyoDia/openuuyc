@@ -108,8 +108,7 @@ pub(super) fn shortcuts(enabled: bool) -> Result<()> {
                 .context("快捷方式目标无效")?;
             let target = PathBuf::from(String::from_utf16_lossy(&target[..end]));
             ensure!(
-                target == directory()?.join("OpenUUYC.exe")
-                    || target == legacy_directory()?.join("OpenUUYCHost.exe")
+                super::super::migration::installed_target(&target)?
                     || crate::platform::windows::notifications::owns_shortcut(&link, &target),
                 "已有同名快捷方式指向其他程序，已保留"
             );

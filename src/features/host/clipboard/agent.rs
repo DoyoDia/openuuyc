@@ -88,7 +88,9 @@ impl Backend {
         let (outgoing, output) = tokio::sync::mpsc::channel(32);
         let settings = policy.clone();
         let reported = status.clone();
+        let activity = crate::platform::windows::host_service::activity::Work::new();
         let worker = tokio::task::spawn_blocking(move || {
+            let _activity = activity;
             let result = worker(
                 platform,
                 settings,
@@ -417,33 +419,42 @@ fn worker(
         Ok(())
     })();
     if let Some(remote) = remote {
-        let _ = super::frame::send(
-            &remote.pipe,
-            Request {
-                policy: Policy::default(),
-                platform,
-                packet: None,
-                close: true,
-            },
-            || true,
-        );
-        // Wait for OLE cancellation/retention before closing the job.
-        unsafe {
-            windows::Win32::System::Threading::WaitForSingleObject(remote.agent.process.0, 2000);
+        if result.is_ok() {
+            let _ = super::frame::send(
+                &remote.pipe,
+                Request {
+                    policy: Policy::default(),
+                    platform,
+                    packet: None,
+                    close: true,
+                },
+                || true,
+            );
         }
+        // An incomplete frame cannot be reused for a close request. Close the
+        // data endpoint before waiting for the independent job-finished reply.
+        let Remote { pipe, agent } = remote;
+        drop(pipe);
+        // Wait for OLE cancellation/retention before closing the job.
+        let _ = agent.finish();
     }
     if stop.is_cancelled() { Ok(()) } else { result }
 }
 
 struct Remote {
     pipe: Pipe,
-    agent: process::Agent,
+    agent: crate::platform::windows::host_service::user_backend::Lease,
 }
 impl Remote {
     fn new(stop: &CancellationToken) -> Result<Self> {
         let name = format!("{PREFIX}{}", uuid::Uuid::new_v4().simple());
         let pipe = Pipe::server(&name, true)?;
-        let agent = process::Agent::start_clipboard(process::active_session(), &name)?;
+        let agent = crate::platform::windows::host_service::user_backend::Lease::connect(
+            crate::platform::windows::host_service::user_backend::Role::Clipboard,
+            &name,
+            process::active_session(),
+            || !stop.is_cancelled(),
+        )?;
         let until = std::time::Instant::now() + Duration::from_secs(10);
         pipe.accept(|| !stop.is_cancelled() && agent.alive() && std::time::Instant::now() < until)?;
         ensure!(
@@ -479,7 +490,11 @@ pub(crate) fn run(name: &str, parent: u32) -> Result<()> {
     // the authenticated pipe peer identity without granting process/token access.
     // The privileged parent independently accepts only its own newly spawned PID.
     ensure!(pipe.peer_session(false)? == session, "剪贴板用户会话不匹配");
-    let permitted = || process::active_session() == session && pipe.queued_bytes().is_ok();
+    let permitted = || {
+        crate::platform::windows::host_service::user_backend::permitted()
+            && process::active_session() == session
+            && pipe.queued_bytes().is_ok()
+    };
     let mut local = None;
     let result = (|| -> Result<()> {
         while permitted() {
@@ -508,7 +523,9 @@ pub(crate) fn run(name: &str, parent: u32) -> Result<()> {
         Ok(())
     })();
     drop(local);
-    crate::features::clipboard::shutdown();
+    if !crate::platform::windows::host_service::user_backend::active() {
+        crate::features::clipboard::shutdown();
+    }
     result
 }
 

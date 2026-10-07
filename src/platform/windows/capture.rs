@@ -20,6 +20,7 @@ pub(crate) use crate::media::capture::{Screen, SourceGone};
 mod inventory;
 mod power;
 mod recovery;
+mod session;
 
 /// Read the state of this process's interactive session. Unknown/failure is
 /// not an unlocked session; callers retain their last confirmed report.
@@ -327,6 +328,7 @@ pub(crate) struct Frame {
 }
 
 enum Backend {
+    Session(Box<session::Session>),
     Dxgi(Duplication),
     Gdi(super::gdi::Capture),
     Remote(Box<super::capture_service::Client>),
@@ -338,6 +340,7 @@ pub(crate) struct Desktop {
     pub available: bool,
     backend: Backend,
     recovery: recovery::Recovery,
+    recovery_probe: Option<Box<RecoveryProbe>>,
     refreshed: std::time::Instant,
     inventory: Option<inventory::Refresh>,
     sampler: super::cursor_shape::Sampler,
@@ -348,6 +351,23 @@ pub(crate) struct Desktop {
 }
 impl Desktop {
     pub fn open_selected(selected: &Screen) -> Result<Self> {
+        if super::host_service::resident::is_owner() {
+            let local = session::Session::new(selected)?;
+            return Ok(Self {
+                device: local.current().device.clone(),
+                screen: local.current().screen.clone(),
+                generation: 0,
+                available: true,
+                backend: Backend::Session(Box::new(local)),
+                recovery: recovery::Recovery::new(true, std::time::Instant::now()),
+                recovery_probe: None,
+                refreshed: std::time::Instant::now(),
+                inventory: None,
+                sampler: Default::default(),
+                cursor: None,
+                _power: None,
+            });
+        }
         if let Some(remote) = super::capture_service::Client::connect(selected)? {
             return Ok(Self {
                 device: remote.device.clone(),
@@ -356,6 +376,7 @@ impl Desktop {
                 available: true,
                 backend: Backend::Remote(Box::new(remote)),
                 recovery: recovery::Recovery::new(false, std::time::Instant::now()),
+                recovery_probe: None,
                 refreshed: std::time::Instant::now(),
                 inventory: None,
                 sampler: Default::default(),
@@ -384,6 +405,7 @@ impl Desktop {
             }
         };
         let device = match &backend {
+            Backend::Session(s) => s.current().device.clone(),
             Backend::Dxgi(d) => d.device.clone(),
             Backend::Gdi(g) => g.device.clone(),
             Backend::Remote(_) => unreachable!(),
@@ -399,6 +421,7 @@ impl Desktop {
             available: true,
             backend,
             recovery,
+            recovery_probe: None,
             refreshed: std::time::Instant::now(),
             inventory: None,
             sampler: Default::default(),
@@ -408,6 +431,7 @@ impl Desktop {
     }
     pub fn backend_name(&self) -> &'static str {
         match &self.backend {
+            Backend::Session(s) => s.backend,
             Backend::Dxgi(_) => "DXGI",
             Backend::Gdi(_) => "GDI",
             Backend::Remote(r) => r.backend_name(),
@@ -415,13 +439,16 @@ impl Desktop {
     }
     pub fn hdr_available(&self) -> bool {
         match &self.backend {
+            Backend::Session(s) => s.hdr,
             Backend::Dxgi(d) => d.source_hdr.is_some(),
             Backend::Gdi(_) => false,
             Backend::Remote(r) => r.hdr,
         }
     }
     fn replace(&mut self, backend: Backend) {
+        self.recovery_probe = None;
         self.device = match &backend {
+            Backend::Session(s) => s.current().device.clone(),
             Backend::Dxgi(d) => d.device.clone(),
             Backend::Gdi(g) => g.device.clone(),
             Backend::Remote(r) => r.device.clone(),
@@ -437,6 +464,15 @@ impl Desktop {
         hdr: bool,
         maximum: (u32, u32),
     ) -> Result<Option<Frame>> {
+        if let Backend::Session(local) = &mut self.backend {
+            let frame = local.next(timeout, quality, cursor, hdr, maximum)?;
+            self.device = local.device.clone();
+            self.screen = local.screen.clone();
+            self.available = local.available;
+            self.cursor = local.cursor.clone();
+            self.generation = local.generation();
+            return Ok(frame);
+        }
         if let Backend::Remote(remote) = &mut self.backend {
             let result = remote.next(timeout, quality, cursor, hdr, maximum);
             self.device = remote.device.clone();
@@ -481,27 +517,51 @@ impl Desktop {
             self.inventory.as_mut().unwrap().request(&self.screen)?;
             self.refreshed = std::time::Instant::now();
         }
-        if matches!(self.backend, Backend::Gdi(_)) && self.recovery.due(std::time::Instant::now()) {
+        if matches!(self.backend, Backend::Gdi(_))
+            && self.recovery_probe.is_none()
+            && self.recovery.due(std::time::Instant::now())
+        {
             self.recovery.attempt(std::time::Instant::now());
-            if let Ok(mut preferred) = Duplication::open(&self.screen.device_name) {
+            if let Ok(preferred) = Duplication::open(&self.screen.device_name) {
                 ensure!(
                     preferred.screen.identity == self.screen.identity
                         && preferred.screen.adapter == self.screen.adapter,
                     "恢复期间所选屏幕变化"
                 );
-                if let Ok(Some(frame)) = preferred.next(timeout, quality, cursor, hdr, maximum) {
-                    self.replace(Backend::Dxgi(preferred));
-                    // One acquired frame does not establish lasting recovery.
+                self.recovery_probe = Some(Box::new(RecoveryProbe {
+                    capture: preferred,
+                    expires: std::time::Instant::now() + std::time::Duration::from_secs(1),
+                }));
+            }
+        }
+        if let Some(mut probe) = self.recovery_probe.take() {
+            // Duplication's first successful acquisition can be pointer-only.
+            // Keep the same candidate until a real image arrives; recreating it
+            // on every probe can repeatedly discard that initial pointer frame.
+            // Zero timeout keeps the GDI stream moving while the candidate waits.
+            match probe.capture.next(0, quality, cursor, hdr, maximum) {
+                Ok(Some(frame)) => {
+                    self.replace(Backend::Dxgi(probe.capture));
                     self.recovery.promoted(std::time::Instant::now());
                     self.available = true;
+                    tracing::info!(device=%self.screen.device_name, "DXGI capture resumed after fallback");
                     return Ok(Some(frame));
+                }
+                Ok(None) if std::time::Instant::now() < probe.expires => {
+                    self.recovery_probe = Some(probe);
+                }
+                Ok(None) => {
+                    tracing::debug!(device=%self.screen.device_name, "DXGI recovery candidate did not produce an image before its deadline")
+                }
+                Err(error) => {
+                    tracing::debug!(device=%self.screen.device_name, error=%format!("{error:#}"), "DXGI recovery candidate failed")
                 }
             }
         }
         let frame = match &mut self.backend {
             Backend::Dxgi(d) => d.next(timeout, quality, cursor, hdr, maximum),
             Backend::Gdi(g) => g.next(request, cursor).map(Some),
-            Backend::Remote(_) => unreachable!(),
+            Backend::Remote(_) | Backend::Session(_) => unreachable!(),
         };
         match frame {
             Ok(frame) => {
@@ -531,16 +591,26 @@ impl Desktop {
                 }
                 // Re-establish only the same physical output. Never reselect by
                 // a reused enumeration index after unplug/replug or desktop loss.
-                self.screen = refresh(&self.screen)?;
+                let current = refresh(&self.screen)?;
+                self.screen.display_name.clone_from(&current.display_name);
+                if current != self.screen {
+                    // Do not consume a mode change by merely overwriting the
+                    // inventory: the backend still owns the previous geometry.
+                    let mut replacement = Self::open_local(&current)?;
+                    replacement.generation = self.generation.wrapping_add(1);
+                    tracing::info!(device=%current.device_name, width=current.width,
+                        height=current.height, backend=replacement.backend_name(),
+                        "capture source changed during failure; rebuilt selected source");
+                    *self = replacement;
+                    return Ok(None);
+                }
                 // T BC3830 maps a non-timeout acquisition failure to 4;
                 // BAA520/BC80A0 disable that candidate and select GDI. Creating
                 // another duplication successfully does not prove it can acquire
                 // frames. The existing delayed probe requires a real frame before
                 // switching back, avoiding an endless ACCESS_LOST rebuild loop.
                 if self.recovery.failed(std::time::Instant::now()) {
-                    tracing::info!(
-                        "DXGI recovery was short-lived; retaining GDI until the display or input desktop changes"
-                    );
+                    tracing::info!("DXGI recovery was short-lived; backing off recovery probes");
                 }
                 let replacement = Backend::Gdi(super::gdi::Capture::new(&self.screen)?);
                 tracing::info!(device=%self.screen.device_name,
@@ -550,6 +620,11 @@ impl Desktop {
             }
         }
     }
+}
+
+struct RecoveryProbe {
+    capture: Duplication,
+    expires: std::time::Instant,
 }
 
 struct Duplication {

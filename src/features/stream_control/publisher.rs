@@ -60,17 +60,25 @@ impl DrawRequest {
     }
 }
 
-/// CaptureSetting has the same RPC contract on TEXT and CONTROL. Current iOS
-/// sends it on CONTROL (including mixed KCP); channel choice is not permission
-/// to execute any of the other TEXT-only operations.
-pub(crate) fn is_capture_setting(bytes: &[u8]) -> Result<bool> {
+/// Display RPC semantics and authorization belong to the session, not the
+/// incoming carrier. Replies use the same TEXT RPC response path on both.
+pub(crate) fn display_request(bytes: &[u8]) -> Result<Option<&'static str>> {
+    if bytes.first() == Some(&b'{') {
+        return Ok(None);
+    }
     let Some(PbPayload::RpcRequest(bytes)) = PbControlMessage::decode(bytes)?.payload else {
-        return Ok(false);
+        return Ok(None);
     };
-    Ok(matches!(
-        PbRpcRequest::decode(bytes.as_slice())?.payload,
-        Some(PbRpcRequestPayload::CaptureSetting(_))
-    ))
+    Ok(match PbRpcRequest::decode(bytes.as_slice())?.payload {
+        Some(PbRpcRequestPayload::CaptureSetting(_)) => Some("CaptureSetting"),
+        Some(PbRpcRequestPayload::CreateVirtualDisplay(_)) => Some("CreateVirtualDisplay"),
+        Some(PbRpcRequestPayload::RemoveVirtualDisplay(_)) => Some("RemoveVirtualDisplay"),
+        Some(PbRpcRequestPayload::EnterSuperScreen(_)) => Some("EnterSuperScreen"),
+        Some(PbRpcRequestPayload::QuitSuperScreen(_)) => Some("QuitSuperScreen"),
+        Some(PbRpcRequestPayload::SendVideoTrack(_)) => Some("SendVideoTrack"),
+        Some(PbRpcRequestPayload::MouseSwitch(_)) => Some("MouseSwitch"),
+        _ => None,
+    })
 }
 
 pub(crate) struct MicrophonePolicy {
@@ -384,6 +392,8 @@ pub(crate) fn secure_desktop(locked: bool) -> Vec<u8> {
 #[derive(Default)]
 pub(crate) struct Received {
     pub messages: Vec<Vec<u8>>,
+    pub handshake_complete: bool,
+    pub handshake_request: bool,
     pub control_screen_reports: Option<bool>,
     pub refresh_state: bool,
     pub refresh_secure: bool,
@@ -558,7 +568,14 @@ pub(crate) fn receive(
     let msg = PbControlMessage::decode(bytes)?;
     match msg.payload {
         Some(PbPayload::SimpleAction(action)) if control && matches!(action.action, 0 | 1) => {
+            tracing::debug!(
+                action = action.action,
+                sequence = msg.seq,
+                "host PB handshake received"
+            );
             Ok(Received {
+                handshake_complete: action.action == 1,
+                handshake_request: action.action == 0,
                 messages: if action.action == 0 {
                     vec![echo(msg.seq, msg.timestamp, false)]
                 } else {

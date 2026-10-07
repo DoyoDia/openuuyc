@@ -14,6 +14,18 @@ pub(crate) struct Capabilities {
 
 #[derive(Default)]
 pub(super) struct Cache(tokio::sync::Mutex<Option<Arc<Capabilities>>>);
+
+fn same_probe_source(a: &capture::Screen, b: &capture::Screen) -> bool {
+    // Placement, label, protocol ID, DPI and display refresh rate do not change
+    // this 720p/30fps encoder check. Keep actual source/graphics/size/HDR bounds.
+    a.identity == b.identity
+        && a.device_name == b.device_name
+        && a.adapter == b.adapter
+        && a.render_adapter == b.render_adapter
+        && a.width == b.width
+        && a.height == b.height
+        && a.hdr == b.hdr
+}
 impl Cache {
     pub fn snapshot(&self) -> Option<Arc<Capabilities>> {
         self.0.try_lock().ok()?.clone()
@@ -25,12 +37,20 @@ impl Cache {
     ) -> Result<Arc<Capabilities>> {
         let mut cached = self.0.lock().await;
         ensure!(active(), "媒体准备已取消");
-        let adapters = capture::encoding_adapters()?;
+        let adapters = tokio::task::spawn_blocking(capture::encoding_adapters).await??;
+        ensure!(active(), "媒体准备已取消");
         if let Some(capabilities) = cached.as_ref()
-            && capabilities.screen == screen
+            && same_probe_source(&capabilities.screen, &screen)
             && capabilities.adapters == adapters
         {
-            return Ok(capabilities.clone());
+            let capabilities = Arc::new(Capabilities {
+                screen,
+                codecs: capabilities.codecs.clone(),
+                adapters,
+            });
+            *cached = Some(capabilities.clone());
+            tracing::info!("host media capabilities reused");
+            return Ok(capabilities);
         }
         let capabilities = Arc::new(probe(screen, adapters, active).await?);
         *cached = Some(capabilities.clone());
@@ -102,6 +122,14 @@ impl Prepared {
             hdr,
             (screen.width, screen.height),
         )?;
+        tracing::info!(
+            parameters = ?options.params,
+            requested_fps = config.requested_fps,
+            fps_limit = config.fps_limit,
+            maximum_fps = config.maximum_fps,
+            effective_fps = config.fps,
+            "host initial capture settings negotiated"
+        );
         Ok(Self {
             screen,
             negotiated,

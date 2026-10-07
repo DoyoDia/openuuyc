@@ -95,4 +95,11 @@ impl StreamControlHandle {
             self.publish_device_preferences(&mut state);
         }
     }
+    pub(crate) fn set_performance_always_visible(&self, always: bool) {
+        let mut state = lock(&self.shared);
+        if state.device_preferences.performance_always_visible != always {
+            state.device_preferences.performance_always_visible = always;
+            self.publish_device_preferences(&mut state);
+        }
+    }
 }

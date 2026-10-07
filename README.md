@@ -10,7 +10,7 @@ Windows 1.0 处于 **beta** 阶段，重点完善兼容性、恢复和稳定性�
 
 从 [Releases](https://github.com/djkcyl/openuuyc/releases) 下载 Windows x64 客户端，扫码或短信登录后连接设备，支持 UU 官方客户端；无需登录也可在登录页开启“接受远程协助”。
 
-最新稳定版为 [v0.7.0](https://github.com/djkcyl/openuuyc/releases/tag/v0.7.0)，最新预发布为 [v1.0.0-beta.1](https://github.com/djkcyl/openuuyc/releases/tag/v1.0.0-beta.1)。
+最新稳定版为 [v0.7.0](https://github.com/djkcyl/openuuyc/releases/tag/v0.7.0)，最新预发布为 [v1.0.0-beta.2](https://github.com/djkcyl/openuuyc/releases/tag/v1.0.0-beta.2)。
 
 **从 alpha.6 或更早版本升级需重新登录，设备 ID 会改变；已使用 alpha.7 的用户不会再次重置。** 旧设备条目请在列表中手动删除。设备资料使用本机真实硬件及当前 Windows 壁纸，上传的壁纸副本添加 OpenUUYC Logo，不修改系统原图。
 
@@ -40,7 +40,7 @@ Windows 1.0 处于 **beta** 阶段，重点完善兼容性、恢复和稳定性�
 
 向官方被控端拖入文件时，需先开启键鼠控制，以及观看窗口“高级设置”中的“剪贴板同步”和“文件复制”。
 
-客户端另提供设备列表与详情、别名管理、自定义快捷键、本机编解码与设备上报诊断、性能监控（简洁 / 详细 / 异常时），以及[插件和节点图](plugins/README.md)。
+客户端另提供设备列表与详情、别名管理、自定义快捷键、本机编解码与设备上报诊断、性能监控（精简 / 详细、可选常驻）及右上角异常图标，以及[插件和节点图](plugins/README.md)。
 
 “日志设置”和“本机诊断”可一键导出脱敏诊断包（ZIP / zstd，压缩后最多 32 MiB），仅保存到本机。
 
@@ -48,9 +48,9 @@ Windows 1.0 处于 **beta** 阶段，重点完善兼容性、恢复和稳定性�
 
 主页“安装服务”会将程序安装到 `Program Files\OpenUUYC`，安装后台服务、输入和显示驱动，创建快捷方式并配置托盘自启动。安装需管理员授权及驱动证书信任；关闭主窗口进入托盘，托盘“退出”结束运行。
 
-安装服务后支持锁屏和 PIN 界面被控。两端新版 OpenUUYC 支持更新期间保留观看窗口，后台自动重连，画面恢复前保持更新等待提示。
+当前源码安装服务后支持锁屏、PIN 界面及重启后未登录 Windows 时接入。
 
-虚拟声卡在“连接设置 → 服务管理”中选装。更新会检查已安装组件；卸载可选择保留虚拟显示驱动、虚拟声卡及用户数据。
+虚拟声卡在“连接设置 → 服务管理”中选装。卸载可选择保留虚拟显示驱动、虚拟声卡及用户数据。
 
 ### 虚拟音频驱动的使用条件
 
@@ -59,11 +59,11 @@ Windows 1.0 处于 **beta** 阶段，重点完善兼容性、恢复和稳定性�
 - 临时测试：Shift + 重启 → 疑难解答 → 高级选项 → 启动设置 → 重启 → **7 / F7 禁用驱动程序强制签名**，仅本次启动有效。[Windows 说明](https://support.microsoft.com/en-us/windows/experience/startup-boot/windows-startup-settings)
 - 持续测试：管理员执行 `bcdedit /set testsigning on` 后重启；恢复时执行 `bcdedit /set testsigning off` 并重启。Secure Boot、BitLocker 或组织策略可能限制操作。[微软说明](https://learn.microsoft.com/en-us/windows-hardware/drivers/install/the-testsigning-boot-configuration-option)
 
-测试启动会降低驱动加载保护，程序不会自动修改这些设置。1.0.0 正式版将在 Windows 完整被控功能完成并验证后发布。
+测试启动会降低驱动加载保护，程序不会自动修改这些设置。
 
 ## 构建
 
-需要 Rust stable（MSVC）、Visual Studio C++ 构建工具、Windows SDK、CMake、NASM 和 UPX，命令行工具需加入 PATH。H.264 / AV1 软件编解码使用项目 Rust 核心及 SIMD 汇编。
+需要 Rust stable（MSVC）、Visual Studio C++ 构建工具、Windows SDK、CMake 和 NASM，命令行工具需加入 PATH。H.264 / AV1 软件编解码使用项目 Rust 核心及 SIMD 汇编。
 
 ```powershell
 git clone https://github.com/djkcyl/openuuyc.git
@@ -71,13 +71,13 @@ cd openuuyc
 cargo dist
 ```
 
-产物在 `target/dist/`，默认 UPX 压缩并校验启动。未压缩构建用 `cargo dist --no-upx`；命令行参数见 `--help`。
+产物为 `target/dist/` 下的单文件 EXE。仅构建原生 EXE 可用 `cargo dist --native`；命令行参数见 `--help`。
 
 源码已包含签名驱动包和公钥证书，构建主程序不需要签名私钥。修改驱动及发布前验证见 [驱动构建说明](drivers/README.md)。
 
 ## 命令行更新
 
-从新下载的程序包运行 `OpenUUYC.exe update --silent`，更新已有安装而不显示更新窗口。保留账号、设置和驱动；会结束当前连接，完成后不自动打开控制中心、不自动重启 Windows。非管理员运行时仍需确认系统 UAC。
+从新下载的程序包运行 `OpenUUYC.exe update --silent`，静默更新已有安装。会中断当前连接，完成后不自动打开控制中心或重启 Windows；非管理员运行时仍需确认系统 UAC。
 
 无人值守脚本使用 `update --silent --no-elevate`，由安装所属用户的管理员终端执行；权限不足返回 740，不弹 UAC。退出码：0 成功、3010 需重启、170 已有安装操作、1605 未安装、2404 驱动占用，其他失败为 1。不要同时保留其他更新窗口。
 

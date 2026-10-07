@@ -217,6 +217,7 @@ impl Runner {
             window,
             notification,
         });
+        if self.root {crate::application::bootstrap::ready();}
         let state = self.state.as_mut().expect("created desktop state");
         state.render()?;
         state.app.0.on_focus_changed(state.window.has_focus());
@@ -372,7 +373,7 @@ impl DesktopWindow {
             && self.window.is_minimized() != Some(true)
         {
             let presented = self.presenter.render(&self.context, drawing, false)?;
-            if presented && self.show_after_present {
+            if presented.ready() && self.show_after_present {
                 self.show_after_present = false;
                 self.window.set_visible(true);
                 if std::mem::take(&mut self.focus_after_present) {

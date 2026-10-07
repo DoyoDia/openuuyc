@@ -9,16 +9,22 @@ pub(in crate::application) fn show_performance_overlay(
     performance: &PerformanceMonitor,
     audio: &crate::media::audio::AudioPlayback,
     mode: PerformancePanelMode,
+    always_visible: bool,
+    video_bounds: egui::Rect,
     grid_id: &'static str,
 ) {
     let stats = performance.snapshot();
+    // Keep observing and expire held alerts even on an otherwise idle desktop.
+    ctx.request_repaint_after(Duration::from_millis(250));
+    super::performance_alerts::show(ctx, &stats.health, video_bounds);
+    if !always_visible {
+        return;
+    }
     match mode {
-        PerformancePanelMode::Hidden => {}
         PerformancePanelMode::Compact => show_compact_performance(ctx, &stats, audio),
         PerformancePanelMode::Detailed => {
             performance_panel::show(ctx, performance, &stats, grid_id)
         }
-        PerformancePanelMode::Alerts => super::performance_alerts::show(ctx, &stats, grid_id),
     }
 }
 

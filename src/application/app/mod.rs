@@ -42,6 +42,8 @@ pub struct GuiOptions {
 }
 
 pub fn run(options: GuiOptions) -> Result<()> {
+    let _user_backend = crate::platform::windows::host_service::user_backend::Server::start()?;
+    let _migration = crate::platform::windows::components::migration::UserRecovery::start();
     let _shortcuts = crate::application::viewer_shortcuts::Watcher::new()?;
     crate::features::host::displays::fallback::start_background();
     let (local_display, display_warning) = match detect_local_display() {
