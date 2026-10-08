@@ -24,6 +24,8 @@ const BUTTON_PRESS: u8 = 4;
 const BUTTON_RELEASE: u8 = 5;
 const MOTION_NOTIFY: u8 = 6;
 const NO_SYMBOL: Keysym = 0;
+/// The pause after each typed character.
+const TEXT_PACE: Duration = Duration::from_millis(3);
 
 /// Lock keys whose state a controller can ask to match.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -156,6 +158,12 @@ impl Injector {
     /// Type text independently of the key layout, the way Windows' Unicode
     /// keyboard input does: each character's keysym is found in the current
     /// map, or bound for the moment to a spare keycode.
+    ///
+    /// Unicode input on Windows ignores the keys being held, so modifiers the
+    /// controller still holds (the Ctrl of the Ctrl+V that asked for a paste)
+    /// are released while typing and pressed again afterwards, and Caps Lock
+    /// does not change the case of a letter. A Windows line break (CR LF)
+    /// is one Enter.
     pub fn text(&self, text: &str, permitted: impl Fn() -> bool) -> Result<()> {
         let count = self.max_keycode - self.min_keycode + 1;
         let map = self
@@ -184,10 +192,26 @@ impl Injector {
         let shift = evdev(0xa0)
             .map(|code| (code + 8) as u8)
             .context("缺少 Shift 键")?;
+        let caps = self.toggled(Lock::Caps).unwrap_or(false);
+        let held = self.held_modifiers()?;
+        for code in &held {
+            self.fake(KEY_RELEASE, *code, 0, 0)?;
+        }
+        // Caps Lock changes the case of letters, including those bound to the
+        // spare keycode, so it is off while typing.
+        if caps {
+            self.tap(0x14)?;
+        }
         let mut bound = false;
         let result = (|| -> Result<()> {
+            let mut previous = None;
             for c in text.chars() {
                 ensure!(permitted(), "文字输入已取消");
+                let after_cr = previous == Some('\r');
+                previous = Some(c);
+                if c == '\n' && after_cr {
+                    continue;
+                }
                 let sym = keysym(c);
                 let (code, shifted) = match find(sym) {
                     Some(found) => found,
@@ -215,10 +239,13 @@ impl Injector {
                     self.fake(KEY_RELEASE, shift, 0, 0)?;
                 }
                 typed?;
-                if bound {
-                    self.connection.get_input_focus()?.reply()?;
-                    std::thread::sleep(Duration::from_millis(12));
-                }
+                // Input methods (IBus) pass each key through another process
+                // and drop keys that arrive faster than they are handled.
+                std::thread::sleep(if bound {
+                    Duration::from_millis(12)
+                } else {
+                    TEXT_PACE
+                });
             }
             Ok(())
         })();
@@ -229,7 +256,42 @@ impl Injector {
                 .change_keyboard_mapping(1, spare, per as u8, &empty);
             let _ = self.connection.flush();
         }
+        if caps {
+            let _ = self.tap(0x14);
+        }
+        for code in &held {
+            let _ = self.fake(KEY_PRESS, *code, 0, 0);
+        }
         result
+    }
+
+    /// Press and release a key by Windows virtual-key code.
+    fn tap(&self, key: u16) -> Result<()> {
+        self.key(key, true)?;
+        self.key(key, false)
+    }
+
+    /// Modifier keys other than the lock keys that are down right now.
+    fn held_modifiers(&self) -> Result<Vec<Keycode>> {
+        let mapping = self.connection.get_modifier_mapping()?.reply()?;
+        let keys = self.connection.query_keymap()?.reply()?.keys;
+        let per = usize::from(mapping.keycodes_per_modifier()).max(1);
+        let mut held = Vec::new();
+        for (index, codes) in mapping.keycodes.chunks(per).enumerate() {
+            // Lock (index 1) is a toggle: pressing it again would flip it.
+            if index == 1 {
+                continue;
+            }
+            for &code in codes {
+                if code != 0
+                    && keys[usize::from(code / 8)] & (1 << (code % 8)) != 0
+                    && !held.contains(&code)
+                {
+                    held.push(code);
+                }
+            }
+        }
+        Ok(held)
     }
 
     /// The process that owns the active window, as the window manager reports.
@@ -481,5 +543,16 @@ mod session_tests {
         println!("foreground pid: {:?}", injector.foreground());
         injector.move_to(before.0, before.1).unwrap();
         injector.flush().unwrap();
+    }
+
+    /// Types OPENUUYC_TYPE_TEXT into whatever has focus on DISPLAY.
+    #[test]
+    #[ignore = "types into the focused window of an X display"]
+    fn types_text() {
+        let text = std::env::var("OPENUUYC_TYPE_TEXT").unwrap();
+        super::Injector::open()
+            .unwrap()
+            .text(&text, || true)
+            .unwrap();
     }
 }

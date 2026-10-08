@@ -102,6 +102,8 @@ impl Backend {
                 stop,
             );
             if let Err(error) = result {
+                // The binding only sees its queue close; the cause is here.
+                tracing::warn!(error = %format!("{error:#}"), "host clipboard worker stopped");
                 *super::super::lock(&reported) = Status {
                     error: Some(error.to_string()),
                     ..Default::default()
