@@ -86,7 +86,17 @@ pub(crate) fn update(silent: bool, no_elevate: bool) -> Result<bool> {
     {
         return Ok(false);
     }
+    ensure!(
+        !is_downgrade(Some(&deployment::installed_version()?)),
+        "已安装较新版本；请打开更新窗口明确确认降级"
+    );
     update_running(true)
+}
+fn is_downgrade(installed: Option<&str>) -> bool {
+    installed
+        .and_then(|v| semver::Version::parse(v).ok())
+        .zip(semver::Version::parse(env!("CARGO_PKG_VERSION")).ok())
+        .is_some_and(|(installed, current)| installed > current)
 }
 pub(crate) fn uninstall(parent: Option<u32>) -> Result<()> {
     if let Some(parent) = parent {
@@ -121,7 +131,9 @@ pub(crate) fn uninstall(parent: Option<u32>) -> Result<()> {
             Err(error) if error.code() == ERROR_INVALID_PARAMETER.to_hresult() => (),
             Err(error) => return Err(error.into()),
         }
-    } else if std::env::current_exe()?.parent() == Some(deployment::active_directory()?.as_path()) {
+    } else if crate::application::bootstrap::cached()
+        || std::env::current_exe()?.parent() == Some(deployment::active_directory()?.as_path())
+    {
         use std::os::windows::process::CommandExt;
         let directory = helpers()?;
         components::files::reject_reparse(directory.parent().context("卸载工作目录无效")?)?;
@@ -180,11 +192,6 @@ fn cleanup_helpers() {
 }
 fn run(uninstall: bool, launch_arguments: Vec<std::ffi::OsString>) -> Result<()> {
     let _installer = super::instance::reserve_installer()?;
-    let _instance = if uninstall {
-        Some(super::instance::reserve_maintenance()?)
-    } else {
-        None
-    };
     if uninstall && deployment::active_directory()?.exists() {
         deployment::verify_directory(&deployment::active_directory()?)?;
     }
@@ -296,9 +303,9 @@ impl crate::ui::App for Maintenance {
                 ui.label(if self.finished {
                     if self.removal.remove_data { "卸载完成，本机数据已清除。" } else { "卸载完成，账号和用户设置已保留。" }
                 } else if self.uninstall {
-                    "将移除程序、后台服务、输入驱动、快捷方式及自启动。"
+                    "将断开当前连接并退出 OpenUUYC，然后移除程序、后台服务、输入驱动、快捷方式及自启动。"
                 } else {
-                    "更新将结束当前连接并关闭运行中的 OpenUUYC，完成后自动打开新版本。"
+                    if is_downgrade(self.installed_version.as_deref()) {"本次版本低于已安装版本。确认后将结束当前连接并降级程序。"}else{"更新将结束当前连接并关闭运行中的 OpenUUYC，完成后自动打开新版本。"}
                 });
                 ui.add_space(12.);
                 if !self.finished {
@@ -350,6 +357,8 @@ impl crate::ui::App for Maintenance {
                                 ui,
                                 Some(controls::DialogAction::new(if self.uninstall {
                                     "卸载程序"
+                                } else if is_downgrade(self.installed_version.as_deref()) {
+                                    "降级并打开"
                                 } else {
                                     "更新并打开"
                                 })),
@@ -394,7 +403,7 @@ impl Maintenance {
             let result = if !uninstall {
                 update_running(false)
             } else {
-                components::request(Kind::Application, Operation::Uninstall, false, removal)
+                maintain_running(Some(removal), true)
             }
             .map_err(|e| format!("{e:#}"));
             let _ = tx.send(result);
@@ -404,6 +413,14 @@ impl Maintenance {
 }
 
 fn update_running(preserve_pause: bool) -> Result<bool> {
+    maintain_running(None, preserve_pause)
+}
+/// Opening/cancelling either dialog is non-destructive. Once confirmed, both
+/// operations drain the GUI and host before taking the deployment reservation.
+fn maintain_running(
+    removal: Option<components::RemovalOptions>,
+    preserve_pause: bool,
+) -> Result<bool> {
     let gate = super::instance::reserve_update().map_err(|error| UpdateExit {
         code: 170,
         message: error.to_string(),
@@ -417,12 +434,12 @@ fn update_running(preserve_pause: bool) -> Result<bool> {
         // Announce before the old GUI's normal exit path pauses the resident.
         // The protected deployment receipt distinguishes pre-notification builds
         // without sending an unknown IPC request to an older running service.
-        if resume && host_service::install::supports_update_notice()? {
+        if removal.is_none() && resume && host_service::install::supports_update_notice()? {
             preparing_update = true;
             prepare_resident_update(host_service::resident::call)?;
         }
         if let Some(running) = running {
-            running.close()?;
+            running.close(removal.is_none())?;
         }
         // Headless and pre-handoff builds can leave their resident online after
         // the UI exits. Pause it and wait for its agents before deployment.
@@ -436,26 +453,49 @@ fn update_running(preserve_pause: bool) -> Result<bool> {
                 None if started.elapsed() < Duration::from_secs(5) => {
                     if let Some(running) = super::instance::running_installed()? {
                         had_window = true;
-                        running.close()?;
+                        running.close(removal.is_none())?;
                     }
                     std::thread::sleep(Duration::from_millis(50))
                 }
                 None => anyhow::bail!("运行版本仍在退出，尚未开始替换文件"),
             }
         };
-        components::request_update(!preserve_pause || !background || resume)
+        match removal {
+            Some(removal) => {
+                components::request(Kind::Application, Operation::Uninstall, false, removal)
+            }
+            None => components::request_update(!preserve_pause || !background || resume),
+        }
     })();
     drop(gate);
     if let Err(error) = result {
         if preparing_update {
             let _ = host_service::resident::call(host_service::resident::Request::CancelUpdate);
         }
-        let restored = if had_window {
-            deployment::start_installed(std::iter::empty::<std::ffi::OsString>())
-        } else if resume {
+        // Pause can succeed before a later GUI/deployment step fails. Restore
+        // the original online intent even when an existing GUI is still alive;
+        // merely activating that GUI does not resume a paused resident.
+        let service_remains = removal.is_none()
+            || host_service::install::status()
+                .map(|s| s.installed)
+                .unwrap_or(true);
+        let resumed = if resume && service_remains {
             host_service::resident::call(host_service::resident::Request::Resume).map(|_| ())
         } else {
             Ok(())
+        };
+        let image_remains = removal.is_none() || deployment::image().is_ok_and(|p| p.is_file());
+        let reopened = if had_window && image_remains {
+            deployment::start_installed(std::iter::empty::<std::ffi::OsString>())
+        } else {
+            Ok(())
+        };
+        let restored = match (resumed, reopened) {
+            (Err(a), Err(b)) => Err(anyhow::anyhow!(
+                "恢复被控失败：{a:#}；打开原版本失败：{b:#}"
+            )),
+            (Err(e), _) | (_, Err(e)) => Err(e),
+            _ => Ok(()),
         };
         return match restored {
             Ok(()) => Err(error),
@@ -476,30 +516,16 @@ fn prepare_resident_update(
         Ok(_) => anyhow::bail!("更新准备返回了无效响应"),
         Err(error) => error,
     };
-    // The running peer may close immediately after the update notice. Verify
-    // actual session retirement, rather than guessing from an error string or
-    // treating temporary loss of Connected as the absence of a session.
-    let deadline = std::time::Instant::now() + Duration::from_secs(3);
-    loop {
-        match request(Request::Snapshot {
-            ui: false,
-            device_cursor: None,
-        }) {
-            Ok(Reply::Snapshot(snapshot)) => {
-                if !snapshot.status.session_active && !snapshot.status.connected {
-                    // Re-arm the admission gate; a failed PrepareUpdate releases
-                    // it. The retired session must not receive a duplicate notice.
-                    return match request(Request::PrepareUpdate)? {
-                        Reply::Done => Ok(()),
-                        _ => anyhow::bail!("更新准备返回了无效响应"),
-                    };
-                }
-            }
-            _ => return Err(error.context("无法确认旧被控会话已结束，尚未开始更新")),
-        }
-        if std::time::Instant::now() >= deadline {
-            return Err(error.context("被控会话仍未结束，尚未开始更新"));
-        }
-        std::thread::sleep(Duration::from_millis(25));
+    // The running service can still use the old mandatory-notice policy.
+    // Its protected Pause closes admission and only returns Done after the
+    // resident/agent owner has exited. Do not infer retirement from a transient
+    // Connected flag, replay the notice, or bypass deployment's exit checks.
+    tracing::warn!(error=%format!("{error:#}"), "update preparation could not notify remote; stopping old host");
+    match request(Request::Pause) {
+        Ok(Reply::Done) => Ok(()),
+        Ok(_) => anyhow::bail!("结束旧被控后台返回无效响应，尚未开始更新"),
+        Err(shutdown) => Err(anyhow::anyhow!(
+            "更新通知未完成：{error:#}；结束旧被控后台失败，尚未开始更新：{shutdown:#}"
+        )),
     }
 }

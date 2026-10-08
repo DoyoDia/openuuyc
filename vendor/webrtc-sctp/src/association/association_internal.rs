@@ -2373,11 +2373,24 @@ impl AssociationInternal {
     }
 
     async fn create_selective_ack_chunk(&mut self) -> ChunkSelectiveAck {
+        // RFC 9260 6.2.1: a SACK must fit in one path-MTU-sized packet.
+        // Report the lowest gaps first; omitted higher TSNs remain in the
+        // receive queue and can be acknowledged in a later SACK. DATA already
+        // respects this MTU, but an unbounded gap list can exceed it during a
+        // burst of reordered file traffic and prevent recovery itself.
+        let fixed = COMMON_HEADER_SIZE as usize
+            + crate::chunk::chunk_header::CHUNK_HEADER_SIZE
+            + crate::chunk::chunk_selective_ack::SELECTIVE_ACK_HEADER_SIZE;
+        let entries = (self.mtu as usize).saturating_sub(fixed) / 4;
+        let mut gaps = self.payload_queue.get_gap_ack_blocks(self.peer_last_tsn);
+        gaps.truncate(entries);
+        let mut duplicates = self.payload_queue.pop_duplicates();
+        duplicates.truncate(entries.saturating_sub(gaps.len()));
         ChunkSelectiveAck {
             cumulative_tsn_ack: self.peer_last_tsn,
             advertised_receiver_window_credit: self.get_my_receiver_window_credit().await,
-            gap_ack_blocks: self.payload_queue.get_gap_ack_blocks(self.peer_last_tsn),
-            duplicate_tsn: self.payload_queue.pop_duplicates(),
+            gap_ack_blocks: gaps,
+            duplicate_tsn: duplicates,
         }
     }
 

@@ -75,6 +75,21 @@ pub(crate) mod resident {
     pub(crate) fn call(_request: Request) -> Result<Reply> {
         bail!(NO_SERVICE)
     }
+    /// Only asked of a managed client; with no service there is nothing to retire.
+    pub(crate) async fn pause_for_exit() -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Work the resident owner waits for before it reports itself paused. With no
+/// service there is no owner waiting, so nothing is counted.
+pub(crate) mod activity {
+    pub(crate) struct Work;
+    impl Work {
+        pub fn new() -> Self {
+            Self
+        }
+    }
 }
 
 /// Login startup through an XDG autostart entry, the counterpart of the

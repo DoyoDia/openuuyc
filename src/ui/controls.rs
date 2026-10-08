@@ -33,7 +33,7 @@ pub(crate) use mapping::{
     MappingRow, MappingRowAction, mapping_empty, mapping_row, mapping_table_header,
 };
 pub(crate) use performance::{
-    PerformanceTrace, metric_pair, performance_frame, performance_header, performance_trace,
+    PerformanceTrace, metric_pair, metric_pair_colored, performance_frame, performance_header, performance_trace,
 };
 pub(crate) use updates::{update_actions, update_device_row, update_prepared_notice};
 pub(crate) use viewer_caption::{ViewerCaptionIcon, viewer_caption_button};

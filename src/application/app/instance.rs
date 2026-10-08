@@ -50,6 +50,12 @@ mod platform {
     }
 
     pub fn acquire() -> Result<Option<Instance>> {
+        acquire_with_activation(true)
+    }
+    pub fn acquire_background() -> Result<Option<Instance>> {
+        acquire_with_activation(false)
+    }
+    fn acquire_with_activation(activate: bool) -> Result<Option<Instance>> {
         // The confirmed updater owns startup until replacement or recovery finishes.
         if acquire_named(w!("Local\\OpenUUYC.Updating.v1"))?.is_none() {
             return Ok(None);
@@ -58,7 +64,9 @@ mod platform {
         let message = match &result {
             Ok(Some(_)) => return result,
             Ok(None) => {
-                activate_existing()?;
+                if activate {
+                    activate_existing()?;
+                }
                 return result;
             }
             Err(error) => format!("无法启动 OpenUUYC：{error:#}"),
@@ -134,7 +142,9 @@ mod platform {
             if crate::platform::windows::components::maintaining() {
                 return LRESULT(2);
             }
-            UPDATE_EXIT.store(true, std::sync::atomic::Ordering::Release);
+            // Zero retains the update behavior of existing senders. Removal closes
+            // sessions normally instead of asking remote viewers to wait for an update.
+            UPDATE_EXIT.store(wparam.0 != 1, std::sync::atomic::Ordering::Release);
             return LRESULT(
                 if crate::ui::window_manager::send(crate::ui::window_manager::Request::Exit).is_ok()
                 {
@@ -160,10 +170,6 @@ mod platform {
     }
     pub(crate) fn reserve_after_exit() -> Result<Option<Instance>> {
         acquire_named(w!("Local\\OpenUUYC.ControlCenter.v1"))
-    }
-    pub(crate) fn reserve_maintenance() -> Result<Instance> {
-        acquire_named(w!("Local\\OpenUUYC.ControlCenter.v1"))?
-            .context("请先从托盘退出 OpenUUYC，再安装更新或卸载程序")
     }
 
     fn activate_existing() -> Result<()> {
@@ -211,29 +217,41 @@ mod platform {
         process: crate::platform::windows::host_service::pipe::Handle,
     }
     pub(crate) fn running_installed() -> Result<Option<Running>> {
-        running_image(&crate::platform::windows::components::application::image()?)
+        running_image(
+            &crate::platform::windows::components::application::image()?,
+            true,
+        )
     }
-    fn running_image(expected: &std::path::Path) -> Result<Option<Running>> {
+    fn running_image(expected: &std::path::Path, migrating: bool) -> Result<Option<Running>> {
         use crate::platform::windows::host_service::{pipe::Handle, process, vault};
         use windows::Win32::System::Threading::*;
+        struct Candidates {
+            windows: Vec<HWND>,
+            migrating: bool,
+        }
         unsafe extern "system" fn collect(hwnd: HWND, data: LPARAM) -> BOOL {
-            if !unsafe { GetPropW(hwnd, w!("OpenUUYC.ControlCenter.Window.v1")) }.is_invalid() {
-                unsafe {
-                    (*(data.0 as *mut Vec<HWND>)).push(hwnd);
-                }
+            let candidates = unsafe { &mut *(data.0 as *mut Candidates) };
+            if !unsafe { GetPropW(hwnd, w!("OpenUUYC.ControlCenter.Window.v1")) }.is_invalid()
+                || candidates.migrating
+                    && crate::platform::windows::components::migration::legacy_center(hwnd)
+            {
+                candidates.windows.push(hwnd);
             }
             true.into()
         }
-        let mut windows = Vec::<HWND>::new();
+        let mut candidates = Candidates {
+            windows: Vec::new(),
+            migrating,
+        };
         unsafe {
-            EnumWindows(Some(collect), LPARAM(&mut windows as *mut _ as isize))?;
+            EnumWindows(Some(collect), LPARAM(&mut candidates as *mut _ as isize))?;
         }
         let image = std::fs::canonicalize(expected)?;
         let own = std::process::id();
         let sid = vault::sid(own)?;
         let session = process::session(own)?;
         let mut found = None;
-        for window in windows {
+        for window in candidates.windows {
             let mut pid = 0;
             unsafe {
                 GetWindowThreadProcessId(window, Some(&mut pid));
@@ -254,10 +272,16 @@ mod platform {
             let Ok(path) = process::image(pid).and_then(|p| Ok(std::fs::canonicalize(p)?)) else {
                 continue;
             };
-            if !path
+            if process::session(pid)? != session || vault::sid(pid)? != sid {
+                continue;
+            }
+            let same_image = path
                 .as_os_str()
                 .to_string_lossy()
-                .eq_ignore_ascii_case(&image.as_os_str().to_string_lossy())
+                .eq_ignore_ascii_case(&image.as_os_str().to_string_lossy());
+            if !same_image
+                && !(migrating
+                    && crate::platform::windows::components::migration::registered_client(&path)?)
             {
                 continue;
             }
@@ -282,8 +306,8 @@ mod platform {
     pub(crate) fn deliver_notification(uri: &str) -> Result<()> {
         use windows::Win32::{System::DataExchange::COPYDATASTRUCT, UI::WindowsAndMessaging::*};
         anyhow::ensure!(uri.len() <= 256, "通知参数过长");
-        let running =
-            running_image(&std::env::current_exe()?)?.context("通知已过期或控制中心已退出")?;
+        let running = running_image(&std::env::current_exe()?, false)?
+            .context("通知已过期或控制中心已退出")?;
         // Protocol activation carries the user's foreground grant to the existing UI.
         let mut pid = 0;
         unsafe {
@@ -316,7 +340,7 @@ mod platform {
         Ok(())
     }
     impl Running {
-        pub fn close(self) -> Result<()> {
+        pub fn close(self, updating: bool) -> Result<()> {
             use windows::Win32::{
                 Foundation::WAIT_OBJECT_0, System::Threading::*, UI::WindowsAndMessaging::*,
             };
@@ -338,7 +362,7 @@ mod platform {
                     SendMessageTimeoutW(
                         self.window,
                         message,
-                        WPARAM(0),
+                        WPARAM(usize::from(!updating)),
                         LPARAM(0),
                         SMTO_ABORTIFHUNG | SMTO_BLOCK,
                         2000,
@@ -410,6 +434,12 @@ mod platform {
         }
     }
 
+    /// Starting in the background never brings the running window forward,
+    /// and on Linux a second start never does either.
+    pub fn acquire_background() -> Result<Option<Instance>> {
+        acquire()
+    }
+
     /// X11 and Wayland have no portable window-property handshake; the lock file
     /// is the whole reservation and the running window is left untouched.
     pub(crate) fn register_window(_window: &winit::window::Window) -> Result<()> {
@@ -423,10 +453,10 @@ mod platform {
 }
 
 pub use platform::Instance;
+pub use platform::acquire_background;
 #[cfg(windows)]
 pub(crate) use platform::{
-    deliver_notification, reserve_after_exit, reserve_installer, reserve_maintenance,
-    reserve_update, running_installed,
+    deliver_notification, reserve_after_exit, reserve_installer, reserve_update, running_installed,
 };
 pub(crate) use platform::{register_window, take_update_exit};
 

@@ -55,12 +55,14 @@ impl Worker {
         handle: Lease,
         cancel: CancellationToken,
         connected: Arc<AtomicBool>,
+        business_ready: Arc<AtomicBool>,
         config: Arc<Mutex<VideoConfig>>,
         negotiated: Arc<crate::features::host::format::Negotiated>,
         transport: crate::features::host::transport::Transport,
         publication: tokio::sync::watch::Sender<Published>,
         pointer: Arc<Mutex<Option<crate::platform::cursor_shape::Snapshot>>>,
     ) -> Result<Self> {
+        let worker_started = Instant::now();
         let keyframe = Arc::new(AtomicBool::new(true));
         let request_keyframe = keyframe.clone();
         let feedback_cancel = cancel.clone();
@@ -218,6 +220,7 @@ impl Worker {
                     owner_cancel.clone(),
                     owner_encode_cancel,
                     connected,
+                    business_ready,
                     config,
                     owner_keyframe,
                     frames_tx,
@@ -470,7 +473,13 @@ impl Worker {
                     if frame.keyframe {
                         awaiting_keyframe = false;
                     }
-                    sent_first_frame.store(true, Ordering::Release);
+                    if !sent_first_frame.swap(true, Ordering::AcqRel) {
+                        tracing::info!(
+                            track = index,
+                            elapsed_ms = worker_started.elapsed().as_millis(),
+                            "host first video frame submitted"
+                        );
+                    }
                     send_handle.frame();
                 }
             }

@@ -7,6 +7,7 @@ fn main() {
     );
     if windows {
         println!("cargo:rerun-if-changed=assets/windows.rc");
+        println!("cargo:rerun-if-changed=assets/windows.manifest");
         println!("cargo:rerun-if-changed=assets/icon.ico");
         embed_resource::compile_for("assets/windows.rc", ["OpenUUYC"], embed_resource::NONE)
             .manifest_required()

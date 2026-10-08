@@ -12,6 +12,23 @@ use winit::window::Window;
 pub(crate) use super::video_layer::VideoPlacement;
 use crate::ui::gfx::nonzero_size;
 
+/// What a render call did with the window, as the D3D11 presenter reports
+/// it. A wgpu surface has no skipped or visibility-deferred frames: it either
+/// presents or keeps the output for the next repaint.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UiFrame {
+    Presented,
+    Pending,
+}
+impl UiFrame {
+    pub fn ready(self) -> bool {
+        self == Self::Presented
+    }
+    pub fn presented(self) -> bool {
+        self == Self::Presented
+    }
+}
+
 /// egui drawing output, separated from the platform half of `FullOutput`.
 pub(crate) struct RendererOutput {
     pub(crate) textures_delta: egui::TexturesDelta,
@@ -218,10 +235,10 @@ impl UiPresenter {
         context: &egui::Context,
         output: RendererOutput,
         transparent: bool,
-    ) -> Result<bool> {
+    ) -> Result<UiFrame> {
         self.defer_output(output);
         let Some(mut output) = self.pending_output.take() else {
-            return Ok(false);
+            return Ok(UiFrame::Pending);
         };
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) => frame,
@@ -237,7 +254,7 @@ impl UiPresenter {
                 self.pending_output = Some(output);
                 self.flush_writes();
                 context.request_repaint();
-                return Ok(false);
+                return Ok(UiFrame::Pending);
             }
             other => {
                 // Timeout or occluded: keep the frame and try again later.
@@ -245,7 +262,7 @@ impl UiPresenter {
                 self.pending_output = Some(output);
                 self.flush_writes();
                 context.request_repaint();
-                return Ok(false);
+                return Ok(UiFrame::Pending);
             }
         };
         let pixels_per_point = output.pixels_per_point;
@@ -328,7 +345,7 @@ impl UiPresenter {
         if let Err(error) = self.device.poll(wgpu::PollType::Poll) {
             tracing::debug!(?error, "维护 GPU 设备失败");
         }
-        Ok(true)
+        Ok(UiFrame::Presented)
     }
 
     /// Hand any queued `write_texture` data to the GPU without drawing.

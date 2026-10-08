@@ -6,7 +6,7 @@ use crate::transport::rtcp_timing::RtcpTiming;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::ice_transport::ice_candidate_type::RTCIceCandidateType;
 use webrtc::peer_connection::RTCPeerConnection;
@@ -236,6 +236,7 @@ pub(super) async fn sample_network_performance(
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut pipeline_sample = 0_u8;
     let mut last_candidate_pair = None;
+    let mut ice_sample: Option<(String, u64, Instant)> = None;
     loop {
         interval.tick().await;
         let mut selected_candidate_ids = None;
@@ -303,6 +304,7 @@ pub(super) async fn sample_network_performance(
             selected_route = Some(route);
         }
         let mut delay_seconds = None;
+        let mut ice_observed_at = None;
         let rtcp_rtt = rtcp_timing.publish_rtt();
         for report in connection.get_stats().await.reports.into_values() {
             match report {
@@ -323,6 +325,13 @@ pub(super) async fn sample_network_performance(
                             .or(average.filter(|value| value.is_finite() && *value >= 0.0));
                     if candidate.is_some() {
                         delay_seconds = candidate;
+                        if ice_sample.as_ref().is_none_or(|(id, count, _)| {
+                            *id != pair.id || *count != pair.responses_received
+                        }) {
+                            ice_sample =
+                                Some((pair.id.clone(), pair.responses_received, Instant::now()));
+                        }
+                        ice_observed_at = ice_sample.as_ref().map(|(_, _, at)| *at);
                     }
                 }
                 StatsReportType::LocalCandidate(stats)
@@ -345,10 +354,13 @@ pub(super) async fn sample_network_performance(
         stream_control
             .network_control()
             .observe_rtt(delay_seconds.map(Duration::from_secs_f64));
-        performance.set_measured_media_rtt(rtcp_rtt);
+        performance.set_measured_media_rtt(rtcp_rtt, rtcp_timing.published_rtt_at());
         for track in tracks.all() {
             let measured = rtcp_timing.rtt_for(track.metadata.ssrc);
-            track.performance.set_measured_media_rtt(measured);
+            track.performance.set_measured_media_rtt(
+                measured,
+                rtcp_timing.rtt_observed_at_for(track.metadata.ssrc),
+            );
             if let Some(rtt) = measured {
                 track.nack_rtt_micros.store(
                     rtt.as_micros().min(u128::from(u64::MAX)) as u64,
@@ -356,9 +368,14 @@ pub(super) async fn sample_network_performance(
                 );
             }
         }
-        if let Some(delay) = rtcp_rtt.or_else(|| delay_seconds.map(Duration::from_secs_f64)) {
-            performance.set_current_delay(delay);
-        }
+        let measured = rtcp_rtt
+            .zip(rtcp_timing.published_rtt_at())
+            .filter(|(_, at)| at.elapsed() <= Duration::from_secs(5));
+        performance.set_current_delay(measured.or_else(|| {
+            delay_seconds
+                .map(Duration::from_secs_f64)
+                .zip(ice_observed_at)
+        }));
         if let Some(rtt) = rtcp_rtt {
             nack_rtt_micros.store(
                 rtt.as_micros().min(u128::from(u64::MAX)) as u64,

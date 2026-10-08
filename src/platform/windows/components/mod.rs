@@ -2,6 +2,7 @@
 pub(crate) mod application;
 pub(crate) mod driver;
 pub(crate) mod files;
+pub(crate) mod migration;
 pub(crate) mod suite;
 use anyhow::{Context, Result, ensure};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -316,7 +317,7 @@ fn request_with_resume(
     anyhow::bail!("请使用统一安装或卸载入口")
 }
 pub(super) fn elevate(args: &str, kind: Kind) -> Result<bool> {
-    let exe = std::env::current_exe()?;
+    let exe = dunce::canonicalize(std::env::current_exe()?)?;
     let exe: Vec<u16> = exe
         .as_os_str()
         .to_string_lossy()
@@ -326,7 +327,7 @@ pub(super) fn elevate(args: &str, kind: Kind) -> Result<bool> {
     let args: Vec<u16> = args.encode_utf16().chain(Some(0)).collect();
     let mut info = SHELLEXECUTEINFOW {
         cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
-        fMask: SEE_MASK_NOCLOSEPROCESS,
+        fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI,
         lpVerb: w!("runas"),
         lpFile: PCWSTR(exe.as_ptr()),
         lpParameters: PCWSTR(args.as_ptr()),

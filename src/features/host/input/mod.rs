@@ -115,7 +115,7 @@ struct Shared {
     cancel: CancellationToken,
     connected: Arc<AtomicBool>,
     geometry: Box<dyn Fn() -> Geometry + Send + Sync>,
-    ready: tokio::sync::watch::Sender<Option<u64>>,
+
     policy: wire::Policy,
     configuration: tokio::sync::watch::Sender<Arc<config::Configuration>>,
     mouse_policy: tokio::sync::watch::Sender<config::MousePolicy>,
@@ -145,7 +145,7 @@ impl Session {
             cancel,
             connected,
             geometry: Box::new(geometry),
-            ready: tokio::sync::watch::channel(None).0,
+
             policy,
             configuration: tokio::sync::watch::channel(Arc::new(Default::default())).0,
             mouse_policy: tokio::sync::watch::channel(Default::default()).0,
@@ -201,34 +201,17 @@ impl Receiver {
         gate.generation = gate.generation.wrapping_add(1);
         gate.stream = Some(stream);
         gate.faulted = false;
-        self.shared.ready.send_replace(None);
         gate.binding
     }
     pub fn generation(&self, stream: u16) -> Option<u64> {
         let gate = lock(&self.shared.gate);
         (gate.stream == Some(stream)).then_some(gate.binding)
     }
-    pub async fn ready(&self, stream: u16, generation: u64) -> bool {
-        let mut ready = self.shared.ready.subscribe();
-        loop {
-            {
-                let gate = lock(&self.shared.gate);
-                if gate.stream != Some(stream) || gate.binding != generation {
-                    return false;
-                }
-            }
-            if *ready.borrow_and_update() == Some(generation) {
-                return true;
-            }
-            tokio::select! {_=self.shared.cancel.cancelled()=>return false,result=ready.changed()=>{if result.is_err(){return false}}}
-        }
-    }
     pub fn close(&self, stream: u16, generation: u64) -> bool {
         let mut gate = lock(&self.shared.gate);
         if gate.stream == Some(stream) && gate.binding == generation {
             gate.stream = None;
             gate.generation = gate.generation.wrapping_add(1);
-            self.shared.ready.send_replace(None);
             true
         } else {
             false
@@ -237,7 +220,6 @@ impl Receiver {
     pub fn transport_lost(&self) {
         let mut gate = lock(&self.shared.gate);
         gate.generation = gate.generation.wrapping_add(1);
-        self.shared.ready.send_replace(None);
     }
     /// Return true for input envelopes, including rejected/unknown JSON actions.
     /// Never route malformed input into another business handler or log payloads.
@@ -434,17 +416,6 @@ fn run(shared: Arc<Shared>, rx: mpsc::Receiver<()>) {
                     }
                 }
             }
-            let gate = lock(&shared.gate);
-            if gate.generation == current && shared.permitted() {
-                shared.ready.send_if_modified(|ready| {
-                    if *ready == Some(gate.binding) {
-                        false
-                    } else {
-                        *ready = Some(gate.binding);
-                        true
-                    }
-                });
-            }
         }
         let mut item = lock(&shared.gate).pending.pop_front();
         if item.is_none() {
@@ -563,7 +534,6 @@ fn run(shared: Arc<Shared>, rx: mpsc::Receiver<()>) {
             let mut gate = lock(&shared.gate);
             gate.generation = gate.generation.wrapping_add(1);
             gate.faulted = true;
-            shared.ready.send_replace(None);
             generation = None;
         }
     }

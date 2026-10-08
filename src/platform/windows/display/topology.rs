@@ -12,6 +12,12 @@ use windows::{
     core::PCWSTR,
 };
 
+/// CDS_TEST rejected the requested mode before any change was applied. Initial
+/// preferences may retain the current mode; explicit runtime requests still fail.
+#[derive(Debug, thiserror::Error)]
+#[error("显示驱动拒绝分辨率：{0}")]
+pub(crate) struct ModeTestRejected(pub i32);
+
 pub(crate) const DPI_VALUES: [u32; 12] =
     [100, 125, 150, 175, 200, 225, 250, 300, 350, 400, 450, 500];
 
@@ -555,7 +561,7 @@ fn dpi(adapter: LUID, id: u32) -> Result<Dpi> {
 impl Target {
     pub(crate) fn revalidate(&self) -> Result<Self> {
         Topology::query(false)?
-            .targets()?
+            .metadata()?
             .into_iter()
             .find(|t| t.identity == self.identity && t.available)
             .context("目标显示器已断开")
@@ -599,13 +605,6 @@ impl Target {
     ) -> Result<()> {
         let target = self.revalidate()?;
         ensure!(target.active, "目标显示器未启用");
-        ensure!(
-            target
-                .modes
-                .iter()
-                .any(|m| m.width == width && m.height == height),
-            "不支持的物理分辨率"
-        );
         let source = wide(&target.source);
         let mut mode = DEVMODEW {
             dmSize: size_of::<DEVMODEW>() as u16,
@@ -626,17 +625,21 @@ impl Target {
         if (mode.dmPelsWidth, mode.dmPelsHeight) == (width, height) {
             return Ok(());
         }
+        ensure!(
+            modes(&target.source)?
+                .iter()
+                .any(|m| m.width == width && m.height == height),
+            "不支持的物理分辨率"
+        );
         mode.dmPelsWidth = width;
         mode.dmPelsHeight = height;
         mode.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT;
         let status = unsafe {
             ChangeDisplaySettingsExW(PCWSTR(source.as_ptr()), Some(&mode), None, CDS_TEST, None)
         };
-        ensure!(
-            status == DISP_CHANGE_SUCCESSFUL,
-            "显示驱动拒绝分辨率：{}",
-            status.0
-        );
+        if status != DISP_CHANGE_SUCCESSFUL {
+            return Err(ModeTestRejected(status.0).into());
+        }
         // Apply once; an ambiguous failure is never automatically replayed.
         ensure!(active(), "显示操作已取消");
         let status = unsafe {

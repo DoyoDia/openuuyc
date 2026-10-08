@@ -25,6 +25,7 @@ mod protection;
 mod settings;
 mod track;
 mod transport;
+pub(crate) mod update_resume;
 pub(crate) mod wol;
 
 use std::sync::{Mutex, MutexGuard};

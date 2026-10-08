@@ -101,6 +101,10 @@ pub(super) async fn bind_channel(
                     closing_microphone.transport_lost();
                 }
                 *current = None;
+                if control {
+                    routes.handshake_complete = false;
+                    routes.handshake_answered = false;
+                }
                 routes.revision = routes.revision.wrapping_add(1);
                 true
             } else {
@@ -129,6 +133,8 @@ pub(super) async fn bind_channel(
             opening_target.send_modify(|routes| {
                 if control {
                     routes.control = Some(Arc::downgrade(&channel));
+                    routes.handshake_complete = false;
+                    routes.handshake_answered = false;
                 } else {
                     routes.text = Some(Arc::downgrade(&channel));
                 }
@@ -145,13 +151,8 @@ pub(super) async fn bind_channel(
             if file {
                 return;
             }
-            if !opening_input
-                .ready(channel.id(), input_generation.unwrap())
-                .await
-                || opening.is_cancelled()
-            {
-                return;
-            }
+            // PB readiness belongs to this channel, not the input executor.
+            // Input continues to enforce its own binding/desktop readiness.
             tracing::info!(channel = channel.label(), "host business channel opened");
             let bytes = crate::features::stream_control::publisher::echo(1, 0, true);
             let result = send_business(&channel, control, &opening_kcp, bytes).await;
@@ -449,6 +450,13 @@ pub(super) async fn publish_state(
             }
         }
         let routes = target.borrow_and_update().clone();
+        // S547AF0: initial state is published after the peer answers our PB
+        // handshake, not merely when DCEP opens. Otherwise the controller can
+        // consume a catalog before its connection-success initialization.
+        if !routes.handshake_complete || !routes.handshake_answered {
+            reports.media_ready.store(false, Ordering::Release);
+            continue;
+        }
         if revision != Some(routes.revision) {
             revision = Some(routes.revision);
             last_screen = None;
@@ -599,6 +607,12 @@ pub(super) async fn publish_state(
             && send(false, publisher::capture_change(source, selected.is_some())).await
         {
             last_capture = Some(capture);
+        }
+        // The controller's own ECHO response must precede its source catalog
+        // and first video frame. Answering our ECHO alone does not complete
+        // its reconnect/UI initialization.
+        if last_screen.is_some() && last_capture.is_some() {
+            reports.media_ready.store(true, Ordering::Release);
         }
         let visible = media.iter().any(|(_, s)| s.capturing && s.visible);
         let permission = (visible, audio.allowed());

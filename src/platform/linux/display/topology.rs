@@ -14,6 +14,18 @@ use x11rb::protocol::randr::{
 use x11rb::protocol::xproto::{ConnectionExt as _, Window};
 use x11rb::rust_connection::RustConnection;
 
+/// Windows tests a mode with the driver before changing anything and reports
+/// a refusal with this. RandR has no such test-only call, so on X11 no mode is
+/// ever rejected this way.
+#[derive(Debug)]
+pub(crate) enum ModeTestRejected {}
+impl std::fmt::Display for ModeTestRejected {
+    fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {}
+    }
+}
+impl std::error::Error for ModeTestRejected {}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Mode {
     pub width: u32,
@@ -593,4 +605,14 @@ impl Target {
         ensure!(missing.is_empty(), "显示器在切换分辨率时断开");
         Ok(())
     }
+}
+
+/// The sizes the output named `source` offers, as `Target::modes` lists them.
+pub(crate) fn modes(source: &str) -> Result<Vec<Mode>> {
+    Ok(Topology::query(true)?
+        .targets()?
+        .into_iter()
+        .find(|target| target.source == source)
+        .map(|target| target.modes)
+        .unwrap_or_default())
 }

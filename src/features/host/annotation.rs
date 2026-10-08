@@ -79,7 +79,9 @@ impl Receiver {
         }));
         let (input, incoming) = mpsc::sync_channel::<Work>(64);
         let state = binding.clone();
+        let activity=crate::platform::host_service::activity::Work::new();
         let worker = tokio::task::spawn_blocking(move || {
+            let _activity=activity;
             let mut backend = agent::Backend::default();
             let mut generation = 0;
             while !cancel.is_cancelled() {
@@ -189,13 +191,29 @@ impl Receiver {
         let Some(request) = publisher::draw_request(bytes)? else {
             return Ok(false);
         };
-        let generation = {
-            let b = super::lock(&self.binding);
-            if !b.channel.ptr_eq(&Arc::downgrade(channel)) {
-                return Ok(true);
-            }
-            b.generation
+        let Some(generation) = self.generation(channel) else {
+            return Ok(true);
         };
+        self.receive_official(channel, request, generation).await?;
+        Ok(true)
+    }
+    pub fn generation(&self, channel: &Arc<RTCDataChannel>) -> Option<u64> {
+        let b = super::lock(&self.binding);
+        b.channel
+            .ptr_eq(&Arc::downgrade(channel))
+            .then_some(b.generation)
+    }
+    /// Both official ingress carriers execute against the same TEXT-bound owner.
+    /// Capture the epoch at admission, not after an asynchronous queue wait.
+    pub async fn receive_official(
+        &self,
+        channel: &Arc<RTCDataChannel>,
+        request: publisher::DrawRequest,
+        generation: u64,
+    ) -> Result<()> {
+        if self.generation(channel) != Some(generation) {
+            return Ok(());
+        }
         let (reply, result) = tokio::sync::oneshot::channel();
         let code = if !model::valid(&request.command) {
             4
@@ -232,7 +250,7 @@ impl Receiver {
                 .send_text_bytes(&bytes::Bytes::from(request.response(code)))
                 .await?;
         }
-        Ok(true)
+        Ok(())
     }
     async fn receive_native(
         &self,

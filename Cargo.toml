@@ -1,6 +1,6 @@
 [package]
 name = "openuuyc"
-version = "1.0.0-beta.1"
+version = "1.0.0-beta.2"
 edition = "2024"
 description = "Third-party Rust client for UU Remote protocol interoperability"
 license-file = "LICENSE"
@@ -105,6 +105,7 @@ epaint_default_fonts = "=0.36.1"
 flate2 = "1.1.10"
 
 [target.'cfg(windows)'.dependencies]
+openuuyc-bootstrap = { path = "crates/bootstrap" }
 # Required by the generated code of #[windows::core::implement].
 windows-core = "0.62.2"
 # The host role's Intel VPL and AMD AMF encoders beside NVENC.

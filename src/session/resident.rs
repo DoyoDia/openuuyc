@@ -8,6 +8,11 @@ use serde::{Deserialize, Serialize};
 pub(crate) enum Request {
     Resume,
     Pause,
+    Quiescent,
+    DeploymentReady,
+    FinishMigration {
+        target: String,
+    },
     PrepareUpdate,
     CancelUpdate,
     Snapshot {
@@ -90,10 +95,15 @@ pub(crate) struct Snapshot {
 #[derive(Serialize, Deserialize)]
 pub(crate) enum Reply {
     Done,
+    #[cfg(windows)]
+    Migration(crate::platform::windows::components::migration::Report),
     Snapshot(Box<Snapshot>),
     Identity(Box<NativeIdentity>),
     Error(String),
-    ApiError { code: i32, message: String },
+    ApiError {
+        code: i32,
+        message: String,
+    },
 }
 impl Reply {
     pub(crate) fn from_error(error: anyhow::Error) -> Self {

@@ -279,13 +279,22 @@ impl Handle {
             Some(Err(error)) => Err(error),
             None => Ok(()),
         };
-        if result.is_err() {
-            self.cancel_update();
+        if let Err(error) = result {
+            // PrepareUpdate closes admission, not a remote-consent gate. A
+            // controller that cannot acknowledge must not veto a local update.
+            // Pause/deployment still owns and verifies actual process exit.
+            tracing::warn!(error=%format!("{error:#}"), "update notification unavailable; continuing local shutdown");
         }
-        result
+        Ok(())
     }
+    // Only the installed Windows service's resident owner cancels an update;
+    // a desktop client's update exit never returns.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub(crate) fn cancel_update(&self) {
         lock(&self.ownership).updating = false;
+        if let Err(error) = super::update_resume::clear(&self.scope) {
+            tracing::warn!(%error, "cancelled update media handoff cleanup failed");
+        }
     }
     pub(crate) fn bind_account(&mut self, account: String) {
         self.account = account;
@@ -706,6 +715,11 @@ impl Handle {
     pub(crate) fn set_allowed(&self, allowed: bool) {
         if !allowed {
             self.power.invalidate();
+            if !crate::platform::host_service::resident::managed() {
+                if let Err(error) = super::update_resume::clear(&self.scope) {
+                    tracing::warn!(%error, "revoked update media handoff cleanup failed");
+                }
+            }
         }
 
         let mut state = lock(&self.ownership);
@@ -853,12 +867,20 @@ impl Handle {
         self.power.invalidate();
         self.assistance.unavailable();
         let mut state = lock(&self.ownership);
+        let clear_update =
+            !state.updating && !crate::platform::host_service::resident::managed();
         state.active = false;
         state.permission = state.permission.wrapping_add(1);
         finish_session(&mut state);
         state.status.ready = false;
         state.status.message = "本机离线".into();
         self.desired.send_replace(None);
+        drop(state);
+        if clear_update {
+            if let Err(error) = super::update_resume::clear(&self.scope) {
+                tracing::warn!(%error, "retired update media handoff cleanup failed");
+            }
+        }
     }
     pub(crate) fn room_closed(&self) {
         self.assistance.unavailable();
@@ -1126,6 +1148,9 @@ impl Lease {
     }
     pub(crate) fn requested(&self) -> bool {
         self.current(&lock(&self.handle.ownership))
+    }
+    pub(crate) fn updating(&self) -> bool {
+        lock(&self.handle.ownership).updating
     }
     pub(crate) fn update(&self, ready: bool, connected: bool, message: impl Into<String>) {
         self.modify(|state| Handle::update_locked(state, ready, connected, message.into()));

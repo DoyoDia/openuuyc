@@ -92,6 +92,26 @@ pub(crate) async fn request(request: Request) -> Result<Reply> {
         .context("被控后台请求中断")?
 }
 
+/// A missing pipe is not proof that the host has stopped. Check SCM before
+/// skipping retirement, including when the service stops during the request.
+pub(crate) async fn pause_for_exit() -> Result<()> {
+    tokio::task::spawn_blocking(|| {
+        if !super::install::running()? {
+            return Ok(());
+        }
+        match call(Request::Pause) {
+            Ok(Reply::Done) => Ok(()),
+            Ok(_) => anyhow::bail!("结束被控后台返回无效响应"),
+            Err(error) => match super::install::running() {
+                Ok(false) => Ok(()),
+                _ => Err(error),
+            },
+        }
+    })
+    .await
+    .context("被控后台退出请求中断")?
+}
+
 fn authorize(pipe: &Pipe) -> Result<()> {
     let pid = pipe.peer_pid(true)?;
     // This management surface exposes only the installing user's own account
@@ -122,8 +142,7 @@ pub(crate) fn supervise(running: impl Fn() -> bool + Sync) -> Result<()> {
         let result = (|| -> Result<()> {
             while alive() {
                 let session = process::active_session();
-                let enabled =
-                    vault::applies()? && !paused.load(Ordering::Acquire) && session != u32::MAX;
+                let enabled = session != u32::MAX;
                 if child
                     .as_ref()
                     .is_some_and(|(id, agent)| !enabled || *id != session || !agent.alive())
@@ -220,6 +239,21 @@ fn control_connection(
         let result = (|| -> Result<Reply> {
             let request: Request = pipe.receive_timeout(Duration::from_secs(5), running)?;
             match request {
+                Request::FinishMigration { target } => {
+                    let (_, worker) = wait_for_session(child, &AtomicBool::new(false), running)?;
+                    worker.send(&Request::DeploymentReady, running)?;
+                    ensure!(
+                        matches!(
+                            worker
+                                .receive_timeout::<Reply>(Duration::from_secs(5), running)?
+                                .checked()?,
+                            Reply::Done
+                        ),
+                        "新版执行进程尚未就绪"
+                    );
+                    crate::platform::windows::components::migration::finish_machine(&target)
+                        .map(Reply::Migration)
+                }
                 Request::Resume => {
                     boot_pause(Some(false))?;
                     paused.store(false, Ordering::Release);
@@ -228,15 +262,24 @@ fn control_connection(
                 Request::Pause => {
                     boot_pause(Some(true))?;
                     paused.store(true, Ordering::Release);
-                    let started = std::time::Instant::now();
-                    while child.load(Ordering::Acquire) != 0
-                        && running()
-                        && started.elapsed() < Duration::from_secs(12)
-                    {
-                        std::thread::sleep(Duration::from_millis(50));
+                    if child.load(Ordering::Acquire) == 0 {
+                        Ok(Reply::Done)
+                    } else {
+                        let (_, target) =
+                            wait_for_session(child, &AtomicBool::new(false), running)?;
+                        target.send(&Request::Pause, running)?;
+                        target.receive_timeout(Duration::from_secs(12), running)
                     }
-                    ensure!(child.load(Ordering::Acquire) == 0, "后台尚未完全退出");
-                    Ok(Reply::Done)
+                }
+                Request::Quiescent => {
+                    if child.load(Ordering::Acquire) == 0 {
+                        Ok(Reply::Done)
+                    } else {
+                        let (_, target) =
+                            wait_for_session(child, &AtomicBool::new(false), running)?;
+                        target.send(&Request::Quiescent, running)?;
+                        target.receive_timeout(Duration::from_secs(5), running)
+                    }
                 }
                 request => {
                     ensure!(
@@ -429,6 +472,7 @@ pub(crate) fn run(parent: u32) -> Result<()> {
     let parent_raw = parent_handle.0.0 as usize;
     let running = || unsafe { windows::Win32::System::Threading::WaitForSingleObject(windows::Win32::Foundation::HANDLE(stop_raw as *mut _), 0) == windows::Win32::Foundation::WAIT_TIMEOUT } && process::active_session() == session && unsafe { windows::Win32::System::Threading::WaitForSingleObject(windows::Win32::Foundation::HANDLE(parent_raw as *mut _), 0) == windows::Win32::Foundation::WAIT_TIMEOUT };
     OWNER.store(true, Ordering::Release);
+    crate::features::host::displays::recovery::recover_abandoned()?;
     if let Err(error) = super::super::virtual_audio::Defaults::recover_defaults() {
         // Before Windows logon there is no user's default microphone to touch.
         // A later authorized request retries recovery before selecting ours.
@@ -439,6 +483,22 @@ pub(crate) fn run(parent: u32) -> Result<()> {
     let stop = tokio_util::sync::CancellationToken::new();
     let alive = || running() && !stop.is_cancelled();
     std::thread::scope(|scope| -> Result<()> {
+        let displays = scope.spawn(|| {
+            let mut owner = crate::features::host::displays::fallback::Maintainer::default();
+            let mut last = String::new();
+            while alive() {
+                if let Err(error) = owner.tick() {
+                    let error = format!("{error:#}");
+                    if error != last {
+                        tracing::warn!(%error,"display maintenance deferred");
+                        last = error;
+                    }
+                } else {
+                    last.clear();
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        });
         let io = scope.spawn(|| {
             let result = std::thread::scope(|workers_scope| -> Result<()> {
                 let _cancel = stop.clone().drop_guard();
@@ -488,11 +548,43 @@ pub(crate) fn run(parent: u32) -> Result<()> {
         });
         let result = runtime.block_on(run_account(rx, &alive));
         stop.cancel();
+        displays
+            .join()
+            .map_err(|_| anyhow::anyhow!("显示维护线程异常"))?;
         result.and(io.join().map_err(|_| anyhow::anyhow!("后台命令线程异常"))?)
     })
 }
 type Incoming = tokio::sync::mpsc::Receiver<(Request, tokio::sync::oneshot::Sender<Reply>)>;
 async fn run_account(mut incoming: Incoming, running: &impl Fn() -> bool) -> Result<()> {
+    while running() {
+        if !vault::applies()? {
+            let command = tokio::select! { value=incoming.recv()=>value,_=tokio::time::sleep(Duration::from_millis(200))=>None };
+            if let Some((request, reply)) = command {
+                let result = if matches!(
+                    request,
+                    Request::Pause | Request::Quiescent | Request::DeploymentReady
+                ) {
+                    Reply::Done
+                } else {
+                    Reply::Error("本机尚未授权常驻被控".into())
+                };
+                let _ = reply.send(result);
+            } else if incoming.is_closed() {
+                break;
+            }
+            continue;
+        }
+        run_authorized_account(&mut incoming, running).await?;
+        if incoming.is_closed() {
+            break;
+        }
+    }
+    Ok(())
+}
+async fn run_authorized_account(
+    incoming: &mut Incoming,
+    running: &impl Fn() -> bool,
+) -> Result<()> {
     let device = DeviceRuntime::start()?;
     let store = KeyringSessionStore::new()?;
     let mut client: Option<HostClient> = None;
@@ -510,13 +602,46 @@ async fn run_account(mut incoming: Incoming, running: &impl Fn() -> bool) -> Res
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let result: Result<()> = async {
         while running() {
+            if !vault::applies()? {break;}
+            if preparation.as_ref().is_some_and(|(_,task)|task.is_finished()) {
+                cancel_preparation(&mut preparation).await;
+            }
             let command =
                 tokio::select! { value = incoming.recv() => value, _ = tick.tick() => None, _ = initializers.join_next(), if !initializers.is_empty() => None };
             if incoming.is_closed() && command.is_none() {
                 break;
             }
             if let Some((request, reply)) = command {
+                if paused()? && !matches!(&request,Request::Pause|Request::Quiescent|Request::DeploymentReady) {
+                    let _=reply.send(Reply::Error("被控后台已暂停".into()));
+                    continue;
+                }
                 let result: Result<Reply> = match request {
+                    Request::DeploymentReady=>Ok(Reply::Done),
+                    Request::Pause => {
+                        initializers.abort_all();
+                        while initializers.join_next().await.is_some() {}
+                        cancel_preparation(&mut preparation).await;
+                        if let Some(current)=client.take(){
+                            // Maintenance suspends hosting, not the account.
+                            // Retiring the identity tells ActivePresence that
+                            // authentication was revoked and clears saved login.
+                            current.host.retire();
+                            if let Some(p)=presence.take(){p.close().await;}
+                            current.close().await;
+                        }
+                        online=PresenceState::Offline;
+                        let deadline=std::time::Instant::now()+Duration::from_secs(10);
+                        while !(super::activity::idle() && super::user_backend::idle().unwrap_or(false)) && std::time::Instant::now()<deadline {
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                        }
+                        if super::activity::idle() && super::user_backend::idle()? {Ok(Reply::Done)}else{Err(anyhow::anyhow!("会话资源尚未排空"))}
+                    },
+                    Request::Quiescent => {
+                        if client.as_ref().is_none_or(|c|c.host.status().connection.is_none())
+                            && preparation.is_none() && initializers.is_empty() && super::activity::idle() && super::user_backend::idle()? {Ok(Reply::Done)}
+                        else{Err(anyhow::anyhow!("后台仍有活动会话"))}
+                    },
                     Request::PrepareUpdate => {
                         if let Some(current)=&client {current.host.prepare_update().await.map(|_|Reply::Done)} else {Ok(Reply::Done)}
                     },
@@ -641,6 +766,7 @@ async fn run_account(mut incoming: Incoming, running: &impl Fn() -> bool) -> Res
                 };
                 let _ = reply.send(result.unwrap_or_else(Reply::from_error));
             }
+            if paused()? || !vault::applies()? { continue; }
             let saved = store.load()?.map(|s| s.generation()).unwrap_or_default();
             let desired_identity = if saved.is_empty() {
                 format!("guest:{}",device.handle().identity().client_identity()?.client_id)

@@ -155,7 +155,9 @@ impl Session {
         let state = self.state.clone();
         let lease = self.lease.clone();
         let closed = self.closed.clone();
+        let activity=crate::platform::host_service::activity::Work::new();
         tokio::task::spawn_blocking(move || {
+            let _activity=activity;
             let _serial = display::recovery::Serial::acquire()?;
             let mut state = lock(&state);
             ensure!(
@@ -443,7 +445,9 @@ impl Session {
             return Ok(());
         }
         let state = self.state.clone();
+        let activity=crate::platform::host_service::activity::Work::new();
         tokio::task::spawn_blocking(move || {
+            let _activity=activity;
             let _serial = display::recovery::Serial::acquire()?;
             let mut state = lock(&state);
             if state.dirty {
@@ -504,7 +508,7 @@ fn remove_owned(driver: &Driver, guid: &str) -> Result<()> {
 }
 fn current_dpi() -> Result<Vec<(String, u32)>> {
     Ok(Topology::query(true)?
-        .targets()?
+        .metadata()?
         .into_iter()
         .filter_map(|t| t.dpi.map(|d| (t.identity, d.current)))
         .collect())
@@ -516,7 +520,7 @@ fn find_screen(identity: &str) -> Result<capture::Screen> {
         .context("显示目标尚未进入桌面")
 }
 fn restore_dpi(values: &[(String, u32)]) -> Result<()> {
-    let targets = Topology::query(true)?.targets()?;
+    let targets = Topology::query(true)?.metadata()?;
     for (identity, dpi) in values {
         if let Some(target) = targets.iter().find(|t| &t.identity == identity) {
             target.set_dpi(*dpi, || true)?;
@@ -617,7 +621,11 @@ impl State {
             self.journal.applied = Some(self.journal.baseline.clone());
             self.journal.applied_dpi = self.journal.dpi.clone();
             self.save()?;
-            if let Err(error) = display::recovery::start_guard(&self.journal.token) {
+            if let Err(error) = if crate::platform::host_service::resident::is_owner() {
+                // The service supervises this persistent owner and its next
+                // incarnation replays the durable recovery journal.
+                Ok(())
+            } else { display::recovery::start_guard(&self.journal.token) } {
                 let _ = std::fs::remove_file(&self.path);
                 return Err(error);
             }

@@ -87,23 +87,11 @@ fn verify_service(service: &Sc) -> Result<bool> {
         let config = &*buffer.as_ptr().cast::<QUERY_SERVICE_CONFIGW>();
         let path = config.lpBinaryPathName.to_string()?;
         let current = path.eq_ignore_ascii_case(&command()?);
-        let previous = path.eq_ignore_ascii_case(&format!(
-            "\"{}\" service",
-            deployment::legacy_directory()?
-                .join("OpenUUYCHost.exe")
-                .display()
-        ));
+        let previous = crate::platform::windows::components::migration::legacy_service_command(&path)?;
         ensure!(
             config.dwServiceType == SERVICE_WIN32_OWN_PROCESS && (current || previous),
             "现有同名服务不属于本程序，已保留"
         );
-        if previous {
-            ensure!(
-                std::fs::read_to_string(deployment::legacy_directory()?.join("owner.txt"))?
-                    == RECEIPT,
-                "既有组件归属不匹配"
-            );
-        }
         Ok(current)
     }
 }
@@ -247,7 +235,11 @@ fn ensure_idle(service: &Sc) -> Result<()> {
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(0);
-    let display_agent = super::displays::maintenance_pid(state.dwProcessId)?.unwrap_or(0);
+    let display_agent = crate::platform::windows::components::migration::legacy_display_pid(state.dwProcessId)?.unwrap_or(0);
+    if resident != 0 {
+        ensure!(matches!(super::resident::call(super::resident::Request::Quiescent)?.checked()?,
+            super::resident::Reply::Done), "后台会话尚未排空");
+    }
     let snapshot = super::pipe::Handle(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)? });
     let mut entry = PROCESSENTRY32W {
         dwSize: size_of::<PROCESSENTRY32W>() as u32,
@@ -271,7 +263,14 @@ fn ensure_idle(service: &Sc) -> Result<()> {
                     .context("安装文件名无效")?,
             ))
         {
-            return Err(ActiveSession.into());
+            // A service-launched ordinary control center is not a privileged
+            // capture/input lease. Its host work was drained above; require the
+            // registered application image before excluding it from this check.
+            if super::vault::sid(entry.th32ProcessID)? != "S-1-5-18" {
+                verify_client(entry.th32ProcessID)?;
+            } else {
+                return Err(ActiveSession.into());
+            }
         }
         result = unsafe { Process32NextW(snapshot.0, &mut entry) };
     }

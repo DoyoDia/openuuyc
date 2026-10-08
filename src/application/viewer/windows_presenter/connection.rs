@@ -663,7 +663,7 @@ impl WindowsConnectionApp {
         let presented = self
             .presenter
             .render(&self.egui_context, renderer_output, false)?;
-        if presented && window.is_visible() == Some(false) {
+        if presented.ready() && window.is_visible() == Some(false) {
             window.set_visible(true);
         }
         if let Some(audit) = UiTimingAudit::active(&mut self.timing_audit, started) {
@@ -672,7 +672,7 @@ impl WindowsConnectionApp {
                 layout_elapsed,
                 started.elapsed().saturating_sub(layout_elapsed),
                 immediate,
-                presented,
+                presented.presented(),
             );
         }
         if let Some(direction) = resize {

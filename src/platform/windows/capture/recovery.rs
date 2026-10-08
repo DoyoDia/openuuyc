@@ -15,11 +15,11 @@ impl Recovery {
         }
     }
     pub fn due(&self, now: Instant) -> bool {
-        self.attempts < 5 && now >= self.next
+        now >= self.next
     }
     pub fn attempt(&mut self, now: Instant) {
-        self.attempts += 1;
-        self.next = now + Duration::from_secs(10);
+        self.attempts = self.attempts.saturating_add(1);
+        self.next = now + self.delay();
     }
     pub fn promoted(&mut self, now: Instant) {
         self.dxgi_since = Some(now);
@@ -38,10 +38,21 @@ impl Recovery {
                 .dxgi_since
                 .is_some_and(|at| now.saturating_duration_since(at) < Duration::from_secs(30));
         if unstable {
-            self.attempts = 5;
+            self.attempts = self.attempts.max(3);
         }
         self.dxgi_since = None;
-        self.next = now + Duration::from_secs(10);
+        self.next = now + self.delay();
         unstable
+    }
+
+    fn delay(&self) -> Duration {
+        // Fullscreen/driver transitions can outlive a fixed retry budget without
+        // changing screen identity or dimensions. Back off instead of permanently
+        // disabling DXGI; a short-lived recovery must not cause a rapid loop.
+        Duration::from_secs(match self.attempts {
+            0 | 1 => 10,
+            2 => 30,
+            _ => 60,
+        })
     }
 }

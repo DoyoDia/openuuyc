@@ -31,6 +31,7 @@ use webrtc::{
 };
 
 pub(crate) struct Peer {
+    activity: Option<crate::platform::host_service::activity::Work>,
     core: ConnectionCore,
     pub candidates: mpsc::UnboundedReceiver<RTCIceCandidateInit>,
     cancel: CancellationToken,
@@ -74,6 +75,8 @@ pub(super) struct ReportRoutes {
     pub(super) clipboard: i32,
     control: Option<std::sync::Weak<RTCDataChannel>>,
     control_screens: bool,
+    handshake_complete: bool,
+    handshake_answered: bool,
     revision: u64,
     secure_revision: u64,
 }
@@ -82,6 +85,8 @@ impl ReportRoutes {
         &mut self,
         received: &crate::features::stream_control::publisher::Received,
     ) -> bool {
+        let opened = received.handshake_complete && !self.handshake_complete;
+        self.handshake_complete |= received.handshake_complete;
         if let Some(level) = received.clipboard {
             self.clipboard = level;
         }
@@ -91,13 +96,17 @@ impl ReportRoutes {
         if let Some(value) = received.control_screen_reports {
             self.control_screens = value;
         }
-        if reroute || received.refresh_state || received.clipboard.is_some() {
+        if opened || reroute || received.refresh_state || received.clipboard.is_some() {
             self.revision = self.revision.wrapping_add(1);
         }
         if received.refresh_secure {
             self.secure_revision = self.secure_revision.wrapping_add(1);
         }
-        reroute || received.refresh_state || received.refresh_secure || received.clipboard.is_some()
+        opened
+            || reroute
+            || received.refresh_state
+            || received.refresh_secure
+            || received.clipboard.is_some()
     }
 }
 type ReportTarget = tokio::sync::watch::Sender<ReportRoutes>;
@@ -126,6 +135,7 @@ impl Peer {
         clipboard_level: i32,
         file_capabilities: crate::features::file_transfer::host::Capabilities,
         data_only: bool,
+        update_resume: Option<super::update_resume::Context>,
     ) -> Result<Self> {
         let audio_only = deferred.is_some() && !data_only;
         let handle = owner.with_cancellation(cancel.clone());
@@ -606,7 +616,12 @@ impl Peer {
             clipboard: clipboard_level,
             ..Default::default()
         });
-        handle.set_update_notice(UpdateNotice::new(report_target.clone(), cancel.clone()));
+        handle.set_update_notice(UpdateNotice::new(
+            report_target.clone(),
+            cancel.clone(),
+            update_resume,
+            screens.clone(),
+        ));
         let cursor = tokio::spawn(cursor::run(
             reports.clone(),
             report_receiver.clone(),
@@ -663,6 +678,7 @@ impl Peer {
             negotiated: negotiated.clone(),
             input: input.receiver(),
             files: files.clone(),
+            annotation: annotation.clone(),
             screens: screens.clone(),
             report_target: report_target.clone(),
             kcp: kcp.clone(),
@@ -765,8 +781,14 @@ impl Peer {
             }
         });
         let capture_audio = audio.clone();
+        let activity = crate::platform::host_service::activity::Work::new();
         stream_tasks.push(tokio::spawn(async move {
-            if let Err(error) = tokio::task::spawn_blocking(move || capture_audio.run()).await {
+            if let Err(error) = tokio::task::spawn_blocking(move || {
+                let _activity = activity;
+                capture_audio.run()
+            })
+            .await
+            {
                 tracing::error!(%error,"desktop audio worker failed");
             }
         }));
@@ -788,8 +810,39 @@ impl Peer {
             tokio::select! { _=feedback_cancel.cancelled()=>{}, _=feedback_audio.transmitter().feedback(audio_sender)=>{} }
         }));
         let peer_transport = transport.clone();
+        // Only the installed Windows service hosts on behalf of a separate
+        // user GUI process.
+        #[cfg(windows)]
+        if crate::platform::host_service::resident::is_owner() {
+            let user_cancel = cancel.clone();
+            let user_lease = handle.clone();
+            stream_tasks.push(tokio::spawn(async move {
+                let mut observed:Option<crate::platform::windows::host_service::user_backend::Observer>=None;
+                loop {
+                    tokio::select!{_=user_cancel.cancelled()=>break,_=tokio::time::sleep(Duration::from_millis(100))=>{}}
+                    if let Some(owner)=&observed {
+                        if !owner.alive() {
+                            // A restarted GUI is a new user execution authority.
+                            // Do not retain old file/clipboard/input operations.
+                            tracing::warn!("user backend exited; retiring controlled connection");
+                            // Retire the execution lease so signaling sends
+                            // clear_out; a bare media cancel leaves viewers
+                            // waiting to reconnect to an invalid old session.
+                            user_lease.finish();
+                            user_cancel.cancel();break;
+                        }
+                    } else {
+                        match crate::platform::windows::host_service::user_backend::observe() {
+                            Ok(owner)=>observed=owner.filter(|owner|owner.alive()),
+                            Err(error)=>{tracing::warn!(%error,"user backend observation failed");user_lease.finish();user_cancel.cancel();break;}
+                        }
+                    }
+                }
+            }));
+        }
         construction.disarm();
         Ok(Self {
+            activity: Some(crate::platform::host_service::activity::Work::new()),
             core,
             candidates,
             cancel,
@@ -1007,10 +1060,13 @@ impl Peer {
         }
     }
     pub(crate) async fn close(mut self) {
+        let started = std::time::Instant::now();
         self.cancel.cancel();
         self.input.close();
         self.microphone.close();
+        let input_done = started.elapsed();
         let _ = self.core.close().await;
+        let transport_done = started.elapsed();
         let tracks = std::mem::take(&mut *lock(&self.microphone_tracks));
         for track in tracks {
             let _ = track.await;
@@ -1018,8 +1074,17 @@ impl Peer {
         for task in self.tasks.drain(..) {
             let _ = task.await;
         }
+        let workers_done = started.elapsed();
         self.screens.lock().await.close().await;
         self.handle.finish();
+        tracing::info!(
+            input_ms = input_done.as_millis(),
+            transport_ms = (transport_done - input_done).as_millis(),
+            workers_ms = (workers_done - transport_done).as_millis(),
+            screens_ms = (started.elapsed() - workers_done).as_millis(),
+            total_ms = started.elapsed().as_millis(),
+            "host connection shutdown completed"
+        );
     }
     pub(crate) fn load_input_configuration(
         &mut self,
@@ -1048,11 +1113,13 @@ impl Drop for Peer {
         // cancelled close future or an exceptional drop by the signal owner.
         let closing = self.core.close_detached();
         let screens = self.screens.clone();
+        let activity = self.activity.take();
         tokio::spawn(async move {
             if let Some(closing) = closing {
                 let _ = closing.await;
             }
             screens.lock().await.close().await;
+            drop(activity);
         });
     }
 }

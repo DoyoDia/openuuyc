@@ -23,6 +23,7 @@ pub(super) fn capture_loop(
     cancel: CancellationToken,
     encode_cancel: Arc<AtomicBool>,
     connected: Arc<AtomicBool>,
+    business_ready: Arc<AtomicBool>,
     config: Arc<Mutex<VideoConfig>>,
     keyframe: Arc<AtomicBool>,
     sender: mpsc::Sender<encoder::Encoded>,
@@ -32,6 +33,7 @@ pub(super) fn capture_loop(
     publication: tokio::sync::watch::Sender<Published>,
     pointer: Arc<Mutex<Option<crate::platform::cursor_shape::Snapshot>>>,
 ) -> Result<()> {
+    let _activity = crate::platform::host_service::activity::Work::new();
     let _runtime = encoder::Runtime::new()?;
     let mut desktop = None;
     let mut encoder = None;
@@ -74,14 +76,23 @@ pub(super) fn capture_loop(
         }
 
         let requested_hdr = wanted.format.hdr();
-        if desktop.is_none()
-            && connected.load(Ordering::Acquire)
-            && transport.media_ready()
-            && wanted.sending
-            && wanted.capturing
-        {
+        if desktop.is_none() && transport.media_ready() && wanted.sending && wanted.capturing {
+            // The authorized track is already negotiated. Prepare its native
+            // capture while ICE/DTLS is still connecting; the gate below still
+            // forbids frame acquisition/encoding/sending until transport is up.
+            // Nothing is kept warm outside this track's lease/cancellation scope.
+            let opened_at = Instant::now();
+            let connecting = !connected.load(Ordering::Acquire);
             desktop = Some(capture::Desktop::open_selected(&screen)?);
             generation = desktop.as_ref().unwrap().generation;
+            tracing::info!(
+                elapsed_ms = opened_at.elapsed().as_millis(),
+                connecting,
+                "host capture preparation completed"
+            );
+            // Native setup may overlap incoming CaptureSetting changes. Read
+            // the current revision before configuring or encoding any frame.
+            continue;
         }
         if let Some(desktop) = desktop.as_ref() {
             // T CCDCA0/CF3450 gate HDR on the actual source, not only the
@@ -231,6 +242,7 @@ pub(super) fn capture_loop(
             transport.pause();
         }
         if !connected.load(Ordering::Acquire)
+            || !business_ready.load(Ordering::Acquire)
             || !transport.media_ready()
             || !wanted.sending
             || !wanted.capturing

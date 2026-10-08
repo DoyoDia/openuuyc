@@ -64,6 +64,34 @@ impl Session {
 }
 
 impl State {
+    fn initial_resolution(
+        &mut self,
+        target: &Target,
+        width: u32,
+        height: u32,
+        lease: &Lease,
+    ) -> Result<bool> {
+        self.intend_mode(&target.identity, width, height)?;
+        match target.set_resolution(width, height, || lease.requested()) {
+            Ok(()) => Ok(true),
+            Err(error)
+                if error
+                    .downcast_ref::<display::topology::ModeTestRejected>()
+                    .is_some() =>
+            {
+                ensure!(lease.requested(), "显示操作已取消");
+                // Preflight did not modify Windows. Do not leave a fictitious
+                // desired mode for cleanup, or persist it as successfully applied.
+                self.journal.desired = None;
+                self.save()?;
+                tracing::warn!(width, height, %error,
+                    "initial display mode rejected; retaining current mode for connection");
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     fn prepare(
         &mut self,
         options: ConnectOptions,
@@ -155,21 +183,31 @@ impl State {
             }
             // Only restore explicit settings for targets which still exist.
             for saved in self.preferences.physical.clone() {
-                if let Some(target) = Topology::query(true)?
-                    .targets()?
+                let topology = Topology::query(true)?;
+                if let Some(target) = topology
+                    .metadata()?
                     .into_iter()
                     .find(|t| t.identity == saved.identity)
                 {
-                    self.begin()?;
-                    if target
-                        .modes
-                        .iter()
-                        .any(|m| m.width == saved.width && m.height == saved.height)
-                    {
-                        self.intend_mode(&target.identity, saved.width, saved.height)?;
-                        target.set_resolution(saved.width, saved.height, || lease.requested())?;
+                    let same_resolution = topology.snapshot()?.targets.iter().any(|t| {
+                        t.identity == saved.identity
+                            && t.width == saved.width
+                            && t.height == saved.height
+                    });
+                    let change_resolution = !same_resolution
+                        && display::topology::modes(&target.source)?
+                            .iter()
+                            .any(|m| m.width == saved.width && m.height == saved.height);
+                    let change_dpi =
+                        saved.dpi > 0 && target.dpi.as_ref().is_none_or(|d| d.current != saved.dpi);
+                    if !change_resolution && !change_dpi {
+                        continue;
                     }
-                    if saved.dpi > 0 {
+                    self.begin()?;
+                    if change_resolution {
+                        self.initial_resolution(&target, saved.width, saved.height, lease)?;
+                    }
+                    if change_dpi {
                         self.intend_dpi(&target.identity, saved.dpi)?;
                         target.set_dpi(saved.dpi, || lease.requested())?;
                     }
@@ -217,6 +255,15 @@ impl State {
         };
         if let Some((width, height)) = requested {
             validate_modes(&[(width, height)])?;
+            if (selected.width, selected.height) == (width, height) {
+                // Preserve the explicit preference without starting a recovery
+                // guard or writing mutation intent for an unchanged mode.
+                self.remember_physical(
+                    selected.identity.as_deref().context("缺少初始显示目标")?,
+                    Some(choice),
+                )?;
+                return Ok(selected);
+            }
             let target = Topology::query(true)?
                 .targets()?
                 .into_iter()
@@ -230,10 +277,11 @@ impl State {
                 return self.enter_super(width, height, 0, false, lease);
             }
             self.begin()?;
-            self.intend_mode(&target.identity, width, height)?;
-            target.set_resolution(width, height, || lease.requested())?;
+            let changed = self.initial_resolution(&target, width, height, lease)?;
             self.applied()?;
-            self.remember_physical(&target.identity, Some(choice))?;
+            if changed {
+                self.remember_physical(&target.identity, Some(choice))?;
+            }
             return find_screen(&target.identity);
         }
         Ok(selected)

@@ -58,7 +58,9 @@ pub(super) struct Journal {
 
 pub(super) fn root() -> Result<PathBuf> {
     // The installed service keeps display state in its protected vault.
-    if crate::platform::host_service::vault::applies()? {
+    if crate::platform::host_service::resident::is_owner()
+        || crate::platform::host_service::vault::applies()?
+    {
         return Ok(crate::platform::host_service::vault::root()?.join("displays"));
     }
     portable_root()

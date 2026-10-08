@@ -5,8 +5,11 @@ use std::time::{Duration, Instant};
 
 use crossbeam_queue::ArrayQueue;
 
+pub(crate) mod health;
+
 #[derive(Clone, Debug)]
 pub struct PerformanceSnapshot {
+    pub(crate) health: health::Assessment,
     pub connection: String,
     pub network_switch_phase: u8,
     pub network_switch_attempts: u64,
@@ -189,7 +192,10 @@ struct PerformanceInner {
     marked_rendered_frames: AtomicU64,
     presentation_started: AtomicBool,
     current_delay_micros: AtomicU64,
+    current_delay_observed_micros: AtomicU64,
+    presentation_epoch: AtomicU64,
     measured_media_rtt_micros: AtomicU64,
+    measured_media_rtt_observed_micros: AtomicU64,
     assembly_delay_micros: AtomicU64,
     local_frame_delay_micros: AtomicU64,
     input_queue_delay_micros: AtomicU64,
@@ -218,6 +224,7 @@ struct PerformanceInner {
     sample_events: ArrayQueue<PerformanceSampleEvent>,
     sample_state: Mutex<PerformanceSampleState>,
     snapshot_cache: Mutex<Option<(Instant, Arc<PerformanceSnapshot>)>>,
+    health: Mutex<health::Health>,
 }
 
 #[derive(Clone, Copy)]
@@ -440,6 +447,7 @@ struct LatencyState {
 }
 
 struct RtpTimingState {
+    last_arrival: Option<Instant>,
     base_arrival: Option<Instant>,
     base_timestamp: u32,
     previous_transit_ticks: Option<f64>,
@@ -589,7 +597,10 @@ impl PerformanceMonitor {
                 marked_rendered_frames: AtomicU64::new(0),
                 presentation_started: AtomicBool::new(false),
                 current_delay_micros: AtomicU64::new(u64::MAX),
+                current_delay_observed_micros: AtomicU64::new(u64::MAX),
+                presentation_epoch: AtomicU64::new(0),
                 measured_media_rtt_micros: AtomicU64::new(u64::MAX),
+                measured_media_rtt_observed_micros: AtomicU64::new(u64::MAX),
                 assembly_delay_micros: AtomicU64::new(0),
                 local_frame_delay_micros: AtomicU64::new(0),
                 input_queue_delay_micros: AtomicU64::new(0),
@@ -630,6 +641,7 @@ impl PerformanceMonitor {
                     packet_loss_percent: 0.0,
                 }),
                 rtp_timing: Mutex::new(RtpTimingState {
+                    last_arrival: None,
                     base_arrival: None,
                     base_timestamp: 0,
                     previous_transit_ticks: None,
@@ -655,6 +667,7 @@ impl PerformanceMonitor {
                     frame_period: FrameDelayPeriod::default(),
                 }),
                 snapshot_cache: Mutex::new(None),
+                health: Mutex::new(health::Health::default()),
             }),
         }
     }
@@ -722,6 +735,7 @@ impl PerformanceMonitor {
     pub(crate) fn record_video_rtp_arrival(&self, timestamp: u32) {
         let now = Instant::now();
         let mut timing = mutex_lock(&self.inner.rtp_timing);
+        timing.last_arrival = Some(now);
         let Some(base_arrival) = timing.base_arrival else {
             timing.base_arrival = Some(now);
             timing.base_timestamp = timestamp;
@@ -977,18 +991,35 @@ impl PerformanceMonitor {
             .fetch_max(frames, Ordering::Relaxed);
     }
 
-    pub(crate) fn set_current_delay(&self, delay: Duration) {
-        self.inner
-            .current_delay_micros
-            .store(duration_micros(delay), Ordering::Relaxed);
+    pub(crate) fn set_current_delay(&self, delay: Option<(Duration, Instant)>) {
+        self.inner.current_delay_micros.store(
+            delay.map_or(u64::MAX, |(value, _)| duration_micros(value)),
+            Ordering::Relaxed,
+        );
+        self.inner.current_delay_observed_micros.store(
+            delay
+                .and_then(|(_, at)| at.checked_duration_since(self.inner.started_at))
+                .map_or(u64::MAX, duration_micros),
+            Ordering::Relaxed,
+        );
     }
 
     /// The HUD network RTT may fall back to ICE. The UU frm calculation must
     /// use the selected RTP module's measured RTCP RTT, not that fallback.
-    pub(crate) fn set_measured_media_rtt(&self, delay: Option<Duration>) {
+    pub(crate) fn set_measured_media_rtt(
+        &self,
+        delay: Option<Duration>,
+        observed_at: Option<Instant>,
+    ) {
         self.inner
             .measured_media_rtt_micros
             .store(delay.map_or(u64::MAX, duration_micros), Ordering::Relaxed);
+        self.inner.measured_media_rtt_observed_micros.store(
+            observed_at
+                .and_then(|at| at.checked_duration_since(self.inner.started_at))
+                .map_or(u64::MAX, duration_micros),
+            Ordering::Relaxed,
+        );
     }
 
     pub(crate) fn set_playout_timing(
@@ -1037,6 +1068,9 @@ impl PerformanceMonitor {
     }
 
     pub(crate) fn pause_presentation(&self) {
+        self.inner
+            .presentation_epoch
+            .fetch_add(1, Ordering::Relaxed);
         self.inner
             .presentation_started
             .store(false, Ordering::Relaxed);
@@ -1233,13 +1267,14 @@ impl PerformanceMonitor {
             }
         }
         let now = Instant::now();
-        if let Some((sampled_at, snapshot)) = mutex_lock(&self.inner.snapshot_cache).as_ref()
+        let mut cache = mutex_lock(&self.inner.snapshot_cache);
+        if let Some((sampled_at, snapshot)) = cache.as_ref()
             && now.duration_since(*sampled_at) < SNAPSHOT_CACHE_TTL
         {
             return Arc::clone(snapshot);
         }
         let snapshot = Arc::new(self.build_snapshot());
-        *mutex_lock(&self.inner.snapshot_cache) = Some((now, Arc::clone(&snapshot)));
+        *cache = Some((now, Arc::clone(&snapshot)));
         snapshot
     }
 
@@ -1340,7 +1375,26 @@ impl PerformanceMonitor {
             );
             (active_track, capture, encoder)
         };
-        PerformanceSnapshot {
+        let now = Instant::now();
+        let received_at = cadence.receive.last_at;
+        let rendered_at = latency.last_rendered_at;
+        let rtt_at = common.current_delay_observed_micros.load(Ordering::Relaxed);
+        let rtt_at =
+            (rtt_at != u64::MAX).then(|| common.started_at + Duration::from_micros(rtt_at));
+        let packet_at = mutex_lock(&self.inner.rtp_timing).last_arrival;
+        let media_rtt_at = self
+            .inner
+            .measured_media_rtt_observed_micros
+            .load(Ordering::Relaxed);
+        let media_rtt_fresh = media_rtt_at != u64::MAX
+            && self
+                .inner
+                .started_at
+                .elapsed()
+                .saturating_sub(Duration::from_micros(media_rtt_at))
+                <= Duration::from_secs(5);
+        let mut snapshot = PerformanceSnapshot {
+            health: health::Assessment::default(),
             connection: read_lock(&common.connection).clone(),
             network_switch_phase: common.network_switch_phase.load(Ordering::Relaxed) as u8,
             network_switch_attempts: common.network_switch_attempts.load(Ordering::Relaxed),
@@ -1441,7 +1495,54 @@ impl PerformanceMonitor {
             pipeline_stats,
             stream_switch: stream_switch_snapshot(&self.inner.stream_switch),
             uptime: self.inner.started_at.elapsed(),
-        }
+        };
+        use health::Observation;
+        let fresh = Duration::from_secs(1);
+        let rate_fresh = Duration::from_millis(1500);
+        let stall = rendered_at
+            .zip(received_at)
+            .filter(|(rendered, received)| received > rendered)
+            .filter(|(_, received)| {
+                now.saturating_duration_since(*received) < Duration::from_millis(500)
+            })
+            .filter(|_| self.inner.presentation_started.load(Ordering::Relaxed))
+            .and_then(|(rendered, received)| {
+                Observation::new(
+                    received.duration_since(rendered).as_secs_f64() * 1000.0,
+                    Some(received),
+                    fresh,
+                )
+            });
+        snapshot.health = mutex_lock(&self.inner.health).update(
+            now,
+            self.inner.presentation_epoch.load(Ordering::Relaxed),
+            [
+                Observation::new(
+                    snapshot.packet_loss_percent,
+                    packet_at.map(|at| at.min(rates.sampled_at)),
+                    rate_fresh,
+                ),
+                snapshot
+                    .current_delay_ms
+                    .and_then(|v| Observation::new(v, rtt_at, Duration::from_secs(5))),
+                Observation::new(snapshot.rtp_jitter_ms, packet_at, fresh),
+                snapshot
+                    .frame_delay_ms
+                    .filter(|_| media_rtt_fresh)
+                    .and_then(|v| {
+                        Observation::new(
+                            v as f64,
+                            received_at.map(|at| at.min(rates.sampled_at)),
+                            rate_fresh,
+                        )
+                    }),
+                Observation::new(snapshot.local_frame_delay_ms, rendered_at, fresh),
+                stall,
+            ],
+            snapshot.total_rendered_frames,
+            snapshot.dropped_present_frames,
+        );
+        snapshot
     }
 
     fn refresh_rates(&self) {

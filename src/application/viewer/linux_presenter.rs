@@ -492,7 +492,10 @@ impl ConnectingWindowsRunner {
         if !drawing {
             shell.presenter.defer_output(ui_output);
         } else {
-            presented = shell.presenter.render(&shell.context, ui_output, false)?;
+            presented = shell
+                .presenter
+                .render(&shell.context, ui_output, false)?
+                .presented();
             if presented && window.is_visible() == Some(false) {
                 window.set_visible(true);
             }
@@ -681,8 +684,6 @@ struct Player {
     scale: f32,
     /// Last failure from a control request, shown next to the toolbar.
     control_error: Option<String>,
-    /// The panel size the caption button restores; the stream menu picks it.
-    performance_restore: PerformancePanelMode,
     /// The remote cursor shape, decoded once per distinct image.
     cursor: Option<(usize, egui::TextureHandle, [u32; 2], [u32; 2])>,
     /// Whether the pointer is currently locked to the window for raw motion.
@@ -720,7 +721,7 @@ impl Player {
             wake,
             owner,
             stream_control_ui: StreamControlUi::default(),
-            performance_mode: PerformancePanelMode::Hidden,
+            performance_mode: PerformancePanelMode::Compact,
             intercept_shortcuts: true,
             current: None,
             video_size: None,
@@ -733,7 +734,6 @@ impl Player {
             physical_buttons: 0,
             scale: window.scale_factor() as f32,
             control_error: None,
-            performance_restore: PerformancePanelMode::Compact,
             cursor: None,
             pointer_locked: false,
             focused: true,
@@ -845,6 +845,7 @@ impl Player {
         self.intercept_shortcuts = preferences.intercept_shortcuts;
         let mut view = super::stream_menu::LocalViewSettings {
             performance_mode: self.performance_mode,
+            performance_always_visible: preferences.performance_always_visible,
             intercept_shortcuts: self.intercept_shortcuts,
             send_ctrl_alt_del: false,
         };
@@ -859,6 +860,9 @@ impl Player {
             display_size,
         );
         self.set_performance_mode(view.performance_mode);
+        self.session
+            .stream_control
+            .set_performance_always_visible(view.performance_always_visible);
         if self.intercept_shortcuts != view.intercept_shortcuts {
             self.intercept_shortcuts = view.intercept_shortcuts;
             self.session
@@ -877,6 +881,9 @@ impl Player {
             &self.session.performance,
             &self.session.stream_control.audio(),
             self.performance_mode,
+            view.performance_always_visible,
+            self.video_rect
+                .unwrap_or_else(|| ui.available_rect_before_wrap()),
             "linux-player",
         );
         if self.focused && !self.stream_control_ui.open {
@@ -1043,22 +1050,21 @@ impl Player {
         if row.button("全屏").clicked() {
             toggle_fullscreen(window);
         }
+        let always_visible = self
+            .session
+            .stream_control
+            .device_preferences()
+            .performance_always_visible;
         if row
-            .selectable_label(
-                self.performance_mode != PerformancePanelMode::Hidden,
-                "性能",
-            )
+            .selectable_label(always_visible, "性能")
+            .on_hover_text("关闭后仅在异常时临时显示")
             .clicked()
         {
-            // A caption button shows or hides; the stream menu chooses between
-            // the compact and detailed panels.
-            let mode = if self.performance_mode == PerformancePanelMode::Hidden {
-                self.performance_restore
-            } else {
-                self.performance_restore = self.performance_mode;
-                PerformancePanelMode::Hidden
-            };
-            self.set_performance_mode(mode);
+            // The caption button is the stream menu's「性能监控常驻」switch;
+            // the menu chooses between the compact and detailed panels.
+            self.session
+                .stream_control
+                .set_performance_always_visible(!always_visible);
         }
         if row.button("串流设置").clicked() {
             self.stream_control_ui.open = !self.stream_control_ui.open;
