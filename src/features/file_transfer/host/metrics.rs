@@ -1,4 +1,4 @@
-//! File-page settings are resolved in the same Windows user context as file IO.
+//! Resolve the save directory in the file executor; the session owns control permission.
 use super::*;
 use prost::Message as _;
 
@@ -22,6 +22,10 @@ struct Metrics {
 struct Setting {
     #[prost(string, tag = "5")]
     directory: String,
+    #[prost(int32, tag = "8")]
+    capture_permission: i32,
+    #[prost(int32, tag = "9")]
+    operation_permission: i32,
     #[prost(int32, tag = "10")]
     control_allowed: i32,
 }
@@ -65,31 +69,64 @@ pub(super) fn reply(bytes: &[u8], allowed: bool) -> Result<Option<Packet>> {
         return Ok(None);
     }
     let directory = if allowed {
-        filesystem::directory(":/Default")?
-            .to_string_lossy()
-            .into_owned()
+        match filesystem::directory(":/Default") {
+            Ok(path) => path.to_string_lossy().into_owned(),
+            Err(error) => {
+                // An unavailable user directory must not suppress the global
+                // control report or masquerade as a session permission denial.
+                tracing::warn!(%error, "host file save directory unavailable");
+                String::new()
+            }
+        }
     } else {
         String::new()
     };
+    tracing::debug!(
+        file_allowed = allowed,
+        directory_available = !directory.is_empty(),
+        "host settings directory prepared"
+    );
     message.metrics = Some(Metrics {
         // The official producer lists which metrics are present in its reply.
         requested: vec![2],
         setting: Some(Setting {
             directory,
-            control_allowed: if allowed { 2 } else { 1 },
+            // This is the whole-session permission, not a file-access flag.
+            // Only the network owner can fill it from the live session lease.
+            control_allowed: 0,
+            capture_permission: 0,
+            operation_permission: 0,
         }),
     });
     message.sequence = 0;
     message.timestamp = 0;
-    tracing::debug!(allowed, "host file settings response prepared");
     Ok(Some(Packet {
         data: message.encode_to_vec(),
         file: false,
     }))
 }
-pub(super) fn denied(bytes: &[u8]) -> Result<bool> {
-    Ok(message(bytes)?
-        .and_then(|m| m.metrics)
-        .and_then(|m| m.setting)
-        .is_some_and(|s| s.control_allowed == 1))
+pub(crate) struct Settings(Message);
+impl Settings {
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Option<Self>> {
+        Ok(message(bytes)?
+            .filter(|m| m.metrics.as_ref().is_some_and(|v| v.setting.is_some()))
+            .map(Self))
+    }
+
+    // Called only after the network owner checks that its session lease is current.
+    pub(crate) fn authorized(mut self, file_allowed: bool) -> Packet {
+        let setting = self.0.metrics.as_mut().unwrap().setting.as_mut().unwrap();
+        setting.control_allowed = 2;
+        // Windows grants these operations through the current host lease;
+        // these are authorization states, not capture/HID readiness reports.
+        setting.capture_permission = 2;
+        setting.operation_permission = 2;
+        if !file_allowed {
+            setting.directory.clear();
+        }
+        Packet {
+            data: self.0.encode_to_vec(),
+            file: false,
+        }
+    }
 }

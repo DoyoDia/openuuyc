@@ -68,11 +68,30 @@ impl Format {
     pub fn valid(self) -> bool {
         matches!(self.chroma, 1 | 3) && matches!(self.depth, 8 | 10)
     }
-    pub fn hdr(self) -> bool {
-        self.depth == 10
+    pub fn capability(self, implementation: i32, maximum: (u32, u32)) -> CodecCapability {
+        CodecCapability {
+            video_codec: self.codec.wire(),
+            width: maximum.0 as i32,
+            height: maximum.1 as i32,
+            chroma_sampling: self.chroma,
+            bit_depth: self.depth,
+            codec_impl: implementation,
+        }
     }
-    pub fn color(self, metadata: Option<HdrMetadata>) -> VideoColorSpace {
-        if self.hdr() {
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Color {
+    #[default]
+    Sdr,
+    Hdr,
+}
+impl Color {
+    pub fn is_hdr(self) -> bool {
+        self == Self::Hdr
+    }
+    pub fn space(self, metadata: Option<HdrMetadata>) -> VideoColorSpace {
+        if self == Self::Hdr {
             VideoColorSpace {
                 primaries: 9,
                 transfer: 16,
@@ -88,16 +107,6 @@ impl Format {
                 range: 1,
                 hdr_metadata: None,
             }
-        }
-    }
-    pub fn capability(self, implementation: i32, maximum: (u32, u32)) -> CodecCapability {
-        CodecCapability {
-            video_codec: self.codec.wire(),
-            width: maximum.0 as i32,
-            height: maximum.1 as i32,
-            chroma_sampling: self.chroma,
-            bit_depth: self.depth,
-            codec_impl: implementation,
         }
     }
 }
@@ -147,11 +156,8 @@ impl Backend {
             return false;
         }
         match self {
-            // T C4C300 rejects Y410, and the current AVC configuration has no
-            // 10-bit producer. A generic D3D converter is not encoder support.
-            Self::Nvidia => {
-                !(format.depth == 10 && (format.chroma == 3 || format.codec == Codec::H264))
-            }
+            // HEVC 44410 uses same-GPU planar CUDA input; AVC10 has no consumer.
+            Self::Nvidia => !(format.depth == 10 && format.codec == Codec::H264),
             Self::Software => format.software().can_encode(),
             Self::Amd | Self::Intel => true,
         }

@@ -305,6 +305,22 @@ pub(super) async fn gui_worker_loop(
                         }
                     }
                 }
+                GuiCommand::Diagnostics {
+                    generation,
+                    device,
+                    options,
+                } => {
+                    if generation == catalog_generation
+                        && logout_task.is_none()
+                        && let Some(client) = &client
+                    {
+                        crate::diagnostics::remote::service::start(
+                            Arc::clone(client),
+                            device,
+                            options,
+                        );
+                    }
+                }
                 GuiCommand::RefreshAssist => {
                     if assist_lists_task.is_none() {
                         next_assist_refresh = Some(Instant::now());

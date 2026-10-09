@@ -13,6 +13,7 @@ mod device_details;
 mod device_visuals;
 mod devices;
 mod diagnostic_export;
+mod remote_diagnostics;
 mod diagnostics_panel;
 mod host_assist;
 mod host_settings;
@@ -347,6 +348,11 @@ fn presence_text(state: &PresenceState) -> (&'static str, Color32) {
 }
 
 fn form_row(ui: &mut egui::Ui, label: &str, hint: &str, content: impl FnOnce(&mut egui::Ui)) {
+    form_row_content(ui, label, hint, content);
+    ui.separator();
+}
+
+fn form_row_content(ui: &mut egui::Ui, label: &str, hint: &str, content: impl FnOnce(&mut egui::Ui)) {
     ui.horizontal(|ui| {
         let label_width = (ui.available_width() - 258.0).max(160.0);
         ui.allocate_ui_with_layout(
@@ -365,7 +371,6 @@ fn form_row(ui: &mut egui::Ui, label: &str, hint: &str, content: impl FnOnce(&mu
         );
         ui.with_layout(egui::Layout::right_to_left(Align::Center), content);
     });
-    ui.separator();
 }
 
 fn section(ui: &mut egui::Ui, title: &str) {
@@ -914,19 +919,19 @@ impl DeviceCenterApp {
             State::Current => (
                 current.clone(),
                 MUTED,
-                format!("当前版本 {current}，已是最新正式版，点击重新检查"),
+                format!("当前版本 {current}，已是最新{}，点击重新检查", self.updates.release_label()),
                 None,
             ),
             State::Ahead => (
                 current.clone(),
                 MUTED,
-                format!("当前版本 {current} 高于 GitHub 最新正式版，点击重新检查"),
+                format!("当前版本 {current} 高于 GitHub 最新{}，点击重新检查", self.updates.release_label()),
                 None,
             ),
             State::NoRelease => (
                 current.clone(),
                 MUTED,
-                format!("当前版本 {current}，暂无公开正式版本，点击重新检查"),
+                format!("当前版本 {current}，暂无公开{}，点击重新检查", self.updates.release_label()),
                 None,
             ),
             State::Failed(error) => (
@@ -935,7 +940,7 @@ impl DeviceCenterApp {
                 format!("当前版本 {current}\n检查更新失败：{error}\n点击重试"),
                 None,
             ),
-            State::Available { version, url, .. } => {
+            State::Available { version, url, prerelease, .. } => {
                 let label = format!("↑ v{version}");
                 (
                     if label.chars().count() <= 10 {
@@ -944,7 +949,7 @@ impl DeviceCenterApp {
                         "有新版本".into()
                     },
                     BLUE,
-                    format!("发现新版本 v{version}（当前 {current}）\n点击查看更新内容"),
+                    format!("发现{} v{version}（当前 {current}）\n点击查看更新内容", if *prerelease { "测试版" } else { "新版本" }),
                     Some(url.clone()),
                 )
             }
@@ -1167,6 +1172,7 @@ impl DeviceCenterApp {
     }
 
     fn settings_page(&mut self, ui: &mut egui::Ui) {
+        let original_media = self.media;
         ui.label(
             RichText::new("连接设置")
                 .size(crate::ui::theme::TITLE)
@@ -1177,7 +1183,7 @@ impl DeviceCenterApp {
         crate::ui::controls::page_scroll("center-settings-scroll").show(ui, |ui| {
             self.host_settings(ui);
             self.notification_settings(ui);
-            section(ui, "画面与连接");
+            section(ui, "本机作为主控");
             form_row(ui, "串流帧率", "以远端实际刷新率为准", |ui| {
                 egui::ComboBox::from_id_salt("center-fps")
                     .width(238.0)
@@ -1194,37 +1200,61 @@ impl DeviceCenterApp {
             });
             form_row(
                 ui,
-                "视频编码",
-                "自动选择双方支持的编码",
+                "编码格式",
+                if self.media.codec.restricted() { "已固定，可在高级限制中调整" } else { "不可用时自动回退；重连后生效" },
                 |ui| {
+                    if self.media.codec.restricted() {
+                        ui.label(self.media.codec.label());
+                        return;
+                    }
                     egui::ComboBox::from_id_salt("center-codec")
                         .width(238.0)
                         .selected_text(self.media.codec.label())
                         .show_ui(ui, |ui| {
-                            for choice in [
-                                CodecPreference::Auto,
-                                CodecPreference::Av1,
-                                CodecPreference::H265,
-                                CodecPreference::H264,
-                            ] {
+                            for choice in CodecPreference::PREFERRED {
                                 ui.selectable_value(&mut self.media.codec, choice, choice.label());
                             }
                         });
                 },
             );
-            form_row(ui, "解码方式", "仅影响本机播放", |ui| {
-                egui::ComboBox::from_id_salt("center-decoder")
-                    .width(238.0)
-                    .selected_text(if self.media.hardware_decode {
-                        "优先硬件解码"
-                    } else {
-                        "软件解码"
-                    })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.media.hardware_decode, true, "优先硬件解码");
-                        ui.selectable_value(&mut self.media.hardware_decode, false, "软件解码");
-                    });
+            form_row(ui, "解码器", "仅影响本机播放；重连后生效", |ui| {
+                if self.media.decoder.mode.hardware() {
+                    self.media_inventory.draw(ui, "center-decoder-gpu", &mut self.media.decoder.gpu, false);
+                } else {
+                    ui.label("仅软件解码");
+                }
             });
+            let restriction = super::media_preferences::limits_title(
+                self.media.decoder.mode,
+                self.media.codec.restricted().then(|| self.media.codec.label()),
+            );
+            egui::CollapsingHeader::new(restriction)
+                .id_salt("controller-codec-limits")
+                .show(ui, |ui| {
+                    form_row(ui, "解码方式", "", |ui| {
+                        egui::ComboBox::from_id_salt("center-decoder")
+                            .width(238.)
+                            .selected_text(self.media.decoder.mode.label())
+                            .show_ui(ui, |ui| {
+                                for mode in crate::media::selection::ProcessingMode::ALL {
+                                    ui.selectable_value(&mut self.media.decoder.mode, mode, mode.label());
+                                }
+                            });
+                    });
+                    form_row(ui, "格式限制", "", |ui| {
+                        egui::ComboBox::from_id_salt("center-codec-only")
+                            .width(238.)
+                            .selected_text(if self.media.codec.restricted() { self.media.codec.label() } else { "不限制" })
+                            .show_ui(ui, |ui| {
+                                if ui.selectable_label(!self.media.codec.restricted(), "不限制").clicked() {
+                                    self.media.codec = CodecPreference::Auto;
+                                }
+                                for codec in CodecPreference::ONLY {
+                                    ui.selectable_value(&mut self.media.codec, codec, codec.label());
+                                }
+                            });
+                    });
+                });
             form_row(
                 ui,
                 "连接线路",
@@ -1254,6 +1284,12 @@ impl DeviceCenterApp {
                 .is_some_and(|h| h.status().session_active);
             self.center_ui.components.management(ui, active);
         });
+        if self.media != original_media {
+            if let Err(error)=crate::media::preferences::save(self.media) {
+                self.media=original_media;
+                self.status=StatusMessage::error(format!("保存编解码设置失败：{error:#}"));
+            }
+        }
     }
 
     pub(super) fn draw_dialogs(&mut self, ctx: &egui::Context) {

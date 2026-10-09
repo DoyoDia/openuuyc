@@ -86,6 +86,7 @@ fn build_control_frames_with_id(
         "openuuyc_audio_only": purpose == ControlPurpose::Audio,
         "openuuyc_audio_control": 1,
         "openuuyc_annotation": 1,
+        "openuuyc_diagnostics": 1,
         "openuuyc_drag_drop": 1,
         "device_capability": decoder_support
     }))?;

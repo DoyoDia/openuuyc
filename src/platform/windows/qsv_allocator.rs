@@ -32,16 +32,11 @@ pub(super) struct Allocator {
 }
 impl Allocator {
     pub fn new(device: &ID3D11Device, bind_flags: u32) -> Result<Box<Self>> {
-        unsafe {
-            let context = device.GetImmediateContext()?;
-            let multithread: ID3D11Multithread = context.cast()?;
-            let _ = multithread.SetMultithreadProtected(true);
-            Ok(Box::new(Self {
-                device: device.clone(),
-                bind_flags,
-                state: Mutex::new(State::default()),
-            }))
-        }
+        Ok(Box::new(Self {
+            device: device.clone(),
+            bind_flags,
+            state: Mutex::new(State::default()),
+        }))
     }
     pub fn callbacks(&mut self) -> v::mfxFrameAllocator {
         v::mfxFrameAllocator {

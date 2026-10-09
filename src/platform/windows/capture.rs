@@ -277,6 +277,8 @@ use super::adapter_type;
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct EncodingAdapter {
+    #[serde(default)]
+    pub id: Option<crate::media::selection::GpuId>,
     pub luid: u64,
     pub vendor: u32,
     pub name: String,
@@ -299,6 +301,10 @@ pub(crate) fn encoding_adapters() -> Result<Vec<EncodingAdapter>> {
                     continue;
                 }
                 result.push(EncodingAdapter {
+                    id: adapter_type::address(desc.AdapterLuid).map(|location| crate::media::selection::GpuId {
+                        vendor: desc.VendorId, device: desc.DeviceId, subsystem: desc.SubSysId,
+                        revision: desc.Revision, location,
+                    }),
                     luid: (u64::from(desc.AdapterLuid.HighPart as u32) << 32)
                         | u64::from(desc.AdapterLuid.LowPart),
                     vendor: desc.VendorId,
@@ -850,11 +856,7 @@ impl Duplication {
         unsafe {
             let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
             let mut resource = None;
-            // Keep ownership while the consumer encodes and waits for its next
-            // capture tick. Otherwise DXGI copies every desktop update during
-            // that interval, including game presents we will never transmit.
-            // Release immediately before acquiring, as required for efficient
-            // desktop duplication (IDXGIOutputDuplication::ReleaseFrame).
+            // Also covers a frame held by a failed/interrupted prior call.
             self.release_frame()?;
             let duplication = self.duplication.as_ref().context("DXGI采集对象缺失")?;
             match duplication.AcquireNextFrame(timeout_ms.min(50), &mut info, &mut resource) {
@@ -865,8 +867,7 @@ impl Duplication {
                 Err(error) => return Err(error).context("桌面采集失效，需要重建所选屏幕采集"),
             }
             // Conversion copies into our own texture; no borrowed duplication
-            // surface escapes this call. Successful acquisition stays owned
-            // until the next call, errors and Drop release it immediately.
+            // surface escapes this call.
             let captured = std::time::Instant::now();
             let cursor_update = self.cursor.update(&self.device, duplication, &info);
             let result = (|| -> Result<Option<Frame>> {
@@ -932,8 +933,13 @@ impl Duplication {
                     hdr_metadata: if hdr { self.source_hdr } else { None },
                 }))
             })();
-            if result.is_err() {
-                let _ = self.release_frame();
+            // Submit the copy before returning the duplication lease. DWM can
+            // then prepare the next image while our owned texture is encoded,
+            // instead of adding that copy/wait after synchronous encoding.
+            self.context.Flush();
+            let released = self.release_frame();
+            if result.is_ok() {
+                released?;
             }
             result
         }

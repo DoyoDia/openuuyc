@@ -23,6 +23,115 @@ pub(super) struct Analysis {
 fn same8(a: &[u8], b: &[u8], stride: usize) -> bool {
     (0..8).all(|y| a[y * stride..][..8] == b[y * stride..][..8])
 }
+// Verify an apparent cut against a common translation. Colocated SAD alone
+// classifies a full-screen pan as a new scene on every frame, repeatedly
+// spending the intra budget and forcing rate-control skips. Use a bounded
+// coarse/refined search and require agreement across most spatial samples.
+fn translated_motion(src: &[u8], old: &[u8], w: usize, h: usize) -> Option<Mv> {
+    if w < 288 || h < 288 {
+        return None;
+    }
+    let points: [(usize, usize); 9] =
+        std::array::from_fn(|i| ((i % 3 + 1) * w / 4, (i / 3 + 1) * h / 4));
+    let score = |dx: i32, dy: i32, step: usize| -> u32 {
+        let mut sum = 0;
+        for &(x, y) in &points {
+            let rx = (x as i32 + dx) as usize;
+            let ry = (y as i32 + dy) as usize;
+            for py in (0..8).step_by(step) {
+                for px in (0..8).step_by(step) {
+                    sum += u32::from(
+                        src[(y + py) * w + x + px].abs_diff(old[(ry + py) * w + rx + px]),
+                    );
+                }
+            }
+        }
+        sum
+    };
+    let zero = score(0, 0, 1);
+    if zero == 0 {
+        return None;
+    }
+    let mut best = (0, 0, zero);
+    for dy in (-64..=64).step_by(4) {
+        for dx in (-64..=64).step_by(4) {
+            let s = score(dx, dy, 4) * 16;
+            if s < best.2 {
+                best = (dx, dy, s);
+            }
+        }
+    }
+    let (cx, cy, _) = best;
+    best = (cx, cy, score(cx, cy, 1));
+    for dy in (cy - 3).max(-64)..=(cy + 3).min(64) {
+        for dx in (cx - 3).max(-64)..=(cx + 3).min(64) {
+            let s = score(dx, dy, 1);
+            if s < best.2 {
+                best = (dx, dy, s);
+            }
+        }
+    }
+    if best.2 * 4 >= zero {
+        return None;
+    }
+    let matching = points
+        .iter()
+        .filter(|&&(x, y)| {
+            let at = (y as i32 + best.1) as usize * w + (x as i32 + best.0) as usize;
+            search::sad(&src[y * w + x..], w, &old[at..], w, 8) <= 8 * 64
+        })
+        .count();
+    (matching >= 7).then_some(Mv {
+        x: best.0 as i16 * 4,
+        y: best.1 as i16 * 4,
+    })
+}
+// Perspective motion and independently moving objects do not share one scroll
+// vector. Before refreshing the entire reference, check whether distributed
+// patches still have useful local predictors. This only vetoes a scene IDR;
+// it must not mark blocks static or supply a fictitious global motion vector.
+fn continuous_motion(src: &[u8], old: &[u8], w: usize, h: usize) -> bool {
+    if w < 288 || h < 288 {
+        return false;
+    }
+    let mut colocated = 0u32;
+    let mut predicted = 0u32;
+    let mut matching = 0;
+    for i in 0..9 {
+        let x = (i % 3 + 1) * w / 4;
+        let y = (i / 3 + 1) * h / 4;
+        let source = &src[y * w + x..];
+        let cost = |dx: i32, dy: i32| {
+            let at = (y as i32 + dy) as usize * w + (x as i32 + dx) as usize;
+            search::sad(source, w, &old[at..], w, 8)
+        };
+        let zero = cost(0, 0);
+        let mut best = (0, 0, zero);
+        if zero > 4 * 64 {
+            for dy in (-64..=64).step_by(2) {
+                for dx in (-64..=64).step_by(2) {
+                    let value = cost(dx, dy);
+                    if value < best.2 {
+                        best = (dx, dy, value);
+                    }
+                }
+            }
+            let (cx, cy, _) = best;
+            for dy in (cy - 1).max(-64)..=(cy + 1).min(64) {
+                for dx in (cx - 1).max(-64)..=(cx + 1).min(64) {
+                    let value = cost(dx, dy);
+                    if value < best.2 {
+                        best = (dx, dy, value);
+                    }
+                }
+            }
+        }
+        colocated += zero;
+        predicted += best.2;
+        matching += usize::from(best.2 <= 16 * 64);
+    }
+    matching >= 6 && predicted * 4 < colocated * 3
+}
 /// T 7590B2 -> 873375: the unmasked product path searches nine vertical
 /// regions. A successful zero displacement remains a positive detection.
 fn scroll_motion(src: &[u8], old: &[u8], w: usize, h: usize) -> Option<i16> {
@@ -229,6 +338,46 @@ impl Analysis {
             }
         }
         self.large_change = moving >= ((total as f32 * 0.8 + 0.5) as u32);
+        if self.large_change
+            && let Some(motion) = translated_motion(src, old, w, h)
+        {
+            self.large_change = false;
+            self.scroll = motion;
+            self.scroll_detected = true;
+            for my in 0..h / 16 {
+                for mx in 0..w / 16 {
+                    let mb = my * (w / 16) + mx;
+                    for part in 0..4 {
+                        if self.static_parts[mb][part] == 1 {
+                            continue;
+                        }
+                        let x = mx * 16 + part % 2 * 8;
+                        let y = my * 16 + part / 2 * 8;
+                        let rx = x as i32 + i32::from(motion.x) / 4;
+                        let ry = y as i32 + i32::from(motion.y) / 4;
+                        self.static_parts[mb][part] = if rx >= 0
+                            && ry >= 0
+                            && rx as usize + 8 <= w
+                            && ry as usize + 8 <= h
+                            && same8(&src[y * w + x..], &old[ry as usize * w + rx as usize..], w)
+                        {
+                            2
+                        } else {
+                            0
+                        };
+                    }
+                    let parts = self.static_parts[mb];
+                    self.static_kind[mb] = if parts.iter().all(|&v| v == parts[0]) {
+                        parts[0]
+                    } else {
+                        0
+                    };
+                }
+            }
+        }
+        if self.large_change && continuous_motion(src, old, w, h) {
+            self.large_change = false;
+        }
     }
     /// Screen RC complexity is independent of source scene/static analysis:
     /// T 3D0688 selects min(colocated reconstructed SAD, source H/V SAD).

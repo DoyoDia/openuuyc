@@ -18,12 +18,13 @@ impl DeviceCenterApp {
             url,
             notes,
             published,
+            prerelease,
         } = &self.updates.state
         else {
             self.updates.dialog_open = false;
             return;
         };
-        let (dismiss, download) = release_prompt(ctx, version, notes, published.as_deref());
+        let (dismiss, download) = release_prompt(ctx, version, notes, published.as_deref(), *prerelease);
         if download {
             ctx.open_url(egui::OpenUrl::new_tab(url));
         }
@@ -38,6 +39,7 @@ fn release_prompt(
     version: &str,
     notes: &str,
     published: Option<&str>,
+    prerelease: bool,
 ) -> (bool, bool) {
     let mut dismiss = false;
     let mut download = false;
@@ -49,7 +51,7 @@ fn release_prompt(
             );
             dismiss = crate::ui::controls::dialog_header(
                 ui,
-                "发现新版本",
+                if prerelease { "发现测试版" } else { "发现新版本" },
                 crate::ui::controls::DialogIcon::Required,
                 true,
             );

@@ -92,6 +92,12 @@ fn update_media_summary(status: &mut Status) {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ActiveEncoding {
+    #[serde(default)]
+    pub preferred_gpu: Option<crate::media::selection::GpuId>,
+    #[serde(default)]
+    pub preferred_codec: Option<i32>,
+    #[serde(default)]
+    pub selection: crate::media::selection::SelectionReason,
     pub backend: super::format::Backend,
     pub adapter: u64,
     pub format: super::format::Format,
@@ -409,6 +415,10 @@ impl Handle {
                 handle.set_allowed(allowed);
                 let mut state = lock(&handle.ownership);
                 state.encoding = encoding;
+                // An unavailable encoder choice must remain editable without
+                // discarding unrelated saved permissions and device settings.
+                state.status.settings_error =
+                    encoding.validate().err().map(|error| error.to_string());
                 state.audio_device.send_replace(audio_device);
                 state.audio_defaults = audio_defaults;
                 state.audio_quality = audio_quality;
@@ -1180,6 +1190,13 @@ impl Lease {
     pub(crate) fn port_status(&self, status: crate::features::port_mapping::host::Status) {
         self.modify(|s| s.status.ports = status);
     }
+    pub(crate) fn diagnostic_input(&self) -> crate::diagnostics::bundle::Input {
+        let status = self.handle.status();
+        crate::diagnostics::bundle::Input {
+            summary: serde_json::json!({"host": status, "source": "remote_host"}),
+            private_values: vec![self.handle.scope.clone()],
+        }
+    }
     pub(crate) fn file_access(&self) -> bool {
         self.requested()
             && self.assistance.is_none()
@@ -1247,6 +1264,10 @@ impl Lease {
         }
     }
     pub(crate) fn fail(&self, error: impl Into<String>) {
-        self.modify(|state| state.status.error = Some(error.into()));
+        let error = error.into();
+        self.modify(|state| {
+            tracing::warn!(track = self.track, %error, "host media operation failed");
+            state.status.error = Some(error);
+        });
     }
 }

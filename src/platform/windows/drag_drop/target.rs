@@ -1,17 +1,27 @@
 //! Apartment-owned OLE drop registration. It copies path metadata only; callers
 //! enumerate/read the selected files outside Windows' drag callbacks.
 use anyhow::{Result, ensure};
-use std::{cell::RefCell, path::PathBuf, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    path::PathBuf,
+    rc::Rc,
+};
 use windows::{
     Win32::{
         Foundation::*,
         System::{Com::*, Memory::GlobalSize, Ole::*, SystemServices::MODIFIERKEYS_FLAGS},
-        UI::Shell::{DragQueryFileW, HDROP},
+        UI::Shell::{CLSID_DragDropHelper, DragQueryFileW, HDROP, IDropTargetHelper},
     },
     core::{Ref, implement},
 };
 
 pub(crate) trait Handler {
+    fn description(&self) -> Option<&'static str> {
+        None
+    }
+    fn reenter(&mut self, _identity: super::appearance::Identity, _point: POINTL) -> Option<u32> {
+        None
+    }
     fn enter(&mut self, paths: Vec<PathBuf>, point: POINTL) -> u32;
     fn over(&mut self, point: POINTL) -> u32;
     fn leave(&mut self);
@@ -20,7 +30,7 @@ pub(crate) trait Handler {
 
 pub(crate) struct Registration {
     hwnd: HWND,
-    _target: IDropTarget,
+    _target: Option<IDropTarget>,
     handler: Rc<RefCell<dyn Handler>>,
 }
 impl Registration {
@@ -31,6 +41,12 @@ impl Registration {
         }
         let target: IDropTarget = Target {
             handler: handler.clone(),
+            hwnd,
+            data: RefCell::new(None),
+            drag_identity: Cell::new(None),
+            description_effect: Cell::new(None),
+            helper: unsafe { CoCreateInstance(&CLSID_DragDropHelper, None, CLSCTX_INPROC_SERVER) }
+                .ok(),
         }
         .into();
         if let Err(error) = unsafe { RegisterDragDrop(hwnd, &target) } {
@@ -41,7 +57,7 @@ impl Registration {
         }
         Ok(Self {
             hwnd,
-            _target: target,
+            _target: Some(target),
             handler,
         })
     }
@@ -53,6 +69,9 @@ impl Drop for Registration {
         }
         unsafe {
             let _ = RevokeDragDrop(self.hwnd);
+        }
+        self._target.take();
+        unsafe {
             OleUninitialize();
         }
     }
@@ -60,8 +79,31 @@ impl Drop for Registration {
 #[implement(IDropTarget, Agile = false)]
 struct Target {
     handler: Rc<RefCell<dyn Handler>>,
+    hwnd: HWND,
+    helper: Option<IDropTargetHelper>,
+    data: RefCell<Option<IDataObject>>,
+    drag_identity: Cell<Option<super::appearance::Identity>>,
+    description_effect: Cell<Option<u32>>,
 }
 impl Target {
+    fn describe(&self, effect: u32) {
+        let text = self.handler.try_borrow().ok().and_then(|h| h.description());
+        if text.is_none() || self.description_effect.replace(Some(effect)) == Some(effect) {
+            return;
+        }
+        let data = self.data.borrow().clone();
+        if let Some(data) = data {
+            let _ = super::appearance::description(
+                &data,
+                effect,
+                Some(if effect & DROPEFFECT_COPY.0 != 0 {
+                    text.unwrap()
+                } else {
+                    "无法复制到此位置"
+                }),
+            );
+        }
+    }
     fn apply(&self, effect: *mut DROPEFFECT, operation: impl FnOnce(&mut dyn Handler) -> u32) {
         if effect.is_null() {
             return;
@@ -92,8 +134,18 @@ impl IDropTarget_Impl for Target_Impl {
         point: &POINTL,
         effect: *mut DROPEFFECT,
     ) -> windows::core::Result<()> {
+        let retired = std::mem::replace(&mut *self.data.borrow_mut(), data.as_ref().cloned());
+        drop(retired);
+        self.description_effect.set(None);
+        self.drag_identity
+            .set(data.as_ref().and_then(super::appearance::identity));
         self.apply(effect, |handler| {
             handler.leave();
+            if let Some(identity) = self.drag_identity.get()
+                && let Some(effect) = handler.reenter(identity, *point)
+            {
+                return effect;
+            }
             match data.as_ref().map(paths).transpose() {
                 Ok(Some(paths)) => handler.enter(paths, *point),
                 Ok(None) => 0,
@@ -103,6 +155,24 @@ impl IDropTarget_Impl for Target_Impl {
                 }
             }
         });
+        if !effect.is_null() {
+            self.describe(unsafe { (*effect).0 });
+        }
+        if let (Some(helper), Some(data)) = (&self.helper, data.as_ref())
+            && !effect.is_null()
+        {
+            unsafe {
+                let _ = helper.DragEnter(
+                    self.hwnd,
+                    data,
+                    &POINT {
+                        x: point.x,
+                        y: point.y,
+                    },
+                    *effect,
+                );
+            }
+        }
         Ok(())
     }
     fn DragOver(
@@ -111,25 +181,84 @@ impl IDropTarget_Impl for Target_Impl {
         point: &POINTL,
         effect: *mut DROPEFFECT,
     ) -> windows::core::Result<()> {
-        self.apply(effect, |handler| handler.over(*point));
+        self.apply(effect, |handler| {
+            // Enter can hit a resize edge, title bar or letterbox. Keep the
+            // identity for the whole hover so moving into video can hand back
+            // the original gesture, without parsing it as a new upload.
+            if let Some(identity) = self.drag_identity.get()
+                && let Some(effect) = handler.reenter(identity, *point)
+            {
+                return effect;
+            }
+            handler.over(*point)
+        });
+        if !effect.is_null() {
+            self.describe(unsafe { (*effect).0 });
+        }
+        if let Some(helper) = &self.helper
+            && !effect.is_null()
+        {
+            unsafe {
+                let _ = helper.DragOver(
+                    &POINT {
+                        x: point.x,
+                        y: point.y,
+                    },
+                    *effect,
+                );
+            }
+        }
         Ok(())
     }
     fn DragLeave(&self) -> windows::core::Result<()> {
+        self.drag_identity.set(None);
+        let data = self.data.borrow_mut().take();
+        if self.description_effect.take().is_some()
+            && let Some(data) = data
+        {
+            let _ = super::appearance::description(&data, 0, None);
+        }
         let mut effect = DROPEFFECT_COPY;
         self.apply(&mut effect, |handler| {
             handler.leave();
             0
         });
+        if let Some(helper) = &self.helper {
+            unsafe {
+                let _ = helper.DragLeave();
+            }
+        }
         Ok(())
     }
     fn Drop(
         &self,
-        _: Ref<'_, IDataObject>,
+        data: Ref<'_, IDataObject>,
         _: MODIFIERKEYS_FLAGS,
         point: &POINTL,
         effect: *mut DROPEFFECT,
     ) -> windows::core::Result<()> {
+        self.drag_identity.set(None);
         self.apply(effect, |handler| handler.drop_at(*point));
+        if !effect.is_null() {
+            self.describe(unsafe { (*effect).0 });
+        }
+        if let (Some(helper), Some(data)) = (&self.helper, data.as_ref())
+            && !effect.is_null()
+        {
+            unsafe {
+                let _ = helper.Drop(
+                    data,
+                    &POINT {
+                        x: point.x,
+                        y: point.y,
+                    },
+                    *effect,
+                );
+            }
+        }
+        let retired = self.data.borrow_mut().take();
+        drop(retired);
+        self.description_effect.set(None);
         Ok(())
     }
 }

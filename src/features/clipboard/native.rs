@@ -1556,6 +1556,7 @@ fn data_object(offer: Arc<RemoteOffer>) -> IDataObject {
         offer,
         async_mode: AtomicBool::new(true),
         in_operation: AtomicBool::new(false),
+        shell: Mutex::new(HashMap::new()),
     }
     .into()
 }
@@ -1614,11 +1615,30 @@ impl Drop for RemoteOffer {
 fn com_error(e: anyhow::Error) -> windows::core::Error {
     windows::core::Error::new(E_FAIL, e.to_string())
 }
+enum ShellMedium {
+    Memory(Vec<u8>),
+    Stream(windows::core::AgileReference<IStream>, usize),
+}
+impl ShellMedium {
+    fn kind(&self) -> TYMED {
+        match self {
+            Self::Memory(_) => TYMED_HGLOBAL,
+            Self::Stream(_, _) => TYMED_ISTREAM,
+        }
+    }
+    fn size(&self) -> usize {
+        match self {
+            Self::Memory(v) => v.len(),
+            Self::Stream(_, n) => *n,
+        }
+    }
+}
 #[implement(IDataObject, IDataObjectAsyncCapability)]
 struct RemoteData {
     offer: Arc<RemoteOffer>,
     async_mode: AtomicBool,
     in_operation: AtomicBool,
+    shell: Mutex<HashMap<u32, Arc<ShellMedium>>>,
 }
 impl Drop for RemoteData {
     fn drop(&mut self) {
@@ -1668,6 +1688,27 @@ impl IDataObject_Impl for RemoteData_Impl {
         let f = unsafe { &*p };
         self.offer.valid().map_err(com_error)?;
         let id = f.cfFormat as u32;
+        let private = lock(&self.shell).get(&id).cloned();
+        if let Some(private) = private {
+            return match private.as_ref() {
+                ShellMedium::Memory(bytes) => memory_medium(&bytes),
+                ShellMedium::Stream(reference, _) => {
+                    // Resolve in the caller's apartment and give every consumer
+                    // its own cursor. Never hold our mutex across COM calls.
+                    let stream = unsafe { reference.resolve()?.Clone()? };
+                    unsafe {
+                        stream.Seek(0, STREAM_SEEK_SET, None)?;
+                    }
+                    Ok(STGMEDIUM {
+                        tymed: TYMED_ISTREAM.0 as u32,
+                        u: STGMEDIUM_0 {
+                            pstm: ManuallyDrop::new(Some(stream)),
+                        },
+                        pUnkForRelease: ManuallyDrop::new(None),
+                    })
+                }
+            };
+        }
         if id == formats::register(REMOTE_MARKER) {
             return memory_medium(&[1]);
         }
@@ -1768,14 +1809,17 @@ impl IDataObject_Impl for RemoteData_Impl {
         let private = self.offer.file_operation
             && (id == formats::register("InShellDragLoop")
                 || id == formats::register("Preferred DropEffect")
-                || lock(&self.offer.cached).contains_key(&id));
+                || lock(&self.shell).contains_key(&id));
         if id != formats::register(REMOTE_MARKER)
             && !self.offer.formats.iter().any(|v| v.local == id)
             && !private
         {
             return DV_E_FORMATETC;
         }
-        let kind = if id == formats::register("FileContents") {
+        let private_kind = lock(&self.shell).get(&id).map(|v| v.kind());
+        let kind = if let Some(kind) = private_kind {
+            kind
+        } else if id == formats::register("FileContents") {
             if f.lindex < 0 {
                 return DV_E_LINDEX;
             }
@@ -1814,31 +1858,65 @@ impl IDataObject_Impl for RemoteData_Impl {
             return Err(E_POINTER.into());
         }
         let (format, medium) = unsafe { (&*format, &*medium) };
-        if ![
-            "Performed DropEffect",
-            "Logical Performed DropEffect",
-            "Paste Succeeded",
-        ]
-        .iter()
-        .any(|name| format.cfFormat as u32 == formats::register(name))
+
+        // Shell's drag-image helper uses registered private formats through
+        // SetData/GetData. Never let them replace the read-only file provider.
+        if format.cfFormat < 0xc000
+            || format.dwAspect != DVASPECT_CONTENT.0
+            || format.lindex != -1
+            || !format.ptd.is_null()
+            || format.cfFormat as u32 == formats::register(REMOTE_MARKER)
+            || self
+                .offer
+                .formats
+                .iter()
+                .any(|f| f.local == format.cfFormat as u32)
         {
             return Err(E_NOTIMPL.into());
         }
-        if medium.tymed != TYMED_HGLOBAL.0 as u32 {
+        if format.tymed & medium.tymed == 0 {
             return Err(DV_E_TYMED.into());
         }
-        let size = unsafe { GlobalSize(medium.u.hGlobal) };
-        if !(4..=32).contains(&size) {
-            return Err(E_INVALIDARG.into());
-        }
-        let data = global_bytes(unsafe { medium.u.hGlobal }).map_err(com_error)?;
-        {
-            let mut cache = lock(&self.offer.cached);
-            if !cache.contains_key(&(format.cfFormat as u32)) && cache.len() >= 16 {
+        let data = if medium.tymed == TYMED_HGLOBAL.0 as u32 {
+            let size = unsafe { GlobalSize(medium.u.hGlobal) };
+            if !(1..=1024 * 1024).contains(&size) {
+                return Err(E_INVALIDARG.into());
+            }
+            ShellMedium::Memory(global_bytes(unsafe { medium.u.hGlobal }).map_err(com_error)?)
+        } else if medium.tymed == TYMED_ISTREAM.0 as u32 {
+            // The Shell helper supplies an owning IStream. Keep an agile COM
+            // reference, not an apartment-bound pointer in our thread-safe object.
+            if medium.pUnkForRelease.is_some() {
+                return Err(E_NOTIMPL.into());
+            }
+            let stream = unsafe { medium.u.pstm.as_ref() }
+                .ok_or_else(|| windows::core::Error::from(E_POINTER))?;
+            let mut stat = STATSTG::default();
+            unsafe {
+                stream.Stat(&mut stat, STATFLAG_NONAME)?;
+            }
+            if stat.cbSize > 1024 * 1024 {
+                return Err(E_INVALIDARG.into());
+            }
+            ShellMedium::Stream(
+                windows::core::AgileReference::new(stream)?,
+                stat.cbSize as usize,
+            )
+        } else {
+            return Err(DV_E_TYMED.into());
+        };
+        let retired = {
+            let mut cache = lock(&self.shell);
+            let old = cache.get(&(format.cfFormat as u32)).map_or(0, |v| v.size());
+            if (!cache.contains_key(&(format.cfFormat as u32)) && cache.len() >= 32)
+                || cache.values().map(|v| v.size()).sum::<usize>() - old + data.size()
+                    > 4 * 1024 * 1024
+            {
                 return Err(E_OUTOFMEMORY.into());
             }
-            cache.insert(format.cfFormat as u32, data);
-        }
+            cache.insert(format.cfFormat as u32, Arc::new(data))
+        };
+        drop(retired); // COM references may release outside our application mutex.
         if release.as_bool() {
             unsafe {
                 let mut owned = std::ptr::read(medium);
@@ -1881,6 +1959,11 @@ impl IDataObject_Impl for RemoteData_Impl {
                     -1,
                     TYMED_HGLOBAL.0 as u32,
                 ));
+            }
+            for (id, medium) in lock(&self.shell).iter() {
+                if !formats.iter().any(|f| f.cfFormat as u32 == *id) {
+                    formats.push(format_etc(*id, -1, medium.kind().0 as u32));
+                }
             }
         }
         unsafe { SHCreateStdEnumFmtEtc(&formats) }

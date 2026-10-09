@@ -37,16 +37,7 @@ impl Format {
             }
     }
     pub const fn can_encode(self) -> bool {
-        self.can_decode() && (!matches!(self.codec, Codec::H264) || self.chroma == 1)
-    }
-    pub(crate) const fn encoder_input(self) -> PixelFormat {
-        match (self.codec, self.chroma, self.depth) {
-            (Codec::H264, _, _) => PixelFormat::Bgra,
-            (_, 1, 8) => PixelFormat::Nv12,
-            (_, 1, _) => PixelFormat::P010,
-            (_, _, 8) => PixelFormat::Ayuv,
-            _ => PixelFormat::Y410,
-        }
+        matches!(self.codec, Codec::H264) && self.chroma == 1 && self.depth == 8
     }
 }
 

@@ -116,11 +116,12 @@ impl RenderWorker {
                     if (redraw || is_new_submission)
                         && let Some(frame) = replacement.as_ref().or(current_frame.as_ref())
                     {
-                        // SelectRendererAllocator adopts non-shared decoder resources.
+                        // Shared handles cross devices on one GPU, not arbitrary GPUs.
+                        // Follow the decoder adapter; adopt non-shared resources directly.
                         // Release the old swap chain before constructing its replacement.
                         let changed = presenter.as_ref().is_some_and(|p| {
                             matches!(&frame.surface, RenderSurface::D3D11(surface)
-                            if surface.shared_handle().is_none() && !p.accepts_surface(surface))
+                            if !p.can_render_surface(surface))
                         });
                         if changed {
                             presenter.take();

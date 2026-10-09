@@ -17,6 +17,8 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+mod metrics;
+
 pub(super) fn capture_loop(
     mut screen: capture::Screen,
     handle: Lease,
@@ -53,13 +55,15 @@ pub(super) fn capture_loop(
     let mut transfer = None::<crate::features::host::transfer::Transfer>;
     let mut frame_metadata = std::collections::BTreeMap::new();
     let mut last_diagnostics = None;
+    let mut metrics = metrics::Metrics::default();
 
     while !cancel.is_cancelled() && handle.requested() {
+        let iteration_started = Instant::now();
         let mut wanted = *lock(&config);
         if !negotiated.permits_format(wanted.format) {
             let previous = wanted.revision;
             let chroma = wanted.format.chroma;
-            let hdr = wanted.format.hdr();
+            let hdr = wanted.color.is_hdr();
             negotiated.apply(
                 &mut wanted,
                 None,
@@ -75,7 +79,7 @@ pub(super) fn capture_loop(
             *active = wanted;
         }
 
-        let requested_hdr = wanted.format.hdr();
+        let requested_hdr = wanted.color.is_hdr();
         if desktop.is_none() && transport.media_ready() && wanted.sending && wanted.capturing {
             // The authorized track is already negotiated. Prepare its native
             // capture while ICE/DTLS is still connecting; the gate below still
@@ -122,49 +126,8 @@ pub(super) fn capture_loop(
             initial_auto = true;
             requested = Some(settings);
         }
-        let on_source = |codec| {
-            negotiated.choices.iter().any(|c| {
-                c.capability.adapter == screen.adapter
-                    && c.capability.backend != crate::features::host::format::Backend::Software
-                    && c.capability.format.chroma == wanted.format.chroma
-                    && c.capability.format.depth == wanted.format.depth
-                    && c.capability.format.codec == codec
-            })
-        };
-        let skip_cross_hevc = on_source(crate::features::host::format::Codec::H264)
-            && !on_source(crate::features::host::format::Codec::H265);
-        let candidate = negotiated
-            .choices
-            .iter()
-            .filter(|c| {
-                negotiated.permits_format(c.capability.format)
-                    && c.capability.format.chroma == wanted.format.chroma
-                    && c.capability.format.depth == wanted.format.depth
-                    && (c.capability.format.codec == wanted.format.codec
-                        || (wanted.format.codec == crate::features::host::format::Codec::Av1
-                            && c.capability.format.codec
-                                == crate::features::host::format::Codec::H265)
-                        || c.capability.format.codec == crate::features::host::format::Codec::H264)
-                    && !(skip_cross_hevc
-                        && c.capability.adapter != screen.adapter
-                        && c.capability.format.codec == crate::features::host::format::Codec::H265)
-                    && !failed.contains(&(
-                        c.capability.adapter,
-                        c.capability.backend,
-                        c.capability.format,
-                    ))
-            })
-            .max_by_key(|c| {
-                let maximum = c.maximum_for(wanted.requested_maximum);
-                (
-                    c.capability.format == wanted.format,
-                    c.capability.format.codec == crate::features::host::format::Codec::H265,
-                    c.capability.backend != crate::features::host::format::Backend::Software,
-                    c.fps.min(wanted.maximum_fps),
-                    c.capability.adapter == screen.render_adapter.unwrap_or(screen.adapter),
-                    maximum.0.max(maximum.1),
-                )
-            })
+        let candidate = negotiated.candidate(&wanted, (screen.width,screen.height),
+            screen.render_adapter.unwrap_or(screen.adapter), &failed)
             .context("本会话的协商编码候选已全部失败")?;
         let hardware =
             candidate.capability.backend != crate::features::host::format::Backend::Software;
@@ -174,8 +137,12 @@ pub(super) fn capture_loop(
             candidate.capability.format,
         );
         wanted.format = candidate.capability.format;
+        if wanted.format.depth < 10 {
+            wanted.color = crate::features::host::format::Color::Sdr;
+        }
         wanted.maximum = candidate.maximum_for(wanted.requested_maximum);
         wanted.fps = wanted.fps.min(candidate.fps).min(screen.fps).max(1);
+        metrics.report(wanted.fps, screen.adapter, candidate.capability.adapter);
         let period = Duration::from_secs_f64(1.0 / f64::from(wanted.fps));
         if paced_fps != wanted.fps {
             paced_fps = wanted.fps;
@@ -237,7 +204,7 @@ pub(super) fn capture_loop(
         };
         if wanted.sending && wanted.capturing {
             transport.quality(automatic.is_some(), wanted.quality, changed);
-            transport.configure(bounds, changed);
+            transport.configure(bounds);
         } else {
             transport.pause();
         }
@@ -281,6 +248,7 @@ pub(super) fn capture_loop(
             continue;
         }
         if sender.capacity() == 0 {
+            metrics.backpressure_waits += 1;
             std::thread::sleep(Duration::from_millis(2));
             continue;
         }
@@ -302,9 +270,10 @@ pub(super) fn capture_loop(
             wait_ms,
             wanted.quality,
             wanted.cursor_capture,
-            wanted.format.hdr(),
+            wanted.color.is_hdr(),
             wanted.maximum,
         );
+        metrics.capture.record(capture_started.elapsed());
         let captured = captured?;
         let capture_state = desktop.as_ref().context("缺少采集源")?;
         *lock(&pointer) = capture_state.cursor.clone();
@@ -330,7 +299,9 @@ pub(super) fn capture_loop(
             changed
         });
         handle.source(&screen, capture_state.backend_name());
-        if wanted.format.hdr() != (requested_hdr && capture_state.hdr_available()) {
+        if wanted.color.is_hdr()
+            != (requested_hdr && capture_state.hdr_available() && wanted.format.depth == 10)
+        {
             // Capture recovery or source refresh changed the effective format.
             // Rebuild preprocessing/encoder before admitting this frame.
             cached = None;
@@ -351,10 +322,12 @@ pub(super) fn capture_loop(
         }
         let frame = match captured {
             Some(frame) => {
+                metrics.new_frames += u64::from(frame.is_new);
                 cached = Some(frame.clone());
                 frame
             }
             None => {
+                metrics.empty_captures += 1;
                 let Some(mut frame) = cached.clone() else {
                     continue;
                 };
@@ -391,7 +364,7 @@ pub(super) fn capture_loop(
             encoding_device.as_ref().unwrap().1.clone()
         };
         if current.is_none_or(|(old_size, old_candidate)| {
-            old_size != size || old_candidate != candidate_id
+            old_size != size || old_candidate != (candidate_id, wanted.color)
         }) {
             // Release before replacement to avoid consuming a second driver
             // session solely for a size/candidate transition (T C2D840).
@@ -408,6 +381,7 @@ pub(super) fn capture_loop(
                         quality: wanted.quality,
                         quality_target,
                     },
+                    wanted.color,
                 )
             } else {
                 encoder::Encoder::software_format(
@@ -442,7 +416,7 @@ pub(super) fn capture_loop(
                     continue;
                 }
             };
-            current = Some((size, candidate_id));
+            current = Some((size, (candidate_id, wanted.color)));
             frame_metadata.clear();
             encode_errors = 0;
             keyframe.store(true, Ordering::Release);
@@ -458,9 +432,11 @@ pub(super) fn capture_loop(
         let (media_rate, discard_frame) =
             admission.next(peak, codec_minimum, transport.cwnd_ratio());
         if discard_frame {
+            metrics.admission_drops += 1;
             continue;
         }
         let needs_transfer = device != *source_device;
+        let transfer_started = Instant::now();
         let prepared = (|| -> Result<Option<crate::features::host::transfer::Delivery>> {
             if !needs_transfer {
                 return Ok(None);
@@ -477,19 +453,26 @@ pub(super) fn capture_loop(
             }
             transfer.as_mut().unwrap().copy(&frame)
         })();
+        if needs_transfer {
+            metrics.transfer.record(transfer_started.elapsed());
+        }
         if needs_transfer && prepared.as_ref().is_ok_and(|frame| frame.is_none()) {
+            metrics.transfer_busy += 1;
             continue;
         }
         let encoded = (|| -> Result<_> {
             // Delivery failures share the source-loss/candidate-recovery exits.
             let delivery = prepared?;
-            if active_encoder.configure_rate(crate::features::host::format::Rate {
+            let rate_started = Instant::now();
+            let reconfigured = active_encoder.configure_rate(crate::features::host::format::Rate {
                 target: media_rate,
                 peak,
                 fps: wanted.fps,
                 quality: wanted.quality,
                 quality_target,
-            })? {
+            });
+            metrics.rate.record(rate_started.elapsed());
+            if reconfigured? {
                 keyframe.store(true, Ordering::Release);
             }
             // Network requests are rate-limited at their RTCP entry. Explicit
@@ -516,7 +499,9 @@ pub(super) fn capture_loop(
                 timestamp,
                 force,
                 &encode_cancel,
-            )?;
+            );
+            metrics.encode.record(encode_started.elapsed());
+            let encoded = encoded?;
             for output in &encoded {
                 if let Some(actual) = crate::media::video_format::parse_stream_format(
                     output.format.codec.media(),
@@ -533,6 +518,7 @@ pub(super) fn capture_loop(
             }
             Ok((encoded, force, Instant::now()))
         })();
+        metrics.work.record(iteration_started.elapsed());
         if cancel.is_cancelled() || !handle.requested() {
             break;
         }
@@ -581,12 +567,16 @@ pub(super) fn capture_loop(
                 continue;
             }
         };
+        metrics.encoded_frames += encoded.len() as u64;
         if force && !encoded.iter().any(|frame| frame.keyframe) {
             keyframe.store(true, Ordering::Release);
         }
         last_frame = Some(frame.captured);
         if !encoded.is_empty() {
             let diagnostics = super::super::ActiveEncoding {
+                preferred_gpu: negotiated.preference().0,
+                preferred_codec: negotiated.preference().1,
+                selection: negotiated.selection_reason(&candidate.capability, !failed.is_empty()),
                 backend: candidate.capability.backend,
                 adapter: candidate.capability.adapter,
                 format: wanted.format,
@@ -627,7 +617,11 @@ pub(super) fn capture_loop(
                 frame_metadata.remove(&frame.timestamp_100ns)
             {
                 frame.is_new = is_new;
-                frame.color = frame.format.color(metadata);
+                frame.color.hdr_metadata = if frame.color.transfer == 16 {
+                    metadata
+                } else {
+                    None
+                };
                 frame.timing = Some(encoder::FrameTiming {
                     captured,
                     encode_started: input_started,

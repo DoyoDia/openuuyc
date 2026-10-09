@@ -1,6 +1,7 @@
 //! A negotiated drag owns an isolated file provider and one native operation.
 //! Clipboard observation, input ownership and network binding remain separate.
 pub(crate) mod controller;
+mod returning;
 use crate::{
     features::clipboard::{self, Clipboard, FileOffer, FileSummary},
     media::capture::Screen,
@@ -39,6 +40,7 @@ pub(crate) enum Stage {
     Preparing,
     Dragging,
     Submitted,
+    Returning,
     Reading,
     Complete,
     Cancelled,
@@ -58,6 +60,7 @@ pub(crate) struct Ticket {
     binding: std::sync::Weak<Shared>,
     alive: Arc<AtomicBool>,
     point: Mutex<Point>,
+    resume_position: Mutex<Option<Arc<dyn Fn() -> Option<Point> + Send + Sync>>>,
     snapshot: Mutex<Snapshot>,
     input: mpsc::Sender<Command>,
 }
@@ -113,6 +116,7 @@ struct Shared {
     enabled: AtomicBool,
     ready: AtomicBool,
     peer_enabled: AtomicBool,
+    return_capable: AtomicBool,
     token: AtomicU64,
     screens: Mutex<Vec<Screen>>,
     stop: CancellationToken,
@@ -147,14 +151,20 @@ pub(crate) struct Endpoint {
     input: mpsc::Sender<Command>,
     _life: Arc<Lifetime>,
 }
-struct ReleaseSource(Option<Arc<dyn Fn() + Send + Sync>>);
+struct ReleaseSource {
+    release: Option<Arc<dyn Fn() + Send + Sync>>,
+    resume: Option<Arc<dyn Fn(Point, bool) -> bool + Send + Sync>>,
+    current: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    wake: Option<Arc<dyn Fn() + Send + Sync>>,
+}
 impl Drop for ReleaseSource {
     fn drop(&mut self) {
-        if let Some(release) = self.0.take() {
+        if let Some(release) = self.release.take() {
             release();
         }
     }
 }
+
 enum Command {
     Policy,
     Probe(Arc<Ticket>, ReleaseSource),
@@ -166,6 +176,8 @@ enum Command {
     Prepared(u64, Result<FileSummary, String>),
     Offer(u64, FileOffer, Result<FileSummary, String>),
     Native(u64, native::Event),
+    Resume(u64),
+    Image(u64, wire::DragImage),
 }
 impl Command {
     fn drag(&self) -> Option<u64> {
@@ -178,7 +190,9 @@ impl Command {
             | Self::Clipboard(id, _)
             | Self::Prepared(id, _)
             | Self::Offer(id, _, _)
-            | Self::Native(id, _) => Some(*id),
+            | Self::Native(id, _)
+            | Self::Resume(id)
+            | Self::Image(id, _) => Some(*id),
         }
     }
 }
@@ -200,6 +214,7 @@ impl Endpoint {
             enabled: AtomicBool::new(false),
             ready: AtomicBool::new(false),
             peer_enabled: AtomicBool::new(role == Role::Host),
+            return_capable: AtomicBool::new(false),
             token: AtomicU64::new(0),
             screens: Mutex::default(),
             stop: stop.clone(),
@@ -262,6 +277,7 @@ impl Endpoint {
             binding: Arc::downgrade(&self.shared),
             alive: Arc::new(AtomicBool::new(true)),
             point: Mutex::new(point),
+            resume_position: Mutex::new(None),
             snapshot: Mutex::new(Snapshot {
                 stage: Stage::Preparing,
                 effect: 0,
@@ -293,7 +309,7 @@ impl Endpoint {
         }
         Ok(ticket)
     }
-    pub fn probe(&self, point: Point, release: Arc<dyn Fn() + Send + Sync>) -> Result<Arc<Ticket>> {
+    fn probe(&self, point: Point, release: ReleaseSource) -> Result<Arc<Ticket>> {
         ensure!(
             self.available() && point.valid(),
             "当前连接不能接管文件拖动"
@@ -313,6 +329,7 @@ impl Endpoint {
             binding: Arc::downgrade(&self.shared),
             alive: Arc::new(AtomicBool::new(true)),
             point: Mutex::new(point),
+            resume_position: Mutex::new(None),
             snapshot: Mutex::new(Snapshot {
                 stage: Stage::Preparing,
                 effect: 0,
@@ -324,7 +341,7 @@ impl Endpoint {
         });
         if self
             .input
-            .try_send(Command::Probe(ticket.clone(), ReleaseSource(Some(release))))
+            .try_send(Command::Probe(ticket.clone(), release))
             .is_err()
         {
             let _ = self.shared.source_held.compare_exchange(
@@ -371,6 +388,15 @@ struct Entry {
     portal: Option<native::portal::Portal>,
     release_source: Option<ReleaseSource>,
     source_released: bool,
+    image: Option<wire::DragImage>,
+    preserve_source: bool,
+    resuming: bool,
+    returned: Option<bool>,
+    native_finished: bool,
+    resume_at: Option<Instant>,
+    cancel_requested: bool,
+    original: Option<native::original::Original>,
+    handed_back: bool,
     pending_offer: Option<(FileOffer, FileSummary)>,
     shared: Arc<Shared>,
     accepted: bool,
@@ -379,6 +405,11 @@ struct Entry {
 }
 impl Drop for Entry {
     fn drop(&mut self) {
+        if !self.handed_back {
+            if let Some(original) = self.original {
+                let _ = original.cancel();
+            }
+        }
         let _ = self.shared.pointer_owner.compare_exchange(
             self.ticket.id,
             0,
@@ -456,6 +487,7 @@ impl Actor {
         };
         let data = wire::encode(Packet {
             token: self.token,
+            capabilities: wire::NATIVE_RETURN,
             drag: id,
             sequence,
             payload: Some(payload),
@@ -481,6 +513,7 @@ impl Actor {
                 binding: Arc::downgrade(&self.shared),
                 alive: Arc::new(AtomicBool::new(true)),
                 point: Mutex::new(point),
+                resume_position: Mutex::new(None),
                 snapshot: Mutex::new(Snapshot {
                     stage: Stage::Preparing,
                     effect: 0,
@@ -551,6 +584,15 @@ impl Actor {
             portal: None,
             release_source: None,
             source_released: false,
+            image: None,
+            preserve_source: false,
+            resuming: false,
+            returned: None,
+            native_finished: false,
+            resume_at: None,
+            cancel_requested: false,
+            original: None,
+            handed_back: false,
             pending_offer: None,
             shared: self.shared.clone(),
             accepted: false,
@@ -583,6 +625,20 @@ impl Actor {
         })
     }
     async fn finish(&mut self, id: u64, stage: u32, message: String) -> Result<()> {
+        // After the portal is gone, cancel the identified original OLE loop
+        // before acknowledging failure (the peer then releases its held press).
+        if let Some(original) = self
+            .entries
+            .get(&id)
+            .and_then(|e| e.original)
+            .filter(|v| v.live())
+        {
+            original.cancel()?;
+            let until = Instant::now() + Duration::from_millis(500);
+            while original.live() && Instant::now() < until {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
         tracing::info!(drag = id, stage, "native file drag finished");
         let _ =
             self.shared
@@ -623,6 +679,15 @@ impl Actor {
     async fn command(&mut self, command: Command) -> Result<()> {
         match command {
             Command::Policy => self.policy().await?,
+            Command::Resume(id) => self.begin_return(id).await?,
+            Command::Image(id, image) => {
+                if let Some(entry) = self.entries.get_mut(&id) {
+                    entry.image = Some(image.clone());
+                    if self.shared.return_capable.load(Ordering::Acquire) {
+                        self.emit(id, Payload::Image(image), false).await?;
+                    }
+                }
+            }
             Command::Incoming(packet) => self.receive(packet).await?,
             Command::Probe(ticket, release) => {
                 tracing::info!(drag = ticket.id, "native file drag handoff requested");
@@ -647,6 +712,8 @@ impl Actor {
                 let point = *lock(&ticket.point);
                 let mut entry = self.entry(id, point, false, Some(ticket))?;
                 entry.reverse = true;
+                entry.preserve_source = self.shared.return_capable.load(Ordering::Acquire)
+                    && release.current.as_ref().is_some_and(|f| f());
                 entry.release_source = Some(release);
                 self.entries.insert(id, entry);
                 self.emit(id, Payload::Probe(point), false).await?;
@@ -656,16 +723,22 @@ impl Actor {
                     return Ok(());
                 }
                 match event {
-                    native::portal::Event::Captured(paths) => {
+                    native::portal::Event::Captured(paths, preserve) => {
                         tracing::info!(
                             drag = id,
                             selections = paths.len(),
+                            preserve,
                             "native file drag selection captured"
                         );
                         let entry = self.entries.get_mut(&id).unwrap();
+                        entry.preserve_source = preserve;
                         let source = entry.clipboard.clone();
                         let commands = self.input.clone();
                         entry.prepare = Some(tokio::spawn(async move {
+                            let image = selection_image(&paths).await;
+                            if commands.send(Command::Image(id, image)).await.is_err() {
+                                return;
+                            }
                             let result =
                                 source.publish_files(paths).await.map_err(|e| e.to_string());
                             let _ = commands.send(Command::Prepared(id, result)).await;
@@ -676,10 +749,23 @@ impl Actor {
                             Payload::Begin(wire::Begin {
                                 point: Some(point),
                                 reverse: true,
+                                preserve,
                             }),
                             false,
                         )
                         .await?;
+                    }
+                    native::portal::Event::Resumed(original) => {
+                        tracing::info!(drag = id, "native original portal handed back");
+                        let entry = self.entries.get_mut(&id).unwrap();
+                        entry.original = Some(original);
+                        let _ = self.shared.pointer_owner.compare_exchange(
+                            id,
+                            0,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        );
+                        self.emit(id, Payload::Resumed(true), false).await?;
                     }
                     native::portal::Event::Released => {
                         let entry = self.entries.get_mut(&id).unwrap();
@@ -740,6 +826,10 @@ impl Actor {
                 let source = entry.clipboard.clone();
                 let commands = self.input.clone();
                 entry.prepare = Some(tokio::spawn(async move {
+                    let image = selection_image(&paths).await;
+                    if commands.send(Command::Image(id, image)).await.is_err() {
+                        return;
+                    }
                     let result = source.publish_files(paths).await.map_err(|e| e.to_string());
                     let _ = commands.send(Command::Prepared(id, result)).await;
                 }));
@@ -749,6 +839,7 @@ impl Actor {
                     Payload::Begin(wire::Begin {
                         point: Some(point),
                         reverse: false,
+                        preserve: false,
                     }),
                     false,
                 )
@@ -786,12 +877,8 @@ impl Actor {
                 match result {
                     Err(error) => self.finish(id, 4, error).await?,
                     Ok(summary) => {
-                        if self.entries[&id].reverse && !self.entries[&id].source_released {
-                            self.entries.get_mut(&id).unwrap().pending_offer =
-                                Some((offer, summary));
-                        } else {
-                            self.start_native(id, offer, summary)?;
-                        }
+                        self.entries.get_mut(&id).unwrap().pending_offer = Some((offer, summary));
+                        self.try_start_native(id)?;
                     }
                 }
             }
@@ -801,6 +888,9 @@ impl Actor {
                 }
                 match event {
                     native::Event::Feedback(effect) => {
+                        if self.entries[&id].resuming {
+                            return Ok(());
+                        }
                         if !self.entries[&id].committed {
                             let mut snapshot = lock(&self.entries[&id].ticket.snapshot);
                             snapshot.stage = Stage::Dragging;
@@ -817,10 +907,20 @@ impl Actor {
                         .await?;
                     }
                     native::Event::Released => {
+                        if self.entries[&id].resuming {
+                            return Ok(());
+                        }
                         tracing::info!(drag = id, "native file drag released to target");
                         if self.entries[&id].reverse {
                             let entry = self.entries.get_mut(&id).unwrap();
                             entry.committed = true;
+                            drop(entry.release_source.take());
+                            let _ = self.shared.source_held.compare_exchange(
+                                id,
+                                0,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            );
                             lock(&entry.ticket.snapshot).stage = Stage::Submitted;
                             if let Some(offer) = &entry.offer {
                                 offer.dragging(false);
@@ -850,6 +950,11 @@ impl Actor {
                         effect,
                         error,
                     } => {
+                        if self.entries[&id].resuming {
+                            self.entries.get_mut(&id).unwrap().native_finished = true;
+                            self.complete_return(id).await?;
+                            return Ok(());
+                        }
                         if accepted && effect == wire::COPY {
                             let entry = self.entries.get_mut(&id).unwrap();
                             entry.accepted = true;
@@ -917,10 +1022,29 @@ impl Actor {
                 alive.store(false, Ordering::Release);
             }
         });
+        let image = self.entries[&id].image.clone();
+        let identity = (reverse && self.entries[&id].preserve_source).then_some(
+            native::appearance::Identity {
+                token: self.token,
+                drag: id,
+            },
+        );
+        let object = move || {
+            let object = file.object()?;
+            if let Some(identity) = identity {
+                native::appearance::identify(&object, identity)?;
+            }
+            if let Some(image) = image {
+                if let Err(error) = native::appearance::decorate(&object, &image) {
+                    tracing::debug!(%error,"native drag image unavailable");
+                }
+            }
+            Ok(object)
+        };
         let native = if reverse {
-            native::Session::physical(guard, move || file.object(), notify)?
+            native::Session::physical(guard, object, notify)?
         } else {
-            native::Session::start(position, guard, move || file.object(), notify)?
+            native::Session::start(position, guard, object, notify)?
         };
         let entry = self.entries.get_mut(&id).unwrap();
         lock(&entry.ticket.snapshot).summary = Some(summary);
@@ -944,6 +1068,7 @@ impl Actor {
             self.token = token;
             self.reported = None;
             self.shared.ready.store(false, Ordering::Release);
+            self.shared.return_capable.store(false, Ordering::Release);
             if token != 0 {
                 self.emit(0, Payload::Hello(1), false).await?;
             }
@@ -969,6 +1094,10 @@ impl Actor {
                 self.token = packet.token;
                 self.shared.token.store(self.token, Ordering::Release);
             }
+            self.shared.return_capable.store(
+                packet.capabilities & wire::NATIVE_RETURN != 0,
+                Ordering::Release,
+            );
             self.shared.ready.store(true, Ordering::Release);
             self.emit(0, Payload::HelloAck(1), false).await?;
             return Ok(());
@@ -980,7 +1109,46 @@ impl Actor {
         let commit = matches!(&packet.payload, Some(Payload::Commit(_)));
         match packet.payload.unwrap() {
             Payload::HelloAck(1) if self.role == Role::Host => {
+                self.shared.return_capable.store(
+                    packet.capabilities & wire::NATIVE_RETURN != 0,
+                    Ordering::Release,
+                );
                 self.shared.ready.store(true, Ordering::Release)
+            }
+            Payload::Resume(point) => self.receive_return(id, point).await?,
+            Payload::Resumed(ok) => {
+                if let Some(entry) = self
+                    .entries
+                    .get_mut(&id)
+                    .filter(|e| e.resuming && !e.sending)
+                {
+                    entry.returned = Some(ok);
+                    self.complete_return(id).await?;
+                }
+            }
+            Payload::HandoffDone(true) => {
+                if let Some(entry) = self
+                    .entries
+                    .get_mut(&id)
+                    .filter(|e| e.resuming && e.sending && e.original.is_some())
+                {
+                    entry.handed_back = true;
+                    self.entries.remove(&id);
+                }
+            }
+            Payload::Image(image) => {
+                ensure!(
+                    self.shared.return_capable.load(Ordering::Acquire),
+                    "未协商拖放图像"
+                );
+                if let Some(entry) = self
+                    .entries
+                    .get_mut(&id)
+                    .filter(|e| !e.sending && !e.committed)
+                {
+                    entry.image = Some(image);
+                    self.try_start_native(id)?;
+                }
             }
             Payload::Available(enabled) if self.role == Role::Controller => {
                 self.shared.peer_enabled.store(enabled, Ordering::Release)
@@ -993,13 +1161,16 @@ impl Actor {
                         .filter(|e| e.reverse && !e.sending)
                         .ok_or_else(|| anyhow::anyhow!("未请求这个反向拖放"))?;
                     ensure!(entry.point == begin.point.unwrap(), "拖出来源屏幕不符");
-                    drop(entry.release_source.take());
-                    let _ = self.shared.source_held.compare_exchange(
-                        id,
-                        0,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    );
+                    entry.preserve_source &= begin.preserve;
+                    if !entry.preserve_source {
+                        drop(entry.release_source.take());
+                        let _ = self.shared.source_held.compare_exchange(
+                            id,
+                            0,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        );
+                    }
                     return Ok(());
                 }
                 ensure!(
@@ -1082,7 +1253,7 @@ impl Actor {
                 if !self
                     .entries
                     .get(&id)
-                    .is_some_and(|e| e.sending || result.stage >= 3)
+                    .is_some_and(|e| e.sending || result.stage >= 3 || (e.reverse && e.resuming))
                 {
                     return Ok(());
                 }
@@ -1147,6 +1318,7 @@ impl Actor {
                 let alive = entry.ticket.alive.clone();
                 entry.portal = Some(native::portal::Portal::start(
                     position,
+                    self.shared.return_capable.load(Ordering::Acquire),
                     guard,
                     Arc::new(move |event| {
                         if commands.try_send(Command::Portal(id, event)).is_err() {
@@ -1160,12 +1332,13 @@ impl Actor {
                 if let Some(entry) = self
                     .entries
                     .get_mut(&id)
-                    .filter(|e| e.reverse && !e.sending && e.release_source.is_none())
+                    .filter(|e| e.reverse && !e.sending)
                 {
                     entry.source_released = true;
-                    if let Some((offer, summary)) = entry.pending_offer.take() {
-                        self.start_native(id, offer, summary)?;
+                    if entry.preserve_source && !entry.committed && !entry.resuming {
+                        entry.ticket.cancel();
                     }
+                    self.try_start_native(id)?;
                 }
             }
             Payload::Progress(bytes) => {
@@ -1182,10 +1355,15 @@ impl Actor {
         self.policy().await?;
         let ids: Vec<_> = self.entries.keys().copied().collect();
         for id in ids {
+            if self.entries[&id].resuming {
+                self.return_tick(id).await?;
+                continue;
+            }
             let entry = &self.entries[&id];
             if entry.reverse
                 && !entry.sending
                 && entry.release_source.is_some()
+                && lock(&entry.ticket.snapshot).stage == Stage::Preparing
                 && entry.created_at.elapsed() > Duration::from_secs(3)
             {
                 self.emit(id, Payload::Cancel(true), false).await?;
@@ -1245,4 +1423,13 @@ impl Actor {
         }
         Ok(())
     }
+}
+
+async fn selection_image(paths: &[PathBuf]) -> wire::DragImage {
+    let paths = paths.to_vec();
+    tokio::task::spawn_blocking(move || native::appearance::selection(&paths))
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default()
 }

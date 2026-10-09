@@ -19,6 +19,7 @@ pub(super) struct ResolvedConnection {
     pub(super) target_device_id: String,
     pub(super) controller_device_id: String,
     pub(super) profile: ConnectionMediaProfile,
+    pub(super) default_codec: crate::media::CodecPreference,
     pub(super) transport: crate::media::TransportChoice,
     pub(super) summary: ConnectionSummary,
     pub(super) assist: Option<assist::AssistConnection>,
@@ -96,6 +97,9 @@ impl ResolvedConnection {
             let session = Arc::clone(&connection.forwarder.session);
             let setup = async {
                 let handle = connection.stream_control_handle();
+                // A file/port session can be created before any viewer. Its
+                // input platform is still unset until viewing takes ownership.
+                handle.mouse().set_keyboard_platform(self.target_platform);
                 let store = self.client.viewing_settings_store(&self.target_device_id)?;
                 if let Some(saved) = store.load().await? {
                     let preferences =
@@ -243,6 +247,15 @@ impl ResolvedConnection {
                 None
             }
         };
+        self.profile.codec = self.default_codec;
+        if !self.default_codec.restricted() && let Some(store) = &store {
+            match cancellable(cancel, store.load_device()).await {
+                Ok(saved) => { if let Some(codec)=saved.codec { self.profile.codec=codec; } }
+                Err(error) if cancel.is_cancelled() => return Err(error),
+                Err(error) => persistence_error=Some(error.to_string()),
+            }
+        }
+        self.summary.codec = self.profile.codec.label();
         if self.preferences.is_none()
             && let Some(store) = &store
         {
@@ -492,6 +505,7 @@ pub(super) async fn resolve_connection_with_client(
         target_device_id,
         controller_device_id,
         profile,
+        default_codec: profile.codec,
         transport: options.transport,
         summary,
         assist: None,

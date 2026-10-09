@@ -64,6 +64,18 @@ impl DeviceCenterApp {
                 clicked
             })
             .inner;
+        if let Some(task) = &state.task {
+            let progress = task.progress();
+            ui.add(
+                egui::ProgressBar::new(progress.fraction())
+                    .animate(progress.total == 0)
+                    .text(if progress.total == 0 {
+                        progress.stage
+                    } else {
+                        format!("{} · {:.0}%", progress.stage, progress.fraction() * 100.0)
+                    }),
+            );
+        }
         if let Some(error) = &state.error {
             ui.colored_label(theme::RED, error);
         }

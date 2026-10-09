@@ -371,8 +371,8 @@ fn worker(
                     local.receive(&packet)?;
                 }
                 Reply {
-                    status: local.status(),
                     packet: local.packet(),
+                    status: local.status(),
                 }
             } else {
                 // There is no interactive user before logon. Keep video/input alive, without granting SYSTEM clipboard access.
@@ -514,8 +514,8 @@ pub(crate) fn run(name: &str, parent: u32) -> Result<()> {
             super::frame::send(
                 &pipe,
                 Reply {
-                    status: local.status(),
                     packet: local.packet(),
+                    status: local.status(),
                 },
                 permitted,
             )?;

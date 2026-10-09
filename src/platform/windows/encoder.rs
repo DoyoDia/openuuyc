@@ -62,20 +62,6 @@ pub(crate) fn probe(
         Backend::Software,
         Format::AVC,
     ));
-    for chroma in [1, 3] {
-        for depth in [8, 10] {
-            candidates.push((
-                adapter,
-                desktop.device.clone(),
-                Backend::Software,
-                Format {
-                    codec: Codec::Av1,
-                    chroma,
-                    depth,
-                },
-            ));
-        }
-    }
     // Capability verification needs an input sample, not a new desktop present
     // for every candidate. Keep one owned converted sample per input format.
     let mut samples = [None::<super::capture::Frame>, None];
@@ -87,12 +73,12 @@ pub(crate) fn probe(
             anyhow::bail!("被控准备已取消");
         }
         let probe = (|| -> Result<Capability> {
-            let cached = &mut samples[usize::from(format.hdr())];
+            let cached = &mut samples[usize::from(format.depth == 10)];
             for _ in 0..if cached.is_none() { 20 } else { 0 } {
                 if !is_active() {
                     anyhow::bail!("被控准备已取消");
                 }
-                if let Some(frame) = desktop.next(50, 1, false, format.hdr(), (1280, 720))? {
+                if let Some(frame) = desktop.next(50, 1, false, format.depth == 10, (1280, 720))? {
                     acquired_frame = true;
                     *cached = Some(frame);
                     break;
@@ -122,7 +108,17 @@ pub(crate) fn probe(
             let mut encoder = if backend == Backend::Software {
                 Encoder::software_format(&device, (frame.width, frame.height), format, rate)?
             } else {
-                Encoder::hardware_format(&device, (frame.width, frame.height), format, rate)?
+                Encoder::hardware_format(
+                    &device,
+                    (frame.width, frame.height),
+                    format,
+                    rate,
+                    if format.depth == 10 {
+                        super::format::Color::Hdr
+                    } else {
+                        super::format::Color::Sdr
+                    },
+                )?
             };
             let mut output = None;
             for i in 0..20 {
@@ -246,19 +242,20 @@ impl Encoder {
         size: (u32, u32),
         format: super::format::Format,
         rate: super::format::Rate,
+        color: super::format::Color,
     ) -> Result<Self> {
         unsafe {
             let dxgi: windows::Win32::Graphics::Dxgi::IDXGIDevice = device.cast()?;
             let desc = dxgi.GetAdapter()?.GetDesc()?;
             match desc.VendorId {
                 0x10de => Ok(Self::Nvidia(super::nvenc::Encoder::new_format(
-                    device, size.0, size.1, rate, format,
+                    device, size.0, size.1, rate, format, color,
                 )?)),
                 0x1002 => Ok(Self::Amd(super::amf::Encoder::new(
-                    device, size, format, rate,
+                    device, size, format, rate, color,
                 )?)),
                 0x8086 => Ok(Self::Intel(super::qsv::Encoder::new(
-                    device, size, format, rate,
+                    device, size, format, rate, color,
                 )?)),
                 _ => anyhow::bail!("当前采集适配器没有可用的硬件编码候选"),
             }

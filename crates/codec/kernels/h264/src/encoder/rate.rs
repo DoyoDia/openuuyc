@@ -13,7 +13,9 @@ fn round(n: i64, d: i64) -> i64 {
     if d > 0 { (n + d / 2) / d } else { n }
 }
 fn frame_budget(cfg: Config) -> i64 {
-    let fps = cfg.fps.min(60) as f32;
+    // The public encoder accepts up to 144fps. Capping this divisor at 60
+    // silently doubles the allowed bitrate when configured for 120fps.
+    let fps = cfg.fps as f32;
     ((cfg.bitrate as f32 + 0.5 * fps) / fps) as i64
 }
 fn qp(step: i64) -> i32 {
@@ -100,8 +102,8 @@ impl Rate {
             initial_qp: 30,
             idr: true,
             frame_qp: 30,
-            min_qp: 26,
-            max_qp: 35,
+            min_qp: 10,
+            max_qp: 51,
             target: bpf * 4,
             complexity: 1,
             group_size: cfg.width.div_ceil(16) as usize
@@ -133,6 +135,23 @@ impl Rate {
     }
     pub fn configure(&mut self, cfg: Config) {
         self.cfg = cfg;
+        // Admission runs before begin(). Waiting for an accepted picture to
+        // apply a new rate leaves skipped inputs repaying the old budget and
+        // delays recovery after a bandwidth increase. Keep the real bit debt,
+        // but apply the new drain rate and capacity before the next decision.
+        self.refresh_budget();
+    }
+    fn refresh_budget(&mut self) {
+        let bpf = frame_budget(self.cfg);
+        if bpf != self.bits_per_frame && self.bits_per_frame > 1 {
+            self.remaining = round(self.remaining * bpf, self.bits_per_frame);
+        }
+        self.bits_per_frame = bpf;
+        self.buffer_limit = (i64::from(self.cfg.bitrate) + 1) / 2;
+        self.max_bits_per_frame = frame_budget(Config {
+            bitrate: MAXIMUM_BITRATE,
+            ..self.cfg
+        });
     }
     pub fn request_keyframe(&mut self) {
         // T 296377 clears the window initialization flag. Automatic scene
@@ -140,7 +159,7 @@ impl Rate {
         self.window_start = None;
     }
     /// T 296C18/3D1BE3: explicit/period IDR wins over the pending RC skip.
-    /// A skipped input repays one old frame budget without advancing VGOP.
+    /// A skipped input repays one current frame budget without advancing VGOP.
     pub fn admit(&mut self, idr: bool, timestamp: i64) -> bool {
         // T 290AB8 normalizes an unspecified maximum to 288 Mbps. T 29B610
         // checks overlapping 5 s windows with a 2.5 s shift on every input.
@@ -204,18 +223,9 @@ impl Rate {
         true
     }
     pub fn begin(&mut self, idr: bool, complexity: u64, mb_cost: &[u32]) -> i32 {
-        // T 299FE9/299A5F commits rates only for an encoded picture. The
-        // original VGOP allocation stays unchanged until the next boundary.
-        let bpf = frame_budget(self.cfg);
-        if bpf != self.bits_per_frame && self.bits_per_frame > 1 {
-            self.remaining = round(self.remaining * bpf, self.bits_per_frame);
-        }
-        self.bits_per_frame = bpf;
-        self.buffer_limit = (i64::from(self.cfg.bitrate) + 1) / 2;
-        self.max_bits_per_frame = frame_budget(Config {
-            bitrate: MAXIMUM_BITRATE,
-            ..self.cfg
-        });
+        // VGOP allocation stays unchanged until the next boundary; admission
+        // already consumes the current rate, including after skipped inputs.
+        self.refresh_budget();
         self.consecutive_skips = 0;
         if idr || self.position >= 8 {
             self.remaining -= (8 - i64::from(self.position)) * (self.allocated / 8);
@@ -264,12 +274,13 @@ impl Rate {
                 [0.03, 0.05, 0.09, 0.13],
                 [0.01, 0.03, 0.06, 0.1],
             ];
-            let bpp = self.cfg.bitrate as f64 / (self.cfg.fps.min(60) as f64 * area as f64);
+            let bpp = self.cfg.bitrate as f64 / (self.cfg.fps as f64 * area as f64);
             let col = thresholds[row].iter().position(|&x| bpp <= x).unwrap_or(4);
-            let ranges = [(40, 28), (37, 25), (36, 24), (35, 23), (34, 22)];
-            let (high, low) = ranges[col];
-            self.min_qp = low.clamp(26, 35);
-            self.max_qp = high.clamp(26, 35);
+            // Share AVC's useful quantizer range with hardware rate control.
+            // The old 26..35 clamp prevented high-budget detail refinement
+            // and repaid difficult scenes with skips instead of coarser QP.
+            self.min_qp = 10;
+            self.max_qp = 51;
             let initial = [
                 [34, 28, 26, 24, 22],
                 [36, 30, 28, 26, 24],
@@ -284,8 +295,8 @@ impl Rate {
             self.initial_qp = q.clamp(self.min_qp, self.max_qp);
             self.initial_qp
         } else {
-            self.min_qp = (self.last_qp - 3).clamp(26, 35);
-            self.max_qp = (self.last_qp + 5).clamp(26, 35);
+            self.min_qp = (self.last_qp - 3).clamp(10, 51);
+            self.max_qp = (self.last_qp + 5).clamp(10, 51);
             let q = if self.inter.count == 0 {
                 self.initial_qp
             } else if exceeded {

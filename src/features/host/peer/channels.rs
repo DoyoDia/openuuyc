@@ -23,9 +23,13 @@ pub(super) async fn bind_channel(
     annotation: crate::features::host::annotation::Receiver,
     control_ingress: crate::transport::uu_kcp::ControlReceiver,
 ) {
+    if cancel.is_cancelled() {
+        return;
+    }
     let control = channel.label() == "CONTROL_DATA_CHANNEL";
     let text = channel.label() == "TEXT_DATA_CHANNEL";
     let file = channel.label() == "FILE_DATA_CHANNEL";
+    kcp.bind_stream(channel.id(), control);
     if !control && !text && !file {
         return;
     }
@@ -45,6 +49,12 @@ pub(super) async fn bind_channel(
         None
     };
     let input_generation = if control {
+        report_target.send_modify(|routes| {
+            routes.control = None;
+            routes.handshake_complete = false;
+            routes.handshake_answered = false;
+            routes.revision = routes.revision.wrapping_add(1);
+        });
         Some(input.bind(channel.id()))
     } else {
         None
@@ -54,9 +64,6 @@ pub(super) async fn bind_channel(
         stream_id = channel.id(),
         "host business channel bound"
     );
-    if control {
-        kcp.set_control_stream(channel.id(), true);
-    }
     let weak = Arc::downgrade(&channel);
     let opening = cancel.clone();
     let opening_kcp = kcp.clone();
@@ -133,13 +140,16 @@ pub(super) async fn bind_channel(
             opening_target.send_modify(|routes| {
                 if control {
                     routes.control = Some(Arc::downgrade(&channel));
-                    routes.handshake_complete = false;
-                    routes.handshake_answered = false;
                 } else {
                     routes.text = Some(Arc::downgrade(&channel));
                 }
                 routes.revision = routes.revision.wrapping_add(1);
             });
+            // KCP can beat DCEP/on_open. Release its queued first message only
+            // after this channel's handshake state and response route exist.
+            if control {
+                opening_kcp.set_control_stream(channel.id(), true);
+            }
             if text {
                 if let Some(hello) = opening_annotation.hello(&channel) {
                     if let Err(error) = channel.send_text_bytes(&Bytes::from(hello)).await {

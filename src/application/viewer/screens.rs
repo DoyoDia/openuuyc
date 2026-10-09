@@ -314,7 +314,7 @@ impl ScreenPlayback {
         }
         let mut session = NativeViewerSession::launch(ViewerLaunchConfig {
             codec: codec(&track.metadata.codec)?,
-            hardware_decode: self.profile.hardware_decode,
+            decoder: self.profile.decoder,
             title: format!("{}{alias}", crate::VIEWER_TITLE_PREFIX, alias = self.alias),
             initial_width: screen.width,
             initial_height: screen.height,

@@ -116,7 +116,6 @@ struct FrameRate {
     maximum: u32,
     configured: u32,
     observed: u32,
-    previous: u32,
     inputs: VecDeque<i64>,
     first: Option<i64>,
     lower: VecDeque<u32>,
@@ -128,7 +127,6 @@ impl FrameRate {
             maximum,
             configured: maximum,
             observed: maximum,
-            previous: 0,
             inputs: VecDeque::new(),
             first: None,
             lower: VecDeque::new(),
@@ -167,7 +165,6 @@ impl FrameRate {
             self.maximum = maximum;
             self.configured = maximum;
             self.observed = self.observed.min(maximum);
-            self.previous = 0;
             self.lower.clear();
             self.lowering_since = None;
         }
@@ -179,7 +176,13 @@ impl FrameRate {
         let minimum = 30.min(maximum);
         let wanted = (observed * 110).div_ceil(100).clamp(minimum, maximum);
         let tier = (minimum + (wanted - minimum).div_ceil(5) * 5).min(maximum);
-        if self.previous > 0 && observed * 100 >= self.previous * 125 && self.configured < maximum {
+        // The one-second input window rises gradually even after an abrupt
+        // source-rate increase. Comparing consecutive samples for a 25% jump
+        // misses that recovery and reconfigures every five FPS instead. QSV
+        // starts a new coded sequence for each FPS change, creating an IDR
+        // burst. Recover the requested ceiling once input outgrows the current
+        // tier's headroom; retain the four-second settling rule for decreases.
+        if tier > self.configured && self.configured < maximum {
             self.configured = maximum;
             self.lower.clear();
             self.lowering_since = None;
@@ -208,7 +211,6 @@ impl FrameRate {
                 self.lowering_since = None;
             }
         }
-        self.previous = observed;
         (self.configured, observed)
     }
 }

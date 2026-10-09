@@ -110,6 +110,7 @@ pub(crate) struct Engine {
     foreground: Option<u32>,
     mouse_policy: super::config::MousePolicy,
     game_simulation: Option<bool>,
+    route_diagnostics: u16,
     privileged: bool,
 }
 impl Engine {
@@ -151,6 +152,7 @@ impl Engine {
             foreground: None,
             mouse_policy: Default::default(),
             game_simulation: None,
+            route_diagnostics: 0,
             privileged,
         })
     }
@@ -406,6 +408,26 @@ impl Engine {
             return Ok(());
         }
         let route = self.mouse_route();
+        if down {
+            // Record each route/coordinate/keyboard combination only once per
+            // session. No key codes, text or foreground application names.
+            let signature = u32::from(route == MouseRoute::Hid)
+                | (u32::from(matches!(self.mouse_mode, MouseMode::Relative)) << 1)
+                | (u32::from(!self.keys.is_empty()) << 2)
+                | (u32::from(button == 1) << 3);
+            let bit = 1u16 << signature;
+            if self.route_diagnostics & bit == 0 {
+                self.route_diagnostics |= bit;
+                tracing::debug!(
+                    hid = route == MouseRoute::Hid,
+                    relative = matches!(self.mouse_mode, MouseMode::Relative),
+                    keyboard_held = !self.keys.is_empty(),
+                    primary = button == 1,
+                    legacy_simulation = ?self.game_simulation,
+                    "host mouse button injection route"
+                );
+            }
+        }
         let previous = self.buttons;
         if down {
             self.buttons |= bit
@@ -425,10 +447,13 @@ impl Engine {
     }
     fn mouse_route(&self) -> MouseRoute {
         self.mouse_route.unwrap_or(
-            if self.hid_allowed()
-                && self.game_simulation != Some(false)
-                && matches!(self.mouse_mode, MouseMode::Relative)
-            {
+            // Coordinates and injection backend are independent. Prefer the
+            // same owned HID path as physical keys for mouse buttons, including
+            // absolute-position control. The official simulation hint selects
+            // its injector implementation; it is not a local HID permission.
+            // Preserve system fallback and origin-loop prevention, and retain
+            // the down's route until every mouse button has been released.
+            if self.hid_allowed() {
                 MouseRoute::Hid
             } else {
                 MouseRoute::System

@@ -4,6 +4,14 @@ use crate::features::viewing_settings::{DevicePreferences, PerformancePanelMode}
 use anyhow::Result;
 
 impl StreamControlHandle {
+    pub(crate) fn set_codec_preference(&self, codec: Option<crate::media::CodecPreference>) {
+        let mut state=lock(&self.shared);
+        if state.device_preferences.codec != codec {
+            state.device_preferences.codec=codec;
+            self.publish_device_preferences(&mut state);
+        }
+    }
+
     pub(crate) fn device_preferences(&self) -> DevicePreferences {
         lock(&self.shared).device_preferences
     }

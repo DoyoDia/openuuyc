@@ -49,6 +49,16 @@ struct Session {
 impl Session {
     fn new(device: &ID3D11Device) -> Result<Self> {
         unsafe {
+            // QSV may use the immediate context as soon as SetHandle binds it.
+            // Preparing this in Allocator::new is too late: that constructor
+            // runs only after the session has accepted the D3D11 device.
+            let context = device.GetImmediateContext()?;
+            let multithread: ID3D11Multithread = context.cast()?;
+            let _ = multithread.SetMultithreadProtected(true);
+            ensure!(
+                multithread.GetMultithreadProtected().as_bool(),
+                "QSV D3D11多线程保护未生效"
+            );
             let mut result = Self {
                 loader: v::MFXLoad(),
                 session: ptr::null_mut(),
@@ -95,10 +105,30 @@ impl Session {
                 "CreateSession",
             )?;
             ensure!(!result.session.is_null(), "oneVPL未返回编码会话");
-            check(
-                v::MFXVideoCORE_SetHandle(result.session, 3, device.as_raw()),
-                "SetD3D11Device",
-            )?;
+            let status = v::MFXVideoCORE_SetHandle(result.session, 3, device.as_raw());
+            if status < 0 {
+                // Do not swallow -16 or give the allocator a different device.
+                // Record whether the runtime already bound a device so a
+                // driver/session ownership error remains distinguishable from
+                // an unsupported codec. GetHandle returns an owned COM ref.
+                let mut bound = ptr::null_mut();
+                let query = v::MFXVideoCORE_GetHandle(result.session, 3, &mut bound);
+                let existing =
+                    (query >= 0 && !bound.is_null()).then(|| ID3D11Device::from_raw(bound));
+                let existing_luid = existing.as_ref().and_then(|device| {
+                    let adapter = device.cast::<IDXGIDevice>().ok()?.GetAdapter().ok()?;
+                    let id = adapter.GetDesc().ok()?.AdapterLuid;
+                    Some((u64::from(id.HighPart as u32) << 32) | u64::from(id.LowPart))
+                });
+                tracing::warn!(
+                    status,
+                    query,
+                    ?existing_luid,
+                    same_device = existing.as_ref().is_some_and(|bound| bound == device),
+                    "QSV D3D11 device binding failed after enabling multithread protection"
+                );
+            }
+            check(status, "SetD3D11Device")?;
             check(v::MFXSetPriority(result.session, 2), "SetPriority")?;
             Ok(result)
         }
@@ -194,9 +224,10 @@ impl Encoder {
         size: (u32, u32),
         format: Format,
         rate: Rate,
+        color: super::format::Color,
     ) -> Result<Self> {
         Ok(Self {
-            active: Some(Active::new(device, size, format, rate)?),
+            active: Some(Active::new(device, size, format, rate, color)?),
             device: device.clone(),
             size,
             format,
@@ -228,6 +259,7 @@ impl Encoder {
                     active.frame_rate.clone(),
                 );
                 let rate = active.rate;
+                let color = active.conversion.color;
                 // C449A0 closes the whole failed encoder BEFORE opening its
                 // replacement; the old allocator/callbacks outlive that close.
                 drop(self.active.take());
@@ -238,7 +270,7 @@ impl Encoder {
                         self.size,
                         self.format,
                         rate,
-                        Conversion::pixel(&self.device, self.size, self.format, 16)?,
+                        Conversion::pixel(&self.device, self.size, self.format, 16, color)?,
                         Some(restored),
                     )
                 })()
@@ -263,8 +295,24 @@ fn unwrap_encode_error(error: anyhow::Error) -> anyhow::Error {
     }
 }
 impl Extensions {
-    fn new(version: (u16, u16), size: (u32, u32), format: Format, low_power: bool) -> Self {
-        let color = format.color(None);
+    fn new(
+        version: (u16, u16),
+        size: (u32, u32),
+        format: Format,
+        low_power: bool,
+        color: super::format::Color,
+    ) -> Self {
+        // Use the same VBR contract for SDR HEVC8/10. LowDelayBRC adds a strict
+        // per-frame size constraint: on tested Iris Xe it undershoots Main10
+        // and degrades HEVC8 text/IDR recovery. No-lookahead/no-reordering and
+        // the negotiated target/peak remain unchanged; HDR keeps its contract.
+        let low_delay_brc = match format.codec {
+            Codec::Av1 => 16,
+            Codec::H265 if color.is_hdr() && low_power => 16,
+            Codec::H265 => 32,
+            _ => 0,
+        };
+        let color = color.space(None);
         let mut result = Self {
             one: Box::new(v::mfxExtCodingOption {
                 Header: header::<v::mfxExtCodingOption>(v::MFX_EXTBUFF_CODING_OPTION),
@@ -285,13 +333,7 @@ impl Extensions {
             three: Box::new(v::mfxExtCodingOption3 {
                 Header: header::<v::mfxExtCodingOption3>(v::MFX_EXTBUFF_CODING_OPTION3),
                 ScenarioInfo: 8,
-                LowDelayBRC: if format.codec == Codec::Av1 {
-                    16
-                } else if format.codec == Codec::H265 {
-                    if low_power { 16 } else { 32 }
-                } else {
-                    0
-                },
+                LowDelayBRC: low_delay_brc,
                 TargetChromaFormatPlus1: if format.chroma == 3 { 4 } else { 0 },
                 TargetBitDepthLuma: format.depth.into(),
                 TargetBitDepthChroma: format.depth.into(),
@@ -379,8 +421,9 @@ impl Active {
         size: (u32, u32),
         format: Format,
         rate: Rate,
+        color: super::format::Color,
     ) -> Result<Self> {
-        let conversion = Conversion::aligned(device, size, format, 16)?;
+        let conversion = Conversion::aligned(device, size, format, 16, color)?;
         let compute = conversion.is_compute();
         match Self::create(device, size, format, rate, conversion, None) {
             Ok(encoder) => Ok(encoder),
@@ -391,7 +434,7 @@ impl Active {
                     size,
                     format,
                     rate,
-                    Conversion::pixel(device, size, format, 16)?,
+                    Conversion::pixel(device, size, format, 16, color)?,
                     None,
                 )
             }
@@ -477,7 +520,7 @@ impl Active {
                 ..Default::default()
             };
             set_rate(&mut params, rate);
-            let mut extensions = Extensions::new(version, size, format, true);
+            let mut extensions = Extensions::new(version, size, format, true, conversion.color);
             let mut frame_rate = super::encoder_rate::Controller::new(rate);
             if let Some((previous, previous_extensions, previous_rate)) = restored {
                 params = previous;
@@ -516,7 +559,7 @@ impl Active {
                 params,
                 surface,
                 conversion,
-                buffer: vec![0; 1024 * 1024],
+                buffer: vec![0; output_capacity(size, format, &params)?],
                 rate,
                 frame_rate,
                 maximum: size,
@@ -554,6 +597,9 @@ impl Active {
                 "GetVideoParam",
             )?;
             validate(&this.params, size, format)?;
+            this.buffer
+                .resize(output_capacity(size, format, &this.params)?, 0);
+            report_rate("initialized", &this.params, &this.extensions, rate);
             this.maximum = this.maximum_for_format(format).unwrap_or(size);
             Ok(this)
         }
@@ -642,6 +688,11 @@ impl Active {
         }
         let changed_quality = self.rate.quality != rate.quality;
         self.params = params;
+        let capacity = output_capacity(self.size, self.format, &self.params)?;
+        if capacity > self.buffer.len() {
+            self.buffer.resize(capacity, 0);
+        }
+        report_rate("reconfigured", &self.params, &self.extensions, update.rate);
         self.surface.Info = unsafe { params.__bindgen_anon_1.mfx.FrameInfo };
         self.rate = rate;
         self.frame_rate.commit(update);
@@ -708,7 +759,8 @@ impl Active {
                     }
                     SubmitAction::Grow => {
                         ensure!(self.buffer.len() < 64 * 1024 * 1024, "QSV码流超过64MiB");
-                        self.buffer.resize(self.buffer.len() * 2, 0);
+                        self.buffer
+                            .resize((self.buffer.len() * 2).min(64 * 1024 * 1024), 0);
                         continue;
                     }
                     SubmitAction::Retry => {
@@ -758,7 +810,7 @@ impl Active {
             is_new: true,
             timing: None,
             format: self.format,
-            color: self.format.color(None),
+            color: self.conversion.color.space(None),
         }])
     }
 }
@@ -773,6 +825,62 @@ unsafe fn slice<'a, T>(data: *const T, count: u16) -> Result<&'a [T]> {
         } else {
             std::slice::from_raw_parts(data, count as usize)
         })
+    }
+}
+fn output_capacity(size: (u32, u32), format: Format, params: &v::mfxVideoParam) -> Result<usize> {
+    // Complex IDRs can exceed the original fixed 1MiB allocation. On the Intel
+    // driver this can surface from SyncOperation, after the input was accepted,
+    // too late for the unsubmitted-input grow/retry path. Reserve a whole raw
+    // frame plus headers up front, and honor the driver's queried requirement.
+    const LIMIT: usize = 64 * 1024 * 1024;
+    let pixels = size.0.div_ceil(16) as usize * 16 * size.1.div_ceil(16) as usize * 16;
+    let samples = if format.chroma == 3 {
+        pixels * 3
+    } else {
+        pixels * 3 / 2
+    };
+    let raw = samples * if format.depth > 8 { 2 } else { 1 };
+    let driver = unsafe {
+        let mfx = params.__bindgen_anon_1.mfx;
+        usize::from(mfx.__bindgen_anon_1.__bindgen_anon_1.BufferSizeInKB)
+            * usize::from(mfx.BRCParamMultiplier).max(1)
+            * 1000
+    };
+    ensure!(driver <= LIMIT, "QSV驱动要求的码流缓冲超过64MiB");
+    Ok((raw + 64 * 1024).min(LIMIT).max(driver).max(1024 * 1024))
+}
+fn report_rate(stage: &str, params: &v::mfxVideoParam, extensions: &Extensions, requested: Rate) {
+    unsafe {
+        let mfx = params.__bindgen_anon_1.mfx;
+        let encoding = mfx.__bindgen_anon_1.__bindgen_anon_1;
+        let factor = u32::from(mfx.BRCParamMultiplier).max(1);
+        tracing::debug!(
+            stage,
+            requested_bps = requested.target,
+            effective_target_bps = u32::from(encoding.__bindgen_anon_2.TargetKbps) * factor * 1000,
+            effective_peak_bps = u32::from(encoding.__bindgen_anon_3.MaxKbps) * factor * 1000,
+            buffer_bytes = u32::from(encoding.BufferSizeInKB) * factor * 1000,
+            rate_control = encoding.RateControlMethod,
+            fps_n = mfx.FrameInfo.FrameRateExtN,
+            fps_d = mfx.FrameInfo.FrameRateExtD,
+            low_power = mfx.LowPower,
+            profile = mfx.CodecProfile,
+            level = mfx.CodecLevel,
+            shift = mfx.FrameInfo.Shift,
+            min_qpi = extensions.two.MinQPI,
+            min_qpp = extensions.two.MinQPP,
+            max_qpi = extensions.two.MaxQPI,
+            max_qpp = extensions.two.MaxQPP,
+            max_frame_bytes = extensions.two.MaxFrameSize,
+            max_i_bytes = extensions.three.MaxFrameSizeI,
+            max_p_bytes = extensions.three.MaxFrameSizeP,
+            window_max_kbps = extensions.three.WinBRCMaxAvgKbps,
+            window_frames = extensions.three.WinBRCSize,
+            low_delay_brc = extensions.three.LowDelayBRC,
+            gpb = extensions.three.GPB,
+            scenario = extensions.three.ScenarioInfo,
+            "QSV effective driver rate parameters"
+        );
     }
 }
 fn set_rate(params: &mut v::mfxVideoParam, rate: Rate) {

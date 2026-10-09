@@ -599,7 +599,7 @@ impl ControllerConnection {
         reporter: Option<&ConnectionProgressReporter>,
         display: ViewerDisplayHandle,
     ) -> Result<(NativeViewerSession, PlaybackSummary)> {
-        let hardware_decode = self.profile.hardware_decode;
+        let hardware_decode = self.profile.decoder.mode.hardware();
         report_progress(
             reporter,
             9,
@@ -661,7 +661,7 @@ impl ControllerConnection {
         );
         let mut viewer = NativeViewerSession::launch(ViewerLaunchConfig {
             codec,
-            hardware_decode,
+            decoder: profile.decoder,
             title,
             initial_width: profile.local_display.width,
             initial_height: profile.local_display.height,

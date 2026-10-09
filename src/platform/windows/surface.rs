@@ -28,11 +28,14 @@ pub(crate) struct D3D11Surface {
     texture: ID3D11Texture2D,
     subresource: u32,
     desc: D3D11_TEXTURE2D_DESC,
+    // Shader interpretation can differ from storage for CPU-produced packed YUV.
+    pixel_format: DXGI_FORMAT,
     shared_handle: Option<isize>,
     shared: Arc<D3D11Shared>,
 }
 
 struct D3D11Shared {
+    adapter: u64,
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     reported_format: Mutex<Option<windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT>>,
@@ -80,7 +83,8 @@ impl std::fmt::Debug for D3D11Surface {
             .debug_struct("D3D11Surface")
             .field("width", &self.desc.Width)
             .field("height", &self.desc.Height)
-            .field("format", &self.desc.Format)
+            .field("pixel_format", &self.pixel_format)
+            .field("storage_format", &self.desc.Format)
             .finish_non_exhaustive()
     }
 }
@@ -140,10 +144,41 @@ impl D3D11SurfaceWriter {
     }
 
     pub(crate) fn available() -> Result<Vec<Self>> {
+        let mut writers = Vec::new();
+        for adapter in Self::adapters()? {
+            match Self::from_adapter(&adapter) {
+                Ok(writer) => writers.push(writer),
+                Err(error) => tracing::debug!(%error, "D3D11 adapter unavailable"),
+            }
+        }
+        if writers.is_empty() {
+            bail!("no usable hardware D3D11 adapter");
+        }
+        Ok(writers)
+    }
+
+    pub(crate) fn adapter_ids() -> Result<Vec<u64>> {
+        Self::adapters()?.iter().map(adapter_id).collect()
+    }
+
+    pub(crate) fn for_adapter(id: u64) -> Result<Self> {
+        for adapter in Self::adapters()? {
+            if adapter_id(&adapter)? == id {
+                return Self::from_adapter(&adapter);
+            }
+        }
+        bail!("requested D3D11 adapter {id:016x} is unavailable")
+    }
+
+    pub(crate) fn adapter_id(&self) -> u64 {
+        self.shared.adapter
+    }
+
+    fn adapters() -> Result<Vec<IDXGIAdapter1>> {
         let factory: IDXGIFactory1 =
             unsafe { CreateDXGIFactory1() }.context("enumerate D3D11 adapters")?;
         let preferred = factory.cast::<IDXGIFactory6>().ok();
-        let mut writers = Vec::new();
+        let mut adapters = Vec::new();
         for index in 0.. {
             let adapter: windows::core::Result<IDXGIAdapter1> = unsafe {
                 match &preferred {
@@ -155,20 +190,15 @@ impl D3D11SurfaceWriter {
             let Ok(adapter) = adapter else {
                 break;
             };
-            if unsafe { adapter.GetDesc1() }
-                .is_ok_and(|desc| desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0)
+            let desc = unsafe { adapter.GetDesc1()? };
+            if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0
+                || super::adapter_type::indirect(desc.AdapterLuid) == Some(true)
             {
                 continue;
             }
-            match Self::from_adapter(&adapter) {
-                Ok(writer) => writers.push(writer),
-                Err(error) => tracing::debug!(index, %error, "D3D11 adapter unavailable"),
-            }
+            adapters.push(adapter);
         }
-        if writers.is_empty() {
-            bail!("no usable hardware D3D11 adapter");
-        }
-        Ok(writers)
+        Ok(adapters)
     }
 
     fn from_adapter(adapter: &IDXGIAdapter1) -> Result<Self> {
@@ -205,6 +235,7 @@ impl D3D11SurfaceWriter {
         configure_device(&device, true);
         Ok(Self {
             shared: Arc::new(D3D11Shared {
+                adapter: adapter_id(adapter)?,
                 device,
                 context,
                 reported_format: Mutex::new(None),
@@ -286,7 +317,13 @@ impl D3D11SurfaceWriter {
             Height: h,
             MipLevels: 1,
             ArraySize: 1,
-            Format: format,
+            // Packed CPU pixels only need a shader-readable bit layout; native
+            // AYUV/Y410 video resources are optional even on modern adapters.
+            Format: match format {
+                DXGI_FORMAT_AYUV => DXGI_FORMAT_R8G8B8A8_UNORM,
+                DXGI_FORMAT_Y410 => DXGI_FORMAT_R10G10B10A2_UNORM,
+                _ => format,
+            },
             SampleDesc: DXGI_SAMPLE_DESC {
                 Count: 1,
                 Quality: 0,
@@ -311,6 +348,7 @@ impl D3D11SurfaceWriter {
             texture: texture.context("missing uploaded video texture")?,
             subresource: 0,
             desc,
+            pixel_format: format,
             shared_handle: None,
             _frame: None,
             visible_origin: (0, 0),
@@ -372,12 +410,18 @@ impl D3D11SurfaceWriter {
             texture: frame.texture().clone(),
             subresource: frame.subresource(),
             desc: source_desc,
+            pixel_format: source_desc.Format,
             shared_handle,
             visible_origin: (frame.visible_x(), frame.visible_y()),
             _frame: Some(frame),
             shared: Arc::clone(&self.shared),
         })
     }
+}
+
+fn adapter_id(adapter: &IDXGIAdapter1) -> Result<u64> {
+    let id = unsafe { adapter.GetDesc1()? }.AdapterLuid;
+    Ok((u64::from(id.HighPart as u32) << 32) | u64::from(id.LowPart))
 }
 
 fn create_renderer_device(
@@ -430,6 +474,10 @@ fn configure_device(device: &ID3D11Device, limit_device_latency: bool) {
 }
 
 impl D3D11Surface {
+    pub(crate) fn adapter_id(&self) -> u64 {
+        self.shared.adapter
+    }
+
     pub(crate) fn texture(&self) -> &ID3D11Texture2D {
         &self.texture
     }
@@ -470,6 +518,6 @@ impl D3D11Surface {
     }
 
     pub(crate) fn format(&self) -> windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT {
-        self.desc.Format
+        self.pixel_format
     }
 }

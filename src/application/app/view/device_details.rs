@@ -6,6 +6,7 @@ enum Glyph {
     Headphones,
     PortMapping,
     Files,
+    Diagnostics,
     Power,
     Restart,
     Board,
@@ -235,6 +236,7 @@ fn paint_glyph(p: &egui::Painter, r: egui::Rect, g: Glyph, color: Color32) {
         Glyph::Monitor => paint_icon(p, r, Icon::Monitor, color),
         Glyph::Headphones => crate::ui::controls::paint_headphones(p, r, color),
         Glyph::PortMapping => crate::ui::controls::paint_port_mapping_icon(p, r, color),
+        Glyph::Diagnostics => crate::ui::controls::paint_file_icon(p, r, color, false),
         Glyph::Files => crate::ui::controls::paint_file_icon(p, r, color, true),
         Glyph::Edit => paint_icon(p, r, Icon::Edit, color),
         Glyph::System => {
@@ -388,6 +390,13 @@ impl DeviceCenterApp {
         let mut refresh = false;
         let mut ports = false;
         let mut files = false;
+        let mut diagnostics = false;
+        let controller_id = self
+            .devices
+            .as_ref()
+            .map(|list| list.current_device.device_id.clone())
+            .unwrap_or_default();
+        let diagnostic_state = crate::diagnostics::remote::service::snapshot(&controller_id, &id);
         let has_ports = self.devices.as_ref().is_some_and(|list| {
             list.my_binded_devices.iter().any(|d| {
                 d.device_id == id
@@ -395,6 +404,7 @@ impl DeviceCenterApp {
                     && matches!(d.platform, 1 | 4)
             })
         });
+        let has_diagnostics = has_ports && device.platform == 1;
         let (header, _) = ui.allocate_exact_size(vec2(viewport.x, 48.0), Sense::hover());
         let mut header_ui = ui.new_child(
             egui::UiBuilder::new()
@@ -425,6 +435,7 @@ impl DeviceCenterApp {
             && !self.logout_confirmation
             && !self.exit_requested
             && self.takeover_confirmation.is_none()
+            && !egui::Popup::is_any_open(ui.ctx())
             && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
         {
             back = true;
@@ -890,6 +901,40 @@ impl DeviceCenterApp {
                     {
                         edit = Some(EditAction::Rename);
                     }
+                    if has_diagnostics {
+                        let label =
+                            super::remote_diagnostics::button_label(diagnostic_state.as_ref());
+                        let can_start = device.is_connected()
+                            && device.controllable
+                            && device.controlled_support;
+                        let button = detail_button(
+                            ui,
+                            &label,
+                            Glyph::Diagnostics,
+                            can_start || diagnostic_state.is_some(),
+                            vec2(144.0, theme::CONTROL_HEIGHT),
+                            ButtonTone::Normal,
+                        )
+                        .on_hover_text("获取远端 OpenUUYC 诊断包；点击查看进度和结果");
+                        if let Some(state) = &diagnostic_state
+                            && state.busy
+                            && state.progress.total > 0
+                        {
+                            crate::ui::controls::task_button_progress(
+                                ui,
+                                button.rect,
+                                state.progress.fraction(),
+                            );
+                        }
+                        diagnostics |= super::remote_diagnostics::popup(
+                            &button,
+                            &controller_id,
+                            &id,
+                            diagnostic_state.as_ref(),
+                            can_start,
+                        );
+                        ui.ctx().request_repaint_after(Duration::from_millis(200));
+                    }
                     if current {
                         if detail_button(
                             ui,
@@ -924,6 +969,9 @@ impl DeviceCenterApp {
                 self.mutation_pending.then_some("正在处理设备操作…"),
             );
         });
+        if diagnostics {
+            self.fetch_diagnostics(device.clone());
+        }
         if ports {
             self.open_port_mapping(id.clone());
         }

@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
 pub(crate) mod polling;
+mod recovery;
+pub(crate) use recovery::InputRecovery;
 
 const MAX_EVENTS: usize = 512;
 const MOTION_JITTER: Duration = Duration::from_micros(100);
@@ -185,6 +187,8 @@ struct State {
     mode: MouseMode,
     relative: bool,
     owner: Option<u64>,
+    drag_hold: Option<(u64, u64)>,
+    drag_serial: u64,
     held: [bool; 5],
     // Marked before handing DOWN to transport. A concurrent stop must release
     // even an in-flight press, not just messages whose send() already returned.
@@ -206,6 +210,7 @@ struct State {
     cancellation: tokio_util::sync::CancellationToken,
     error: Option<String>,
     recovering: bool,
+    transport_recovery: Option<recovery::RecoveryState>,
     throttle: Option<MouseThrottleRate>,
     next_motion_at: Option<Instant>,
     deadline_timer: Option<crate::platform::windows::input::deadline::Timer>,
@@ -470,6 +475,7 @@ impl RemoteInput {
         let mut s = self.lock();
         let became_ready = ready && !s.ready && !s.stopping;
         if !ready {
+            s.drag_hold = None;
             Self::advance_epoch(&mut s);
             s.mode = MouseMode::View;
             s.waiting_for_neutral = false;
@@ -501,6 +507,9 @@ impl RemoteInput {
         if !s.ready || s.stopping {
             bail!("控制连接尚未就绪");
         }
+        if s.transport_recovery.as_ref().is_some_and(|r| !r.confirmed) {
+            bail!("键鼠通道正在恢复，请稍候");
+        }
         if s.mode == mode {
             s.relative = relative;
             return Ok(());
@@ -523,6 +532,7 @@ impl RemoteInput {
     }
 
     fn advance_epoch(s: &mut State) {
+        s.transport_recovery = None;
         s.next_motion_at = None;
         if let Some(timer) = &mut s.deadline_timer {
             timer.disarm();
@@ -536,6 +546,7 @@ impl RemoteInput {
     }
 
     fn release_locked(s: &mut State) {
+        s.drag_hold = None;
         s.assists.clear();
         s.assist_button_owner = None;
         s.assist_down = false;
@@ -576,9 +587,72 @@ impl RemoteInput {
         if s.owner != Some(owner) {
             return;
         }
-        Self::release_locked(&mut s);
+        if s.drag_hold
+            .is_some_and(|(held_owner, _)| held_owner == owner)
+            && s.held[0]
+        {
+            // Only the original LMB press belongs to a file handoff. Ordinary
+            // focus loss still retires keyboard and other button ownership.
+            if !s.keys.is_empty() || s.held[1..].iter().any(|v| *v) {
+                s.queue.clear();
+                s.keyboard_generation = s.keyboard_generation.wrapping_add(1);
+                let keys: Vec<_> = s.remote_keys.keys().copied().collect();
+                s.release_checkpoint.extend(keys.iter().copied());
+                for modifier in [false, true] {
+                    for &key in &keys {
+                        if matches!(key,16..=18|91..=92|160..=165) == modifier {
+                            s.queue.push_back(InputEvent::Key {
+                                key,
+                                down: false,
+                                lock: None,
+                                interrupt: false,
+                            });
+                        }
+                    }
+                }
+                s.keys.clear();
+                for (index, button) in BUTTONS.into_iter().enumerate().skip(1) {
+                    if s.remote_held[index] {
+                        s.queue.push_back(InputEvent::Button {
+                            button,
+                            down: false,
+                        });
+                    }
+                    s.held[index] = false;
+                }
+            }
+        } else {
+            Self::release_locked(&mut s);
+        }
         drop(s);
         self.wake.notify_one();
+    }
+
+    pub(crate) fn hold_drag(&self, owner: u64) -> Result<DragHold> {
+        let mut s = self.lock();
+        anyhow::ensure!(
+            s.ready
+                && !s.stopping
+                && s.mode != MouseMode::View
+                && !s.relative
+                && s.owner == Some(owner)
+                && s.held[0]
+                && s.remote_held[0]
+                && s.drag_hold.is_none(),
+            "原拖动按下已失效"
+        );
+        s.drag_serial = s
+            .drag_serial
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("拖动代次已用尽"))?;
+        let serial = s.drag_serial;
+        s.drag_hold = Some((owner, serial));
+        Ok(DragHold(Arc::new(DragHoldInner {
+            input: self.clone(),
+            owner,
+            serial,
+            active: std::sync::atomic::AtomicBool::new(true),
+        })))
     }
 
     /// Retire input belonging to a display layout that is being replaced.
@@ -1211,5 +1285,91 @@ impl RemoteInput {
             tracing::warn!("mouse release drain timed out; remote receipt is unknown");
         }
         self.set_ready(false);
+    }
+}
+
+/// A handoff may preserve an already-submitted press, never synthesize a new one.
+#[derive(Clone)]
+pub(crate) struct DragHold(Arc<DragHoldInner>);
+struct DragHoldInner {
+    input: RemoteInput,
+    owner: u64,
+    serial: u64,
+    active: std::sync::atomic::AtomicBool,
+}
+impl DragHold {
+    pub(crate) fn current(&self) -> bool {
+        let s = self.0.input.lock();
+        self.0.active.load(std::sync::atomic::Ordering::Acquire)
+            && s.ready
+            && !s.stopping
+            && s.drag_hold == Some((self.0.owner, self.0.serial))
+            && s.owner == Some(self.0.owner)
+            && s.held[0]
+            && s.remote_held[0]
+    }
+    pub(crate) fn cancel(&self) {
+        self.0.cancel();
+    }
+    pub(crate) fn resume(&self, screen: i32, x: f64, y: f64, left: bool) -> bool {
+        if screen < 0
+            || !x.is_finite()
+            || !y.is_finite()
+            || !(0.0..=1.0).contains(&x)
+            || !(0.0..=1.0).contains(&y)
+        {
+            return false;
+        }
+        let mut s = self.0.input.lock();
+        if !s.ready
+            || s.stopping
+            || s.mode == MouseMode::View
+            || s.drag_hold != Some((self.0.owner, self.0.serial))
+            || s.owner != Some(self.0.owner)
+            || !s.held[0]
+            || !s.remote_held[0]
+            || !self
+                .0
+                .active
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            return false;
+        }
+        s.drag_hold = None;
+        let mut accepted = RemoteInput::push(&mut s, InputEvent::Absolute { screen, x, y });
+        if accepted && !left {
+            s.held[0] = false;
+            accepted = RemoteInput::push(
+                &mut s,
+                InputEvent::Button {
+                    button: 1,
+                    down: false,
+                },
+            );
+        }
+        drop(s);
+        self.0.input.wake.notify_one();
+        self.0.input.repaint();
+        accepted
+    }
+}
+impl DragHoldInner {
+    fn cancel(&self) {
+        if !self.active.swap(false, std::sync::atomic::Ordering::AcqRel) {
+            return;
+        }
+        let mut s = self.input.lock();
+        if s.drag_hold == Some((self.owner, self.serial)) {
+            s.drag_hold = None;
+            RemoteInput::release_locked(&mut s);
+        }
+        drop(s);
+        self.input.wake.notify_one();
+        self.input.repaint();
+    }
+}
+impl Drop for DragHoldInner {
+    fn drop(&mut self) {
+        self.cancel();
     }
 }

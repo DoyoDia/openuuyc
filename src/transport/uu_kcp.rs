@@ -29,6 +29,7 @@ const UU_KCP_HEADER: usize = 28;
 const FEC_HEADER: usize = 32;
 const RECOVERY_INFO_SIZE: usize = 37;
 const MAX_CONTROL_MESSAGE: usize = 0x40080;
+mod streams;
 const MAX_FEC_ORIGINALS: usize = 20;
 const MAX_RECENT_PACKETS: usize = 4_096;
 const FEC_RETENTION: Duration = Duration::from_millis(1_000);
@@ -48,7 +49,7 @@ const CMD_FEC_DUPLICATE: u8 = 88;
 #[derive(Clone, Default)]
 pub(crate) struct UuKcpControl {
     state: Arc<StdMutex<ControlState>>,
-    control_streams: Arc<StdMutex<HashSet<u16>>>,
+    control_streams: Arc<StdMutex<streams::Streams>>,
     send_failure: Arc<StdMutex<Option<(Instant, String)>>>,
     progress: Arc<AtomicU8>,
 }
@@ -76,6 +77,9 @@ type SendGuard = Arc<dyn Fn() -> bool + Send + Sync>;
 pub(crate) type ControlReceiver = Arc<dyn Fn(u16, &[u8]) -> Result<()> + Send + Sync>;
 
 enum WorkerCommand {
+    Drain {
+        result: oneshot::Sender<()>,
+    },
     Send {
         stream_id: u16,
         payload: Vec<u8>,
@@ -125,12 +129,11 @@ impl UuKcpControl {
     }
 
     pub(crate) fn set_control_stream(&self, stream_id: u16, open: bool) {
-        let mut streams = lock(&self.control_streams);
-        if open {
-            streams.insert(stream_id);
-        } else {
-            streams.remove(&stream_id);
-        }
+        lock(&self.control_streams).set_open(stream_id, open);
+    }
+
+    pub(crate) fn bind_stream(&self, stream_id: u16, control: bool) {
+        lock(&self.control_streams).bind(stream_id, control);
     }
 
     pub(crate) fn start_receiver(
@@ -215,6 +218,21 @@ impl UuKcpControl {
 
     pub(crate) async fn send(&self, stream_id: u16, payload: Vec<u8>) -> Result<usize> {
         self.send_inner(stream_id, payload, None, false).await
+    }
+    /// Enqueued after the recovery release/probe pass. Completion means all
+    /// earlier reliable segments were acknowledged, not just written to DTLS.
+    pub(crate) async fn drain(&self) -> Result<()> {
+        let sender = lock(&self.state)
+            .sender
+            .clone()
+            .context("UU mixed-KCP is not active")?;
+        let (result, received) = oneshot::channel();
+        sender
+            .send(WorkerCommand::Drain { result })
+            .map_err(|_| anyhow!("UU mixed-KCP worker is closed"))?;
+        received
+            .await
+            .context("UU mixed-KCP worker stopped before acknowledgement")
     }
     pub(crate) async fn send_input(
         &self,
@@ -323,7 +341,7 @@ struct Worker {
     last_recovery_info: Instant,
     last_fec_network_update: Instant,
     last_remote_header: Option<RemoteHeader>,
-    control_streams: Arc<StdMutex<HashSet<u16>>>,
+    control_streams: Arc<StdMutex<streams::Streams>>,
     send_failure: Arc<StdMutex<Option<(Instant, String)>>>,
     last_send_warning: Option<Instant>,
     progress: Arc<AtomicU8>,
@@ -347,7 +365,7 @@ async fn run_worker(
     version: u8,
     mut commands: mpsc::UnboundedReceiver<WorkerCommand>,
     stream_control: ControlReceiver,
-    control_streams: Arc<StdMutex<HashSet<u16>>>,
+    control_streams: Arc<StdMutex<streams::Streams>>,
     send_failure: Arc<StdMutex<Option<(Instant, String)>>>,
     progress: Arc<AtomicU8>,
 ) -> Result<()> {
@@ -411,7 +429,14 @@ async fn run_worker(
     let mut pending = None;
     let mut pending_since = Instant::now();
     let mut wait_reported = false;
+    let mut drains: Vec<oneshot::Sender<()>> = Vec::new();
     loop {
+        drains.retain(|waiter| !waiter.is_closed());
+        if worker.kcp.wait_snd() == 0 {
+            for waiter in drains.drain(..) {
+                let _ = waiter.send(());
+            }
+        }
         worker
             .progress
             .store(Progress::Idle as u8, Ordering::Relaxed);
@@ -468,7 +493,10 @@ async fn run_worker(
         tokio::select! {
             command = commands.recv(), if pending.is_none() => {
                 let Some(command) = command else { break; };
-                pending = Some(command);
+                match command {
+                    WorkerCommand::Drain { result } => drains.push(result),
+                    command => pending = Some(command),
+                }
                 pending_since = Instant::now();
                 wait_reported = false;
             }
@@ -483,6 +511,7 @@ async fn run_worker(
             _ = tick.tick() => {
                 worker.progress.store(Progress::Processing as u8, Ordering::Relaxed);
                 worker.on_tick()?;
+                worker.deliver_messages(&stream_control);
                 worker.flush_output(&endpoint).await?;
             }
         }
@@ -788,6 +817,7 @@ impl Worker {
     }
 
     fn drain_messages(&mut self, stream_control: &ControlReceiver) -> Result<()> {
+        self.deliver_messages(stream_control);
         while let Ok(size) = self.kcp.peeksize() {
             let mut message = vec![0_u8; size];
             let received = self
@@ -802,7 +832,10 @@ impl Worker {
             let trailer = message.split_off(message.len() - 4);
             let stream_id = u16::from_le_bytes([trailer[0], trailer[1]]);
             let message_type = u16::from_le_bytes([trailer[2], trailer[3]]);
-            if !lock(&self.control_streams).contains(&stream_id) {
+            if !lock(&self.control_streams)
+                .push(stream_id, message)
+                .map_err(|error| anyhow!(error))?
+            {
                 tracing::debug!(
                     stream_id,
                     message_type,
@@ -810,6 +843,17 @@ impl Worker {
                 );
                 continue;
             }
+            self.deliver_messages(stream_control);
+        }
+        self.deliver_messages(stream_control);
+        Ok(())
+    }
+
+    fn deliver_messages(&mut self, stream_control: &ControlReceiver) {
+        loop {
+            // Do not hold the registry lock while calling a business consumer.
+            let pending = lock(&self.control_streams).pop_ready();
+            let Some((stream_id, message)) = pending else { break };
             self.progress
                 .store(Progress::Delivering as u8, Ordering::Relaxed);
             let delivered = stream_control(stream_id, &message);
@@ -821,7 +865,6 @@ impl Worker {
                 tracing::warn!(%error, stream_id, bytes = message.len(), "invalid UU CONTROL protobuf from mixed-KCP");
             }
         }
-        Ok(())
     }
 }
 

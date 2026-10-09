@@ -1,4 +1,5 @@
-//! NVENC on the capture adapter. Raw desktop pixels never leave D3D11.
+//! NVENC on the capture adapter. Raw desktop pixels stay in GPU memory.
+mod cuda_input;
 use super::{
     format::{Backend, Codec, Format, Rate},
     gpu_conversion::Conversion,
@@ -145,6 +146,7 @@ pub(crate) struct Encoder {
     config: nv::NV_ENC_CONFIG,
     init: nv::NV_ENC_INITIALIZE_PARAMS,
     conversion: Conversion,
+    cuda: Option<cuda_input::Input>,
     index: u32,
     quality: i32,
     maximum: (u32, u32),
@@ -162,8 +164,19 @@ impl Encoder {
         height: u32,
         rate: Rate,
         format: Format,
+        color: super::format::Color,
     ) -> Result<Self> {
-        let conversion = Conversion::new(device, (width, height), format)?;
+        if format.chroma == 3 && format.depth == 10 {
+            return Self::create(
+                device,
+                width,
+                height,
+                rate,
+                format,
+                Conversion::planar_44410(device, (width, height), color)?,
+            );
+        }
+        let conversion = Conversion::new(device, (width, height), format, color)?;
         let compute = conversion.is_compute();
         match Self::create(device, width, height, rate, format, conversion) {
             Err(error) if compute && error.downcast_ref::<InputRejected>().is_some() => {
@@ -174,7 +187,7 @@ impl Encoder {
                     height,
                     rate,
                     format,
-                    Conversion::pixel(device, (width, height), format, 1)?,
+                    Conversion::pixel(device, (width, height), format, 1, color)?,
                 )
             }
             result => result,
@@ -213,6 +226,15 @@ impl Encoder {
         // Query the actual codec-specific preset; changing only its GUID on
         // reconfigure would leave the old preset configuration in place.
         let (preset_guid, tuning) = api.preset(format.codec);
+        let cuda = if format.chroma == 3 && format.depth == 10 {
+            Some(cuda_input::Input::new(
+                device,
+                &conversion.output,
+                (width, height),
+            )?)
+        } else {
+            None
+        };
         let mut encoder = Self {
             frame_rate: super::encoder_rate::Controller::new(Rate { quality: 0, ..rate }),
             api,
@@ -222,17 +244,27 @@ impl Encoder {
             config: nv::NV_ENC_CONFIG::default(),
             init: nv::NV_ENC_INITIALIZE_PARAMS::default(),
             conversion,
+            cuda,
             index: 0,
             quality: 0,
             maximum: (0, 0),
             format,
         };
+        let _current = encoder
+            .cuda
+            .as_ref()
+            .map(|input| input.enter())
+            .transpose()?;
         unsafe {
             let mut open = nv::NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS::default();
             open.version = encoder.api.structure(1, false);
             open.apiVersion = encoder.api.version;
             open.deviceType = nv::NV_ENC_DEVICE_TYPE::NV_ENC_DEVICE_TYPE_DIRECTX;
             open.device = device.as_raw();
+            if let Some(input) = &encoder.cuda {
+                open.deviceType = nv::NV_ENC_DEVICE_TYPE::NV_ENC_DEVICE_TYPE_CUDA;
+                open.device = input.context;
+            }
             let f = &encoder.api.functions;
             let status = f.nvEncOpenEncodeSessionEx.unwrap()(&mut open, &mut encoder.session);
             encoder
@@ -261,6 +293,9 @@ impl Encoder {
                 dimension(nv::NV_ENC_CAPS::NV_ENC_CAPS_WIDTH_MAX)?,
                 dimension(nv::NV_ENC_CAPS::NV_ENC_CAPS_HEIGHT_MAX)?,
             );
+            if encoder.cuda.is_some() {
+                encoder.maximum.1 = encoder.maximum.1.min(16384 / 3) & !1;
+            }
             ensure!(
                 width <= encoder.maximum.0 && height <= encoder.maximum.1,
                 "所选画面超出 NVENC 尺寸能力"
@@ -337,7 +372,7 @@ impl Encoder {
                 av1.set_enableFilmGrainParams(0);
                 av1.filmGrainParams = ptr::null_mut();
                 av1.maxTemporalLayersMinus1 = 0;
-                let color = format.color(None);
+                let color = encoder.conversion.color.space(None);
                 av1.colorPrimaries = nv::NV_ENC_VUI_COLOR_PRIMARIES(color.primaries.into());
                 av1.transferCharacteristics =
                     nv::NV_ENC_VUI_TRANSFER_CHARACTERISTIC(color.transfer.into());
@@ -371,7 +406,7 @@ impl Encoder {
                     hevc.set_enableFillerDataInsertion(0);
                     &mut hevc.hevcVUIParameters
                 };
-                let color = format.color(None);
+                let color = encoder.conversion.color.space(None);
                 vui.videoSignalTypePresentFlag = 1;
                 vui.videoFormat = nv::NV_ENC_VUI_VIDEO_FORMAT::NV_ENC_VUI_VIDEO_FORMAT_UNSPECIFIED;
                 vui.videoFullRangeFlag = u32::from(color.range == 2);
@@ -426,8 +461,15 @@ impl Encoder {
             resource.bufferFormat = match (format.chroma, format.depth) {
                 (1, 10) => nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_YUV420_10BIT,
                 (3, 8) => nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_AYUV,
+                (3, 10) => nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_YUV444_10BIT,
                 _ => nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_NV12,
             };
+            if let Some(input) = &encoder.cuda {
+                resource.resourceType =
+                    nv::NV_ENC_INPUT_RESOURCE_TYPE::NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR;
+                resource.resourceToRegister = input.pointer as usize as *mut c_void;
+                resource.pitch = input.pitch;
+            }
             resource.bufferUsage = nv::NV_ENC_BUFFER_USAGE::NV_ENC_INPUT_IMAGE;
             encoder
                 .api
@@ -459,6 +501,7 @@ impl Encoder {
     }
 
     pub(crate) fn configure_rate(&mut self, rate: Rate) -> Result<bool> {
+        let _current = self.cuda.as_ref().map(|input| input.enter()).transpose()?;
         ensure!(
             (1..=144).contains(&rate.fps) && rate.target > 0,
             "NVENC 重配参数无效"
@@ -514,6 +557,10 @@ impl Encoder {
     ) -> Result<Vec<super::encoder::Encoded>> {
         self.frame_rate.input(timestamp_100ns);
         self.conversion.convert(texture)?;
+        let _current = self.cuda.as_ref().map(|input| input.enter()).transpose()?;
+        if let Some(input) = &self.cuda {
+            input.copy()?;
+        }
         unsafe {
             let f = &self.api.functions;
             let mut map = nv::NV_ENC_MAP_INPUT_RESOURCE::default();
@@ -535,6 +582,9 @@ impl Encoder {
                 .structure(if self.api.level < 0xc0 { 4 } else { 6 }, true);
             picture.inputWidth = self.init.encodeWidth;
             picture.inputHeight = self.init.encodeHeight;
+            if let Some(input) = &self.cuda {
+                picture.inputPitch = input.pitch;
+            }
             picture.inputBuffer = map.mappedResource;
             picture.bufferFmt = map.mappedBufferFmt;
             picture.outputBitstream = self.bitstream;
@@ -580,7 +630,7 @@ impl Encoder {
             .to_vec();
             Ok(vec![super::encoder::Encoded {
                 format: self.format,
-                color: self.format.color(None),
+                color: self.conversion.color.space(None),
                 data: bytes,
                 keyframe: bitstream.pictureType == nv::NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_IDR,
                 is_new: true,
@@ -609,11 +659,12 @@ fn set_rate(
 ) {
     config.rcParams.averageBitRate = rate.target;
     config.rcParams.maxBitRate = rate.peak.max(rate.target);
-    // VBV is a bit allocation window, not queued input frames. AVC/HEVC need
-    // burst headroom for detail; one-frame VBV works better for our AV1 path.
-    // No B frames, lookahead, filler or startup buffer delay for any codec.
+    // VBV is a bit allocation window, not queued input frames. A time floor
+    // preserves detail during IDR recovery at high FPS; retain the existing
+    // larger allowance when input FPS is low. No startup buffering is added.
     let frames = if codec == Codec::Av1 { 1 } else { 5 };
     config.rcParams.vbvBufferSize = (u64::from(rate.target) * frames / u64::from(buffer_fps.max(1)))
+        .max(u64::from(rate.target) / 8)
         .min(u64::from(u32::MAX)) as u32;
     config.rcParams.vbvInitialDelay = 0;
     if codec == Codec::Av1 {
@@ -663,6 +714,7 @@ impl Drop for Locked<'_> {
 }
 impl Drop for Encoder {
     fn drop(&mut self) {
+        let _current = self.cuda.as_ref().and_then(|input| input.enter().ok());
         unsafe {
             let f = &self.api.functions;
             if !self.registered.is_null() {

@@ -3,3 +3,4 @@
 #[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
 compile_error!("OpenUUYC AMF bindings require Windows x64");
 include!("bindings.rs");
+include!("av1.rs");

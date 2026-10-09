@@ -290,46 +290,59 @@ impl DeviceCenterApp {
                         .as_ref()
                         .is_none_or(|caps| caps.codecs.iter().any(|cap| settings.accepts(cap)))
             };
-            form_row(
-                ui,
-                "被控编码方式",
-                "下次连接生效；硬件优先允许软件回退",
-                |ui| {
-                    egui::ComboBox::from_id_salt("host-encoder-mode")
-                        .width(238.0)
-                        .selected_text(selected.mode.label())
+            form_row(ui, "编码格式", if selected.codec == EncoderCodec::Automatic { "主控未指定时使用；重连后生效" } else { "已固定，可在高级限制中调整" }, |ui| {
+                if selected.codec != EncoderCodec::Automatic {
+                    ui.label(selected.codec.label());
+                } else {
+                    egui::ComboBox::from_id_salt("host-codec-preferred")
+                        .width(238.)
+                        .selected_text(selected.preferred_codec.label())
                         .show_ui(ui, |ui| {
-                            for mode in EncoderMode::ALL {
-                                let enabled = available(EncodingSettings { mode, ..selected });
-                                ui.add_enabled_ui(enabled, |ui| {
-                                    ui.selectable_value(&mut selected.mode, mode, mode.label())
-                                })
-                                .inner
-                                .on_disabled_hover_text("当前编码格式与已验证能力不支持此组合");
+                            for codec in crate::media::CodecPreference::PREFERRED {
+                                ui.selectable_value(&mut selected.preferred_codec, codec, codec.label());
                             }
                         });
-                },
+                }
+            });
+            form_row(ui, "编码器", "不可用时自动回退；重连后生效", |ui| {
+                if selected.mode == EncoderMode::Software {
+                    ui.label("仅软件编码");
+                } else {
+                    self.media_inventory.draw(ui, "host-encoder-gpu", &mut selected.gpu, true);
+                }
+            });
+            let restriction = super::super::media_preferences::limits_title(
+                selected.mode,
+                (selected.codec != EncoderCodec::Automatic).then(|| selected.codec.label()),
             );
-            form_row(
-                ui,
-                "被控编码格式",
-                "下次连接生效；需与控制端解码能力匹配",
-                |ui| {
-                    egui::ComboBox::from_id_salt("host-encoder-codec")
-                        .width(238.0)
-                        .selected_text(selected.codec.label())
-                        .show_ui(ui, |ui| {
-                            for codec in EncoderCodec::ALL {
-                                let enabled = available(EncodingSettings { codec, ..selected });
-                                ui.add_enabled_ui(enabled, |ui| {
-                                    ui.selectable_value(&mut selected.codec, codec, codec.label())
-                                })
-                                .inner
-                                .on_disabled_hover_text("当前编码方式与已验证能力不支持此格式");
-                            }
-                        });
-                },
-            );
+            egui::CollapsingHeader::new(restriction)
+                .id_salt("host-codec-limits")
+                .show(ui, |ui| {
+                    form_row(ui, "编码方式", "", |ui| {
+                        egui::ComboBox::from_id_salt("host-encoder-mode")
+                            .width(238.)
+                            .selected_text(selected.mode.label())
+                            .show_ui(ui, |ui| {
+                                for mode in EncoderMode::ALL {
+                                    ui.add_enabled_ui(available(EncodingSettings { mode, ..selected }), |ui| {
+                                        ui.selectable_value(&mut selected.mode, mode, mode.label());
+                                    });
+                                }
+                            });
+                    });
+                    form_row(ui, "格式限制", "", |ui| {
+                        egui::ComboBox::from_id_salt("host-encoder-codec")
+                            .width(238.)
+                            .selected_text(if selected.codec == EncoderCodec::Automatic { "不限制" } else { selected.codec.label() })
+                            .show_ui(ui, |ui| {
+                                for codec in EncoderCodec::ALL {
+                                    ui.add_enabled_ui(available(EncodingSettings { codec, ..selected }), |ui| {
+                                        ui.selectable_value(&mut selected.codec, codec, if codec == EncoderCodec::Automatic { "不限制" } else { codec.label() });
+                                    });
+                                }
+                            });
+                    });
+                });
             if selected != original {
                 match host.set_encoding_settings(selected) {
                     Ok(()) => self.save_host_settings(),

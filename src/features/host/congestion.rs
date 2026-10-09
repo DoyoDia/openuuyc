@@ -19,6 +19,7 @@ pub(crate) struct Controller {
     origin: Instant,
     maximum: u32,
     bounds: super::parameters::Bounds,
+    video_configured: bool,
     sequence: i64,
     history: BTreeMap<i64, Tracked>,
     flight: usize,
@@ -97,6 +98,7 @@ impl Controller {
             origin: Instant::now(),
             maximum,
             bounds,
+            video_configured: bounds.maximum > 0,
             sequence: rand::random::<u16>().into(),
             history: BTreeMap::new(),
             flight: 0,
@@ -192,18 +194,21 @@ impl Controller {
         self.probes.clear();
         self.apply(update);
     }
-    pub fn configure(&mut self, bounds: super::parameters::Bounds, restart: bool) {
-        if bounds == self.bounds && !restart {
+    pub fn configure(&mut self, bounds: super::parameters::Bounds, video: bool) {
+        // File/audio connections may attach their first video later. Seed that
+        // first video once, but never treat a quality/FPS revision as a route
+        // change: a starting_rate overwrites both live bandwidth estimators.
+        let start = (video && !self.video_configured).then_some(bounds.initial);
+        self.video_configured |= video;
+        if bounds == self.bounds && start.is_none() {
             return;
         }
         let maximum = bounds.network_maximum();
         self.maximum = maximum;
         self.bounds = bounds;
-        let update = self.core.on_target_rate_constraints(constraints(
-            self.now(),
-            maximum,
-            restart.then_some(bounds.initial),
-        ));
+        let update = self
+            .core
+            .on_target_rate_constraints(constraints(self.now(), maximum, start));
         self.apply(update);
         let update = self.core.on_streams_config(StreamsConfig {
             at_time: self.now(),

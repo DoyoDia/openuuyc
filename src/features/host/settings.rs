@@ -96,7 +96,6 @@ impl Store {
         let record: Record =
             serde_json::from_slice(&bytes).map_err(|_| anyhow::anyhow!("已保存的被控设置无效"))?;
         ensure!(record.schema == 1, "不支持的被控设置格式");
-        record.encoding.validate()?;
         let audio_quality = record.audio_quality.restore()?;
         record.assistance.validate()?;
         if let Some(device) = &record.audio_device {

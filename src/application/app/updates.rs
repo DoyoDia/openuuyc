@@ -4,11 +4,14 @@ use serde::Deserialize;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
+mod settings;
 
 const LATEST_RELEASE: &str = "https://api.github.com/repos/djkcyl/openuuyc/releases/latest";
+const RELEASE_LIST: &str = "https://api.github.com/repos/djkcyl/openuuyc/releases";
 const RELEASES: &str = "https://github.com/djkcyl/openuuyc/releases";
 const RETRY_INTERVAL: Duration = Duration::from_secs(10);
 
+#[derive(Debug)]
 pub(super) enum State {
     Checking,
     Current,
@@ -18,6 +21,7 @@ pub(super) enum State {
         url: String,
         notes: String,
         published: Option<String>,
+        prerelease: bool,
     },
     NoRelease,
     Failed(String),
@@ -30,10 +34,16 @@ pub(super) struct UpdateCheck {
     pending: Option<Receiver<Result<State>>>,
     cancel: Option<oneshot::Sender<()>>,
     retry_at: Instant,
+    settings: settings::Settings,
+    pub settings_error: Option<String>,
 }
 
 impl UpdateCheck {
     pub fn start(ctx: &egui::Context) -> Self {
+        let (settings, settings_error) = match settings::Settings::load() {
+            Ok(settings) => (settings, None),
+            Err(error) => (Default::default(), Some(format!("{error:#}"))),
+        };
         let mut check = Self {
             state: State::Checking,
             dialog_open: false,
@@ -41,9 +51,49 @@ impl UpdateCheck {
             pending: None,
             cancel: None,
             retry_at: Instant::now(),
+            settings,
+            settings_error,
         };
         check.request(ctx);
         check
+    }
+    pub fn allow_prerelease(&self) -> bool {
+        self.settings.allow_prerelease
+    }
+    pub fn release_label(&self) -> &'static str {
+        if self.allow_prerelease() {
+            "可用版本"
+        } else {
+            "正式版"
+        }
+    }
+    pub fn set_allow_prerelease(&mut self, allow: bool, ctx: &egui::Context) -> Result<()> {
+        if allow == self.allow_prerelease() {
+            return Ok(());
+        }
+        let next = settings::Settings {
+            allow_prerelease: allow,
+        };
+        if let Err(error) = next.save() {
+            self.settings_error = Some(format!("{error:#}"));
+            return Err(error);
+        }
+        self.change_channel(next);
+        self.request(ctx);
+        Ok(())
+    }
+    fn change_channel(&mut self, next: settings::Settings) {
+        if let Some(cancel) = self.cancel.take() {
+            let _ = cancel.send(());
+        }
+        // Drop the old mailbox before a replacement can publish its result.
+        self.pending = None;
+        self.settings = next;
+        self.settings_error = None;
+        self.dialog_open = false;
+        self.notified_version = None;
+        self.state = State::Checking;
+        self.retry_at = Instant::now();
     }
 
     pub fn request(&mut self, ctx: &egui::Context) {
@@ -54,6 +104,7 @@ impl UpdateCheck {
         let (tx, rx) = mpsc::channel();
         let (cancel_tx, cancel_rx) = oneshot::channel();
         let ctx = ctx.clone();
+        let allow_prerelease = self.allow_prerelease();
         let worker = std::thread::Builder::new()
             .name("release-check".into())
             .spawn(move || {
@@ -66,7 +117,8 @@ impl UpdateCheck {
                             tokio::select! {
                                 biased;
                                 _ = cancel_rx => None,
-                                result = latest() => Some(result),
+                                result = tokio::time::timeout(Duration::from_secs(25), latest(allow_prerelease)) =>
+                                    Some(result.context("更新检查超时").and_then(|r|r)),
                             }
                         });
                         runtime.shutdown_background();
@@ -134,7 +186,7 @@ struct Release {
     published_at: Option<String>,
 }
 
-async fn latest() -> Result<State> {
+async fn latest(allow_prerelease: bool) -> Result<State> {
     let client = crate::transport::http_client()
         .https_only(true)
         .redirect(reqwest::redirect::Policy::none())
@@ -143,31 +195,96 @@ async fn latest() -> Result<State> {
         .user_agent(concat!("OpenUUYC/", env!("CARGO_PKG_VERSION")))
         .build()
         .context("无法创建更新检查连接")?;
+    if !allow_prerelease {
+        return match fetch(&client, LATEST_RELEASE, 512 * 1024).await? {
+            Some(body) => release_state(&body, env!("CARGO_PKG_VERSION")),
+            None => Ok(State::NoRelease),
+        };
+    }
+    let mut releases = Vec::new();
+    let mut total_bytes = 0usize;
+    for page in 1..=10 {
+        let url = format!("{RELEASE_LIST}?per_page=100&page={page}");
+        let Some(body) = fetch(&client, &url, 2 * 1024 * 1024).await? else {
+            if page == 1 {
+                return Ok(State::NoRelease);
+            }
+            bail!("GitHub 版本列表读取不完整，请重试");
+        };
+        total_bytes += body.len();
+        ensure!(total_bytes <= 8 * 1024 * 1024, "GitHub 版本列表过大");
+        let batch: Vec<Release> =
+            serde_json::from_slice(&body).context("无法解析 GitHub 版本列表")?;
+        let complete = batch.len() < 100;
+        releases.extend(batch);
+        if complete {
+            return select_release(releases, env!("CARGO_PKG_VERSION"), true);
+        }
+    }
+    bail!("GitHub 版本列表过长，未完成检查")
+}
+
+async fn fetch(
+    client: &reqwest::Client,
+    url: &str,
+    maximum_bytes: usize,
+) -> Result<Option<Vec<u8>>> {
     let mut response = client
-        .get(LATEST_RELEASE)
+        .get(url)
         .header("Accept", "application/vnd.github+json")
         .header("X-GitHub-Api-Version", "2026-03-10")
         .send()
         .await
         .context("无法连接 GitHub，请检查网络后重试")?;
     match response.status() {
-        reqwest::StatusCode::NOT_FOUND => return Ok(State::NoRelease),
+        reqwest::StatusCode::NOT_FOUND => return Ok(None),
         reqwest::StatusCode::FORBIDDEN | reqwest::StatusCode::TOO_MANY_REQUESTS => {
             bail!("GitHub 暂时限制请求，请稍后重试")
         }
-        _ => response
-            .error_for_status_ref()
-            .context("GitHub 更新检查失败")?,
-    };
+        _ => {
+            response
+                .error_for_status_ref()
+                .context("GitHub 更新检查失败")?;
+        }
+    }
     let mut body = Vec::new();
     while let Some(chunk) = response.chunk().await.context("读取版本信息失败")? {
         ensure!(
-            body.len() + chunk.len() <= 512 * 1024,
+            body.len() + chunk.len() <= maximum_bytes,
             "GitHub 版本信息过大"
         );
         body.extend_from_slice(&chunk);
     }
-    release_state(&body, env!("CARGO_PKG_VERSION"))
+    Ok(Some(body))
+}
+
+fn select_release(releases: Vec<Release>, current: &str, allow_prerelease: bool) -> Result<State> {
+    let selected = releases
+        .into_iter()
+        .filter_map(|release| {
+            if release.draft || release.published_at.is_none() {
+                return None;
+            }
+            let version = semver::Version::parse(
+                release
+                    .tag_name
+                    .strip_prefix('v')
+                    .unwrap_or(&release.tag_name),
+            )
+            .ok()?;
+            if !allow_prerelease && (release.prerelease || !version.pre.is_empty()) {
+                return None;
+            }
+            Some((version, release))
+        })
+        .max_by(|(a, ra), (b, rb)| {
+            a.cmp_precedence(b)
+                .then_with(|| rb.prerelease.cmp(&ra.prerelease))
+        });
+    match selected {
+        Some((version, release)) => state_for_release(release, version, current),
+        None => Ok(State::NoRelease),
+    }
 }
 
 fn release_state(body: &[u8], current: &str) -> Result<State> {
@@ -184,18 +301,22 @@ fn release_state(body: &[u8], current: &str) -> Result<State> {
     )
     .context("GitHub 正式版本号格式不正确")?;
     ensure!(version.pre.is_empty(), "GitHub 最新版本不是正式版本");
+    state_for_release(release, version, current)
+}
+
+fn state_for_release(release: Release, version: semver::Version, current: &str) -> Result<State> {
     let current = semver::Version::parse(current).context("当前程序版本号格式不正确")?;
     match version.cmp_precedence(&current) {
         std::cmp::Ordering::Equal => Ok(State::Current),
         std::cmp::Ordering::Less => Ok(State::Ahead),
         std::cmp::Ordering::Greater => {
-            // Construct the destination on our fixed repository, ignoring remote URLs.
             let mut url = url::Url::parse(RELEASES)?;
             url.path_segments_mut()
                 .expect("GitHub base URL")
                 .push("tag")
                 .push(&release.tag_name);
             Ok(State::Available {
+                prerelease: release.prerelease || !version.pre.is_empty(),
                 version: version.to_string(),
                 url: url.to_string(),
                 notes: release.body.unwrap_or_default(),

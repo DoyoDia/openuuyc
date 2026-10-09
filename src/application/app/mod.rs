@@ -1,4 +1,5 @@
 //! Native graphical device center and host-presence lifecycle.
+mod media_preferences;
 
 use crate::account::api::{DeviceInfo, DeviceList};
 use crate::account::client::AuthenticatedClient;
@@ -39,6 +40,7 @@ const WORKER_TICK: Duration = Duration::from_millis(250);
 pub struct GuiOptions {
     pub background: bool,
     pub media: ConnectionMediaOptions,
+    pub startup_warning: Option<String>,
 }
 
 pub fn run(options: GuiOptions) -> Result<()> {
@@ -54,6 +56,10 @@ pub fn run(options: GuiOptions) -> Result<()> {
                 "显示器探测失败（{error:#}），暂用 1920×1080 @ 60 Hz"
             )),
         ),
+    };
+    let display_warning = match (display_warning, options.startup_warning) {
+        (Some(a),Some(b)) => Some(format!("{a}；{b}")),
+        (a,b) => a.or(b),
     };
     options
         .media
@@ -162,6 +168,7 @@ struct DeviceCenterApp {
     selected_device_id: Option<String>,
     local_display: LocalDisplayInfo,
     media: ConnectionMediaOptions,
+    media_inventory: media_preferences::Inventory,
     presence: PresenceState,
     host: Option<crate::features::host::Handle>,
     notifications: notifications::Center,
@@ -218,6 +225,7 @@ impl DeviceCenterApp {
             selected_device_id: None,
             local_display,
             media,
+            media_inventory: media_preferences::Inventory::new(),
             presence: PresenceState::Connecting,
             host: None,
             notifications: notifications::Center::new(ctx),

@@ -32,6 +32,18 @@ impl Drop for AdapterHandle {
     }
 }
 
+pub(super) fn address(luid: LUID) -> Option<[u32; 3]> {
+    let mut opened = OpenAdapter { luid, handle: 0 };
+    if unsafe { D3DKMTOpenAdapterFromLuid(&mut opened) } < 0 { return None; }
+    let handle = AdapterHandle { handle: opened.handle };
+    let mut address = [0u32; 3];
+    let status = unsafe { D3DKMTQueryAdapterInfo(&QueryAdapter {
+        handle: handle.handle, kind: 6, // KMTQAITYPE_ADAPTERADDRESS
+        data: address.as_mut_ptr().cast(), size: std::mem::size_of_val(&address) as u32,
+    }) };
+    (status >= 0).then_some(address)
+}
+
 /// Unknown classification must not silently remove a potentially usable GPU.
 pub(super) fn indirect(luid: LUID) -> Option<bool> {
     let mut opened = OpenAdapter { luid, handle: 0 };

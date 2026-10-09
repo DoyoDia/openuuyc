@@ -38,6 +38,7 @@ pub(crate) struct Budget {
     demand: f64,
     rates: Rates,
     totals: [u64; 3],
+    media_samples: VecDeque<(Instant, [u64; 3])>,
     baseline: Option<(Instant, [u64; 3])>,
     sampled: Option<Instant>,
     queue_enter: Option<Instant>,
@@ -73,6 +74,7 @@ impl Default for Budget {
             demand: 0.0,
             rates: Rates::default(),
             totals: [0; 3],
+            media_samples: VecDeque::new(),
             baseline: None,
             sampled: None,
             queue_enter: None,
@@ -126,6 +128,26 @@ impl Budget {
             Kind::Probe => return,
         };
         self.totals[index] = self.totals[index].saturating_add(bytes as u64);
+        let now = Instant::now();
+        while self
+            .media_samples
+            .front()
+            .is_some_and(|(at, _)| now.duration_since(*at) >= Duration::from_secs(1))
+        {
+            self.media_samples.pop_front();
+        }
+        // Encoder allocation uses the sender's one-second egress statistics
+        // (T2798A8 -> T5212A0, initialized at T5201A4), independently of the
+        // 200ms fast samples used by the congestion/repair state machine.
+        // Coalesce packets within a millisecond to bound storage at 1000 bins.
+        if self
+            .media_samples
+            .back()
+            .is_none_or(|(at, _)| now.duration_since(*at) >= Duration::from_millis(1))
+        {
+            self.media_samples.push_back((now, [0; 3]));
+        }
+        self.media_samples.back_mut().unwrap().1[index] += bytes as u64;
     }
     fn roll(&mut self, now: Instant) {
         if now.duration_since(self.window) >= Duration::from_millis(500) {
@@ -436,9 +458,20 @@ impl Budget {
         self.debt = self.debt.saturating_add(debt);
     }
     pub fn media_rate(&self, total: u32) -> u32 {
-        let all = self.rates.media + self.rates.rtx + self.rates.fec;
-        let overhead = if self.sampled.is_some() && all > 0.0 {
-            (self.rates.rtx + self.rates.fec) / all
+        let now = Instant::now();
+        let sent = self
+            .media_samples
+            .iter()
+            .filter(|(at, _)| now.duration_since(*at) < Duration::from_secs(1))
+            .fold([0u64; 3], |mut sum, (_, bytes)| {
+                for i in 0..3 {
+                    sum[i] += bytes[i];
+                }
+                sum
+            });
+        let all = sent.iter().sum::<u64>();
+        let overhead = if all > 0 {
+            (sent[1] + sent[2]) as f64 / all as f64
         } else {
             0.0
         };

@@ -106,17 +106,17 @@ enum Commands {
         #[arg(long)]
         background: bool,
         /// 初始码流帧率：auto、144、90、60 或 30
-        #[arg(long, default_value = "auto")]
-        fps: media::FrameRateChoice,
-        /// 初始视频编码：auto、h264 或 h265
-        #[arg(long, default_value = "auto")]
-        codec: media::CodecPreference,
+        #[arg(long)]
+        fps: Option<media::FrameRateChoice>,
+        /// 格式：auto、prefer-av1/prefer-hevc/prefer-h264；h264/h265/av1 为仅使用
+        #[arg(long)]
+        codec: Option<media::CodecPreference>,
         /// 是否优先使用平台原生硬件解码器
-        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-        hardware_decode: bool,
+        #[arg(long, action = clap::ArgAction::Set)]
+        hardware_decode: Option<bool>,
         /// 传输策略：auto、p2p 或 relay
-        #[arg(long, default_value = "auto")]
-        transport: media::TransportChoice,
+        #[arg(long)]
+        transport: Option<media::TransportChoice>,
     },
     /// 恢复保存的登录态，或进行二维码登录
     Login,
@@ -137,17 +137,17 @@ enum Commands {
         #[arg(long)]
         audio_only: bool,
         /// 码流帧率：auto、144、90、60 或 30
-        #[arg(long, default_value = "auto")]
-        fps: media::FrameRateChoice,
-        /// 视频编码：auto、h264 或 h265
-        #[arg(long, default_value = "auto")]
-        codec: media::CodecPreference,
+        #[arg(long)]
+        fps: Option<media::FrameRateChoice>,
+        /// 格式：auto、prefer-av1/prefer-hevc/prefer-h264；h264/h265/av1 为仅使用
+        #[arg(long)]
+        codec: Option<media::CodecPreference>,
         /// 是否优先使用平台原生硬件解码器
-        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-        hardware_decode: bool,
+        #[arg(long, action = clap::ArgAction::Set)]
+        hardware_decode: Option<bool>,
         /// 传输策略：auto、p2p 或 relay
-        #[arg(long, default_value = "auto")]
-        transport: media::TransportChoice,
+        #[arg(long)]
+        transport: Option<media::TransportChoice>,
     },
 }
 
@@ -177,10 +177,10 @@ fn main() -> Result<()> {
     if cli.bootstrap_version {println!("1");return Ok(())}
     let command = cli.command.unwrap_or(Commands::Gui {
         background: false,
-        fps: media::FrameRateChoice::Auto,
-        codec: media::CodecPreference::Auto,
-        hardware_decode: true,
-        transport: media::TransportChoice::Auto,
+        fps: None,
+        codec: None,
+        hardware_decode: None,
+        transport: None,
     });
 
     if let Commands::Notification { uri } = &command {
@@ -294,17 +294,17 @@ fn main() -> Result<()> {
             codec,
             hardware_decode,
             transport,
-        } => app::run(app::GuiOptions {
-            background,
-            media: media::ConnectionMediaOptions {
-                audio_only: false,
-                muted: false,
-                frame_rate: fps,
-                codec,
-                hardware_decode,
-                transport,
-            },
-        }),
+        } => {
+            let (mut options, startup_warning) = match media::preferences::load() {
+                Ok(options) => (options, None),
+                Err(error) => (Default::default(), Some(format!("读取编解码设置失败，暂用默认设置：{error:#}"))),
+            };
+            if let Some(fps) = fps { options.frame_rate = fps; }
+            if let Some(codec) = codec { options.codec = codec; }
+            if let Some(hardware) = hardware_decode { options.decoder.mode = media::selection::DecoderPreference::from_hardware(hardware).mode; }
+            if let Some(transport) = transport { options.transport = transport; }
+            app::run(app::GuiOptions { background, media: options, startup_warning })
+        },
         Commands::Login => {
             tokio::runtime::Runtime::new()?.block_on(login::interactive_login())?;
             Ok(())
@@ -319,18 +319,15 @@ fn main() -> Result<()> {
             codec,
             hardware_decode,
             transport,
-        } => tokio::runtime::Runtime::new()?.block_on(connect_device(
-            device,
-            media::ConnectionMediaOptions {
-                audio_only,
-                muted: mute,
-                frame_rate: fps,
-                codec,
-                hardware_decode,
-                transport,
-            },
-            device_id,
-        )),
+        } => {
+            let mut options = media::preferences::load()?;
+            options.audio_only=audio_only; options.muted=mute;
+            if let Some(fps)=fps {options.frame_rate=fps;}
+            if let Some(codec)=codec {options.codec=codec;}
+            if let Some(hardware)=hardware_decode {options.decoder.mode=media::selection::DecoderPreference::from_hardware(hardware).mode;}
+            if let Some(transport)=transport {options.transport=transport;}
+            tokio::runtime::Runtime::new()?.block_on(connect_device(device,options,device_id))
+        },
     };
     if let Err(error) = &result {
         tracing::error!(target: "openuuyc", error = %format_args!("{error:#}"), "application stopped with an error");

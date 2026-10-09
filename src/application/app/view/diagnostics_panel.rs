@@ -634,6 +634,7 @@ impl DeviceCenterApp {
             if let Some(error) = &host.microphone.error {
                 diagnostics_row(ui, "麦克风状态", error);
             }
+            let adapters = self.host.as_ref().and_then(|host|host.capabilities()).map(|caps|caps.adapters.clone()).unwrap_or_default();
             for (index, stream) in host.streams {
                 let Some(active) = stream.video else {
                     continue;
@@ -644,6 +645,10 @@ impl DeviceCenterApp {
                 }
                 diagnostics_row(ui, "编码器", active.backend.name())
                     .on_hover_text(format!("适配器标识 {:016X}", active.adapter));
+                diagnostics_row(ui, "实际编码显卡", adapters.iter().find(|a|a.luid==active.adapter).map_or("未知",|a|a.name.as_str()));
+                diagnostics_row(ui, "本次显卡首选", active.preferred_gpu.map_or("自动",|id|adapters.iter().find(|a|a.id==Some(id)).map_or("已选显卡不可用",|a|a.name.as_str())));
+                diagnostics_row(ui, "本次格式首选", match active.preferred_codec {Some(1)=>"H.264",Some(2)=>"HEVC",Some(5)=>"AV1",_=>"自动"});
+                diagnostics_row(ui, "选择原因", active.selection.label());
                 diagnostics_row(
                     ui,
                     "采集方式",

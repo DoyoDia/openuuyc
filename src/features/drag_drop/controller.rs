@@ -11,6 +11,7 @@ struct Binding {
     endpoint: Option<Endpoint>,
     reverse: Vec<(u64, Arc<Ticket>)>,
     active: Weak<Ticket>,
+    reverse_owner: Option<u64>,
     input_flags: Option<(Arc<AtomicU64>, Arc<AtomicU64>)>,
     workers: Vec<tokio::task::JoinHandle<()>>,
     enabled: bool,
@@ -19,6 +20,7 @@ struct Binding {
 }
 impl Binding {
     fn stop(&mut self) {
+        self.reverse_owner = None;
         for (_, ticket) in self.reverse.drain(..) {
             ticket.cancel();
         }
@@ -124,6 +126,9 @@ impl Controller {
             return Ok(());
         }
         if matches!(&packet.payload, Some(Payload::Hello(1))) {
+            if !binding.seen_native {
+                tracing::info!("native file drag capability negotiated");
+            }
             binding.seen_native = true;
         }
         if let Some(endpoint) = &binding.endpoint {
@@ -143,17 +148,44 @@ impl Controller {
         ensure!(self.available(), "当前连接没有原生拖出能力");
         let mut binding = lock(&self.0);
         ensure!(binding.reverse.len() < 4, "正在处理的拖出过多");
-        let ticket = binding
+        let endpoint = binding
             .endpoint
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("拖放连接已关闭"))?
-            .probe(
-                point,
-                Arc::new(move || {
-                    input.pause_owner(owner);
-                    input.repaint();
-                }),
-            )?;
+            .ok_or_else(|| anyhow::anyhow!("拖放连接已关闭"))?;
+        let hold = if endpoint.shared.return_capable.load(Ordering::Acquire) {
+            Some(input.hold_drag(owner)?)
+        } else {
+            None
+        };
+        let current = hold
+            .clone()
+            .map(|hold| Arc::new(move || hold.current()) as Arc<dyn Fn() -> bool + Send + Sync>);
+        let resume = hold.clone().map(|hold| {
+            Arc::new(move |point: Point, left| hold.resume(point.screen, point.x, point.y, left))
+                as Arc<dyn Fn(Point, bool) -> bool + Send + Sync>
+        });
+        let wake_input = input.clone();
+        let release = Arc::new(move || {
+            if let Some(hold) = &hold {
+                hold.cancel();
+            } else {
+                input.pause_owner(owner);
+                input.repaint();
+            }
+        });
+        let ticket = endpoint.probe(
+            point,
+            ReleaseSource {
+                release: Some(release),
+                resume,
+                current,
+                wake: Some(Arc::new(move || {
+                    native::wake_viewer(owner);
+                    wake_input.repaint();
+                })),
+            },
+        )?;
+        binding.reverse_owner = Some(owner);
         binding.active = Arc::downgrade(&ticket);
         binding.reverse.push((owner, ticket));
         Ok(())
@@ -173,6 +205,26 @@ impl Controller {
     }
     pub fn interactive(&self) -> bool {
         self.1.load(Ordering::Acquire) != 0
+    }
+    pub fn returning(
+        &self,
+        identity: native::appearance::Identity,
+        owner: u64,
+    ) -> Option<Arc<Ticket>> {
+        let binding = lock(&self.0);
+        let endpoint = binding.endpoint.as_ref()?;
+        if binding.reverse_owner != Some(owner) {
+            return None;
+        }
+        if !endpoint.available() || !endpoint.shared.return_capable.load(Ordering::Acquire) {
+            return None;
+        }
+        binding.active.upgrade().filter(|ticket| {
+            ticket.token == identity.token
+                && ticket.id == identity.drag
+                && ticket.id == self.1.load(Ordering::Acquire)
+                && ticket.snapshot().stage == Stage::Dragging
+        })
     }
     pub fn cancel_gesture(&self, preparing_only: bool) {
         let binding = lock(&self.0);
@@ -203,6 +255,7 @@ impl Controller {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("拖放连接已关闭"))?
             .begin(paths, point)?;
+        binding.reverse_owner = None;
         binding.active = Arc::downgrade(&ticket);
         Ok(ticket)
     }

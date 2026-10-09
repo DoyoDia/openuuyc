@@ -15,7 +15,7 @@ $objectPath = Join-Path $outputDir 'driver.obj'
 & (Join-Path $vcRoot 'bin/Hostx64/x64/cl.exe') /nologo /c /MT /W4 /WX /wd4324 /O2 /GS /D_AMD64_ /D_WIN64 /D_WIN32_WINNT=0x0A00 /DNTDDI_VERSION=0x0A000000 /DUNICODE /D_UNICODE $includeArgs "/Fo$objectPath" (Join-Path $PSScriptRoot 'driver.c')
 if ($LASTEXITCODE) { throw 'Input driver compilation failed.' }
 $driverPath = Join-Path $outputDir 'OpenUUYCInput.dll'
-& (Join-Path $vcRoot 'bin/Hostx64/x64/link.exe') /nologo /dll /subsystem:windows /include:FxDriverEntryUm /machine:x64 /dynamicbase /nxcompat /release "/out:$driverPath" $objectPath "/libpath:$vcRoot/lib/x64" "/libpath:$kitRoot/Lib/$kitVersion/um/x64" "/libpath:$kitRoot/Lib/$kitVersion/ucrt/x64" "/libpath:$kitRoot/Lib/wdf/umdf/x64/2.15" WdfDriverStubUm.lib VhfUm.lib ntdll.lib mincore.lib advapi32.lib
+& (Join-Path $vcRoot 'bin/Hostx64/x64/link.exe') /nologo /dll /subsystem:windows /include:FxDriverEntryUm /machine:x64 /dynamicbase /nxcompat /release "/out:$driverPath" $objectPath "/libpath:$vcRoot/lib/x64" "/libpath:$kitRoot/Lib/$kitVersion/um/x64" "/libpath:$kitRoot/Lib/$kitVersion/ucrt/x64" "/libpath:$kitRoot/Lib/wdf/umdf/x64/2.15" WdfDriverStubUm.lib VhfUm.lib ntdll.lib mincore.lib advapi32.lib bcrypt.lib
 if ($LASTEXITCODE) { throw 'Input driver linking failed.' }
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'OpenUUYCInput.inf') -Destination $outputDir -Force
 & (Join-Path $PSScriptRoot '../package.ps1') -Directory $outputDir -Name OpenUUYCInput -Kind input -SigningThumbprint $SigningThumbprint -Stage:$Stage
