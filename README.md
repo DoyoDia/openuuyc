@@ -10,7 +10,7 @@ Windows 1.0 处于 **beta** 阶段，重点完善兼容性、恢复和稳定性�
 
 从 [Releases](https://github.com/djkcyl/openuuyc/releases) 下载 Windows x64 客户端，扫码或短信登录后连接设备，支持 UU 官方客户端；无需登录也可在登录页开启“接受远程协助”。
 
-最新稳定版为 [v0.7.0](https://github.com/djkcyl/openuuyc/releases/tag/v0.7.0)，最新预发布为 [v1.0.0-beta.2](https://github.com/djkcyl/openuuyc/releases/tag/v1.0.0-beta.2)。
+最新稳定版为 [v0.7.0](https://github.com/djkcyl/openuuyc/releases/tag/v0.7.0)，最新预发布为 [v1.0.0-beta.3](https://github.com/djkcyl/openuuyc/releases/tag/v1.0.0-beta.3)。
 
 **从 alpha.6 或更早版本升级需重新登录，设备 ID 会改变；已使用 alpha.7 的用户不会再次重置。** 旧设备条目请在列表中手动删除。设备资料使用本机真实硬件及当前 Windows 壁纸，上传的壁纸副本添加 OpenUUYC Logo，不修改系统原图。
 
