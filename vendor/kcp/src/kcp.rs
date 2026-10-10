@@ -1041,6 +1041,17 @@ impl<Output> Kcp<Output> {
         self.snd_buf.len() + self.snd_queue.len()
     }
 
+    /// Exclusive send sequence endpoint, including not-yet-transmitted segments.
+    pub fn send_sequence_end(&self) -> u32 {
+        self.snd_nxt.wrapping_add(self.snd_queue.len() as u32)
+    }
+
+    /// First unacknowledged send sequence. Later selective ACKs cannot advance
+    /// this prefix past a missing segment, even though they free resend storage.
+    pub fn send_unacknowledged(&self) -> u32 {
+        self.snd_una
+    }
+
     /// Get `rmt_wnd`, remote window size
     #[inline]
     pub fn rmt_wnd(&self) -> u16 {

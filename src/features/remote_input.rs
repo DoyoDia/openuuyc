@@ -8,7 +8,7 @@ use tokio::sync::Notify;
 
 pub(crate) mod polling;
 mod recovery;
-pub(crate) use recovery::InputRecovery;
+pub(crate) use recovery::{InputRecovery, InputWork};
 
 const MAX_EVENTS: usize = 512;
 const MOTION_JITTER: Duration = Duration::from_micros(100);
@@ -698,6 +698,7 @@ impl RemoteInput {
     }
 
     pub fn fail(&self, error: String) {
+        tracing::warn!(%error, "remote input stopped by local failure");
         self.disable();
         self.lock().error = Some(error);
         self.repaint();
@@ -716,9 +717,11 @@ impl RemoteInput {
 
     fn push(s: &mut State, event: InputEvent) -> bool {
         if s.queue.len() >= MAX_EVENTS {
-            Self::release_locked(s);
-            s.mode = MouseMode::View;
-            s.error = Some("键鼠输入积压，已停止控制并释放按键，请重新开启".into());
+            tracing::warn!(
+                queued = s.queue.len(),
+                "remote input queue full; automatic recovery pending"
+            );
+            Self::begin_recovery_locked(s);
             return false;
         }
         s.queue.push_back(event);
@@ -828,7 +831,7 @@ impl RemoteInput {
         self.wake.notify_one();
     }
 
-    pub async fn next(&self) -> QueuedInputEvent {
+    pub async fn next(&self) -> InputWork {
         loop {
             let wake = self.wake.notified();
             tokio::pin!(wake);
@@ -836,6 +839,9 @@ impl RemoteInput {
             let deadline;
             {
                 let mut s = self.lock();
+                if let Some(recovery) = Self::take_recovery_locked(&mut s) {
+                    return InputWork::Recovery(recovery);
+                }
                 if s.queue
                     .front()
                     .is_some_and(|event| !Self::pending_current(&s, event))
@@ -848,6 +854,7 @@ impl RemoteInput {
                 if let Some(timer) = &mut s.deadline_timer {
                     if let Some(deadline) = deadline {
                         if let Err(error) = timer.arm(deadline) {
+                            tracing::warn!(%error, "remote input stopped by polling timer failure");
                             Self::release_locked(&mut s);
                             s.mode = MouseMode::View;
                             s.error = Some(format!("鼠标节流计时失败，控制已停止：{error:#}"));
@@ -901,10 +908,10 @@ impl RemoteInput {
                         s.remote_keys.insert(key, lock);
                         s.release_checkpoint.remove(&key);
                     }
-                    return QueuedInputEvent {
+                    return InputWork::Event(QueuedInputEvent {
                         epoch: s.epoch,
                         event,
-                    };
+                    });
                 }
             }
             // Physical input, cancellation and the one-shot native timer all
@@ -963,6 +970,42 @@ impl RemoteInput {
     pub fn is_current(&self, event: &QueuedInputEvent) -> bool {
         let s = self.lock();
         s.ready && event.epoch == s.epoch && Self::pending_current(&s, &event.event)
+    }
+
+    /// The sender may have waited for reliable-channel credit after next().
+    /// Fold only consecutive, still-local motion into that event immediately
+    /// before submission; never cross a click/key/wheel, screen or epoch.
+    pub(crate) fn refresh_pending(&self, event: &mut QueuedInputEvent) -> bool {
+        let mut s = self.lock();
+        if !s.ready || event.epoch != s.epoch || !Self::pending_current(&s, &event.event) {
+            return false;
+        }
+        loop {
+            match (&mut event.event, s.queue.front()) {
+                (
+                    InputEvent::Absolute { screen, x, y },
+                    Some(InputEvent::Absolute {
+                        screen: next,
+                        x: nx,
+                        y: ny,
+                    }),
+                ) if screen == next => {
+                    *x = *nx;
+                    *y = *ny;
+                }
+                (InputEvent::Relative { x, y }, Some(InputEvent::Relative { x: nx, y: ny })) => {
+                    let (Some(nx), Some(ny)) = (x.checked_add(*nx), y.checked_add(*ny)) else {
+                        break;
+                    };
+                    *x = nx;
+                    *y = ny;
+                }
+                (InputEvent::Heartbeat, Some(InputEvent::Heartbeat)) => {}
+                _ => break,
+            }
+            s.queue.pop_front();
+        }
+        true
     }
 
     pub fn discard(&self, event: &QueuedInputEvent) {

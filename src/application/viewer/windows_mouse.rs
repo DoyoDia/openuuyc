@@ -391,7 +391,7 @@ impl RawRouter {
             target
                 .control
                 .mouse()
-                .fail("读取原始鼠标输入失败，控制已停止".into());
+                .pause_for_recovery("读取原始鼠标输入失败");
             return false;
         }
         let mouse = unsafe { raw.data.mouse };

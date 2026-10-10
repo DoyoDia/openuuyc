@@ -129,6 +129,7 @@ impl StreamControlHandle {
         // independent of an earlier cursor request still awaiting its response.
         state.cursor_sync_needed = true;
         self.refresh_mouse_policy(&mut state);
+        tracing::debug!(?mode, user_choice, "remote input control mode changed");
         drop(state);
         self.mouse.repaint();
         Ok(())
@@ -306,10 +307,8 @@ impl StreamControlHandle {
     }
 
     pub(super) fn refresh_mouse_policy(&self, state: &mut StreamControlState) {
-        if !state.viewing_enabled
-            || state.mouse.mode() == MouseMode::View
-            || self.microphone.needs_cleanup()
-        {
+        let mode = state.mouse.policy_mode();
+        if !state.viewing_enabled || mode == MouseMode::View || self.microphone.needs_cleanup() {
             self.disable_microphone_locked(state);
         }
         self.clipboard.policy(
@@ -319,7 +318,7 @@ impl StreamControlHandle {
                 && state.text_channel_open
                 && state.mouse_transport_connected
                 && state.peer_clipboard >= 1
-                && state.mouse.mode() != MouseMode::View,
+                && mode != MouseMode::View,
             state.peer_clipboard >= 2 && state.clipboard_files_allowed,
         );
         self.drag_drop.enable(
@@ -332,7 +331,6 @@ impl StreamControlHandle {
         if !state.viewing_enabled {
             return;
         }
-        let mode = state.mouse.mode();
         let (relative, wanted) = mouse_policy(state, mode);
         if mode == MouseMode::Smart && state.mouse.relative_mode() != relative {
             state.mouse.set_relative_mode(relative);
@@ -357,7 +355,7 @@ impl StreamControlHandle {
 }
 
 pub(super) fn smart_mouse_requested(state: &StreamControlState) -> bool {
-    state.mouse.mode() == MouseMode::Smart
+    state.mouse.policy_mode() == MouseMode::Smart
 }
 
 pub(super) fn mouse_policy(state: &StreamControlState, mode: MouseMode) -> (bool, bool) {

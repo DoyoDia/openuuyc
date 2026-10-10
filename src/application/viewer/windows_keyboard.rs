@@ -602,9 +602,7 @@ impl Router {
 
     fn stop_ordering(&mut self) {
         if let Some(target) = &self.target {
-            target
-                .input
-                .fail("键盘事件顺序中断，已停止控制并释放按键".into());
+            target.input.pause_for_recovery("键盘事件顺序中断");
         }
         self.clear();
     }

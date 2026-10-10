@@ -305,7 +305,7 @@ pub(in crate::application::viewer) fn player_title_bar(
     action.toggle_mouse = actions
         .add_enabled_ui(enabled || control.ready, |ui| {
             let hint = if bar.stream_control.mouse().transport_recovering() {
-                "连接暂时不畅，键鼠控制将在恢复后自动接续；点击取消".into()
+                "键鼠控制正在自动恢复；点击取消".into()
             } else if bar.stream_control.mouse().waiting_for_neutral() {
                 format!(
                     "等待松开全部键鼠；退出控制快捷键：{}",

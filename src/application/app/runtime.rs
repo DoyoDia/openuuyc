@@ -894,6 +894,7 @@ pub(super) async fn gui_worker_loop(
                         guest_allowed = true;
                         GuiEvent::SignedOut
                     } else {
+                        tracing::warn!(%error, "saved account could not be opened; credentials retained");
                         GuiEvent::SessionUnavailable(format!("无法打开账号会话：{error:#}"))
                     };
                     let _ = events.send(event);
@@ -972,6 +973,7 @@ pub(super) async fn gui_worker_loop(
             {
                 if active_client.restoration_failed().await {
                     allow_load = false;
+                    tracing::warn!(%error, "saved account restoration failed");
                     let _ = events.send(GuiEvent::SessionUnavailable(format!(
                         "登录恢复未完成，凭据已保留，可点击登录重试：{error:#}"
                     )));
