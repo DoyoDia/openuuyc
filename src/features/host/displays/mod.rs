@@ -155,9 +155,9 @@ impl Session {
         let state = self.state.clone();
         let lease = self.lease.clone();
         let closed = self.closed.clone();
-        let activity=crate::platform::windows::host_service::activity::Work::new();
+        let activity = crate::platform::windows::host_service::activity::Work::new();
         tokio::task::spawn_blocking(move || {
-            let _activity=activity;
+            let _activity = activity;
             let _serial = display::recovery::Serial::acquire()?;
             let mut state = lock(&state);
             ensure!(
@@ -228,7 +228,10 @@ impl Session {
             .any(|o| o.identity.as_deref() == Some(identity))
     }
     pub(crate) async fn create(&self, resolutions: Vec<(u32, u32)>) -> Result<capture::Screen> {
-        ensure!(!self.lease.is_assistance(), "远程协助不开放添加虚拟屏");
+        ensure!(
+            self.lease.display_expansion_allowed(),
+            "本次会话不允许添加虚拟屏"
+        );
         self.run(move |state, lease| {
             ensure!(
                 state.journal.super_baseline.is_none(),
@@ -445,9 +448,9 @@ impl Session {
             return Ok(());
         }
         let state = self.state.clone();
-        let activity=crate::platform::windows::host_service::activity::Work::new();
+        let activity = crate::platform::windows::host_service::activity::Work::new();
         tokio::task::spawn_blocking(move || {
-            let _activity=activity;
+            let _activity = activity;
             let _serial = display::recovery::Serial::acquire()?;
             let mut state = lock(&state);
             if state.dirty {
@@ -631,7 +634,9 @@ impl State {
                 // The service supervises this persistent owner and its next
                 // incarnation replays the durable recovery journal.
                 Ok(())
-            } else { display::recovery::start_guard(&self.journal.token) } {
+            } else {
+                display::recovery::start_guard(&self.journal.token)
+            } {
                 let _ = std::fs::remove_file(&self.path);
                 return Err(error);
             }

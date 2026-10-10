@@ -548,24 +548,9 @@ pub(super) async fn publish_state(
         } else {
             last_virtual_speaker = None;
         }
-        let mic_state = (mic.enabled, mic.active, mic.error.clone());
-        if last_microphone.as_ref() != Some(&mic_state) {
-            let action = if mic.error.is_some() && mic.enabled {
-                Some(27)
-            } else if mic.enabled {
-                Some(if mic.active { 23 } else { 24 })
-            } else if last_microphone
-                .as_ref()
-                .is_some_and(|(enabled, _, _)| *enabled)
-            {
-                Some(24)
-            } else {
-                None
-            };
-            if action.is_none() || send(false, publisher::audio_device_event(action.unwrap())).await
-            {
-                last_microphone = Some(mic_state);
-            }
+        let action = microphone_event(last_microphone.as_ref(), &mic);
+        if action.is_none() || send(false, publisher::audio_device_event(action.unwrap())).await {
+            last_microphone = Some(mic);
         }
         // Native layout changes and capture restart form one screen transition.
         // Do not publish a half-restored catalog while that owner is awaiting I/O.
@@ -674,5 +659,28 @@ pub(super) async fn publish_state(
                 last_probe = Some(probe);
             }
         }
+    }
+}
+
+fn microphone_event(
+    previous: Option<&super::super::microphone::Status>,
+    next: &super::super::microphone::Status,
+) -> Option<i32> {
+    if previous.is_some_and(|previous| {
+        previous.policy_generation == next.policy_generation
+            && previous.enabled == next.enabled
+            && previous.active == next.active
+            && previous.error == next.error
+    }) {
+        return None;
+    }
+    if next.enabled && next.error.is_some() {
+        Some(27)
+    } else if next.enabled {
+        Some(if next.active { 23 } else { 24 })
+    } else if previous.is_some_and(|previous| previous.enabled) {
+        Some(24)
+    } else {
+        None
     }
 }

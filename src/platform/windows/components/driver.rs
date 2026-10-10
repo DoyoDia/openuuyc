@@ -165,6 +165,21 @@ fn verify_catalog(path: &Path) -> Result<()> {
     ensure!(status == 0, "驱动包签名校验失败（{status:#x}）");
     Ok(())
 }
+fn unavailable_reason(flags: CM_DEVNODE_STATUS_FLAGS, problem: CM_PROB) -> Option<String> {
+    if problem == CM_PROB_UNSIGNED_DRIVER {
+        Some("Windows 无法验证驱动数字签名（代码 52）".into())
+    } else if problem == CM_PROB_DISABLED {
+        Some("设备已禁用（代码 22）".into())
+    } else if problem == CM_PROB_NEED_RESTART {
+        Some("驱动需要重启 Windows 后才能启动（代码 14）".into())
+    } else if problem.0 != 0 {
+        Some(format!("驱动未就绪（代码 {}）", problem.0))
+    } else if !flags.contains(DN_STARTED) {
+        Some("已安装，未启动".into())
+    } else {
+        None
+    }
+}
 impl Package {
     fn nodes(&self) -> Result<(DeviceSet, Vec<SP_DEVINFO_DATA>)> {
         let set = DeviceSet(unsafe {
@@ -279,6 +294,20 @@ impl Package {
         }
         Ok(!self.current_package(&bound)?)
     }
+    /// Read only the matching device's runtime state after an interface-open
+    /// failure. Do not scan the driver store or compare embedded package files
+    /// on an audio request, and do not infer installation state from CreateFile.
+    pub fn unavailable_reason(&self) -> Result<Option<String>> {
+        let (_set, nodes) = self.nodes()?;
+        ensure!(nodes.len() <= 1, "存在多个{}设备", self.kind.label());
+        let Some(device) = nodes.first() else {
+            return Ok(Some("未安装设备".into()));
+        };
+        let (mut flags, mut problem) = (CM_DEVNODE_STATUS_FLAGS(0), CM_PROB(0));
+        let result = unsafe { CM_Get_DevNode_Status(&mut flags, &mut problem, device.DevInst, 0) };
+        ensure!(result == CR_SUCCESS, "无法读取驱动启动状态：{result:?}");
+        Ok(unavailable_reason(flags, problem))
+    }
     pub fn status(&self) -> Result<Status> {
         let (set, nodes) = self.nodes()?;
         ensure!(nodes.len() <= 1, "存在多个{}设备", self.kind.label());
@@ -312,12 +341,8 @@ impl Package {
                 "已安装其他版本，保留现有驱动".into()
             } else if !current {
                 "需要更新".into()
-            } else if problem.0 != 0 {
-                format!("驱动未就绪（代码 {}）", problem.0)
-            } else if flags.contains(DN_STARTED) {
-                "已就绪".into()
             } else {
-                "已安装，未启动".into()
+                unavailable_reason(flags, problem).unwrap_or_else(|| "已就绪".into())
             },
             installed: true,
             removable: owned,

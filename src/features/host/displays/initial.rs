@@ -13,10 +13,13 @@ fn size(value: Option<&Resolution>) -> Option<(u32, u32)> {
 
 impl Session {
     pub(crate) async fn prepare(&self, options: ConnectOptions) -> Result<capture::Screen> {
-        tokio::task::spawn_blocking(recovery::recover_abandoned).await??;
         ensure!(
             options.kind == 1 && matches!(options.connect_type, 1 | 2),
             "不支持的被控连接类型"
+        );
+        ensure!(
+            !options.force_virtual || self.lease.display_expansion_allowed(),
+            "本次会话不允许强制创建虚拟屏"
         );
         ensure!(options.virtual_modes.len() <= 64, "虚拟屏模式数量过多");
         if let Some(params) = &options.params {
@@ -35,6 +38,7 @@ impl Session {
         if !modes.is_empty() {
             validate_modes(&modes)?;
         }
+        tokio::task::spawn_blocking(recovery::recover_abandoned).await??;
         self.run(move |state, lease| state.prepare(options, modes, lease))
             .await
     }

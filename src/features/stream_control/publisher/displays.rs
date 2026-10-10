@@ -250,6 +250,15 @@ pub(crate) async fn receive_session(
                             anyhow::ensure!((1..=144).contains(&fps), "无效超级屏帧率");
                         }
                         code = 501;
+                        // The official controller omits manual/FPS expansion
+                        // in assistance. Enforce our matching session policy
+                        // before stop(-1) or any native topology mutation.
+                        // CaptureSetting's resolution-conversion path below
+                        // and QuitSuperScreen are deliberately independent.
+                        anyhow::ensure!(
+                            session.authorization().display_expansion_allowed(),
+                            "本次会话不允许手动进入超级屏或通过超级屏提高帧率"
+                        );
                         session
                             .enter_super(size.width as u32, size.height as u32, dpi, true)
                             .await?;

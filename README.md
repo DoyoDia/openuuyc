@@ -4,7 +4,7 @@
 
 OpenUUYC 是用 Rust 编写的 UU 远程第三方 Windows 客户端，支持主控、被控和远程协助。
 
-Windows 1.0 处于 **beta** 阶段，重点完善兼容性、恢复和稳定性。**Windows 正式版完成后会适配 Linux 等其他平台。** 提前移植建议先通过 [Issue](https://github.com/djkcyl/openuuyc/issues) 沟通。
+当前源码已进入 **v1.0.0-rc.1** 发布准备，继续完善 Windows 1.0 的兼容性、恢复和稳定性。**Windows 正式版完成后会适配 Linux 等其他平台。** 提前移植建议先通过 [Issue](https://github.com/djkcyl/openuuyc/issues) 沟通。
 
 ## 下载与使用
 

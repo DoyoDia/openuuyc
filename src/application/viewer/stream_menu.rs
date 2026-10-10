@@ -504,6 +504,14 @@ pub(super) fn show_stream_control_window(
 ) {
     topology_menu::show(ctx, handle, local_size);
     topology_menu::show_error(ctx, handle);
+    let mic = handle.microphone().snapshot();
+    crate::ui::controls::observe_notice(
+        ctx,
+        "microphone-error",
+        "麦克风",
+        crate::ui::controls::DialogIcon::Error,
+        mic.error.as_deref(),
+    );
     let audio = handle.audio();
     crate::ui::controls::progress_notice(
         ctx,
@@ -512,21 +520,31 @@ pub(super) fn show_stream_control_window(
         (state.open && state.page == Page::Audio && !audio.output_devices().loaded)
             .then_some("正在读取输出设备…"),
     );
-    let audio_error = audio
-        .output_devices()
-        .error
-        .or_else(|| audio.snapshot().error);
+    let audio_error = audio.snapshot().error;
     if crate::ui::controls::observe_notice_action(
         ctx,
         "audio-output-error",
         "音频输出异常",
         crate::ui::controls::DialogIcon::Error,
-        audio_error.as_deref().filter(|_| state.open),
+        audio_error.as_deref(),
         "重试",
     ) == Some(true)
     {
+        crate::ui::controls::clear_notice(ctx, "audio-output-error");
         audio.retry();
         let _ = audio.refresh_output_devices();
+    }
+    if crate::ui::controls::observe_notice_action(
+        ctx,
+        "audio-device-query-error",
+        "音频设备检查失败",
+        crate::ui::controls::DialogIcon::Error,
+        audio.output_devices().error.as_deref()
+            .filter(|_| state.open && state.page == Page::Audio),
+        "重新检查",
+    ) == Some(true) {
+        crate::ui::controls::clear_notice(ctx, "audio-device-query-error");
+        state.local_error = audio.refresh_output_devices().err().map(|error| error.to_string());
     }
     let snapshot = handle.snapshot();
     crate::ui::controls::observe_notice(
@@ -955,7 +973,6 @@ crate::ui::controls::observe_notice(ui.ctx(), "audio-output-disconnected", "音�
                                 switch_row(ui, "拦截本机快捷键", &mut view.intercept_shortcuts)
                                     .on_hover_text("为此设备保存，同一设备的播放窗口共用。开启后，控制时优先将按键交给远端；关闭后允许本机快捷键响应。播放器自身快捷键始终保留。");
                                 let clipboard = handle.clipboard();
-                                let mic=handle.microphone().snapshot();
                                 let input=handle.microphone().selected_input();
                                 let devices=handle.microphone().input_devices();
                                 let name=input.as_ref().map(|id|devices.devices.iter().find(|d|&d.id==id).map(|d|d.name.as_str()).unwrap_or(if devices.error.is_some() {"所选麦克风"}else{"所选设备已断开"})).unwrap_or("跟随系统默认");
@@ -973,7 +990,6 @@ crate::ui::controls::observe_notice(ui.ctx(), "audio-output-disconnected", "音�
                                     }
                                     if mic.error.is_some() && menu_row(ui,"重试麦克风","",None,true,false).clicked() {handle.microphone().retry();}
                                 }
-                                crate::ui::controls::observe_notice(ui.ctx(),"microphone-error","麦克风",crate::ui::controls::DialogIcon::Error,mic.error.as_deref());
                                 let clip = clipboard.snapshot();
                                 let mut enabled = clip.enabled;
                                 if switch_row(ui, "剪贴板同步", &mut enabled)

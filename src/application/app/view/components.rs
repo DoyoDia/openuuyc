@@ -121,8 +121,7 @@ impl Manager {
             .is_some_and(|s| !s.installed || !s.ready);
         let response = ui.add_enabled(
             actionable && !active && !self.reboot && self.pending.is_none(),
-            crate::ui::controls::centered_primary(label)
-                .min_size(vec2(ui.available_width(), 30.0)),
+            crate::ui::controls::centered_primary(label).min_size(vec2(ui.available_width(), 30.0)),
         );
         if response.clicked() {
             self.confirm = Some(Operation::Install);
@@ -172,15 +171,20 @@ impl Manager {
         self.audio_management(ui, active);
     }
     fn audio_management(&mut self, ui: &mut egui::Ui, active: bool) {
-        let audio = self
+        let audio_result = self
             .components
             .iter()
             .find(|(kind, _)| *kind == Kind::AudioDriver)
-            .and_then(|(_, status)| status.as_ref().ok());
+            .map(|(_, status)| status);
+        let audio = audio_result.and_then(|status| status.as_ref().ok());
         let installed = audio.is_some_and(|s| s.installed);
         let removable = audio.is_some_and(|s| s.removable);
-        let label = audio.map_or("正在检查…", |s| s.label.as_str());
-        form_row(ui, "虚拟声卡", label, |ui| {
+        let label = match audio_result {
+            Some(Ok(status)) => status.label.clone(),
+            Some(Err(error)) => format!("检查失败：{error}"),
+            None => "正在检查…".into(),
+        };
+        form_row(ui, "虚拟声卡", &label, |ui| {
             if !audio.is_some_and(|status| status.ready)
                 && ui
                     .add_enabled(
@@ -205,6 +209,11 @@ impl Manager {
                 self.audio_confirm = Some(Operation::Uninstall);
             }
         });
+        if audio.is_some_and(|status| status.installed && !status.ready) {
+            ui.label(
+                "虚拟声卡使用测试签名驱动，需要 Windows 允许加载；重新安装不一定能解决加载失败。",
+            );
+        }
     }
     fn audio_dialog(&mut self, ctx: &egui::Context, active: bool) {
         if let Some(operation) = self.audio_confirm {
