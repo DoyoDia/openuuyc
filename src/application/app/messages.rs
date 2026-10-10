@@ -39,6 +39,11 @@ pub(super) enum GuiCommand {
         device: DeviceInfo,
         options: ConnectionMediaOptions,
     },
+    Diagnostics {
+        generation: u64,
+        device: DeviceInfo,
+        options: ConnectionMediaOptions,
+    },
     Refresh,
     Login {
         generation: u64,

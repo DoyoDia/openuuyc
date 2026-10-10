@@ -324,7 +324,7 @@ impl ViewerCloseHandle {
 
 pub(crate) struct ViewerLaunchConfig {
     pub codec: VideoCodec,
-    pub hardware_decode: bool,
+    pub decoder: crate::media::selection::DecoderPreference,
     pub title: String,
     // Backend allocation hint only. The bitstream supplies actual dimensions.
     pub initial_width: u32,
@@ -345,7 +345,7 @@ impl NativeViewerSession {
     pub(crate) async fn launch(config: ViewerLaunchConfig) -> Result<Self> {
         let ViewerLaunchConfig {
             codec,
-            hardware_decode,
+            decoder,
             title,
             initial_width,
             initial_height,
@@ -361,7 +361,7 @@ impl NativeViewerSession {
         let shutdown = Arc::new(AtomicBool::new(false));
         let fatal_error = Arc::new(Mutex::new(None));
         let (startup_sender, startup_receiver) = oneshot::channel();
-        let software_decode = Arc::new(AtomicBool::new(!hardware_decode));
+        let software_decode = Arc::new(AtomicBool::new(!decoder.mode.hardware()));
         let decode_enabled = Arc::new(AtomicBool::new(true));
         let (decode_idle_sender, decode_idle) = tokio::sync::watch::channel(0);
         let pause_epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -380,7 +380,7 @@ impl NativeViewerSession {
                     width: initial_width,
                     height: initial_height,
                     frame_rate,
-                    hardware_decode,
+                    decoder,
                     software_decode: manager_software,
                     decode_enabled: manager_enabled,
                     decode_idle: decode_idle_sender,

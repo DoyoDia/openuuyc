@@ -2,23 +2,7 @@
 use super::format::{Backend, Capability, Codec};
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum EncoderMode {
-    #[default]
-    Automatic,
-    Hardware,
-    Software,
-}
-impl EncoderMode {
-    pub const ALL: [Self; 3] = [Self::Automatic, Self::Hardware, Self::Software];
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Automatic => "硬件优先（自动回退）",
-            Self::Hardware => "仅硬件编码",
-            Self::Software => "仅软件编码",
-        }
-    }
-}
+pub(crate) use crate::media::selection::ProcessingMode as EncoderMode;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum EncoderCodec {
@@ -44,6 +28,10 @@ impl EncoderCodec {
 pub(crate) struct EncodingSettings {
     pub mode: EncoderMode,
     pub codec: EncoderCodec,
+    #[serde(default)]
+    pub preferred_codec: crate::media::CodecPreference,
+    #[serde(default)]
+    pub gpu: Option<crate::media::selection::GpuId>,
 }
 impl EncodingSettings {
     pub fn accepts(self, capability: &Capability) -> bool {
@@ -61,12 +49,13 @@ impl EncodingSettings {
     }
     pub fn validate(self) -> anyhow::Result<()> {
         anyhow::ensure!(
+            !self.preferred_codec.restricted(),
+            "格式首选不能包含强制限制"
+        );
+        anyhow::ensure!(
             self.mode != EncoderMode::Software
-                || matches!(
-                    self.codec,
-                    EncoderCodec::Automatic | EncoderCodec::H264 | EncoderCodec::Av1
-                ),
-            "软件编码支持 H.264 和 AV1，请选择自动、H.264 或 AV1"
+                || matches!(self.codec, EncoderCodec::Automatic | EncoderCodec::H264),
+            "软件编码仅支持 H.264，请选择自动或 H.264"
         );
         Ok(())
     }

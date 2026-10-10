@@ -22,7 +22,7 @@ pub(crate) struct DecoderPool {
     width: u32,
     height: u32,
     frame_rate: u32,
-    prefer_hardware: bool,
+    preference: crate::media::selection::DecoderPreference,
     extra_data: Bytes,
     error_count: u32,
     notification: crate::media::decode_api::DecoderNotification,
@@ -48,16 +48,17 @@ impl DecoderPool {
         width: u32,
         height: u32,
         frame_rate: u32,
-        prefer_hardware: bool,
+        preference: crate::media::selection::DecoderPreference,
         extra_data: Bytes,
     ) -> Self {
-        let candidates = DecoderCandidate::available(codec, prefer_hardware)
-            .into_iter()
-            .map(|kind| Candidate {
-                kind,
-                enabled: true,
-            })
-            .collect::<Vec<_>>();
+        let candidates =
+            DecoderCandidate::preferred(codec, preference, decoder.surface_writer().as_ref())
+                .into_iter()
+                .map(|kind| Candidate {
+                    kind,
+                    enabled: true,
+                })
+                .collect::<Vec<_>>();
         let active = candidates
             .iter()
             .position(|entry| entry.kind == decoder.candidate())
@@ -74,7 +75,7 @@ impl DecoderPool {
             width,
             height,
             frame_rate,
-            prefer_hardware,
+            preference,
             extra_data,
             error_count: 0,
             notification: crate::media::decode_api::DecoderNotification::default(),
@@ -87,10 +88,6 @@ impl DecoderPool {
         self.decoder
             .as_ref()
             .map_or("等待可用解码器", NativeVideoDecoder::label)
-    }
-
-    pub(crate) fn format(&self) -> Option<VideoFormatSignature> {
-        self.format
     }
 
     pub(crate) fn decoder(&mut self) -> Option<&mut NativeVideoDecoder> {
@@ -175,13 +172,14 @@ impl DecoderPool {
         }
         if codec_changed {
             self.codec = codec;
-            self.candidates = DecoderCandidate::available(codec, self.prefer_hardware)
-                .into_iter()
-                .map(|kind| Candidate {
-                    kind,
-                    enabled: true,
-                })
-                .collect();
+            self.candidates =
+                DecoderCandidate::preferred(codec, self.preference, self.writer.as_ref())
+                    .into_iter()
+                    .map(|kind| Candidate {
+                        kind,
+                        enabled: true,
+                    })
+                    .collect();
             self.active = 0;
             self.format = None;
         }
@@ -226,6 +224,7 @@ impl DecoderPool {
             };
         }
         let enabled_count = self.candidates.iter().filter(|entry| entry.enabled).count();
+        let failed_index = self.active;
         let failed = self.candidates[self.active].kind;
         if enabled_count > 1 {
             self.candidates[self.active].enabled = false;
@@ -250,7 +249,19 @@ impl DecoderPool {
             "UU decoder fallback transition"
         );
         self.release();
-        let initialized = self.select(self.width, self.height, self.format.or(input_format));
+        let format = self.format.or(input_format);
+        let mut initialized = self.select(self.width, self.height, format);
+        if !initialized && enabled_count > 1 {
+            // Other adapters may be alive but lack this stream's format. Only
+            // after exhausting alternatives, recover the last usable candidate.
+            self.candidates[failed_index].enabled = true;
+            initialized = self.select_candidates(
+                std::iter::once(failed_index),
+                self.width,
+                self.height,
+                format,
+            );
+        }
         DecoderTransition {
             replaced: true,
             // CF87B0 initializes immediately but does not retry the failed frame.
@@ -269,9 +280,20 @@ impl DecoderPool {
     }
 
     fn select(&mut self, width: u32, height: u32, format: Option<VideoFormatSignature>) -> bool {
+        self.select_candidates(0..self.candidates.len(), width, height, format)
+    }
+
+    fn select_candidates(
+        &mut self,
+        indices: impl IntoIterator<Item = usize>,
+        width: u32,
+        height: u32,
+        format: Option<VideoFormatSignature>,
+    ) -> bool {
         self.error_count = 0;
         self.blocked_reason = None;
-        for (index, entry) in self.candidates.iter().enumerate() {
+        for index in indices {
+            let entry = &self.candidates[index];
             if !entry.enabled {
                 continue;
             }
@@ -282,7 +304,7 @@ impl DecoderPool {
             if let Some(format) = format {
                 let supported = match entry.kind {
                     #[cfg(windows)]
-                    DecoderCandidate::WindowsD3d11 => {
+                    DecoderCandidate::WindowsD3d11 { .. } => {
                         (format.chroma_format_idc == 1
                             || matches!(self.codec, VideoCodec::H265 | VideoCodec::Av1)
                                 && format.chroma_format_idc == 3)
@@ -324,6 +346,7 @@ impl DecoderPool {
                 self.software_slot.clone(),
             ) {
                 Ok(mut decoder) => {
+                    decoder.describe_selection(self.preference, self.candidates.iter().any(|c| !c.enabled));
                     {
                         self.software_slot = decoder.software_slot();
                     }

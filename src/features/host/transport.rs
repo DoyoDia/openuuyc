@@ -309,16 +309,13 @@ impl Transport {
             lock(&self.0.controller).configure(bounds, false);
         }
     }
-    pub(crate) fn configure(&self, bounds: super::parameters::Bounds, restart: bool) {
-        let (bounds, restart) = {
+    pub(crate) fn configure(&self, bounds: super::parameters::Bounds) {
+        let bounds = {
             let mut streams = lock(&self.0.allocations);
             streams.insert(self.0.index, bounds);
-            (
-                super::allocation::total(&streams),
-                restart && streams.keys().filter(|id| **id != usize::MAX).count() == 1,
-            )
+            super::allocation::total(&streams)
         };
-        lock(&self.0.controller).configure(bounds, restart);
+        lock(&self.0.controller).configure(bounds, true);
     }
     fn allocation(&self, target: u32, view: super::allocation::View) -> u32 {
         super::allocation::share(&lock(&self.0.allocations), self.0.index, target, view)
@@ -1057,13 +1054,26 @@ impl Transport {
     pub(crate) async fn probes(&self) {
         let mut active = None::<(ProbeClusterConfig, Instant, usize, i64)>;
         while self.active() {
-            tokio::select! {_=self.0.cancel.cancelled()=>break,_=tokio::time::sleep(Duration::from_millis(2))=>{}}
+            // Follow the cluster's byte clock. Sleeping another 2ms on every
+            // iteration accumulates timer rounding and write time, lowering
+            // the measured probe rate (especially with small media packets).
+            let deadline = active
+                .as_ref()
+                .and_then(|(cluster, started, sent, _)| {
+                    let rate = cluster.target_data_rate.bps_or(0);
+                    (rate > 0).then(|| {
+                        *started + Duration::from_micros(*sent as u64 * 8_000_000 / rate as u64)
+                    })
+                })
+                .unwrap_or_else(|| Instant::now() + Duration::from_millis(2));
+            tokio::select! {_=self.0.cancel.cancelled()=>break,_=tokio::time::sleep_until(tokio::time::Instant::from_std(deadline))=>{}}
             let owner = self.streams().into_iter().find(|stream| {
                 stream.0.tcc_id.load(Ordering::Relaxed) != 0
                     && lock(&self.0.allocations).contains_key(&stream.0.index)
                     && !lock(&stream.0.history).packets.is_empty()
             });
             let Some(owner) = owner else {
+                active = None;
                 continue;
             };
             if active.is_none() {
@@ -1132,7 +1142,9 @@ impl Transport {
                 }
             }
             *bursts += 1;
-            if *bursts >= cluster.target_probe_count as i64 && *sent >= minimum {
+            // An unavailable payload/retired writer cannot advance the byte
+            // clock. Retire this attempt instead of spinning on a past deadline.
+            if bytes == 0 || (*bursts >= cluster.target_probe_count as i64 && *sent >= minimum) {
                 active = None;
             }
         }

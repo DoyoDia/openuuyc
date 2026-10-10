@@ -102,7 +102,7 @@ impl StreamControlHandle {
     pub(crate) fn reconcile_mouse_failure(&self) {
         // RemoteInput already released the failed activation. Update cursor and
         // clipboard policy without canceling restoration armed by a concurrent
-        // transport loss. With no new connection, no restore is armed at all.
+        // transport loss. Transient send recovery is owned by RemoteInput.
         let mut state = lock(&self.shared);
         state.cursor_sync_needed = true;
         self.refresh_mouse_policy(&mut state);
@@ -147,11 +147,17 @@ impl StreamControlHandle {
     /// menus/transitions. One attempt per restored connection, not a retry loop.
     pub(crate) fn restore_input_control(&self) -> Result<()> {
         let mut state = lock(&self.shared);
-        if !state.restore_input_pending || !state.device_preferences.control_enabled {
+        let recovering = state.mouse.transport_recovering();
+        if !recovering
+            && (!state.restore_input_pending || !state.device_preferences.control_enabled)
+        {
             return Ok(());
         }
         if state.annotation.enabled || state.annotation.toggling() {
             state.restore_input_pending = false;
+            if recovering {
+                state.mouse.disable();
+            }
             return Ok(());
         }
         if !state.viewing_enabled
@@ -160,10 +166,20 @@ impl StreamControlHandle {
         {
             return Ok(());
         }
+        let mode = if recovering {
+            let Some(mode) = state.mouse.recovered_mode() else {
+                return Ok(());
+            };
+            mode
+        } else {
+            state.device_preferences.mouse_mode
+        };
         state.restore_input_pending = false;
-        let mode = state.device_preferences.mouse_mode;
         let (relative, _) = mouse_policy(&state, mode);
         state.mouse.enable(mode, relative)?;
+        if recovering {
+            tracing::info!("remote input control restored after transport recovery");
+        }
         state.cursor_sync_needed = true;
         self.refresh_mouse_policy(&mut state);
         drop(state);

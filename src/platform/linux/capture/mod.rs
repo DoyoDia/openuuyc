@@ -42,10 +42,13 @@ pub(crate) fn create_device(_adapter: u64) -> Result<(Device, ())> {
     Ok((Device, ()))
 }
 
-/// GPU adapters a hardware encoder could run on. None are offered: encoding
-/// on Linux is the Rust H.264 core, which needs no adapter.
+/// GPU adapters a hardware encoder could be pinned to. None are listed: NVENC
+/// runs on the GPU driving the display and VA-API on the driver's device, so
+/// there is nothing to choose between and the preference stays automatic.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct EncodingAdapter {
+    #[serde(default)]
+    pub id: Option<crate::media::selection::GpuId>,
     pub luid: u64,
     pub vendor: u32,
     pub name: String,

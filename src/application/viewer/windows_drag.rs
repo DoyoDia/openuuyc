@@ -8,7 +8,11 @@ use crate::{
     platform::windows::drag_drop::target::{Handler, Registration},
     protocol::drag_drop::{COPY, Point},
 };
-use std::{cell::RefCell, rc::Rc, sync::Arc};
+use std::{
+    cell::RefCell,
+    rc::Rc,
+    sync::{Arc, Mutex},
+};
 use windows::Win32::Foundation::{POINT, POINTL};
 
 pub(super) struct WindowDrag {
@@ -19,7 +23,7 @@ struct State {
     owner: u64,
     controller: Controller,
     control: StreamControlHandle,
-    geometry: Option<Target>,
+    geometry: Arc<Mutex<Option<Target>>>,
     paths: Vec<std::path::PathBuf>,
     native: bool,
     official: Vec<(
@@ -27,6 +31,7 @@ struct State {
         std::time::Instant,
     )>,
     preview: Option<Arc<Ticket>>,
+    returning: Option<Arc<Ticket>>,
     transfers: Vec<Arc<Ticket>>,
     error: Option<String>,
 }
@@ -39,11 +44,12 @@ impl WindowDrag {
             owner: crate::platform::graphics::window_hwnd(window)?.0 as u64,
             controller: control.drag_drop().clone(),
             control: control.clone(),
-            geometry: None,
+            geometry: Arc::new(Mutex::new(None)),
             paths: Vec::new(),
             native: false,
             official: Vec::new(),
             preview: None,
+            returning: None,
             transfers: Vec::new(),
             error: None,
         }));
@@ -63,7 +69,7 @@ impl WindowDrag {
         if geometry.is_none() {
             state.cancel_preview();
         }
-        state.geometry = geometry;
+        *state.geometry.lock().unwrap_or_else(|e| e.into_inner()) = geometry;
     }
     pub fn show(&self, ctx: &egui::Context) {
         let Ok(mut state) = self.state.try_borrow_mut() else {
@@ -149,6 +155,7 @@ impl WindowDrag {
                                         "松开以复制到此处".to_owned()
                                     }
                                     Stage::Dragging => "此处不能接收文件".to_owned(),
+                                    Stage::Returning => "正在交还原拖动…".to_owned(),
                                     Stage::Submitted => "等待目标接收…".to_owned(),
                                     _ => format!(
                                         "正在复制文件 · {:.1} MiB",
@@ -178,22 +185,87 @@ impl WindowDrag {
 }
 impl State {
     fn point(&self, point: POINTL) -> Option<Point> {
-        let (screen, x, y) = self.geometry.as_ref()?.position(
-            POINT {
-                x: point.x,
-                y: point.y,
-            },
-            false,
-        )?;
+        let (screen, x, y) = self
+            .geometry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()?
+            .position(
+                POINT {
+                    x: point.x,
+                    y: point.y,
+                },
+                false,
+            )?;
         Some(Point { screen, x, y })
     }
     fn cancel_preview(&mut self) {
+        if let Some(ticket) = self.returning.take() {
+            ticket.cancel();
+        }
         if let Some(ticket) = self.preview.take() {
             ticket.cancel();
         }
     }
 }
 impl Handler for State {
+    fn description(&self) -> Option<&'static str> {
+        Some("复制到远端")
+    }
+    fn reenter(
+        &mut self,
+        identity: crate::platform::windows::drag_drop::appearance::Identity,
+        point: POINTL,
+    ) -> Option<u32> {
+        if let Some(ticket) = &self.returning {
+            return Some(
+                self.point(point)
+                    .map_or(0, |point| ticket.return_position(point)),
+            );
+        }
+        // A marker from another connection is never interpreted as local files.
+        let Some(ticket) = self.controller.returning(identity, self.owner) else {
+            return Some(0);
+        };
+        let Some(point) = self.point(point) else {
+            return Some(0);
+        };
+        let owner = self.owner;
+        let hwnd = windows::Win32::Foundation::HWND(owner as _);
+        unsafe {
+            use windows::Win32::UI::WindowsAndMessaging::{
+                GetForegroundWindow, SetForegroundWindow,
+            };
+            if GetForegroundWindow() != hwnd && !SetForegroundWindow(hwnd).as_bool() {
+                return Some(0);
+            }
+        }
+        let geometry = self.geometry.clone();
+        let position = Arc::new(move || {
+            use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, GetForegroundWindow};
+            if unsafe { GetForegroundWindow().0 as u64 } != owner {
+                return None;
+            }
+            let mut cursor = POINT::default();
+            unsafe {
+                GetCursorPos(&mut cursor).ok()?;
+            }
+            let target = geometry.lock().unwrap_or_else(|e| e.into_inner()).clone()?;
+            let (screen, x, y) = target.position(cursor, true)?;
+            Some(Point { screen, x, y })
+        });
+        if let Err(error) = ticket.return_enter(point, position) {
+            self.error = Some(error.to_string());
+            return Some(0);
+        }
+        tracing::info!(
+            owner,
+            drag = identity.drag,
+            "native drag reentry reached viewer video"
+        );
+        self.returning = Some(ticket);
+        Some(0)
+    }
     fn enter(&mut self, paths: Vec<std::path::PathBuf>, point: POINTL) -> u32 {
         self.native = self.controller.is_native();
         self.paths = paths;
@@ -201,6 +273,11 @@ impl Handler for State {
         self.over(point)
     }
     fn over(&mut self, point: POINTL) -> u32 {
+        if let Some(ticket) = &self.returning {
+            return self
+                .point(point)
+                .map_or(0, |point| ticket.return_position(point));
+        }
         // No legacy operation is submitted until Drop. A late native Hello can
         // still select the native protocol before this gesture sends anything.
         self.native |= self.controller.is_native();
@@ -238,10 +315,29 @@ impl Handler for State {
         })
     }
     fn leave(&mut self) {
-        self.cancel_preview();
+        // Canceling our local OLE loop sends DragLeave. The actor owns the
+        // outstanding original-gesture handoff; this callback must not cancel it.
+        self.returning.take();
+        if let Some(ticket) = self.preview.take() {
+            ticket.cancel();
+        }
         self.paths.clear();
     }
     fn drop_at(&mut self, point: POINTL) -> u32 {
+        if let Some(ticket) = self.returning.take() {
+            return match self
+                .point(point)
+                .ok_or_else(|| anyhow::anyhow!("拖回位置已失效"))
+                .and_then(|point| ticket.return_commit(point))
+            {
+                Ok(()) => 0,
+                Err(error) => {
+                    ticket.cancel();
+                    self.error = Some(error.to_string());
+                    0
+                }
+            };
+        }
         self.native |= self.controller.is_native();
         let Some(point) = self.point(point) else {
             self.leave();
@@ -279,7 +375,11 @@ impl Handler for State {
 }
 impl Drop for State {
     fn drop(&mut self) {
+        *self.geometry.lock().unwrap_or_else(|e| e.into_inner()) = None;
         self.cancel_preview();
+        for ticket in self.controller.take_reverse(self.owner) {
+            ticket.cancel();
+        }
         for ticket in &self.transfers {
             ticket.cancel();
         }

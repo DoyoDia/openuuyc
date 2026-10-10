@@ -48,7 +48,7 @@ impl MediaIntent {
             auto_quality: config.auto_quality,
             bitrate: config.bitrate,
             chroma: config.format.chroma,
-            hdr: config.format.hdr(),
+            hdr: config.color.is_hdr(),
             cursor_capture: config.cursor_capture,
         }
     }

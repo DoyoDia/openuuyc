@@ -1,10 +1,10 @@
 //! Linux host encoding: NVENC on the GPU driving the display when the driver
-//! offers it, the Rust software codecs (H.264, AV1) otherwise. As on Windows, hardware comes
+//! offers it, the Rust H.264 software codec otherwise. As on Windows, hardware comes
 //! first and every candidate is proven on the selected desktop by encoding a
 //! frame and checking the SPS it produced.
 use super::capture::{Desktop, Device, Image};
 use super::cuda;
-use crate::media::encoding::{Backend, Capability, Codec, Format, QualityTarget, Rate};
+use crate::media::encoding::{Backend, Capability, Codec, Color, Format, QualityTarget, Rate};
 use anyhow::{Context, Result, bail, ensure};
 
 pub(crate) use crate::media::encoding::{Encoded, FrameTiming};
@@ -40,16 +40,6 @@ pub(crate) fn probe(
         }
     }
     candidates.push((Backend::Software, Format::AVC));
-    for chroma in [1, 3] {
-        let format = Format {
-            codec: Codec::Av1,
-            chroma,
-            depth: 8,
-        };
-        if super::software_encoder::Encoder::accepts(format) {
-            candidates.push((Backend::Software, format));
-        }
-    }
     let rate = Rate {
         target: 2_000_000,
         peak: 2_000_000,
@@ -70,7 +60,7 @@ pub(crate) fn probe(
             let mut encoder = if backend == Backend::Software {
                 Encoder::software_format(&desktop.device, size, format, rate)?
             } else {
-                Encoder::hardware_format(&desktop.device, size, format, rate)?
+                Encoder::hardware_format(&desktop.device, size, format, rate, Color::Sdr)?
             };
             let mut output = None;
             for index in 0..20 {
@@ -137,11 +127,14 @@ impl Encoder {
         size: (u32, u32),
         format: Format,
         rate: Rate,
+        color: Color,
     ) -> Result<Self> {
         ensure!(
             super::nvenc::Encoder::accepts(format),
             "NVENC 的 CUDA 输入不支持该格式"
         );
+        // The capture backends deliver 8-bit SDR BGRA only.
+        ensure!(!color.is_hdr(), "Linux 版暂不支持 HDR 采集");
         let context = cuda::display_context()?;
         Ok(Self::Nvidia(super::nvenc::Encoder::new(
             &context, size, format, rate,
@@ -234,7 +227,7 @@ mod throughput_tests {
     #[test]
     #[ignore]
     fn capture_and_encode_throughput() {
-        use crate::media::encoding::{Format, Rate};
+        use crate::media::encoding::{Color, Format, Rate};
         let screens = super::super::capture::screens().unwrap();
         let mut desktop = super::Desktop::open_selected(&screens[0]).unwrap();
         let size = (screens[0].width & !1, screens[0].height & !1);
@@ -249,7 +242,8 @@ mod throughput_tests {
             },
         };
         let mut encoder =
-            super::Encoder::hardware_format(&desktop.device, size, Format::AVC, rate).unwrap();
+            super::Encoder::hardware_format(&desktop.device, size, Format::AVC, rate, Color::Sdr)
+                .unwrap();
         let started = std::time::Instant::now();
         let (mut frames, mut capture, mut encode, mut bytes) = (
             0u32,

@@ -1,8 +1,5 @@
-//! GPU readback for the unified Rust software codec. No codec algorithms here.
-use super::{
-    format::{Encoded, Format, Rate},
-    gpu_conversion::Conversion,
-};
+//! BGRA readback for the Rust H.264 encoder. No codec algorithms here.
+use super::format::{Encoded, Format, Rate};
 use anyhow::{Context, Result, ensure};
 use openuuyc_codec::encoder::{Config, Encoder as Core};
 use std::sync::{Arc, atomic::AtomicBool};
@@ -10,12 +7,12 @@ use windows::Win32::Graphics::{Direct3D11::*, Dxgi::Common::*};
 
 pub(crate) struct Encoder {
     core: Core,
-    conversion: Option<Conversion>,
     staging: ID3D11Texture2D,
     context: ID3D11DeviceContext,
     size: (u32, u32),
     format: Format,
     rate: Rate,
+    frame_rate: super::encoder_rate::Controller,
 }
 impl Encoder {
     pub fn new(
@@ -31,11 +28,6 @@ impl Encoder {
             fps: rate.fps,
             bitrate: rate.target,
         })?;
-        let conversion = if core.input_format() == openuuyc_codec::PixelFormat::Bgra {
-            None
-        } else {
-            Some(Conversion::new(device, size, format)?)
-        };
         let mut desc = D3D11_TEXTURE2D_DESC {
             Width: size.0,
             Height: size.1,
@@ -48,9 +40,6 @@ impl Encoder {
             },
             ..Default::default()
         };
-        if let Some(conversion) = &conversion {
-            unsafe { conversion.output.GetDesc(&mut desc) };
-        }
         desc.Usage = D3D11_USAGE_STAGING;
         desc.BindFlags = 0;
         desc.MiscFlags = 0;
@@ -61,12 +50,12 @@ impl Encoder {
         }
         Ok(Self {
             core,
-            conversion,
             staging: staging.context("软件编码读回纹理")?,
             context: unsafe { device.GetImmediateContext()? },
             size,
             format,
             rate,
+            frame_rate: super::encoder_rate::Controller::new(rate),
         })
     }
     pub fn request_keyframe(&mut self) {
@@ -76,11 +65,19 @@ impl Encoder {
         openuuyc_codec::encoder::maximum_size(self.format.codec.media())
     }
     pub fn configure(&mut self, rate: Rate) -> Result<bool> {
-        if rate.target != self.rate.target || rate.fps != self.rate.fps {
-            self.core.configure(rate.fps, rate.target)?;
-        }
+        let Some(update) = self.frame_rate.decide(rate) else {
+            return Ok(false);
+        };
+        self.core.configure(update.rate.fps, update.rate.target)?;
         let key = self.rate.quality != rate.quality;
         self.rate = rate;
+        self.frame_rate.commit(update);
+        tracing::debug!(
+            requested_fps = rate.fps,
+            configured_fps = update.rate.fps,
+            target = update.rate.target,
+            "software encoder rate applied"
+        );
         Ok(key)
     }
     pub fn encode(
@@ -90,17 +87,12 @@ impl Encoder {
         key: bool,
         cancel: &Arc<AtomicBool>,
     ) -> Result<Vec<Encoded>> {
+        self.frame_rate.input(timestamp);
         if key {
             self.core.request_keyframe();
         }
-        let source = if let Some(conversion) = &mut self.conversion {
-            conversion.convert(texture)?;
-            &conversion.output
-        } else {
-            texture
-        };
         unsafe {
-            self.context.CopyResource(&self.staging, source);
+            self.context.CopyResource(&self.staging, texture);
         }
         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
         unsafe {
@@ -108,9 +100,7 @@ impl Encoder {
                 .Map(&self.staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
         }
         let prepared = (|| {
-            let (row, rows) = self
-                .core
-                .input_format()
+            let (row, rows) = openuuyc_codec::PixelFormat::Bgra
                 .layout(self.size.0 as usize, self.size.1 as usize)
                 .context("软件读回大小溢出")?;
             let pitch = mapped.RowPitch as usize;
@@ -139,7 +129,7 @@ impl Encoder {
                 is_new: true,
                 timing: None,
                 format: self.format,
-                color: self.format.color(None),
+                color: super::format::Color::Sdr.space(None),
             })
             .collect())
     }

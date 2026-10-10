@@ -174,6 +174,7 @@ impl Screens {
                 screen,
                 &capabilities,
                 &deferred.remote,
+                deferred.encoding,
             )?;
             Ok::<_, anyhow::Error>((prepared, capabilities))
         }
@@ -449,11 +450,13 @@ impl Screens {
             "被控许可已失效"
         );
         let requested_format = config.format;
+        self.slots[index].negotiated.source_gpu(screen.render_adapter.unwrap_or(screen.adapter));
+        let requested_hdr = config.color.is_hdr();
         self.slots[index].negotiated.apply(
             &mut config,
             None,
             requested_format.chroma,
-            requested_format.hdr(),
+            requested_hdr,
             (screen.width, screen.height),
         )?;
         self.stop_at(index).await;

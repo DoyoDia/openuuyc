@@ -45,6 +45,7 @@ pub(super) struct D3D11Presenter {
     pub(super) analysis_at: Instant,
     pub(super) analysis_new: bool,
     pub(super) device: ID3D11Device,
+    adapter: u64,
     pub(super) context: ID3D11DeviceContext,
     pub(super) swap_chain: IDXGISwapChain1,
     pub(super) frame_latency_waitable: isize,
@@ -143,6 +144,17 @@ pub(super) struct ImportedSharedTexture {
 pub(super) const OFFICIAL_TEXTURE_SYNC_TIMEOUT_MS: u32 = 100;
 
 impl D3D11Presenter {
+    pub(super) fn can_render_surface(
+        &self,
+        surface: &crate::platform::surface::D3D11Surface,
+    ) -> bool {
+        if surface.shared_handle().is_some() {
+            self.adapter == surface.adapter_id()
+        } else {
+            self.accepts_surface(surface)
+        }
+    }
+
     pub(super) fn accepts_surface(&self, surface: &crate::platform::surface::D3D11Surface) -> bool {
         surface.belongs_to_device(&self.device)
     }
@@ -184,6 +196,8 @@ impl D3D11Presenter {
         device: ID3D11Device,
         context: ID3D11DeviceContext,
     ) -> Result<Self> {
+        let id = unsafe { device.cast::<IDXGIDevice>()?.GetAdapter()?.GetDesc()? }.AdapterLuid;
+        let adapter = (u64::from(id.HighPart as u32) << 32) | u64::from(id.LowPart);
         let swap_chain_creation = create_swap_chain(&device, hwnd, size)?;
         let swap_chain = swap_chain_creation.swap_chain;
         let allow_tearing = swap_chain_creation.allow_tearing;
@@ -213,6 +227,7 @@ impl D3D11Presenter {
             output_monitor_hdr: false,
             output_hdr_checked: None,
             device,
+            adapter,
             context,
             swap_chain,
             frame_latency_waitable: frame_latency_waitable.0 as isize,

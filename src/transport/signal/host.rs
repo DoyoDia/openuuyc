@@ -13,6 +13,7 @@ pub(crate) enum Event {
     Power(crate::features::host::power::Event),
 }
 pub(crate) struct PreparedPeer {
+    preferred_codec: Option<i32>,
     peer: Peer,
     capabilities: Vec<crate::features::host::format::Capability>,
 }
@@ -26,6 +27,7 @@ impl Drop for PendingPeer {
     }
 }
 pub(crate) struct Session {
+    preferred_codec: Option<i32>,
     power: crate::features::host::power::Inbox,
     client: crate::session::host_client::HostClient,
     desired: tokio::sync::watch::Receiver<Option<crate::features::host::AccessRequest>>,
@@ -44,6 +46,7 @@ pub(crate) struct Session {
 impl Session {
     pub(crate) fn new(client: crate::session::host_client::HostClient) -> Self {
         Self {
+            preferred_codec: None,
             power: client.host.power.bind(),
             desired: client.host.subscribe(),
             client,
@@ -121,6 +124,7 @@ impl Session {
                             && !prepared.peer.access_revoked() =>
                     {
                         self.capabilities = prepared.capabilities;
+                        self.preferred_codec = prepared.preferred_codec;
                         self.peer = Some(prepared.peer);
                         self.active_displays = None;
                         self.active_encoder = None;
@@ -269,6 +273,7 @@ impl Session {
                     self.active_displays = None;
                     self.active_encoder = None;
                 } else if self.peer.as_ref().is_some_and(Peer::ended) {
+                    tracing::info!(error = ?self.client.host.status().error, "host cancelled media session retiring");
                     // Source/encoding failure can invalidate verified values;
                     // a normal remote close or network loss does not.
                     if self.client.host.status().error.is_some() {
@@ -364,6 +369,8 @@ impl Session {
                     .get("openuuyc_audio_control")
                     .and_then(Value::as_u64)
                     == Some(1);
+                let diagnostics_extension =
+                    streamer.get("openuuyc_diagnostics").and_then(Value::as_u64) == Some(1);
                 let annotation_extension =
                     streamer.get("openuuyc_annotation").and_then(Value::as_u64) == Some(1);
                 let drag_extension =
@@ -492,15 +499,15 @@ impl Session {
                                 }
                             } else { None };
                             let prepared = if let Some(restored) = restored {
-                                match desktop::Prepared::new(&restored, screen.clone(), &capabilities, &remote) {
+                                match desktop::Prepared::new(&restored, screen.clone(), &capabilities, &remote, encoding_settings) {
                                     Ok(prepared) => prepared,
                                     Err(error) => {
                                         tracing::warn!(%error, "update media intent no longer supported by current capabilities");
-                                        desktop::Prepared::new(&options, screen, &capabilities, &remote)?
+                                        desktop::Prepared::new(&options, screen, &capabilities, &remote, encoding_settings)?
                                     }
                                 }
                             } else {
-                                desktop::Prepared::new(&options, screen, &capabilities, &remote)?
+                                desktop::Prepared::new(&options, screen, &capabilities, &remote, encoding_settings)?
                             };
                             (
                                 Some(prepared.screen),
@@ -528,6 +535,7 @@ impl Session {
                             deferred,
                             audio_control,
                             annotation_extension,
+                            diagnostics_extension,
                             drag_extension,
                             configuration_client.controlling_features(),
                             crate::protocol::peer_platform::PeerPlatform::from_connect_client_type(
@@ -544,7 +552,7 @@ impl Session {
                             total_ms=preparation_started.elapsed().as_millis(),
                             "host connection preparation completed");
                         peer.load_input_configuration(configuration_client);
-                        Ok(PreparedPeer { peer, capabilities })
+                        Ok(PreparedPeer { peer, capabilities, preferred_codec: encoding_settings.preferred_codec.preferred() })
                     }
                     .await;
                     if result.is_err() {
@@ -622,6 +630,7 @@ impl Session {
                 }
                 self.cancel_preparation().await;
                 if let Some(peer) = self.peer.take() {
+                    tracing::info!(event, "host matching signaling release received");
                     peer.close().await;
                 }
             }
@@ -723,6 +732,8 @@ impl Session {
 
     async fn send_capability(&mut self, signal: &mut SignalSession) -> Result<()> {
         let capability = crate::protocol::capability::DeviceCapability {
+            preferred_codec: self.preferred_codec,
+            openuuyc_sdr_10bit: true,
             ice_id: self.ice_id.clone(),
             display_info: self.peer.as_ref().context("缺少被控会话")?.displays(),
             video_codec_capability: self.capabilities.iter().map(|c| c.wire()).collect(),
@@ -738,6 +749,7 @@ impl Session {
     pub(crate) async fn close(mut self) {
         self.cancel_preparation().await;
         if let Some(peer) = self.peer.take() {
+            tracing::info!("host signaling owner closing active media session");
             peer.close().await;
         }
         self.client.host.room_closed();

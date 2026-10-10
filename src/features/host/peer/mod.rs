@@ -129,6 +129,7 @@ impl Peer {
         deferred: Option<screens::Deferred>,
         audio_control: bool,
         annotation_extension: bool,
+        diagnostics_extension: bool,
         drag_extension: bool,
         controlling_features: Option<crate::account::feature_ability::FeatureCatalog>,
         clipboard_platform: crate::protocol::peer_platform::PeerPlatform,
@@ -630,8 +631,10 @@ impl Peer {
             kcp.clone(),
         ));
         let clipboard_receiver = super::clipboard::Receiver::default();
-        clipboard_receiver.native(drag_extension && !data_only && !audio_only);
-        if !drag_extension && !data_only && !audio_only {
+        // Capability belongs to the connection. The clipboard worker gates execution
+        // on the current video sources, including viewers attached after audio/files.
+        clipboard_receiver.native(drag_extension);
+        if !drag_extension {
             clipboard_receiver.official_drop(controlling_features);
         }
         let clipboard_screens = reports.clone();
@@ -644,10 +647,15 @@ impl Peer {
             clipboard_platform,
             input.receiver(),
             move || {
-                lock(&clipboard_screens.catalog)
+                let viewing = clipboard_screens
+                    .media()
+                    .iter()
+                    .any(|(_, media)| media.capturing);
+                let screens = lock(&clipboard_screens.catalog)
                     .iter()
                     .map(|s| s.screen.clone())
-                    .collect()
+                    .collect();
+                (screens, viewing)
             },
         ));
         let files = super::files::Receiver::default();
@@ -696,7 +704,23 @@ impl Peer {
         let channel_annotation = annotation.clone();
         let channel_clipboard = clipboard_receiver.clone();
         let channel_control = control_receiver.clone();
+        let diagnostics_binding: Arc<Mutex<Option<CancellationToken>>> = Default::default();
+        let diagnostics_lease = handle.clone();
+        let diagnostics_connected = connected.clone();
         connection.on_data_channel(Box::new(move |channel| {
+            if diagnostics_extension && channel.label() == crate::diagnostics::remote::CHANNEL {
+                channel_kcp.bind_stream(channel.id(), false);
+                let token = crate::diagnostics::remote::bind_host(
+                    channel,
+                    diagnostics_lease.clone(),
+                    diagnostics_connected.clone(),
+                    channel_cancel.clone(),
+                );
+                if let Some(previous) = lock(&diagnostics_binding).replace(token) {
+                    previous.cancel();
+                }
+                return Box::pin(async {});
+            }
             let screens = channel_screens.clone();
             let stop = channel_cancel.clone();
             let kcp = channel_kcp.clone();

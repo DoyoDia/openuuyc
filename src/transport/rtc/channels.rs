@@ -52,6 +52,11 @@ impl DataChannels {
             StreamControlHandle::new(profile, performance.clone());
         let port_mapping = Arc::new(crate::features::port_mapping::Transport::default());
         for channel in &local_channels {
+            if channel.label() == crate::diagnostics::remote::CHANNEL {
+                uu_kcp.bind_stream(channel.id(), false);
+                stream_control.diagnostics().bind(channel);
+                continue;
+            }
             stream_control.file_transfer().bind(channel);
             stream_control.drag_drop().bind(channel);
             if channel.label() == "FILE_DATA_CHANNEL" {
@@ -101,7 +106,7 @@ impl DataChannels {
         workers.spawn(send_remote_input(
             control_channel.clone(),
             uu_kcp.clone(),
-            stream_control.mouse().clone(),
+            stream_control.clone(),
         ));
         workers.spawn(send_official_control_messages(
             control_channel,
@@ -134,8 +139,8 @@ impl DataChannels {
         workers: &Arc<SessionWorkers>,
         port_mapping: Arc<crate::features::port_mapping::Transport>,
     ) {
-        if !local_channel && channel.label() == "CONTROL_DATA_CHANNEL" {
-            uu_kcp.set_control_stream(channel.id(), true);
+        if !local_channel {
+            uu_kcp.bind_stream(channel.id(), channel.label() == "CONTROL_DATA_CHANNEL");
         }
         let label = channel.label().to_owned();
         let stats_channel = Arc::downgrade(channel);
@@ -157,13 +162,15 @@ impl DataChannels {
                     return;
                 };
                 tracing::info!(%label, stream_id = stats_channel.id(), "UU data channel opened");
-                if label == "CONTROL_DATA_CHANNEL" {
-                    uu_kcp.set_control_stream(stats_channel.id(), true);
-                }
                 if local_channel
                     && matches!(label.as_str(), "CONTROL_DATA_CHANNEL" | "TEXT_DATA_CHANNEL")
                 {
                     stream_control.set_data_channel_open(&label, true);
+                }
+                if label == "CONTROL_DATA_CHANNEL" {
+                    uu_kcp.set_control_stream(stats_channel.id(), true);
+                } else {
+                    uu_kcp.bind_stream(stats_channel.id(), false);
                 }
                 if label == "STREAMER_DATA_CHANNEL"
                     && streamer_sender_started
@@ -394,8 +401,9 @@ pub(super) async fn send_official_control_messages(
 pub(super) async fn send_remote_input(
     channel: Arc<RTCDataChannel>,
     kcp: UuKcpControl,
-    mouse: crate::features::remote_input::RemoteInput,
+    stream_control: StreamControlHandle,
 ) {
+    let mouse = stream_control.mouse().clone();
     let mut heartbeat = tokio::time::interval(Duration::from_millis(15));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut keyboard_submission_seen = false;
@@ -408,6 +416,7 @@ pub(super) async fn send_remote_input(
             mouse.discard(&event);
             continue;
         }
+        let mut timed_out = false;
         let result = tokio::select! {
             biased;
             _ = mouse.epoch_cancelled(event.epoch) => Err(anyhow::anyhow!("鼠标连接代次已变更")),
@@ -418,12 +427,21 @@ pub(super) async fn send_remote_input(
                     if kcp.is_negotiated(){kcp.send_input(channel.id(),event.event.encode(),Arc::new(move||state.is_current(&guarded)),release).await}
                     else {kcp.send_control(&channel,event.event.encode()).await}
                 }) => result
-                .map_err(|_| match kcp.send_failure_reason() {
+                .map_err(|_| { timed_out = true; match kcp.send_failure_reason() {
                     Some(reason) => anyhow::anyhow!("键鼠输入发送超时：{reason}"),
                     None => anyhow::anyhow!("键鼠输入发送超时"),
-                })
+                } })
                 .and_then(|result| result.map(|_| ())),
         };
+        if timed_out && let Some(recovery) = mouse.pause_transport(&event) {
+            tracing::warn!(
+                worker_stage = kcp.worker_stage(),
+                "remote input send stalled; suspending until reliable release acknowledgement"
+            );
+            stream_control.reconcile_mouse_failure();
+            recover_remote_input(&channel, &kcp, &mouse, recovery).await;
+            continue;
+        }
         if let Err(error) = &result
             && mouse.is_current(&event)
         {
@@ -454,6 +472,58 @@ pub(super) async fn send_remote_input(
                 "keyboard event submitted to CONTROL transport");
         }
         mouse.complete(&event, result);
+    }
+}
+
+async fn recover_remote_input(
+    channel: &RTCDataChannel,
+    kcp: &UuKcpControl,
+    mouse: &crate::features::remote_input::RemoteInput,
+    recovery: crate::features::remote_input::InputRecovery,
+) {
+    use crate::features::remote_input::InputEvent;
+    let epoch = recovery.epoch;
+    let recover = async {
+        // One release pass followed by a harmless, reliably acknowledged probe.
+        // Never resubmit the failed press/motion or switch carriers on failure.
+        for event in recovery.releases.into_iter().chain([InputEvent::Heartbeat]) {
+            anyhow::ensure!(mouse.recovery_current(epoch), "input recovery cancelled");
+            if kcp.is_negotiated() {
+                let state = mouse.clone();
+                kcp.send_input(
+                    channel.id(),
+                    event.encode(),
+                    Arc::new(move || state.recovery_current(epoch)),
+                    true,
+                )
+                .await?;
+            } else {
+                kcp.send_control(channel, event.encode()).await?;
+            }
+        }
+        if kcp.is_negotiated() {
+            kcp.drain().await?;
+        } else {
+            // This SCTP implementation releases buffered bytes on SACK. Sending
+            // the probe alone only means local enqueue, not a healthy carrier.
+            loop {
+                anyhow::ensure!(
+                    channel.ready_state()
+                        == webrtc::data_channel::data_channel_state::RTCDataChannelState::Open,
+                    "CONTROL channel closed during input recovery"
+                );
+                if channel.buffered_amount().await == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+        Ok(())
+    };
+    tokio::select! {
+        biased;
+        _ = mouse.epoch_cancelled(epoch) => {},
+        result = recover => mouse.finish_transport_recovery(epoch, result),
     }
 }
 

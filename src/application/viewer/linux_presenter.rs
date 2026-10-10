@@ -702,6 +702,8 @@ struct Player {
     hidden_since: Option<Instant>,
     /// Files dropped on the window, and drags carried out of it.
     drag: super::linux_drag::WindowDrag,
+    /// Mouse mode of the previous frame, to notice control being dropped.
+    last_mouse_mode: MouseMode,
 }
 
 impl Player {
@@ -742,7 +744,33 @@ impl Player {
             polling_origin: Instant::now(),
             diagnostics_at: [None; 2],
             hidden_since: None,
+            last_mouse_mode: MouseMode::View,
         })
+    }
+
+    /// Control that failed updates cursor and clipboard policy; control
+    /// dropped by a connection loss or a stalled input channel comes back
+    /// once this window is focused and nothing else holds the input.
+    fn restore_control(&mut self, ctx: &egui::Context, window: &Window) {
+        let control = &self.session.stream_control;
+        let mode = control.mouse().mode();
+        if self.last_mouse_mode != MouseMode::View
+            && mode == MouseMode::View
+            && control.mouse().error().is_some()
+        {
+            control.reconcile_mouse_failure();
+        }
+        self.last_mouse_mode = mode;
+        if self.focused
+            && window.is_minimized() != Some(true)
+            && !control.drag_drop().interactive()
+            && !self.stream_control_ui.open
+            && !ctx.any_popup_open()
+            && !ctx.text_edit_focused()
+            && let Err(error) = control.restore_input_control()
+        {
+            control.mouse().fail(error.to_string());
+        }
     }
 
     fn control(&self) -> &crate::features::stream_control::StreamControlHandle {
@@ -898,6 +926,7 @@ impl Player {
         self.drag
             .tick(window, ui.ctx(), available, |position| map(position, false));
         self.drag.show(ui.ctx());
+        self.restore_control(ui.ctx(), window);
         self.update_pointer_lock(window);
         self.draw_remote_cursor(ui, window);
         placement
@@ -1046,7 +1075,12 @@ impl Player {
         );
         row.set_clip_rect(rect);
         row.spacing_mut().item_spacing.x = 6.0;
-        let controlling = self.input().mode() != MouseMode::View;
+        // As in the Windows caption, control waiting for released keys or for
+        // a stalled input channel counts as on, and a click cancels it.
+        let recovering = self.input().transport_recovering();
+        let controlling = self.input().mode() != MouseMode::View
+            || self.input().waiting_for_neutral()
+            || recovering;
         if row.button("全屏").clicked() {
             toggle_fullscreen(window);
         }
@@ -1071,10 +1105,14 @@ impl Player {
         }
         if row
             .selectable_label(controlling, "键鼠控制")
-            .on_hover_text(format!(
-                "退出控制：{}",
-                crate::application::viewer_shortcuts::label(ViewerShortcut::ReleaseMouse)
-            ))
+            .on_hover_text(if recovering {
+                "连接暂时不畅，键鼠控制将在恢复后自动接续；点击取消".to_owned()
+            } else {
+                format!(
+                    "退出控制：{}",
+                    crate::application::viewer_shortcuts::label(ViewerShortcut::ReleaseMouse)
+                )
+            })
             .clicked()
         {
             self.set_control(!controlling);

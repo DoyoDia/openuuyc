@@ -3,7 +3,7 @@
 //! input. Platforms supply the device (D3D11 on Windows, a CUDA context on
 //! Linux) and register their own input surface, so both encode with the same
 //! parameters.
-use super::{Codec, Format, Rate};
+use super::{Codec, Color, Format, Rate};
 use anyhow::{Context, Result, bail, ensure};
 use openuuyc_nvenc_sys as nv;
 use std::{
@@ -159,8 +159,9 @@ impl Api {
     }
 }
 
-/// An input surface registered with a session.
-pub(crate) struct Registered(nv::NV_ENC_REGISTERED_PTR);
+/// An input surface registered with a session, with its row pitch when the
+/// input is a linear device buffer.
+pub(crate) struct Registered(nv::NV_ENC_REGISTERED_PTR, u32);
 
 /// An initialized NVENC session with its output bitstream buffer.
 pub(crate) struct Session {
@@ -174,6 +175,7 @@ pub(crate) struct Session {
     quality: i32,
     maximum: (u32, u32),
     format: Format,
+    color: Color,
 }
 
 // The session is owned and driven by one capture thread at a time.
@@ -188,6 +190,7 @@ impl Session {
         height: u32,
         rate: Rate,
         format: Format,
+        color: Color,
     ) -> Result<Self> {
         let Rate {
             target: bitrate,
@@ -221,6 +224,7 @@ impl Session {
             quality: 0,
             maximum: (0, 0),
             format,
+            color,
         };
         unsafe {
             let mut open = nv::NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS::default();
@@ -332,7 +336,7 @@ impl Session {
                 av1.set_enableFilmGrainParams(0);
                 av1.filmGrainParams = ptr::null_mut();
                 av1.maxTemporalLayersMinus1 = 0;
-                let color = format.color(None);
+                let color = encoder.color.space(None);
                 av1.colorPrimaries = nv::NV_ENC_VUI_COLOR_PRIMARIES(color.primaries.into());
                 av1.transferCharacteristics =
                     nv::NV_ENC_VUI_TRANSFER_CHARACTERISTIC(color.transfer.into());
@@ -366,7 +370,7 @@ impl Session {
                     hevc.set_enableFillerDataInsertion(0);
                     &mut hevc.hevcVUIParameters
                 };
-                let color = format.color(None);
+                let color = encoder.color.space(None);
                 vui.videoSignalTypePresentFlag = 1;
                 vui.videoFormat = nv::NV_ENC_VUI_VIDEO_FORMAT::NV_ENC_VUI_VIDEO_FORMAT_UNSPECIFIED;
                 vui.videoFullRangeFlag = u32::from(color.range == 2);
@@ -452,7 +456,7 @@ impl Session {
                 !registration.registeredResource.is_null(),
                 "驱动未返回注册资源"
             );
-            Ok(Registered(registration.registeredResource))
+            Ok(Registered(registration.registeredResource, pitch))
         }
     }
 
@@ -464,6 +468,21 @@ impl Session {
 
     pub fn maximum_size(&self) -> (u32, u32) {
         self.maximum
+    }
+
+    /// Narrow the size capability to what the platform's input surface can
+    /// hold, rejecting a session already larger than that.
+    #[cfg_attr(
+        not(windows),
+        allow(dead_code, reason = "Only the Windows planar 4:4:4 input is limited.")
+    )]
+    pub fn restrict_maximum(&mut self, limit: (u32, u32)) -> Result<()> {
+        self.maximum = (self.maximum.0.min(limit.0), self.maximum.1.min(limit.1));
+        ensure!(
+            self.init.encodeWidth <= self.maximum.0 && self.init.encodeHeight <= self.maximum.1,
+            "所选画面超出 NVENC 尺寸能力"
+        );
+        Ok(())
     }
 
     pub fn configure_rate(&mut self, rate: Rate) -> Result<bool> {
@@ -543,6 +562,9 @@ impl Session {
                 .structure(if self.api.level < 0xc0 { 4 } else { 6 }, true);
             picture.inputWidth = self.init.encodeWidth;
             picture.inputHeight = self.init.encodeHeight;
+            if input.1 != 0 {
+                picture.inputPitch = input.1;
+            }
             picture.inputBuffer = map.mappedResource;
             picture.bufferFmt = map.mappedBufferFmt;
             picture.outputBitstream = self.bitstream;
@@ -588,7 +610,7 @@ impl Session {
             .to_vec();
             Ok(vec![super::Encoded {
                 format: self.format,
-                color: self.format.color(None),
+                color: self.color.space(None),
                 data: bytes,
                 keyframe: bitstream.pictureType == nv::NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_IDR,
                 is_new: true,
@@ -617,11 +639,12 @@ fn set_rate(
 ) {
     config.rcParams.averageBitRate = rate.target;
     config.rcParams.maxBitRate = rate.peak.max(rate.target);
-    // VBV is a bit allocation window, not queued input frames. AVC/HEVC need
-    // burst headroom for detail; one-frame VBV works better for our AV1 path.
-    // No B frames, lookahead, filler or startup buffer delay for any codec.
+    // VBV is a bit allocation window, not queued input frames. A time floor
+    // preserves detail during IDR recovery at high FPS; retain the existing
+    // larger allowance when input FPS is low. No startup buffering is added.
     let frames = if codec == Codec::Av1 { 1 } else { 5 };
     config.rcParams.vbvBufferSize = (u64::from(rate.target) * frames / u64::from(buffer_fps.max(1)))
+        .max(u64::from(rate.target) / 8)
         .min(u64::from(u32::MAX)) as u32;
     config.rcParams.vbvInitialDelay = 0;
     if codec == Codec::Av1 {

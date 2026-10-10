@@ -67,6 +67,7 @@ pub(crate) struct VideoConfig {
     pub revision: u64,
     pub reported_quality: i32,
     pub format: format::Format,
+    pub color: format::Color,
     // Runtime CaptureSetting scale bounds, separate from initial decoder caps.
     pub requested_maximum: Option<(u32, u32)>,
     pub maximum: (u32, u32),
@@ -88,6 +89,7 @@ impl Default for VideoConfig {
             revision: 0,
             reported_quality: 2,
             format: format::Format::AVC,
+            color: format::Color::Sdr,
             requested_maximum: None,
             maximum: (3840, 2160),
             maximum_fps: 144,

@@ -33,6 +33,11 @@ pub(crate) struct DisplayCapability {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub(crate) struct DeviceCapability {
+    #[serde(default, rename = "openuuyc_preferred_codec", skip_serializing_if = "Option::is_none")]
+    pub preferred_codec: Option<i32>,
+    /// Decoder AND presentation support SDR10 independently from HDR.
+    /// Older receivers advertised ten-bit decode but rendered it as PQ.
+    pub openuuyc_sdr_10bit: bool,
     pub ice_id: String,
     pub display_info: Vec<DisplayCapability>,
     pub video_codec_capability: Vec<CodecCapability>,
@@ -64,6 +69,8 @@ impl FrameQualityCapability {
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub(crate) struct DualCapability {
+    #[serde(skip)]
+    pub preferred_codec: Option<i32>,
     pub remote_display_info: Vec<DisplayCapability>,
     pub local_display_info: Vec<DisplayCapability>,
     pub frame_quality_capability: Vec<FrameQualityCapability>,
@@ -166,6 +173,8 @@ impl DualCapability {
             }
         }
         Self {
+            preferred_codec: local.preferred_codec.filter(|c| matches!(c, 1|2|5))
+                .or(remote.preferred_codec.filter(|c| matches!(c, 1|2|5))),
             remote_display_info: remote.display_info,
             local_display_info: local.display_info.clone(),
             frame_quality_capability: rows,
@@ -195,7 +204,9 @@ impl DualCapability {
         let h264 = self.exact(1, chroma, hdr);
         let h265 = self.exact(2, chroma, hdr);
         let av1 = self.exact(AV1_CODEC_ID, chroma, hdr);
-        for codec in [AV1_CODEC_ID, 2, 1] {
+        let mut order = [AV1_CODEC_ID, 2, 1];
+        order.sort_by_key(|codec| Some(*codec) != self.preferred_codec);
+        for codec in order {
             if let Some(row) = self.preferred_hardware.iter().copied().find(|r| {
                 r.video_codec == codec
                     && r.chroma_sampling == chroma
@@ -208,7 +219,7 @@ impl DualCapability {
                 return row;
             }
         }
-        for row in [av1, h265, h264].into_iter().flatten() {
+        for row in order.into_iter().filter_map(|codec| self.exact(codec, chroma, hdr)) {
             if row.valid() && row.max_frame_quality >= minimum {
                 return row;
             }

@@ -1,25 +1,17 @@
-//! CPU input for the unified Rust software codec. No codec algorithms here:
-//! H.264 takes the captured BGRA as it is, AV1 takes NV12 (4:2:0) or AYUV
-//! (4:4:4), converted here with the matrix and range the stream declares
-//! (BT.601, limited range for SDR), as the Windows GPU conversion does.
+//! CPU input for the Rust H.264 encoder. No codec algorithms here: the
+//! captured BGRA goes in as it is.
 use super::capture::Image;
-use crate::media::encoding::{Encoded, Format, Rate};
+use crate::media::encoding::{Color, Encoded, Format, Rate};
 use anyhow::{Result, ensure};
-use openuuyc_codec::PixelFormat;
 use openuuyc_codec::encoder::{Config, Encoder as Core};
 use std::sync::{Arc, atomic::AtomicBool};
-use yuv::{
-    BufferStoreMut, YuvBiPlanarImageMut, YuvChromaSubsampling, YuvConversionMode,
-    YuvPlanarImageMut, YuvRange, YuvStandardMatrix,
-};
 
 pub(crate) struct Encoder {
     core: Core,
-    /// The converted picture handed to the codec, reused between frames.
-    input: Vec<u8>,
     size: (u32, u32),
     format: Format,
     rate: Rate,
+    frame_rate: crate::media::encoding::rate::Controller,
 }
 impl Encoder {
     /// The formats this side can feed: Linux captures 8-bit SDR only.
@@ -38,10 +30,10 @@ impl Encoder {
         })?;
         Ok(Self {
             core,
-            input: Vec::new(),
             size,
             format,
             rate,
+            frame_rate: crate::media::encoding::rate::Controller::new(rate),
         })
     }
     pub fn request_keyframe(&mut self) {
@@ -51,11 +43,19 @@ impl Encoder {
         openuuyc_codec::encoder::maximum_size(self.format.codec.media())
     }
     pub fn configure(&mut self, rate: Rate) -> Result<bool> {
-        if rate.target != self.rate.target || rate.fps != self.rate.fps {
-            self.core.configure(rate.fps, rate.target)?;
-        }
+        let Some(update) = self.frame_rate.decide(rate) else {
+            return Ok(false);
+        };
+        self.core.configure(update.rate.fps, update.rate.target)?;
         let key = self.rate.quality != rate.quality;
         self.rate = rate;
+        self.frame_rate.commit(update);
+        tracing::debug!(
+            requested_fps = rate.fps,
+            configured_fps = update.rate.fps,
+            target = update.rate.target,
+            "software encoder rate applied"
+        );
         Ok(key)
     }
     pub fn encode(
@@ -66,23 +66,12 @@ impl Encoder {
         cancel: &Arc<AtomicBool>,
     ) -> Result<Vec<Encoded>> {
         ensure!(image.size() == self.size, "采集画面尺寸与编码器不一致");
+        self.frame_rate.input(timestamp);
         if key {
             self.core.request_keyframe();
         }
         let bgra = image.pixels()?;
-        let width = self.size.0;
-        let pitch = match self.core.input_format() {
-            PixelFormat::Bgra => {
-                self.core.prepare(&bgra, width as usize * 4, cancel)?;
-                None
-            }
-            PixelFormat::Nv12 => Some(self.nv12(&bgra)?),
-            PixelFormat::Ayuv => Some(self.ayuv(&bgra)?),
-            other => anyhow::bail!("软件编码输入格式 {other:?} 没有转换"),
-        };
-        if let Some(pitch) = pitch {
-            self.core.prepare(&self.input, pitch, cancel)?;
-        }
+        self.core.prepare(&bgra, self.size.0 as usize * 4, cancel)?;
         Ok(self
             .core
             .encode(timestamp, key, cancel)?
@@ -94,67 +83,17 @@ impl Encoder {
                 is_new: true,
                 timing: None,
                 format: self.format,
-                color: self.format.color(None),
+                color: Color::Sdr.space(None),
             })
             .collect())
-    }
-
-    /// Luma rows, then interleaved UV rows, at a pitch of the width.
-    fn nv12(&mut self, bgra: &[u8]) -> Result<usize> {
-        let (width, height) = self.size;
-        let (w, h) = (width as usize, height as usize);
-        self.input.resize(w * h * 3 / 2, 0);
-        let (y, uv) = self.input.split_at_mut(w * h);
-        let mut image = YuvBiPlanarImageMut {
-            y_plane: BufferStoreMut::Borrowed(y),
-            y_stride: width,
-            uv_plane: BufferStoreMut::Borrowed(uv),
-            uv_stride: width,
-            width,
-            height,
-        };
-        yuv::bgra_to_yuv_nv12(
-            &mut image,
-            bgra,
-            width * 4,
-            YuvRange::Limited,
-            YuvStandardMatrix::Bt601,
-            YuvConversionMode::Balanced,
-        )?;
-        Ok(w)
-    }
-
-    /// Packed V, U, Y, A bytes per pixel, the order AYUV has in memory.
-    fn ayuv(&mut self, bgra: &[u8]) -> Result<usize> {
-        let (width, height) = self.size;
-        let mut planar =
-            YuvPlanarImageMut::<u8>::alloc(width, height, YuvChromaSubsampling::Yuv444);
-        yuv::bgra_to_yuv444(
-            &mut planar,
-            bgra,
-            width * 4,
-            YuvRange::Limited,
-            YuvStandardMatrix::Bt601,
-            YuvConversionMode::Balanced,
-        )?;
-        let pixels = width as usize * height as usize;
-        self.input.resize(pixels * 4, 0);
-        let (y, u, v) = (
-            planar.y_plane.borrow(),
-            planar.u_plane.borrow(),
-            planar.v_plane.borrow(),
-        );
-        for (i, pixel) in self.input.chunks_exact_mut(4).enumerate() {
-            pixel.copy_from_slice(&[v[i], u[i], y[i], 255]);
-        }
-        Ok(width as usize * 4)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::media::encoding::{Codec, QualityTarget};
+    use crate::media::encoding::QualityTarget;
+    use openuuyc_codec::PixelFormat;
 
     /// The converted input must carry the matrix and range the stream
     /// declares: BT.601, limited range. Solid colours go through encoding and
@@ -172,19 +111,7 @@ mod tests {
                 fps: 30,
             },
         };
-        for format in [
-            Format::AVC,
-            Format {
-                codec: Codec::Av1,
-                chroma: 1,
-                depth: 8,
-            },
-            Format {
-                codec: Codec::Av1,
-                chroma: 3,
-                depth: 8,
-            },
-        ] {
+        for format in [Format::AVC] {
             for (name, bgr, expected) in [
                 ("red", [0u8, 0, 255], [81u8, 90, 240]),
                 ("green", [0, 255, 0], [145, 54, 34]),

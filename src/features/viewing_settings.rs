@@ -31,6 +31,8 @@ impl PerformancePanelMode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct DevicePreferences {
+    #[serde(skip_serializing_if="Option::is_none")]
+    pub codec: Option<crate::media::CodecPreference>,
     pub clipboard_sync: bool,
     pub clipboard_files: bool,
     pub control_enabled: bool,
@@ -48,6 +50,7 @@ fn is_true(value: &bool) -> bool {
 impl Default for DevicePreferences {
     fn default() -> Self {
         Self {
+            codec: None,
             clipboard_sync: false,
             clipboard_files: true,
             control_enabled: false,
@@ -62,6 +65,7 @@ impl Default for DevicePreferences {
 }
 impl DevicePreferences {
     fn validate(self) -> Result<Self> {
+        anyhow::ensure!(!self.codec.is_some_and(|codec|codec.restricted()), "设备首选不能包含全局格式限制");
         anyhow::ensure!(
             self.mouse_mode != crate::features::remote_input::MouseMode::View,
             "已保存的鼠标模式无效"
@@ -260,14 +264,9 @@ impl ViewingSettingsStore {
         .await
         .context("麦克风设置保存任务中断")?
     }
-    pub(crate) async fn restore_device(&self, handle: &StreamControlHandle) {
-        // A shared session or an in-memory room replacement already owns newer
-        // intent; a stale credential read must not overwrite it.
-        if handle.device_preferences_loaded() {
-            return;
-        }
+    pub(crate) async fn load_device(&self) -> Result<DevicePreferences> {
         let entry = self.device.clone();
-        let result = tokio::task::spawn_blocking(move || -> Result<DevicePreferences> {
+        tokio::task::spawn_blocking(move || -> Result<DevicePreferences> {
             let bytes = match entry.get_secret() {
                 Ok(bytes) => bytes,
                 Err(Error::NoEntry) => return Ok(DevicePreferences::default()),
@@ -289,7 +288,16 @@ impl ViewingSettingsStore {
         })
         .await
         .context("设备偏好读取任务中断")
-        .and_then(|r| r);
+        .and_then(|r| r)
+    }
+
+    pub(crate) async fn restore_device(&self, handle: &StreamControlHandle) {
+        // A shared session or an in-memory room replacement already owns newer
+        // intent; a stale credential read must not overwrite it.
+        if handle.device_preferences_loaded() {
+            return;
+        }
+        let result = self.load_device().await;
         match result {
             Ok(preferences) => handle.restore_device_preferences(preferences),
             Err(error) => handle.set_device_persistence_error(Some(error.to_string())),

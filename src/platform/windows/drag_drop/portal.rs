@@ -1,5 +1,6 @@
 //! Temporary OLE handoff target on the remote user desktop. Only a real native
-//! file drag can supply paths. The original operation always finishes with NONE.
+//! file drag can supply paths. It is kept alive for a negotiated return; copies
+//! and cancellations end it at the NONE target rather than at an arbitrary app.
 use super::*;
 use std::{
     cell::Cell,
@@ -9,29 +10,38 @@ use std::{
 };
 pub(crate) enum Event {
     Unavailable,
-    Captured(Vec<PathBuf>),
+    Captured(Vec<PathBuf>, bool),
+    Resumed(super::original::Original),
     Released,
     Failed(String),
 }
 pub(crate) struct Portal {
     stop: Arc<AtomicBool>,
+    resume: Arc<Mutex<Option<Position>>>,
 }
 impl Portal {
     pub fn start(
         point: Position,
+        preserve: bool,
         allowed: Arc<dyn Fn() -> bool + Send + Sync>,
         notify: Arc<dyn Fn(Event) + Send + Sync>,
     ) -> Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let ending = stop.clone();
+        let resume = Arc::new(Mutex::new(None));
+        let returning = resume.clone();
         std::thread::Builder::new()
             .name("OLE file handoff".into())
             .spawn(move || {
-                if let Err(error) = run(point, ending, allowed, notify.clone()) {
-                    notify(Event::Failed(error.to_string()));
+                match run(point, preserve, returning, ending, allowed, notify.clone()) {
+                    Ok(event) => notify(event),
+                    Err(error) => notify(Event::Failed(error.to_string())),
                 }
             })?;
-        Ok(Self { stop })
+        Ok(Self { stop, resume })
+    }
+    pub fn resume(&self, point: Position) {
+        *super::super::lock(&self.resume) = Some(point);
     }
 }
 impl Drop for Portal {
@@ -47,6 +57,7 @@ struct Handler {
     left: Rc<Cell<bool>>,
     dropped: Rc<Cell<bool>>,
     notify: Arc<dyn Fn(Event) + Send + Sync>,
+    original: Option<super::original::Original>,
 }
 impl target::Handler for Handler {
     fn enter(&mut self, paths: Vec<PathBuf>, _: POINTL) -> u32 {
@@ -60,7 +71,10 @@ impl target::Handler for Handler {
             if cover_desktop(self.hwnd).is_err() {
                 return 0;
             }
-            (self.notify)(Event::Captured(paths));
+            (self.notify)(Event::Captured(
+                paths,
+                self.original.is_some_and(|v| v.live()),
+            ));
         }
         DROPEFFECT_COPY.0
     }
@@ -102,11 +116,16 @@ unsafe extern "system" fn procedure(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LR
 }
 fn run(
     point: Position,
+    preserve: bool,
+    resume: Arc<Mutex<Option<Position>>>,
     stop: Arc<AtomicBool>,
     allowed: Arc<dyn Fn() -> bool + Send + Sync>,
     notify: Arc<dyn Fn(Event) + Send + Sync>,
-) -> Result<()> {
+) -> Result<Event> {
     ensure!(allowed(), "拖出未获许可");
+    let original = preserve
+        .then(super::original::Original::foreground)
+        .flatten();
     let old = unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
     struct Dpi(DPI_AWARENESS_CONTEXT);
     impl Drop for Dpi {
@@ -163,6 +182,7 @@ fn run(
         left: left.clone(),
         dropped: dropped.clone(),
         notify: notify.clone(),
+        original,
     }));
     let _registration = target::Registration::new(hwnd, handler)?;
     unsafe {
@@ -173,8 +193,19 @@ fn run(
     let deadline = Instant::now() + Duration::from_millis(300);
     let mut released_at: Option<Instant> = None;
     let mut raised_after_leave = false;
+    let mut cancelling: Option<Instant> = None;
     loop {
-        ensure!(!stop.load(Ordering::Acquire) && allowed(), "文件接管已取消");
+        if stop.load(Ordering::Acquire) || !allowed() {
+            if !captured.get() {
+                return Ok(Event::Unavailable);
+            }
+            if cancelling.is_none() {
+                if let Some(original) = original {
+                    original.cancel()?;
+                }
+                cancelling = Some(Instant::now());
+            }
+        }
         let mut msg = MSG::default();
         while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() } {
             unsafe {
@@ -184,10 +215,31 @@ fn run(
         }
         let held = unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) } < 0;
         if captured.get() {
+            if !held && dropped.get() {
+                return Ok(Event::Released);
+            }
+            if let Some(original) = original {
+                if !original.live() && (held || cancelling.is_some()) {
+                    return Ok(Event::Unavailable);
+                }
+            }
+            if let Some(since) = cancelling {
+                ensure!(since.elapsed() < Duration::from_secs(1), "原拖动取消未确认");
+            } else if let Some(position) = super::super::lock(&resume).take() {
+                let original = original
+                    .filter(|v| v.live())
+                    .ok_or_else(|| anyhow::anyhow!("原拖动已结束"))?;
+                ensure!(held, "原鼠标按下已释放");
+                unsafe {
+                    let _ = ShowWindow(hwnd, SW_HIDE);
+                    SetCursorPos(position.x, position.y)?;
+                }
+                // Notify only after run returns and Registration/Window are gone.
+                return Ok(Event::Resumed(original));
+            }
             if !held {
                 if dropped.get() {
-                    notify(Event::Released);
-                    return Ok(());
+                    return Ok(Event::Released);
                 }
                 ensure!(!left.get(), "原文件拖动已取消");
                 // The hardware UP can precede OLE's cross-thread Drop call.
@@ -227,8 +279,7 @@ fn run(
                 }
             }
         } else if !allowed() || stop.load(Ordering::Acquire) || Instant::now() > deadline {
-            notify(Event::Unavailable);
-            return Ok(());
+            return Ok(Event::Unavailable);
         }
         std::thread::sleep(Duration::from_millis(5));
     }

@@ -40,6 +40,8 @@ pub const FILE_SEND_ROW_HEIGHT: f32 = 26.0;
 #[cfg_attr(not(windows), allow(dead_code))]
 pub const FILE_SEND_VISIBLE_ROWS: usize = 5;
 pub const COMPACT_TEXT: f32 = 13.0;
+pub const DIAGNOSTIC_POPUP_WIDTH: f32 = 320.0;
+pub const TASK_PROGRESS_HEIGHT: f32 = 3.0;
 pub const SMALL: f32 = 12.0;
 pub const TINY: f32 = 11.0;
 pub const ICON_STROKE: f32 = 1.35;

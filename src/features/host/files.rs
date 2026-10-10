@@ -147,18 +147,21 @@ pub(super) async fn run(
         if cancel.is_cancelled() || !lease.requested() {
             break;
         }
-        let (generation, ready) = {
+        let (generation, text_ready, file_ready) = {
             let s = lock(&receiver.0);
+            let open = |name| {
+                s.channels
+                    .get(name)
+                    .and_then(Weak::upgrade)
+                    .is_some_and(|c| c.ready_state() == RTCDataChannelState::Open)
+            };
             (
                 s.generation,
-                ["TEXT_DATA_CHANNEL", "FILE_DATA_CHANNEL"].iter().all(|n| {
-                    s.channels
-                        .get(*n)
-                        .and_then(Weak::upgrade)
-                        .is_some_and(|c| c.ready_state() == RTCDataChannelState::Open)
-                }),
+                open("TEXT_DATA_CHANNEL"),
+                open("FILE_DATA_CHANNEL"),
             )
         };
+        let ready = text_ready && file_ready;
         if backend
             .as_ref()
             .is_some_and(|(g, _)| *g != generation || !ready)
@@ -188,9 +191,21 @@ pub(super) async fn run(
         tokio::select! {
             _=cancel.cancelled()=>break,
             _=tick.tick()=>{},
-            packet=input.recv(), if pending.is_none() && ready=>{
+            packet=input.recv(), if pending.is_none() && text_ready=>{
                 let Some((g,packet))=packet else{break};
-                if g==generation{pending=Some((if backend.is_some(){revision}else{u64::MAX},packet));}
+                if g != generation {continue;}
+                // A viewing peer need not have a FILE channel. Answer only its
+                // global settings here, without starting a file executor. Real
+                // file RPCs retain their original both-channels-ready gate.
+                if !file_ready && executor::settings_requested(&packet).unwrap_or(false) {
+                    if let Ok(Some(reply)) = executor::reject(&packet, 8) {
+                        if let Err(e) = send(&receiver,generation,reply,&cancel,&lease,&sequence).await {
+                            lease.file_status(Status{active:false,error:Some(e.to_string())});break;
+                        }
+                    }
+                } else {
+                    pending=Some((if backend.is_some(){revision}else{u64::MAX},packet));
+                }
             },
             permit=async{match &sender{Some(tx)=>tx.reserve().await,None=>std::future::pending().await}}, if pending.is_some()=>{
                 let Ok(permit)=permit else{break};
@@ -214,11 +229,14 @@ pub(super) async fn run(
 async fn send(
     receiver: &Receiver,
     generation: u64,
-    packet: executor::Packet,
+    mut packet: executor::Packet,
     cancel: &CancellationToken,
     lease: &Lease,
     sequence: &std::sync::atomic::AtomicI64,
 ) -> Result<()> {
+    // METRIC_SETTING is shared by the video and file pages. Its control flag
+    // belongs to this session, even when assistance/guest/file policy forbids IO.
+    let settings = executor::Settings::decode(&packet.data)?;
     let rejection = executor::failure_reply(&packet.data)?;
     tracing::debug!(
         file_channel = packet.file,
@@ -226,7 +244,7 @@ async fn send(
         rejection,
         "host file response sending"
     );
-    if !lease.file_access() && !rejection {
+    if !lease.requested() || (!lease.file_access() && !rejection && settings.is_none()) {
         return Ok(());
     }
     let channel = {
@@ -243,7 +261,7 @@ async fn send(
     };
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while channel.buffered_amount().await + packet.data.len() > 2 * 1024 * 1024 {
-        if !lease.file_access() && !rejection {
+        if !lease.requested() || (!lease.file_access() && !rejection && settings.is_none()) {
             return Ok(());
         }
         ensure!(
@@ -256,8 +274,18 @@ async fn send(
         !cancel.is_cancelled() && channel.ready_state() == RTCDataChannelState::Open,
         "文件通道未就绪"
     );
-    if !lease.file_access() && !rejection {
+    if !lease.requested() || (!lease.file_access() && !rejection && settings.is_none()) {
         return Ok(());
+    }
+    ensure!(lock(&receiver.0).generation == generation, "文件通道已替换");
+    if let Some(settings) = settings {
+        let file_allowed = lease.file_access();
+        packet = settings.authorized(file_allowed);
+        tracing::debug!(
+            control_allowed = 2,
+            file_allowed,
+            "host session settings response sending"
+        );
     }
     let data = packet.stamped(sequence.fetch_add(1, Ordering::Relaxed))?;
     let bytes = bytes::Bytes::from(data);

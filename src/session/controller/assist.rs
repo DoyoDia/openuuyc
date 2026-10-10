@@ -120,6 +120,7 @@ pub(super) async fn resolve(
         target_device_id: String::new(),
         controller_device_id,
         profile,
+        default_codec: profile.codec,
         transport: options.transport,
         summary: ConnectionSummary {
             alias: alias.into(),

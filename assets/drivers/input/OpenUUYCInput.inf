@@ -4,7 +4,7 @@ Class=System
 ClassGuid={4D36E97D-E325-11CE-BFC1-08002BE10318}
 Provider=%Provider%
 CatalogFile=OpenUUYCInput.cat
-DriverVer=09/27/2026,1.0.0.4
+DriverVer=10/09/2026,1.0.0.6
 PnpLockdown=1
 
 [Manufacturer]

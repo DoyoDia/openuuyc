@@ -1,9 +1,11 @@
 //! User-desktop OLE drag source. Transport and file ownership stay with callers.
 //! Only this STA's OLE capture window receives synthetic loop notifications;
 //! we do not press a mouse button in an arbitrary destination application.
+pub(crate) mod appearance;
+pub(crate) mod original;
 pub(crate) mod portal;
-pub(crate) mod target;
 pub(crate) mod send_target;
+pub(crate) mod target;
 use anyhow::{Result, ensure};
 use std::{
     cell::RefCell,
@@ -36,6 +38,29 @@ use windows::{
 pub(crate) struct Position {
     pub x: i32,
     pub y: i32,
+}
+/// The OLE loop of a drag handed off to the peer can be resumed when the
+/// drag re-enters the viewer (`NATIVE_RETURN`).
+pub(crate) const RETURN_CAPABLE: bool = true;
+pub(crate) fn left_held() -> bool {
+    unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) < 0 }
+}
+pub(crate) fn wake_viewer(owner: u64) {
+    let hwnd = HWND(owner as _);
+    let mut point = POINT::default();
+    unsafe {
+        let mut process = 0;
+        GetWindowThreadProcessId(hwnd, Some(&mut process));
+        if process != windows::Win32::System::Threading::GetCurrentProcessId()
+            || GetForegroundWindow() != hwnd
+        {
+            return;
+        }
+        if GetCursorPos(&mut point).is_ok() && ScreenToClient(hwnd, &mut point).as_bool() {
+            let xy = LPARAM(((point.x as u16 as u32) | ((point.y as u16 as u32) << 16)) as isize);
+            let _ = PostMessageW(Some(hwnd), WM_MOUSEMOVE, WPARAM(0), xy);
+        }
+    }
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {

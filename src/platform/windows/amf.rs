@@ -102,6 +102,7 @@ impl Encoder {
         size: (u32, u32),
         format: Format,
         rate: Rate,
+        color: super::format::Color,
     ) -> Result<Self> {
         ensure!(format.valid(), "AMF输入格式无效");
         let usages: &[i64] = if format.codec == Codec::H265 {
@@ -119,9 +120,9 @@ impl Encoder {
             for &compute in paths {
                 let candidate = (|| {
                     let conversion = if compute {
-                        Conversion::compute(device, size, format, 1)?
+                        Conversion::compute(device, size, format, 1, color)?
                     } else {
-                        Conversion::pixel(device, size, format, 1)?
+                        Conversion::pixel(device, size, format, 1, color)?
                     };
                     Self::create(device, size, format, rate, conversion, usage)
                 })();
@@ -175,11 +176,11 @@ impl Encoder {
             )?;
             let mut component = ptr::null_mut();
             let id = wide(if format.codec == Codec::Av1 {
-                b"AMFVideoEncoderHW_AV1\0"
+                a::AMFVideoEncoder_AV1
             } else if format.codec == Codec::H264 {
-                b"AMFVideoEncoderVCE_AVC\0"
+                a::AMFVideoEncoderVCE_AVC
             } else {
-                b"AMFVideoEncoder_HEVC\0"
+                a::AMFVideoEncoder_HEVC
             });
             check(
                 factory_vt
@@ -233,7 +234,11 @@ impl Encoder {
                 this.set_initial(
                     b"RateControlMethod\0",
                     b"HevcRateControlMethod\0",
-                    integer(2),
+                    // AVC latency-constrained VBR reduces coded repeats during
+                    // scene/IDR recovery at the same target and peak budget.
+                    // Select it before Init; runtime property acceptance alone
+                    // does not establish that this driver changed its RC mode.
+                    integer(if format.codec == Codec::H264 { 3 } else { 2 }),
                 )?;
                 this.set_initial(b"FrameRate\0", b"HevcFrameRate\0", frame_rate(rate.fps))?;
                 this.set_initial(
@@ -259,6 +264,24 @@ impl Encoder {
                     boolean(false),
                 )?;
                 this.set_initial(b"QueryTimeout\0", b"HevcQueryTimeout\0", integer(10))?;
+                this.set_initial(
+                    b"LowLatencyInternal\0",
+                    b"LowLatencyInternal\0",
+                    boolean(true),
+                )?;
+                // Keep overflow protection: disabling it can exceed the target
+                // substantially on difficult AVC content. Runtime VBV headroom
+                // reduces the repeated pictures caused by ordinary IDR bursts.
+                this.set_initial(
+                    b"RateControlSkipFrameEnable\0",
+                    b"HevcRateControlSkipFrameEnable\0",
+                    boolean(true),
+                )?;
+                this.set_initial(
+                    b"FillerDataEnable\0",
+                    b"HevcFillerDataEnable\0",
+                    boolean(false),
+                )?;
                 if format.codec == Codec::H264 {
                     for (name, value) in [
                         (b"BPicturesPattern\0".as_slice(), integer(0)),
@@ -281,7 +304,14 @@ impl Encoder {
                         this.set_initial(name, name, integer(value))?;
                     }
                 }
-                let color = format.color(None);
+                let color = this.conversion.color.space(None);
+                // The GPU conversion already produced YUV. Explicitly describe
+                // that matrix/range instead of AMF's size-dependent defaults.
+                this.set_initial(
+                    a::AMF_VIDEO_ENCODER_OUTPUT_COLOR_PROFILE,
+                    a::AMF_VIDEO_ENCODER_HEVC_OUTPUT_COLOR_PROFILE,
+                    integer(color_profile(this.conversion.color)),
+                )?;
                 if format.codec == Codec::H265 {
                     this.enable_multi_hw();
                 }
@@ -324,6 +354,7 @@ impl Encoder {
                 "Encoder Init",
             )?;
             this.maximum = this.query_maximum(native).unwrap_or(size);
+            this.report_parameters("initialized");
             ensure!(
                 size.0 <= this.maximum.0 && size.1 <= this.maximum.1,
                 "AMF尺寸超出实际能力"
@@ -343,7 +374,7 @@ impl Encoder {
                 let caps = Owned::<a::AMFCaps>::take(caps)?;
                 let mut value = a::AMFVariantStruct::default();
                 let name = if self.format.codec == Codec::Av1 {
-                    b"Av1MaxBitrate\0".as_slice()
+                    a::AMF_VIDEO_ENCODER_AV1_CAP_MAX_BITRATE
                 } else if self.format.codec == Codec::H265 {
                     b"HevcMaxBitrate\0".as_slice()
                 } else {
@@ -375,6 +406,71 @@ impl Encoder {
             }
         }
         rate
+    }
+    fn report_parameters(&self, stage: &str) {
+        if !tracing::enabled!(tracing::Level::DEBUG) {
+            return;
+        }
+        let Some(component) = self.component.as_ref() else {
+            return;
+        };
+        let Some(get) = component.vt().GetProperty else {
+            return;
+        };
+        let mut values = serde_json::Map::new();
+        for (avc, hevc) in [
+            ("FrameRate", "HevcFrameRate"),
+            ("TargetBitrate", "HevcTargetBitrate"),
+            ("PeakBitrate", "HevcPeakBitrate"),
+            ("VBVBufferSize", "HevcVBVBufferSize"),
+            ("Usage", "HevcUsage"),
+            ("QualityPreset", "HevcQualityPreset"),
+            ("RateControlMethod", "HevcRateControlMethod"),
+            ("QueryTimeout", "HevcQueryTimeout"),
+            ("LowLatencyInternal", "LowLatencyInternal"),
+            ("EnablePreAnalysis", "HevcEnablePreAnalysis"),
+            (
+                "RateControlPreanalysisEnable",
+                "HevcRateControlPreAnalysisEnable",
+            ),
+            (
+                "RateControlSkipFrameEnable",
+                "HevcRateControlSkipFrameEnable",
+            ),
+            ("EnforceHRD", "HevcEnforceHRD"),
+            ("FillerDataEnable", "HevcFillerDataEnable"),
+            ("MinQP", "HevcMinQP_I"),
+            ("MaxQP", "HevcMaxQP_I"),
+        ] {
+            let name = match self.format.codec {
+                Codec::H264 => avc.to_owned(),
+                Codec::H265 => hevc.to_owned(),
+                Codec::Av1 => format!("Av1{avc}"),
+            };
+            let mut value = a::AMFVariantStruct::default();
+            unsafe {
+                let result = get(
+                    component.raw(),
+                    wide(format!("{name}\0").as_bytes()).as_ptr(),
+                    &mut value,
+                );
+                if result != a::AMF_RESULT_AMF_OK {
+                    values.insert(name, serde_json::json!({"status":result}));
+                    continue;
+                }
+                let field = match value.type_ {
+                    1 => serde_json::json!(value.__bindgen_anon_1.boolValue != 0),
+                    2 => serde_json::json!(value.__bindgen_anon_1.int64Value),
+                    7 => {
+                        let r = value.__bindgen_anon_1.rateValue;
+                        serde_json::json!({"num":r.num,"den":r.den})
+                    }
+                    _ => serde_json::json!({"type":value.type_}),
+                };
+                values.insert(name, field);
+            }
+        }
+        tracing::debug!(stage,?self.format,parameters=%serde_json::Value::Object(values),"AMF reported encoder parameters");
     }
     fn set_initial(&self, avc: &[u8], hevc: &[u8], value: a::AMFVariantStruct) -> Result<()> {
         let result = self.set(avc, hevc, value);
@@ -412,60 +508,75 @@ impl Encoder {
                     name.as_ptr(),
                     value,
                 ),
-                &String::from_utf16_lossy(&name),
+                &String::from_utf16_lossy(name.strip_suffix(&[0]).unwrap_or(&name)),
             )
         }
     }
     fn configure_av1(&self, size: (u32, u32), rate: Rate) -> Result<()> {
-        let color = self.format.color(None);
+        let color = self.conversion.color.space(None);
         for (name, value) in [
-            (b"Av1Usage\0".as_slice(), 2),
-            (b"Av1EncodingLatencyMode\0", 3),
-            (b"Av1QualityPreset\0", 100),
-            (b"Av1Profile\0", 1),
+            (a::AMF_VIDEO_ENCODER_AV1_USAGE, 2),
+            (a::AMF_VIDEO_ENCODER_AV1_ENCODING_LATENCY_MODE, 3),
+            (a::AMF_VIDEO_ENCODER_AV1_QUALITY_PRESET, 100),
+            (a::AMF_VIDEO_ENCODER_AV1_PROFILE, 1),
             (
-                b"Av1OutputColorProfile\0",
-                if self.format.hdr() { 5 } else { 0 },
+                a::AMF_VIDEO_ENCODER_AV1_OUTPUT_COLOR_PROFILE,
+                color_profile(self.conversion.color),
             ),
-            (b"Av1ColorBitDepth\0", self.format.depth as i64),
-            (b"Av1RateControlMethod\0", 1),
-            (b"Av1TargetBitrate\0", rate.target as i64),
-            (b"Av1PeakBitrate\0", rate.peak.max(rate.target) as i64),
             (
-                b"Av1VBVBufferSize\0",
+                a::AMF_VIDEO_ENCODER_AV1_COLOR_BIT_DEPTH,
+                self.format.depth as i64,
+            ),
+            (a::AMF_VIDEO_ENCODER_AV1_RATE_CONTROL_METHOD, 1),
+            (a::AMF_VIDEO_ENCODER_AV1_TARGET_BITRATE, rate.target as i64),
+            (
+                a::AMF_VIDEO_ENCODER_AV1_PEAK_BITRATE,
+                rate.peak.max(rate.target) as i64,
+            ),
+            (
+                a::AMF_VIDEO_ENCODER_AV1_VBV_BUFFER_SIZE,
                 i64::from(rate.target / rate.fps.max(1)),
             ),
-            (b"Av1InitialVBVBufferFullness\0", 0),
-            (b"Av1GOPSize\0", 0),
-            (b"Av1HeaderInsertionMode\0", 2),
-            (b"Av1NumTemporalLayers\0", 1),
-            (b"Av1QueryTimeout\0", 10),
-            (b"Av1OutputColorPrimaries\0", color.primaries as i64),
-            (b"Av1OutputColorTransferChar\0", color.transfer as i64),
-            (b"Av1OutMatrixCoeff\0", color.matrix as i64),
+            (a::AMF_VIDEO_ENCODER_AV1_INITIAL_VBV_BUFFER_FULLNESS, 0),
+            (a::AMF_VIDEO_ENCODER_AV1_INTRA_PERIOD, 0),
+            (a::AMF_VIDEO_ENCODER_AV1_HEADER_INSERTION_MODE, 2),
+            (a::AMF_VIDEO_ENCODER_AV1_NUM_TEMPORAL_LAYERS, 1),
+            (a::AMF_VIDEO_ENCODER_AV1_QUERY_TIMEOUT, 10),
+            (
+                a::AMF_VIDEO_ENCODER_AV1_OUTPUT_COLOR_PRIMARIES,
+                color.primaries as i64,
+            ),
+            (
+                a::AMF_VIDEO_ENCODER_AV1_OUTPUT_TRANSFER_CHARACTERISTIC,
+                color.transfer as i64,
+            ),
+            (
+                a::AMF_VIDEO_ENCODER_AV1_OUTPUT_MATRIX_COEFF,
+                color.matrix as i64,
+            ),
         ] {
             self.set(name, name, integer(value))?;
         }
         for name in [
-            b"Av1EnablePreAnalysis\0".as_slice(),
-            b"Av1RateControlPreEncode\0",
-            b"Av1TileGroupObu\0",
-            b"Av1EnforceHRD\0",
-            b"Av1FillerData\0",
+            a::AMF_VIDEO_ENCODER_AV1_PRE_ANALYSIS_ENABLE,
+            a::AMF_VIDEO_ENCODER_AV1_RATE_CONTROL_PREENCODE,
+            a::AMF_VIDEO_ENCODER_AV1_TILE_GROUP_OBU,
+            a::AMF_VIDEO_ENCODER_AV1_ENFORCE_HRD,
+            a::AMF_VIDEO_ENCODER_AV1_FILLER_DATA,
         ] {
             self.set(name, name, boolean(false))?;
         }
         // Older AV1 runtimes have no B-picture properties and only encode
         // forward frames. On runtimes exposing them, keep reordering disabled.
         for name in [
-            b"Av1MaxConsecutiveBPictures\0".as_slice(),
-            b"Av1BPicturesPattern\0",
+            a::AMF_VIDEO_ENCODER_AV1_MAX_CONSECUTIVE_BPICTURES,
+            a::AMF_VIDEO_ENCODER_AV1_B_PIC_PATTERN,
         ] {
             self.set_initial(name, name, integer(0))?;
         }
         self.set(
-            b"Av1FrameSize\0",
-            b"Av1FrameSize\0",
+            a::AMF_VIDEO_ENCODER_AV1_FRAMESIZE,
+            a::AMF_VIDEO_ENCODER_AV1_FRAMESIZE,
             a::AMFVariantStruct {
                 type_: 5,
                 __bindgen_anon_1: a::AMFVariantStruct__bindgen_ty_1 {
@@ -476,7 +587,11 @@ impl Encoder {
                 },
             },
         )?;
-        self.set(b"Av1FrameRate\0", b"Av1FrameRate\0", frame_rate(rate.fps))
+        self.set(
+            a::AMF_VIDEO_ENCODER_AV1_FRAMERATE,
+            a::AMF_VIDEO_ENCODER_AV1_FRAMERATE,
+            frame_rate(rate.fps),
+        )
     }
     fn enable_multi_hw(&self) {
         let result = (|| -> Result<()> {
@@ -591,17 +706,7 @@ impl Encoder {
             self.set(
                 b"VBVBufferSize\0",
                 b"HevcVBVBufferSize\0",
-                integer(
-                    vbv(rate)
-                        * if self.format.codec != Codec::Av1
-                            && rate.peak.max(rate.target) < 120_000_000
-                        {
-                            5
-                        } else {
-                            1
-                        }
-                        / i64::from(update.buffer_fps.max(1)),
-                ),
+                integer(runtime_vbv(rate, self.format.codec, update.buffer_fps)),
             ),
             self.set(
                 b"PeakBitrate\0",
@@ -616,6 +721,7 @@ impl Encoder {
         self.rate = requested;
         self.configured_fps = update.rate.fps;
         self.frame_rate.commit(update);
+        self.report_parameters("reconfigured");
         Ok(changed_quality)
     }
     pub fn encode(
@@ -661,8 +767,11 @@ impl Encoder {
                         ]
                     } else if self.format.codec == Codec::Av1 {
                         vec![
-                            (b"Av1ForceFrameType\0", integer(1)),
-                            (b"Av1ForceInsertSequenceHeader\0", boolean(true)),
+                            (a::AMF_VIDEO_ENCODER_AV1_FORCE_FRAME_TYPE, integer(1)),
+                            (
+                                a::AMF_VIDEO_ENCODER_AV1_FORCE_INSERT_SEQUENCE_HEADER,
+                                boolean(true),
+                            ),
                         ]
                     } else {
                         vec![
@@ -757,7 +866,7 @@ impl Encoder {
             );
             let mut kind = a::AMFVariantStruct::default();
             let name = wide(if self.format.codec == Codec::Av1 {
-                b"Av1OutputFrameType\0"
+                a::AMF_VIDEO_ENCODER_AV1_OUTPUT_FRAME_TYPE
             } else if self.format.codec == Codec::H264 {
                 b"OutputDataType\0"
             } else {
@@ -788,7 +897,7 @@ impl Encoder {
                 is_new: true,
                 timing: None,
                 format: self.format,
-                color: self.format.color(None),
+                color: self.conversion.color.space(None),
             };
             self.pending = None;
             Ok(vec![frame])
@@ -797,6 +906,28 @@ impl Encoder {
 }
 fn vbv(rate: Rate) -> i64 {
     i64::from(rate.peak.max(rate.target))
+}
+fn runtime_vbv(rate: Rate, codec: Codec, fps: u32) -> i64 {
+    let frames = if codec != Codec::Av1 && rate.peak.max(rate.target) < 120_000_000 {
+        5
+    } else {
+        1
+    };
+    let original = vbv(rate) * frames / i64::from(fps.max(1));
+    if codec == Codec::Av1 {
+        original
+    } else {
+        // AMF needs more transient allocation than NVENC to recover an IDR
+        // without a run of duplicate pictures. Preserve lower-FPS headroom.
+        original.max(vbv(rate) / 5)
+    }
+}
+fn color_profile(color: super::format::Color) -> i64 {
+    if color.is_hdr() {
+        a::AMF_VIDEO_CONVERTER_COLOR_PROFILE_ENUM_AMF_VIDEO_CONVERTER_COLOR_PROFILE_FULL_2020.into()
+    } else {
+        a::AMF_VIDEO_CONVERTER_COLOR_PROFILE_ENUM_AMF_VIDEO_CONVERTER_COLOR_PROFILE_601.into()
+    }
 }
 impl Drop for Encoder {
     fn drop(&mut self) {

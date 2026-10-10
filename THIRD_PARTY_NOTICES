@@ -33,15 +33,11 @@ crates/codec/kernels/av1/src/bitstream/syntax/warp.rs adapts dav1d warpmv.c shea
 and reciprocal constants at 9a275d0c9296f2c0ded9d0dd28f99cf22dea2572.
 BSD-2-Clause; see crates/codec/kernels/av1/licenses/COPYING.dav1d.
 
-AV1 streaming software encoder:
-crates/codec/kernels/av1/src/encoder derives from rav1e 31435de9d76fddd38f6dcc31d4014574cebb2092,
-retaining its Rust coding algorithms and SIMD assembly with original notices.
-The local integration adds immediate-output streaming, live rate changes and
-cooperative cancellation; film grain, scene lookahead, temporal-importance
-analysis and two-pass processing are removed.
-Copyright (c) The rav1e contributors. BSD-2-Clause and AOM patent grant;
-see crates/codec/kernels/av1/licenses/COPYING.rav1e and crates/codec/kernels/av1/licenses/PATENTS.rav1e.
-Source: https://github.com/xiph/rav1e
+AV1 decoder SIMD attribution:
+The retained dav1d decoder assembly includes contributions from rav1e authors
+in src/decoder/x86/cdef16_sse.asm and itx16_sse.asm. Original BSD notices
+remain in those files; see crates/codec/kernels/av1/licenses/COPYING.rav1e
+and PATENTS.rav1e for the retained upstream notices and patent grant.
 
 Windows NVENC hardware encoder ABI bindings:
 vendor/nvenc-sys/ retains the NVENC-only Windows bindings, GUIDs, version

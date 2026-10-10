@@ -56,6 +56,7 @@ impl Receiver {
     pub fn official_drop(&self, catalog: Option<crate::account::feature_ability::FeatureCatalog>) {
         super::lock(&self.0).official_drop = catalog;
     }
+    /// Negotiated capability, independent of the initial audio/file/view purpose.
     pub fn native(&self, enabled: bool) {
         super::lock(&self.0).native = enabled;
     }
@@ -127,7 +128,7 @@ pub(super) async fn run(
     cancel: CancellationToken,
     platform: PeerPlatform,
     input: super::input::Receiver,
-    screens: impl Fn() -> Vec<crate::media::capture::Screen> + Send + Sync + 'static,
+    screens: impl Fn() -> (Vec<crate::media::capture::Screen>, bool) + Send + Sync + 'static,
 ) {
     let mut tick = tokio::time::interval(Duration::from_millis(100));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -187,7 +188,7 @@ async fn binding(
     platform: PeerPlatform,
     channel: Arc<RTCDataChannel>,
     input: &super::input::Receiver,
-    screens: &impl Fn() -> Vec<crate::media::capture::Screen>,
+    screens: &impl Fn() -> (Vec<crate::media::capture::Screen>, bool),
 ) -> Result<()> {
     let (generation, mut rx) = {
         let mut state = super::lock(&receiver.0);
@@ -216,6 +217,7 @@ async fn binding(
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut permission = None;
     let mut send_permission = None;
+    let mut native_permission = None;
     let result = async {
         loop {
             if cancel.is_cancelled() || !lease.requested() { break; }
@@ -226,17 +228,21 @@ async fn binding(
                 enabled: settings.enabled && level >= 1 && connected.load(Ordering::Acquire),
                 files: settings.files && level >= 2,
             };
-            let current_screens = screens();
+            let (current_screens, viewing) = screens();
             let native = {
                 let s = super::lock(&receiver.0);
                 crate::features::drag_drop::HostPolicy {
                     token: if s.native { s.token } else { 0 },
-                    enabled: s.native && !native_failed && lease.file_access() && connected.load(Ordering::Acquire)
+                    enabled: s.native && viewing && !native_failed && lease.file_access() && connected.load(Ordering::Acquire)
                         && s.file.upgrade().is_some_and(|c| c.ready_state() == webrtc::data_channel::data_channel_state::RTCDataChannelState::Open),
                     screens: current_screens,
                 }
             };
-            let official_drop = !native.enabled && policy.enabled && policy.files && lease.file_access()
+            if native_permission != Some(native.enabled) {
+                tracing::info!(enabled=native.enabled, capability=native.token!=0, viewing, "native file drag availability changed");
+                native_permission=Some(native.enabled);
+            }
+            let official_drop = viewing && !native.enabled && policy.enabled && policy.files && lease.file_access()
                 && super::lock(&receiver.0).official_drop.as_ref().is_some_and(|c|
                     c.published(platform, crate::account::feature_ability::Feature::FileDrop));
             if send_permission != Some(official_drop) {
@@ -266,6 +272,9 @@ async fn binding(
                 },
                 packet=backend.next()=>{
                     let Some(packet)=packet else { anyhow::bail!(backend.status().error.unwrap_or_else(|| "剪贴板用户会话已结束".into())); };
+                    // The user agent publishes pointer ownership before its
+                    // handoff reply. Apply it before the peer can resume input.
+                    input.drag_pointer(backend.status().dragging);
                     // Finish each SCTP enqueue, then observe cancellation; never tear a reliable message in half.
                     if packet.bulk {
                         if bulk_tx.try_send(packet).is_err() { native_failed=true; }

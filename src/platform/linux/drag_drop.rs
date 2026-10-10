@@ -6,6 +6,8 @@
 //! mouse button: a drag placed from the peer moves the pointer and talks to
 //! whatever window lies under it, and a drag the local user carries out of the
 //! viewer follows the real pointer until its button comes up.
+pub(crate) mod appearance;
+pub(crate) mod original;
 pub(crate) mod portal;
 pub(crate) mod send_target;
 mod xdnd;
@@ -41,6 +43,27 @@ pub(crate) struct Position {
     pub x: i32,
     pub y: i32,
 }
+/// Whether this side can hand a file drag back to its original gesture
+/// when it re-enters the viewer (`NATIVE_RETURN`). The Windows side does it
+/// through OLE; XDND has no counterpart here yet, so it is not offered and
+/// both ends treat a drag out as final.
+pub(crate) const RETURN_CAPABLE: bool = false;
+
+/// Whether the left mouse button is down on the local display.
+pub(crate) fn left_held() -> bool {
+    (|| -> Result<bool> {
+        let (connection, screen) = x11rb::connect(None)?;
+        let root = connection.setup().roots[screen].root;
+        let pointer = connection.query_pointer(root)?.reply()?;
+        Ok(pointer.mask.contains(KeyButMask::BUTTON1))
+    })()
+    .unwrap_or(false)
+}
+
+/// Only used once a returned drag is restored, which `RETURN_CAPABLE`
+/// rules out here.
+pub(crate) fn wake_viewer(_owner: u64) {}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
     Dragging,

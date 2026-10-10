@@ -200,7 +200,7 @@ pub(super) struct DecoderConfig {
     pub(super) width: u32,
     pub(super) height: u32,
     pub(super) frame_rate: u32,
-    pub(super) hardware_decode: bool,
+    pub(super) decoder: crate::media::selection::DecoderPreference,
     pub(super) software_decode: Arc<AtomicBool>,
     pub(super) decode_enabled: Arc<AtomicBool>,
     pub(super) decode_idle: tokio::sync::watch::Sender<u64>,
@@ -224,7 +224,7 @@ pub(super) fn decoder_manager(
     if shutdown.load(Ordering::Acquire) {
         return;
     }
-    tracing::debug!(codec = ?config.codec, hardware_decode = config.hardware_decode,
+    tracing::debug!(codec = ?config.codec, decoder = ?config.decoder,
         "native decoder initialization deferred until the first frame's parameter sets");
     let mut active_codec = config.codec;
     // Only log the format when it actually changes, not once per frame.
@@ -349,7 +349,7 @@ pub(super) fn decoder_manager(
                         width,
                         height,
                         config.frame_rate,
-                        config.hardware_decode,
+                        config.decoder,
                         pool_extra.unwrap_or_default(),
                     );
                     pool = Some(opened_pool);
@@ -368,22 +368,12 @@ pub(super) fn decoder_manager(
         }
         let pool = pool.as_mut().expect("decoder opened before admission");
         pool.set_notification(notification.clone());
-        let mut render_color = frame
+        let render_color = frame
             .color_space
             .map(|color| color.rendering())
             .unwrap_or_default();
-        // Current UU's renderer uses the received bit_depth_minus8 (CA7F90 /
-        // CADDF0 / CAC0C0), not the pending UI checkbox, to select HDR output.
-        // In this product's wire contract high-bit-depth video is the HDR path.
-        render_color.hdr_peak_nits = format
-            .or(pool.format())
-            .filter(|f| f.bit_depth_luma > 8)
-            .map(|_| {
-                frame
-                    .color_space
-                    .and_then(|c| c.hdr_metadata)
-                    .map_or(1000, |m| m.max_luminance)
-            });
+        // Bit depth controls sample precision, not the transfer function.
+        // Preserve explicit SDR/PQ metadata through to the renderer.
         timings.push_back(FrameTiming {
             is_new_picture: frame.is_new_picture,
             color: render_color,
@@ -644,7 +634,7 @@ pub(super) fn open_decoder_with_metadata(
             width,
             height,
             config.frame_rate,
-            config.hardware_decode,
+            config.decoder,
             extra,
             surface_writer,
         ),
@@ -653,7 +643,7 @@ pub(super) fn open_decoder_with_metadata(
             width,
             height,
             config.frame_rate,
-            config.hardware_decode,
+            config.decoder,
             extra,
         ),
     };

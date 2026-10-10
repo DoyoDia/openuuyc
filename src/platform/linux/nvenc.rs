@@ -10,7 +10,7 @@ use super::cuda::{Buffer, Context};
 use crate::media::encoding::nvenc::{
     NV_ENC_BUFFER_FORMAT, NV_ENC_DEVICE_TYPE, NV_ENC_INPUT_RESOURCE_TYPE, Registered, Session,
 };
-use crate::media::encoding::{Encoded, Format, Rate};
+use crate::media::encoding::{Color, Encoded, Format, Rate};
 use anyhow::{Result, ensure};
 use std::sync::Arc;
 
@@ -44,6 +44,7 @@ impl Encoder {
             size.1,
             rate,
             format,
+            Color::Sdr,
         )?;
         let registered = session.register(
             NV_ENC_INPUT_RESOURCE_TYPE::NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR,
@@ -124,7 +125,7 @@ mod tests {
                 fps: 60,
             },
         };
-        let colour = crate::media::encoding::Format::AVC.color(None);
+        let colour = Color::Sdr.space(None);
         println!("declared VUI: {colour:?}");
         for (name, bgr, bt601, bt709) in [
             ("red", [0u8, 0, 255], (81, 90, 240), (63, 102, 240)),

@@ -350,6 +350,7 @@ pub struct StreamControlHandle {
     clipboard: crate::features::clipboard::Clipboard,
     drag_drop: crate::features::drag_drop::controller::Controller,
     files: Arc<crate::features::file_transfer::Transport>,
+    diagnostics: crate::diagnostics::remote::Controller,
     mouse: crate::features::remote_input::RemoteInput,
     cursor: crate::features::remote_cursor::RemoteCursorState,
     audio: crate::media::audio::AudioPlayback,
@@ -620,6 +621,7 @@ impl StreamControlHandle {
                 clipboard: crate::features::clipboard::Clipboard::new(),
                 drag_drop: Default::default(),
                 files: Arc::new(crate::features::file_transfer::Transport::default()),
+                diagnostics: Default::default(),
                 mouse,
                 cursor,
                 audio,
@@ -672,6 +674,10 @@ impl StreamControlHandle {
         &self.files
     }
 
+    pub(crate) fn diagnostics(&self) -> &crate::diagnostics::remote::Controller {
+        &self.diagnostics
+    }
+
     pub fn snapshot(&self) -> StreamControlSnapshot {
         let mut state = lock(&self.shared);
         expire_cursor_request(&mut state);
@@ -719,7 +725,7 @@ impl StreamControlHandle {
                 .and_then(|cap| quality_from_capability(cap.max_frame_quality)),
             mouse_preference: state.device_preferences.mouse_mode,
             mouse_mode: state.mouse.mode(),
-            mouse_pending: state.mouse.waiting_for_neutral(),
+            mouse_pending: state.mouse.waiting_for_neutral() || state.mouse.transport_recovering(),
             mouse_error: state.mouse.error(),
             cursor_pending: state.cursor_pending.is_some(),
             cursor_error: state.cursor_error.clone(),

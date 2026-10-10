@@ -1,5 +1,5 @@
 //! Shared D3D11 input contract for NVENC, AMF and QSV. No raw CPU readback.
-use super::format::Format;
+use super::format::{Color, Format};
 use anyhow::{Context, Result, ensure};
 use windows::Win32::Graphics::{
     Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, Direct3D11::*, Dxgi::Common::*,
@@ -10,6 +10,7 @@ pub(crate) struct Conversion {
     context: ID3D11DeviceContext,
     engine: Engine,
     pub output: ID3D11Texture2D,
+    pub color: Color,
     size: (u32, u32),
 }
 enum Engine {
@@ -32,44 +33,66 @@ impl Conversion {
             Engine::Pixel { .. } => D3D11_BIND_RENDER_TARGET.0 as u32,
         }
     }
-    pub fn new(device: &ID3D11Device, size: (u32, u32), format: Format) -> Result<Self> {
-        Self::aligned(device, size, format, 1)
+    pub fn new(
+        device: &ID3D11Device,
+        size: (u32, u32),
+        format: Format,
+        color: Color,
+    ) -> Result<Self> {
+        Self::aligned(device, size, format, 1, color)
     }
     pub fn aligned(
         device: &ID3D11Device,
         size: (u32, u32),
         format: Format,
         alignment: u32,
+        color: Color,
     ) -> Result<Self> {
-        Self::with_path(device, size, format, alignment, format.chroma == 1, true)
+        Self::with_path(
+            device,
+            size,
+            format,
+            alignment,
+            color,
+            format.chroma == 1,
+            true,
+        )
     }
     pub fn compute(
         device: &ID3D11Device,
         size: (u32, u32),
         format: Format,
         alignment: u32,
+        color: Color,
     ) -> Result<Self> {
         ensure!(format.chroma == 1, "该格式仅使用pixel输入候选");
-        Self::with_path(device, size, format, alignment, true, false)
+        Self::with_path(device, size, format, alignment, color, true, false)
     }
     pub fn pixel(
         device: &ID3D11Device,
         size: (u32, u32),
         format: Format,
         alignment: u32,
+        color: Color,
     ) -> Result<Self> {
-        Self::with_path(device, size, format, alignment, false, true)
+        Self::with_path(device, size, format, alignment, color, false, true)
     }
     fn with_path(
         device: &ID3D11Device,
         size: (u32, u32),
         format: Format,
         alignment: u32,
+        color: Color,
         prefer_compute: bool,
         fallback: bool,
     ) -> Result<Self> {
         ensure!(
-            format.valid() && size.0 > 0 && size.1 > 0 && size.0 % 2 == 0 && size.1 % 2 == 0,
+            format.valid()
+                && (!color.is_hdr() || format.depth == 10)
+                && size.0 > 0
+                && size.1 > 0
+                && size.0 % 2 == 0
+                && size.1 % 2 == 0,
             "无效编码纹理参数"
         );
         let (storage, planes, shader): (_, Vec<_>, &[u8]) = match (format.chroma, format.depth) {
@@ -81,7 +104,11 @@ impl Conversion {
             (1, 10) => (
                 DXGI_FORMAT_P010,
                 vec![DXGI_FORMAT_R16_UNORM, DXGI_FORMAT_R16G16_UNORM],
-                include_bytes!("encode_p010.cso"),
+                if color.is_hdr() {
+                    include_bytes!("encode_p010.cso")
+                } else {
+                    include_bytes!("encode_p010_sdr.cso")
+                },
             ),
             (3, 8) => (
                 DXGI_FORMAT_AYUV,
@@ -91,7 +118,11 @@ impl Conversion {
             (3, 10) => (
                 DXGI_FORMAT_Y410,
                 vec![DXGI_FORMAT_R10G10B10A2_UNORM],
-                include_bytes!("encode_y410.cso"),
+                if color.is_hdr() {
+                    include_bytes!("encode_y410.cso")
+                } else {
+                    include_bytes!("encode_y410_sdr.cso")
+                },
             ),
             _ => unreachable!(),
         };
@@ -167,11 +198,23 @@ impl Conversion {
                             include_bytes!("encode_nv12_uv_ps.cso"),
                         ],
                         (1, 10) => vec![
-                            include_bytes!("encode_p010_y_ps.cso"),
-                            include_bytes!("encode_p010_uv_ps.cso"),
+                            if color.is_hdr() {
+                                include_bytes!("encode_p010_y_ps.cso")
+                            } else {
+                                include_bytes!("encode_p010_sdr_y_ps.cso")
+                            },
+                            if color.is_hdr() {
+                                include_bytes!("encode_p010_uv_ps.cso")
+                            } else {
+                                include_bytes!("encode_p010_sdr_uv_ps.cso")
+                            },
                         ],
                         (3, 8) => vec![include_bytes!("encode_ayuv_ps.cso")],
-                        (3, 10) => vec![include_bytes!("encode_y410_ps.cso")],
+                        (3, 10) => vec![if color.is_hdr() {
+                            include_bytes!("encode_y410_ps.cso")
+                        } else {
+                            include_bytes!("encode_y410_sdr_ps.cso")
+                        }],
                         _ => unreachable!(),
                     };
                     let mut targets = Vec::new();
@@ -214,7 +257,57 @@ impl Conversion {
                 context: device.GetImmediateContext()?,
                 engine,
                 output,
+                color,
                 size,
+            })
+        }
+    }
+    /// Three full-resolution high-bit-aligned planes for NVENC's CUDA input.
+    pub fn planar_44410(device: &ID3D11Device, size: (u32, u32), color: Color) -> Result<Self> {
+        ensure!(
+            size.0 > 0 && size.1 > 0 && size.0 <= 16384 && size.1 <= 16384 / 3,
+            "4:4:4 10位输入尺寸超出GPU纹理限制"
+        );
+        unsafe {
+            let mut output = None;
+            device.CreateTexture2D(
+                &D3D11_TEXTURE2D_DESC {
+                    Width: size.0,
+                    Height: size.1 * 3,
+                    MipLevels: 1,
+                    ArraySize: 1,
+                    Format: DXGI_FORMAT_R16_UNORM,
+                    SampleDesc: DXGI_SAMPLE_DESC {
+                        Count: 1,
+                        Quality: 0,
+                    },
+                    Usage: D3D11_USAGE_DEFAULT,
+                    BindFlags: D3D11_BIND_UNORDERED_ACCESS.0 as u32,
+                    ..Default::default()
+                },
+                None,
+                Some(&mut output),
+            )?;
+            let output = output.context("创建44410平面纹理")?;
+            let mut view = None;
+            device.CreateUnorderedAccessView(&output, None, Some(&mut view))?;
+            let bytes: &[u8] = if color.is_hdr() {
+                include_bytes!("encode_44410_hdr.cso")
+            } else {
+                include_bytes!("encode_44410_sdr.cso")
+            };
+            let mut shader = None;
+            device.CreateComputeShader(bytes, None, Some(&mut shader))?;
+            Ok(Self {
+                device: device.clone(),
+                context: device.GetImmediateContext()?,
+                engine: Engine::Compute {
+                    shader: shader.context("创建44410转换器")?,
+                    views: vec![view],
+                },
+                output,
+                size,
+                color,
             })
         }
     }

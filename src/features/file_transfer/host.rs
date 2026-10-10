@@ -2,6 +2,7 @@
 pub(crate) mod agent;
 mod filesystem;
 mod metrics;
+pub(crate) use metrics::Settings;
 pub(crate) mod notices;
 mod transfer;
 
@@ -151,9 +152,6 @@ pub(crate) fn reject(bytes: &[u8], code: i32) -> Result<Option<Packet>> {
     Ok(Some(response(v.header, reply)))
 }
 pub(crate) fn failure_reply(bytes: &[u8]) -> Result<bool> {
-    if metrics::denied(bytes)? {
-        return Ok(true);
-    }
     let Some(v) = decode(bytes)? else {
         return Ok(false);
     };

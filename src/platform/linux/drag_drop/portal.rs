@@ -24,7 +24,12 @@ use x11rb::wrapper::ConnectionExt as _;
 
 pub(crate) enum Event {
     Unavailable,
-    Captured(Vec<PathBuf>),
+    /// The paths, and whether the original drag is kept for a return. It
+    /// never is: this side does not offer `NATIVE_RETURN`.
+    Captured(Vec<PathBuf>, bool),
+    /// Never sent, as `Original` has no values.
+    #[allow(dead_code, reason = "Linux does not offer the drag return.")]
+    Resumed(super::original::Original),
     Released,
     Failed(String),
 }
@@ -32,8 +37,11 @@ pub(crate) struct Portal {
     stop: Arc<AtomicBool>,
 }
 impl Portal {
+    /// `preserve` asks to keep the original drag for a return, which only a
+    /// peer that saw `NATIVE_RETURN` from this side does; Linux never sends it.
     pub fn start(
         point: Position,
+        _preserve: bool,
         allowed: Arc<dyn Fn() -> bool + Send + Sync>,
         notify: Arc<dyn Fn(Event) + Send + Sync>,
     ) -> Result<Self> {
@@ -48,6 +56,9 @@ impl Portal {
             })?;
         Ok(Self { stop })
     }
+    /// A return is only requested when this side offered it, which Linux does
+    /// not; the original drag has already ended at the handoff.
+    pub fn resume(&self, _point: Position) {}
 }
 impl Drop for Portal {
     fn drop(&mut self) {
@@ -266,7 +277,7 @@ fn run(
         {
             handoff.captured = true;
             handoff.cover()?;
-            notify(Event::Captured(paths));
+            notify(Event::Captured(paths, false));
         }
         let held = connection
             .query_pointer(root)?
@@ -321,11 +332,13 @@ mod tests {
                 x: x.parse().unwrap(),
                 y: y.parse().unwrap(),
             },
+            false,
             Arc::new(|| true),
             Arc::new(move |event| {
                 let _ = tx.send(match event {
                     Event::Unavailable => "unavailable".to_owned(),
-                    Event::Captured(paths) => format!("captured {paths:?}"),
+                    Event::Captured(paths, _) => format!("captured {paths:?}"),
+                    Event::Resumed(original) => match original {},
                     Event::Released => "released".to_owned(),
                     Event::Failed(error) => format!("failed {error}"),
                 });

@@ -82,9 +82,13 @@ impl std::str::FromStr for FrameRateChoice {
     }
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum CodecPreference {
+    #[default]
     Auto,
+    PreferH264,
+    PreferH265,
+    PreferAv1,
     H264,
     H265,
     Av1,
@@ -93,7 +97,7 @@ pub enum CodecPreference {
 impl CodecPreference {
     pub(crate) fn accepts(self, codec: VideoCodec) -> bool {
         match self {
-            Self::Auto => true,
+            Self::Auto | Self::PreferH264 | Self::PreferH265 | Self::PreferAv1 => true,
             Self::H264 => codec == VideoCodec::H264,
             Self::H265 => codec == VideoCodec::H265,
             Self::Av1 => codec == VideoCodec::Av1,
@@ -101,19 +105,40 @@ impl CodecPreference {
     }
     pub fn label(self) -> &'static str {
         match self {
-            Self::Auto => "自动 AV1/H.265/H.264",
-            Self::H264 => "H.264",
-            Self::H265 => "H.265",
-            Self::Av1 => "AV1",
+            Self::Auto => "自动",
+            Self::PreferH264 => "优先 H.264",
+            Self::PreferH265 => "优先 HEVC",
+            Self::PreferAv1 => "优先 AV1",
+            Self::H264 => "仅 H.264",
+            Self::H265 => "仅 HEVC",
+            Self::Av1 => "仅 AV1",
         }
     }
 
+    pub const PREFERRED: [Self; 4] = [
+        Self::Auto,
+        Self::PreferAv1,
+        Self::PreferH265,
+        Self::PreferH264,
+    ];
+    pub const ONLY: [Self; 3] = [Self::Av1, Self::H265, Self::H264];
+    pub fn preferred(self) -> Option<i32> {
+        match self {
+            Self::Auto => None,
+            Self::PreferH264 | Self::H264 => Some(1),
+            Self::PreferH265 | Self::H265 => Some(2),
+            Self::PreferAv1 | Self::Av1 => Some(5),
+        }
+    }
+    pub fn restricted(self) -> bool {
+        matches!(self, Self::H264 | Self::H265 | Self::Av1)
+    }
     pub fn next(self) -> Self {
         match self {
-            Self::Auto => Self::Av1,
-            Self::Av1 => Self::H265,
-            Self::H265 => Self::H264,
-            Self::H264 => Self::Auto,
+            Self::Auto => Self::PreferAv1,
+            Self::PreferAv1 | Self::Av1 => Self::PreferH265,
+            Self::PreferH265 | Self::H265 => Self::PreferH264,
+            _ => Self::Auto,
         }
     }
 }
@@ -124,6 +149,9 @@ impl std::str::FromStr for CodecPreference {
     fn from_str(value: &str) -> Result<Self> {
         match value.to_ascii_lowercase().as_str() {
             "auto" => Ok(Self::Auto),
+            "prefer-h264" => Ok(Self::PreferH264),
+            "prefer-h265" | "prefer-hevc" => Ok(Self::PreferH265),
+            "prefer-av1" => Ok(Self::PreferAv1),
             "h264" | "avc" => Ok(Self::H264),
             "h265" | "hevc" => Ok(Self::H265),
             "av1" => Ok(Self::Av1),
@@ -132,7 +160,7 @@ impl std::str::FromStr for CodecPreference {
     }
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum TransportChoice {
     Auto,
     P2p,
@@ -162,13 +190,14 @@ impl std::str::FromStr for TransportChoice {
     }
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct ConnectionMediaOptions {
     pub audio_only: bool,
     pub muted: bool,
     pub frame_rate: FrameRateChoice,
     pub codec: CodecPreference,
-    pub hardware_decode: bool,
+    pub decoder: super::selection::DecoderPreference,
     pub transport: TransportChoice,
 }
 
@@ -179,7 +208,7 @@ impl Default for ConnectionMediaOptions {
             muted: false,
             frame_rate: FrameRateChoice::Auto,
             codec: CodecPreference::Auto,
-            hardware_decode: true,
+            decoder: Default::default(),
             transport: TransportChoice::Auto,
         }
     }
@@ -193,11 +222,12 @@ pub(crate) struct ConnectionMediaProfile {
     pub stream_fps: u32,
     pub decoder_fps_cap: u32,
     pub codec: CodecPreference,
-    pub hardware_decode: bool,
+    pub decoder: super::selection::DecoderPreference,
 }
 
 impl ConnectionMediaOptions {
     pub(crate) fn resolve(self, display: LocalDisplayInfo) -> Result<ConnectionMediaProfile> {
+        self.validate()?;
         let stream_fps = self.frame_rate.value(display);
         Ok(ConnectionMediaProfile {
             audio_only: self.audio_only,
@@ -206,8 +236,16 @@ impl ConnectionMediaOptions {
             stream_fps,
             decoder_fps_cap: display.refresh_hz.max(stream_fps),
             codec: self.codec,
-            hardware_decode: self.hardware_decode,
+            decoder: self.decoder,
         })
+    }
+    pub fn validate(self) -> Result<()> {
+        anyhow::ensure!(
+            self.decoder.mode != super::selection::ProcessingMode::Software
+                || self.codec != CodecPreference::H265,
+            "软件解码不支持 HEVC，请取消仅 HEVC 限制或启用硬解"
+        );
+        Ok(())
     }
 }
 

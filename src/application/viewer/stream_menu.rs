@@ -641,6 +641,25 @@ pub(super) fn show_stream_control_window(
                             .id_salt("stream-settings-root")
                             .max_height((ctx.content_rect().height() - 150.0).max(140.0))
                             .show(ui, |ui| {
+                                let mut codec = handle.device_preferences().codec;
+                                let previous = codec;
+                                let label = codec.map_or_else(|| "此设备编码偏好".to_owned(), |c| format!("此设备编码偏好 · {}", c.label()));
+                                egui::CollapsingHeader::new(label)
+                                    .id_salt("device-codec-preferences")
+                                    .show(ui, |ui| {
+                                        egui::ComboBox::from_id_salt("device-codec-preference")
+                                            .width(220.)
+                                            .selected_text(codec.map_or("跟随全局", |c| c.label()))
+                                            .show_ui(ui, |ui| {
+                                                ui.selectable_value(&mut codec, None, "跟随全局");
+                                                for value in crate::media::CodecPreference::PREFERRED {
+                                                    ui.selectable_value(&mut codec, Some(value), value.label());
+                                                }
+                                            });
+                                        ui.label("重连后生效");
+                                    });
+                                if codec != previous { handle.set_codec_preference(codec); }
+                                ui.separator();
                                 for (quality, label, detail) in [
                                     (
                                         StreamQuality::Auto,

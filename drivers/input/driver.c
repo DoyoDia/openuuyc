@@ -5,6 +5,7 @@
 #include <ntstatus.h>
 #include <wdf.h>
 #include <vhf.h>
+#include <bcrypt.h>
 #include <stdio.h>
 #include "reports.h"
 
@@ -136,6 +137,25 @@ static VOID DeleteSource(OU_CONTEXT *c) {
     if(vhf)VhfDelete(vhf,TRUE);
     if(target)WdfObjectDelete(target);
 }
+static NTSTATUS InputContainer(WDFDEVICE device,GUID *container) {
+    WDFKEY key;NTSTATUS status;ULONG size=0,type=0;
+    const GUID empty={0};
+    DECLARE_CONST_UNICODE_STRING(name,L"OpenUUYCInputContainerId");
+    status=WdfDeviceOpenRegistryKey(device,PLUGPLAY_REGKEY_DEVICE|WDF_REGKEY_DEVICE_SUBKEY,KEY_READ|KEY_SET_VALUE,WDF_NO_OBJECT_ATTRIBUTES,&key);
+    if(!NT_SUCCESS(status))return status;
+    status=WdfRegistryQueryValue(key,&name,sizeof(*container),container,&size,&type);
+    if(status==STATUS_OBJECT_NAME_NOT_FOUND) {
+        status=BCryptGenRandom(NULL,(PUCHAR)container,sizeof(*container),BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+        if(NT_SUCCESS(status)) {
+            container->Data3=(container->Data3&0x0fff)|0x4000;
+            container->Data4[0]=(container->Data4[0]&0x3f)|0x80;
+            status=WdfRegistryAssignValue(key,&name,REG_BINARY,sizeof(*container),container);
+        }
+    } else if(NT_SUCCESS(status)&&(type!=REG_BINARY||size!=sizeof(*container)||!memcmp(container,&empty,sizeof(empty)))) {
+        status=STATUS_INVALID_PARAMETER;
+    }
+    WdfRegistryClose(key);return status;
+}
 NTSTATUS Prepare(WDFDEVICE device,WDFCMRESLIST raw,WDFCMRESLIST translated) {
     OU_CONTEXT *c=Context(device);WDF_OBJECT_ATTRIBUTES attributes;
     WDF_IO_TARGET_OPEN_PARAMS open;VHF_CONFIG config;NTSTATUS status;
@@ -147,6 +167,12 @@ NTSTATUS Prepare(WDFDEVICE device,WDFCMRESLIST raw,WDFCMRESLIST translated) {
     if(!NT_SUCCESS(status)){DeleteSource(c);return status;}
     VHF_CONFIG_INIT(&config,WdfIoTargetWdmGetTargetFileHandle(c->Target),sizeof(OuDescriptor),OuDescriptor);
     config.VendorID=0;config.ProductID=0x5549;config.VersionNumber=1;
+    /* An unspecified container inherits the computer's internal-device group.
+       Windows classifies internal relative mice as legacy touchpads on laptops,
+       suppressing left clicks during typing. Own one persistent container for
+       this composite input device, independent of the physical touchpad. */
+    status=Checked(InputContainer(device,&config.ContainerID),L"Prepare input container");
+    if(!NT_SUCCESS(status)){DeleteSource(c);return status;}
     status=Checked(VhfCreate(&config,&c->Vhf),L"Create VHF source");
     if(NT_SUCCESS(status))status=Checked(VhfStart(c->Vhf),L"Start VHF source");
     if(!NT_SUCCESS(status))DeleteSource(c);

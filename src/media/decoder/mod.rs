@@ -115,7 +115,9 @@ pub(crate) struct NativeVideoDecoder {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DecoderCandidate {
     #[cfg(windows)]
-    WindowsD3d11,
+    WindowsD3d11 {
+        adapter: u64,
+    },
     /// VA-API through the local driver: NVDEC, Intel or AMD.
     #[cfg(not(windows))]
     LinuxVaapi,
@@ -124,21 +126,59 @@ pub(crate) enum DecoderCandidate {
 }
 
 impl DecoderCandidate {
-    pub(crate) fn available(codec: VideoCodec, prefer_hardware: bool) -> Vec<Self> {
+    #[cfg_attr(
+        not(windows),
+        allow(unused_variables, reason = "Only D3D11 writers name an adapter.")
+    )]
+    pub(crate) fn preferred(
+        codec: VideoCodec,
+        preference: crate::media::selection::DecoderPreference,
+        preferred: Option<&windows_surface::D3D11SurfaceWriter>,
+    ) -> Vec<Self> {
         let mut candidates = Vec::new();
-        if prefer_hardware {
-            #[cfg(windows)]
-            candidates.push(Self::WindowsD3d11);
+        if preference.mode.hardware() {
+            // VA-API decodes on the driver's device; there is no adapter list.
             #[cfg(not(windows))]
             candidates.push(Self::LinuxVaapi);
+            #[cfg(windows)]
+            {
+                if let Some(writer) = preferred {
+                    candidates.push(Self::WindowsD3d11 {
+                        adapter: writer.adapter_id(),
+                    });
+                }
+                match windows_surface::D3D11SurfaceWriter::adapter_ids() {
+                    Ok(adapters) => {
+                        for adapter in adapters {
+                            let candidate = Self::WindowsD3d11 { adapter };
+                            if !candidates.contains(&candidate) {
+                                candidates.push(candidate);
+                            }
+                        }
+                    }
+                    Err(error) => tracing::warn!(%error, "decoder adapter enumeration failed"),
+                }
+            }
         }
 
-        match codec {
-            VideoCodec::H264 | VideoCodec::Av1 => candidates.push(Self::Software),
-            _ => {}
+        if let Some(adapter) = crate::media::selection::resolve_gpu(preference.gpu) {
+            candidates.sort_by_key(|candidate| candidate.adapter() != Some(adapter));
+        }
+        if preference.mode.software() && matches!(codec, VideoCodec::H264 | VideoCodec::Av1) {
+            candidates.push(Self::Software);
         }
 
         candidates
+    }
+
+    /// The GPU adapter a hardware candidate decodes on, where the platform
+    /// names one.
+    pub(crate) const fn adapter(&self) -> Option<u64> {
+        match self {
+            #[cfg(windows)]
+            Self::WindowsD3d11 { adapter } => Some(*adapter),
+            _ => None,
+        }
     }
 }
 
@@ -148,7 +188,7 @@ impl NativeVideoDecoder {
         width: u32,
         height: u32,
         frame_rate: u32,
-        prefer_hardware: bool,
+        preference: crate::media::selection::DecoderPreference,
         extra_data: Bytes,
     ) -> Result<Self> {
         Self::open_inner(
@@ -156,7 +196,7 @@ impl NativeVideoDecoder {
             width,
             height,
             frame_rate,
-            prefer_hardware,
+            preference,
             extra_data,
             None,
         )
@@ -167,7 +207,7 @@ impl NativeVideoDecoder {
         width: u32,
         height: u32,
         frame_rate: u32,
-        prefer_hardware: bool,
+        preference: crate::media::selection::DecoderPreference,
         extra_data: Bytes,
         surface_writer: windows_surface::D3D11SurfaceWriter,
     ) -> Result<Self> {
@@ -176,7 +216,7 @@ impl NativeVideoDecoder {
             width,
             height,
             frame_rate,
-            prefer_hardware,
+            preference,
             extra_data,
             Some(surface_writer),
         )
@@ -187,12 +227,14 @@ impl NativeVideoDecoder {
         width: u32,
         height: u32,
         frame_rate: u32,
-        prefer_hardware: bool,
+        preference: crate::media::selection::DecoderPreference,
         extra_data: Bytes,
         surface_writer: Option<windows_surface::D3D11SurfaceWriter>,
     ) -> Result<Self> {
         let mut last_error = None;
-        for candidate in DecoderCandidate::available(codec, prefer_hardware) {
+        for candidate in
+            DecoderCandidate::preferred(codec, preference, surface_writer.as_ref())
+        {
             match Self::open_candidate(
                 candidate,
                 codec,
@@ -203,7 +245,10 @@ impl NativeVideoDecoder {
                 surface_writer.clone(),
                 None,
             ) {
-                Ok(decoder) => return Ok(decoder),
+                Ok(mut decoder) => {
+                    decoder.describe_selection(preference, last_error.is_some());
+                    return Ok(decoder);
+                }
                 Err(error) => {
                     tracing::debug!(?candidate, %error, "native decoder candidate unavailable");
                     last_error = Some(error);
@@ -258,7 +303,7 @@ impl NativeVideoDecoder {
                 })
             }
             #[cfg(windows)]
-            DecoderCandidate::WindowsD3d11 => {
+            DecoderCandidate::WindowsD3d11 { adapter } => {
                 let supports = |writer: &windows_surface::D3D11SurfaceWriter| {
                     PlatformDecoder::probe_format(
                         writer.device_handle(),
@@ -269,13 +314,16 @@ impl NativeVideoDecoder {
                         chroma,
                     )
                 };
-                let writer = match surface_writer.filter(supports) {
+                let writer = match surface_writer.filter(|writer| {
+                    writer.adapter_id() == adapter
+                        && unsafe { writer.device_handle().GetDeviceRemovedReason().is_ok() }
+                }) {
                     Some(writer) => writer,
-                    None => windows_surface::D3D11SurfaceWriter::available()?
-                        .into_iter()
-                        .find(supports)
-                        .ok_or(DecodeError::Unsupported)?,
+                    None => windows_surface::D3D11SurfaceWriter::for_adapter(adapter)?,
                 };
+                if !supports(&writer) {
+                    return Err(DecodeError::Unsupported.into());
+                }
                 Self::open_windows_hardware(codec, width, height, writer, extra_data)
             }
 
@@ -331,6 +379,20 @@ impl NativeVideoDecoder {
     pub(crate) const fn candidate(&self) -> DecoderCandidate {
         self.candidate
     }
+    pub(crate) fn describe_selection(&mut self, preference: crate::media::selection::DecoderPreference, recovered: bool) {
+        use crate::media::selection::{ProcessingMode, resolve_gpu};
+        let note = if recovered { Some("原候选不可用，已回退") }
+        else if preference.mode == ProcessingMode::Software { None }
+        else if let Some(id) = preference.gpu {
+            match resolve_gpu(Some(id)) {
+                None => Some("首选显卡不可用，自动选择"),
+                Some(adapter) if self.candidate.adapter() != Some(adapter) => Some("首选显卡不支持本次格式，已回退"),
+                _ => Some("首选显卡"),
+            }
+        } else { None };
+        if let Some(note) = note { self.label.push_str(&format!("（{note}）")); }
+        tracing::info!(preference=?preference, actual=?self.candidate, reason=note.unwrap_or("selected"), "decoder preference resolved");
+    }
 
     pub(crate) fn is_software(&self) -> bool {
         self.software_slot.is_some()
@@ -364,11 +426,19 @@ impl NativeVideoDecoder {
             extra_data,
         );
         let backend = PlatformDecoder::open(&config)?;
+        let adapter = reader.adapter_id();
+        tracing::info!(
+            adapter,
+            ?codec,
+            width,
+            height,
+            "opened hardware decoder on adapter"
+        );
         Ok(Self {
             decoder: Box::new(backend),
             frame_reader: FrameReader::Windows(reader),
-            candidate: DecoderCandidate::WindowsD3d11,
-            label: format!("{} D3D11 硬解", platform_label()),
+            candidate: DecoderCandidate::WindowsD3d11 { adapter },
+            label: format!("{} · DXVA11 硬解", crate::platform::capture::encoding_adapters().ok().and_then(|items| items.into_iter().find(|a| a.luid == adapter)).map_or_else(|| platform_label().into(), |a| a.name)),
             software_slot: None,
         })
     }
@@ -493,7 +563,7 @@ pub(crate) fn detect_native_decoder_support(
 ) -> Result<DeviceCapability> {
     std::thread::spawn(move || {
         let mut capabilities = Vec::new();
-        if profile.hardware_decode
+        if profile.decoder.mode.hardware()
             && let Ok(probe) = hardware_probe()
         {
             for (codec, id) in [
@@ -523,7 +593,7 @@ pub(crate) fn detect_native_decoder_support(
                 }
             }
         }
-        if profile.codec.accepts(VideoCodec::H264) {
+        if profile.decoder.mode.software() && profile.codec.accepts(VideoCodec::H264) {
             // streamer 958290: this is the advertised software ceiling, not
             // an arbitrary decoder rejection of a larger hardware-fallback AU.
             for chroma_sampling in [1, 3] {
@@ -540,7 +610,7 @@ pub(crate) fn detect_native_decoder_support(
         // The Linux presenter draws software frames as NV12, which the AV1
         // decoder produces for 8-bit 4:2:0 only.
         #[cfg(not(windows))]
-        if profile.codec.accepts(VideoCodec::Av1) {
+        if profile.decoder.mode.software() && profile.codec.accepts(VideoCodec::Av1) {
             capabilities.push(CodecCapability {
                 video_codec: 5,
                 width: 1920,
@@ -551,7 +621,7 @@ pub(crate) fn detect_native_decoder_support(
             });
         }
         #[cfg(windows)]
-        if profile.codec.accepts(VideoCodec::Av1) {
+        if profile.decoder.mode.software() && profile.codec.accepts(VideoCodec::Av1) {
             if let Ok(writer) = windows_surface::D3D11SurfaceWriter::new() {
                 for chroma in [1, 3] {
                     for depth in [8, 10] {
@@ -577,6 +647,8 @@ pub(crate) fn detect_native_decoder_support(
             bail!("no decoder supports the selected codec and decoding mode");
         }
         Ok(DeviceCapability {
+            preferred_codec: profile.codec.preferred(),
+            openuuyc_sdr_10bit: true,
             ice_id: String::new(),
             display_info: crate::platform::display_hdr::capabilities(
                 profile.local_display.refresh_hz,

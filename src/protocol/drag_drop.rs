@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 const MAGIC: &[u8] = b"OUDD\x01";
 pub(crate) const MAX_PACKET: usize = 524288;
 pub(crate) const COPY: u32 = 1;
+pub(crate) const NATIVE_RETURN: u32 = 2;
 #[derive(Clone, PartialEq, Message)]
 pub(crate) struct Packet {
     #[prost(fixed64, tag = "1")]
@@ -13,7 +14,13 @@ pub(crate) struct Packet {
     pub drag: u64,
     #[prost(uint64, tag = "3")]
     pub sequence: u64,
-    #[prost(oneof = "Payload", tags = "4,5,6,7,8,9,10,11,12,13,14,15,16")]
+    // Optional envelope capability: v1 peers ignore it and keep ordinary drag.
+    #[prost(uint32, tag = "17")]
+    pub capabilities: u32,
+    #[prost(
+        oneof = "Payload",
+        tags = "4,5,6,7,8,9,10,11,12,13,14,15,16,20,21,22,23"
+    )]
     pub payload: Option<Payload>,
 }
 #[derive(Clone, PartialEq, prost::Oneof)]
@@ -44,6 +51,32 @@ pub(crate) enum Payload {
     SourceReleased(bool),
     #[prost(bool, tag = "16")]
     Available(bool),
+    #[prost(message, tag = "20")]
+    Image(DragImage),
+    #[prost(message, tag = "21")]
+    Resume(Point),
+    #[prost(bool, tag = "22")]
+    Resumed(bool),
+    #[prost(bool, tag = "23")]
+    HandoffDone(bool),
+}
+#[derive(Clone, PartialEq, Message)]
+pub(crate) struct DragImage {
+    #[prost(uint32, tag = "1")]
+    pub width: u32,
+    #[prost(uint32, tag = "2")]
+    pub height: u32,
+    /// Top-down BGRA, straight alpha. Empty means no source image available.
+    #[prost(bytes, tag = "3")]
+    pub pixels: Vec<u8>,
+}
+impl DragImage {
+    pub fn valid(&self) -> bool {
+        (self.width == 0 && self.height == 0 && self.pixels.is_empty())
+            || ((1..=128).contains(&self.width)
+                && (1..=128).contains(&self.height)
+                && self.pixels.len() == self.width as usize * self.height as usize * 4)
+    }
 }
 #[derive(Clone, Copy, PartialEq, Message, Serialize, Deserialize)]
 pub(crate) struct Point {
@@ -69,6 +102,8 @@ pub(crate) struct Begin {
     pub point: Option<Point>,
     #[prost(bool, tag = "2")]
     pub reverse: bool,
+    #[prost(bool, tag = "3")]
+    pub preserve: bool,
 }
 #[derive(Clone, Copy, PartialEq, Message)]
 pub(crate) struct Feedback {
@@ -126,7 +161,7 @@ fn validate(packet: &Packet) -> Result<()> {
     }
     match payload {
         Payload::Begin(v) => ensure!(v.point.is_some_and(|p| p.valid()), "拖放起点无效"),
-        Payload::Position(p) | Payload::Commit(p) | Payload::Probe(p) => {
+        Payload::Position(p) | Payload::Commit(p) | Payload::Probe(p) | Payload::Resume(p) => {
             ensure!(p.valid(), "拖放坐标无效")
         }
         Payload::Finished(v) => ensure!(
@@ -134,6 +169,7 @@ fn validate(packet: &Packet) -> Result<()> {
             "拖放结果无效"
         ),
         Payload::Feedback(v) => ensure!(v.effect & !COPY == 0, "拖放效果不支持"),
+        Payload::Image(v) => ensure!(v.valid(), "拖放图像无效"),
         Payload::Data(v) => ensure!(!v.is_empty() && v.len() <= 512000 + 1024, "拖放文件帧无效"),
         _ => {}
     }

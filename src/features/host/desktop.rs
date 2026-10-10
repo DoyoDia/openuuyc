@@ -103,11 +103,14 @@ impl Prepared {
         screen: capture::Screen,
         capabilities: &[format::Capability],
         remote: &DeviceCapability,
+        settings: super::EncodingSettings,
     ) -> Result<Self> {
         let negotiated = Arc::new(format::Negotiated::new(
             capabilities,
             remote,
             &options.decoders,
+            settings,
+            screen.render_adapter.unwrap_or(screen.adapter),
         )?);
         let mut config = publisher::config(options.params.as_ref());
         let chroma = options
