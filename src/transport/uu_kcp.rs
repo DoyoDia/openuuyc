@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -38,6 +38,30 @@ const FEC_NETWORK_UPDATE_INTERVAL: Duration = Duration::from_millis(1_000);
 const BINARY_MESSAGE: u16 = 1;
 const CONTROL_SEND_WINDOW: u16 = 256;
 const CONTROL_RECEIVE_WINDOW: u16 = 256;
+
+// Input must remain replaceable locally instead of filling a reliable stream.
+// One CONTROL MTU of application payload bounds committed input independently
+// of the protocol's 256-segment window. A final event may cross this watermark;
+// finite release obligations bypass it. Both carriers use the same byte budget.
+pub(crate) const INPUT_SEND_BUDGET_BYTES: usize = KCP_STANDARD_MTU - KCP_HEADER - 4;
+
+struct InputWindow {
+    active: AtomicBool,
+    pending: AtomicUsize,
+    changed: tokio::sync::Notify,
+}
+
+impl InputWindow {
+    fn publish(&self, pending: usize) {
+        if self.pending.swap(pending, Ordering::AcqRel) != pending {
+            self.changed.notify_waiters();
+        }
+    }
+    fn close(&self) {
+        self.active.store(false, Ordering::Release);
+        self.changed.notify_waiters();
+    }
+}
 
 const CMD_PUSH: u8 = 81;
 const CMD_ACK: u8 = 82;
@@ -71,6 +95,7 @@ struct ControlState {
     sender: Option<mpsc::UnboundedSender<WorkerCommand>>,
     cancel: Option<oneshot::Sender<()>>,
     task: Option<tokio::task::JoinHandle<()>>,
+    input_window: Option<Arc<InputWindow>>,
 }
 
 type SendGuard = Arc<dyn Fn() -> bool + Send + Sync>;
@@ -174,11 +199,17 @@ impl UuKcpControl {
                 })) => endpoint,
             };
             let result = if let Some(endpoint) = endpoint {
+                let input_window = Arc::new(InputWindow {
+                    active: AtomicBool::new(true),
+                    pending: AtomicUsize::new(0),
+                    changed: tokio::sync::Notify::new(),
+                });
                 let current = {
                     let mut state = lock(&shared_state);
                     let current = state.generation == generation && state.version == version;
                     if current {
                         state.sender = Some(sender);
+                        state.input_window = Some(input_window.clone());
                     }
                     current
                 };
@@ -186,11 +217,12 @@ impl UuKcpControl {
                     tokio::select! {
                         biased;
                         _ = &mut canceled => Ok(()),
-                        result = run_worker(Arc::clone(&endpoint), version, receiver, stream_control, control_streams, send_failure, progress.clone()) => result,
+                        result = run_worker(Arc::clone(&endpoint), version, receiver, stream_control, control_streams, send_failure, progress.clone(), input_window.clone()) => result,
                     }
                 } else {
                     Ok(())
                 };
+                input_window.close();
                 // Unregister only our endpoint, including canceled startup.
                 let _ = Endpoint::close(&endpoint).await;
                 result
@@ -201,6 +233,7 @@ impl UuKcpControl {
             if state.generation == generation {
                 // Worker failure does not renegotiate the wire protocol.
                 state.sender = None;
+                state.input_window = None;
                 progress.store(Progress::Inactive as u8, Ordering::Relaxed);
             }
             drop(state);
@@ -218,6 +251,26 @@ impl UuKcpControl {
 
     pub(crate) async fn send(&self, stream_id: u16, payload: Vec<u8>) -> Result<usize> {
         self.send_inner(stream_id, payload, None, false).await
+    }
+
+    pub(crate) async fn wait_input_capacity(&self) -> Result<()> {
+        let window = lock(&self.state)
+            .input_window
+            .clone()
+            .context("UU mixed-KCP is not active")?;
+        loop {
+            let changed = window.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            ensure!(
+                window.active.load(Ordering::Acquire),
+                "UU mixed-KCP worker is closed"
+            );
+            if window.pending.load(Ordering::Acquire) < INPUT_SEND_BUDGET_BYTES {
+                return Ok(());
+            }
+            changed.await;
+        }
     }
     /// Enqueued after the recovery release/probe pass. Completion means all
     /// earlier reliable segments were acknowledged, not just written to DTLS.
@@ -281,6 +334,9 @@ impl UuKcpControl {
             state.generation = state.generation.wrapping_add(1);
             state.version = 0;
             state.sender.take();
+            if let Some(window) = state.input_window.take() {
+                window.close();
+            }
             if let Some(cancel) = state.cancel.take() {
                 let _ = cancel.send(());
             }
@@ -298,6 +354,9 @@ impl UuKcpControl {
         state.generation = state.generation.wrapping_add(1);
         state.version = 0;
         state.sender.take();
+        if let Some(window) = state.input_window.take() {
+            window.close();
+        }
         if let Some(cancel) = state.cancel.take() {
             let _ = cancel.send(());
         }
@@ -346,6 +405,8 @@ struct Worker {
     last_send_warning: Option<Instant>,
     progress: Arc<AtomicU8>,
     last_peer_input: Option<Instant>,
+    input_credits: VecDeque<(u32, usize)>,
+    input_pending_bytes: usize,
 }
 
 struct WirePacket {
@@ -368,6 +429,7 @@ async fn run_worker(
     control_streams: Arc<StdMutex<streams::Streams>>,
     send_failure: Arc<StdMutex<Option<(Instant, String)>>>,
     progress: Arc<AtomicU8>,
+    input_window: Arc<InputWindow>,
 ) -> Result<()> {
     let output_packets = Arc::new(StdMutex::new(VecDeque::new()));
     let mut kcp = Kcp::new(
@@ -408,6 +470,8 @@ async fn run_worker(
         last_send_warning: None,
         progress,
         last_peer_input: None,
+        input_credits: VecDeque::new(),
+        input_pending_bytes: 0,
     };
     worker
         .kcp
@@ -431,6 +495,7 @@ async fn run_worker(
     let mut wait_reported = false;
     let mut drains: Vec<oneshot::Sender<()>> = Vec::new();
     loop {
+        input_window.publish(worker.pending_input_bytes());
         drains.retain(|waiter| !waiter.is_closed());
         if worker.kcp.wait_snd() == 0 {
             for waiter in drains.drain(..) {
@@ -449,15 +514,14 @@ async fn run_worker(
         }) = pending.take()
         {
             // Check cancellation before assigning reliable sequence numbers.
-            // wait_snd includes packets already on the wire awaiting ACK, not
-            // just unsent input. A full window applies backpressure; it is not
-            // itself a transport failure. The input sender keeps its existing
-            // deadline and coalesces queued motion while we receive ACKs.
+            // The input-only byte watermark applies before assigning reliable
+            // sequence numbers. General CONTROL RPC and finite releases retain
+            // their existing semantics; the negotiated window stays unchanged.
             if result.is_closed() || guard.as_ref().is_some_and(|valid: &SendGuard| !valid()) {
                 let _ = result.send(Err("control request cancelled before transmission".into()));
             } else if guard.is_some()
                 && !release
-                && worker.kcp.wait_snd() >= usize::from(CONTROL_SEND_WINDOW)
+                && worker.input_pending_bytes >= INPUT_SEND_BUDGET_BYTES
             {
                 worker
                     .progress
@@ -466,6 +530,7 @@ async fn run_worker(
                     tracing::warn!(
                         stream_id, waiting_ms = pending_since.elapsed().as_millis() as u64,
                         outstanding = worker.kcp.wait_snd(), remote_window = worker.kcp.rmt_wnd(),
+                        pending_bytes = worker.input_pending_bytes, input_budget = INPUT_SEND_BUDGET_BYTES,
                         kcp_srtt_ms = worker.kcp.rx_srtt(),
                         last_peer_input_ms = ?worker.last_peer_input.map(|at| at.elapsed().as_millis() as u64),
                         "input blocked waiting for mixed-KCP send window"
@@ -487,6 +552,7 @@ async fn run_worker(
                     Ok(bytes) => worker.flush_output(&endpoint).await.map(|()| bytes),
                     Err(error) => Err(error),
                 };
+                input_window.publish(worker.pending_input_bytes());
                 let _ = result.send(outcome.map_err(|error| error.to_string()));
             }
         }
@@ -520,6 +586,19 @@ async fn run_worker(
 }
 
 impl Worker {
+    fn pending_input_bytes(&mut self) -> usize {
+        let prefix = self.kcp.send_unacknowledged();
+        while self
+            .input_credits
+            .front()
+            .is_some_and(|(end, _)| prefix.wrapping_sub(*end) as i32 >= 0)
+        {
+            let (_, bytes) = self.input_credits.pop_front().unwrap();
+            self.input_pending_bytes -= bytes;
+        }
+        self.input_pending_bytes
+    }
+
     fn now_ms(&self) -> u32 {
         self.epoch.elapsed().as_millis() as u32
     }
@@ -533,6 +612,11 @@ impl Worker {
             .kcp
             .send(&message)
             .context("queue UU CONTROL message in mixed-KCP")?;
+        // Retain credit until the ordered ACK prefix crosses the message, not
+        // just until a later segment is selectively acknowledged out of order.
+        self.input_credits
+            .push_back((self.kcp.send_sequence_end(), bytes));
+        self.input_pending_bytes += bytes;
         let now = self.now_ms();
         self.kcp.update(now).context("update UU mixed-KCP")?;
         self.kcp.flush().context("flush UU mixed-KCP message")?;
@@ -853,7 +937,9 @@ impl Worker {
         loop {
             // Do not hold the registry lock while calling a business consumer.
             let pending = lock(&self.control_streams).pop_ready();
-            let Some((stream_id, message)) = pending else { break };
+            let Some((stream_id, message)) = pending else {
+                break;
+            };
             self.progress
                 .store(Progress::Delivering as u8, Ordering::Relaxed);
             let delivered = stream_control(stream_id, &message);

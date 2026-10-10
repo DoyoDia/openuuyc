@@ -1106,7 +1106,7 @@ impl Player {
         if row
             .selectable_label(controlling, "键鼠控制")
             .on_hover_text(if recovering {
-                "连接暂时不畅，键鼠控制将在恢复后自动接续；点击取消".to_owned()
+                "键鼠控制正在自动恢复；点击取消".to_owned()
             } else {
                 format!(
                     "退出控制：{}",

@@ -1,11 +1,12 @@
 //! Authorized remote microphone -> shared NetEq implementation -> virtual input.
 mod routing;
 use super::{Lease, lock};
+use crate::protocol::microphone as errors;
 use crate::{
     media::audio::neteq,
     platform::virtual_audio::{Bridge, State},
 };
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result};
 use bytes::Bytes;
 use crossbeam_queue::ArrayQueue;
 use std::{
@@ -21,6 +22,9 @@ use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Status {
+    // Local publication revision, never a new network or IPC protocol field.
+    #[serde(skip)]
+    pub policy_generation: u64,
     pub enabled: bool,
     pub active: bool,
     #[serde(default)]
@@ -47,15 +51,34 @@ impl std::fmt::Display for PolicyFailure {
     }
 }
 impl std::error::Error for PolicyFailure {}
+impl PolicyFailure {
+    fn not_allowed() -> Self {
+        Self {
+            code: errors::NOT_ALLOWED,
+            detail: "本次会话不允许麦克风输入".into(),
+        }
+    }
+    fn bridge(error: anyhow::Error) -> anyhow::Error {
+        if crate::platform::virtual_audio::unavailable(&error) {
+            Self {
+                code: errors::COMPONENT_UNAVAILABLE,
+                detail: format!("{error:#}"),
+            }
+            .into()
+        } else {
+            error
+        }
+    }
+}
 pub(crate) fn error_code(error: &anyhow::Error) -> i32 {
     error
         .downcast_ref::<PolicyFailure>()
-        .map_or(234893330, |error| error.code)
+        .map_or(errors::INITIALIZATION_FAILED, |error| error.code)
 }
 struct Command {
     enabled: bool,
     intent: u64,
-    done: tokio::sync::oneshot::Sender<Result<(), String>>,
+    done: tokio::sync::oneshot::Sender<Result<()>>,
 }
 struct Shared {
     lease: Lease,
@@ -68,6 +91,7 @@ struct Shared {
     active: AtomicBool,
     generation: AtomicU64,
     intent: AtomicU64,
+    accepted_policy: AtomicU64,
     gate: Mutex<()>,
     packets: ArrayQueue<Packet>,
     status: tokio::sync::watch::Sender<Status>,
@@ -98,6 +122,7 @@ impl Session {
             active: AtomicBool::new(false),
             generation: AtomicU64::new(0),
             intent: AtomicU64::new(0),
+            accepted_policy: AtomicU64::new(0),
             gate: Mutex::new(()),
             packets: ArrayQueue::new(32),
             status: tokio::sync::watch::channel(Status::default()).0,
@@ -140,11 +165,7 @@ impl Receiver {
             intent
         };
         if enabled && !self.shared.permitted() {
-            return Err(PolicyFailure {
-                code: 234893318,
-                detail: "本次会话不允许麦克风输入".into(),
-            }
-            .into());
+            return Err(PolicyFailure::not_allowed().into());
         }
         let (done, result) = tokio::sync::oneshot::channel();
         self.commands
@@ -156,8 +177,8 @@ impl Receiver {
             .map_err(|_| anyhow::anyhow!("麦克风设置繁忙"))?;
         tokio::time::timeout(Duration::from_secs(3), result)
             .await
-            .context("麦克风设置超时")??
-            .map_err(anyhow::Error::msg)
+            .context("麦克风设置超时")?
+            .context("麦克风执行线程已结束")?
     }
     pub fn status(&self) -> tokio::sync::watch::Receiver<Status> {
         self.shared.status.subscribe()
@@ -215,6 +236,7 @@ impl Shared {
     ) {
         self.active.store(active, Ordering::Release);
         let status = Status {
+            policy_generation: self.accepted_policy.load(Ordering::Acquire),
             enabled,
             active,
             speaker_active,
@@ -370,12 +392,17 @@ fn run(shared: Arc<Shared>, commands: mpsc::Receiver<Command>) {
                     }
                     shared.enabled.store(false, Ordering::Release);
                     shared.flush();
+                    shared
+                        .accepted_policy
+                        .store(command.intent, Ordering::Release);
                     shared.publish(false, false, false, None, 0);
                     return Ok(());
                 }
-                ensure!(shared.permitted(), "本次会话已结束");
+                if !shared.permitted() {
+                    return Err(PolicyFailure::not_allowed().into());
+                }
                 if device.is_none() {
-                    let mut bridge = Bridge::open()?;
+                    let mut bridge = Bridge::open().map_err(PolicyFailure::bridge)?;
                     let state = bridge.enable(false, true)?;
                     let playout = Playout::new(state, shared.generation.load(Ordering::Acquire))?;
                     device = Some((bridge, playout));
@@ -385,6 +412,9 @@ fn run(shared: Arc<Shared>, commands: mpsc::Receiver<Command>) {
                     *playout = Playout::new(state, shared.generation.load(Ordering::Acquire))?;
                 }
                 let _gate = lock(&shared.gate);
+                if !shared.permitted() {
+                    return Err(PolicyFailure::not_allowed().into());
+                }
                 if command.done.is_closed()
                     || command.intent != shared.intent.load(Ordering::Acquire)
                 {
@@ -392,6 +422,9 @@ fn run(shared: Arc<Shared>, commands: mpsc::Receiver<Command>) {
                 }
                 shared.enabled.store(true, Ordering::Release);
                 shared.retained.store(true, Ordering::Release);
+                shared
+                    .accepted_policy
+                    .store(command.intent, Ordering::Release);
                 let state = device.as_ref().unwrap().1.state;
                 shared.publish(
                     true,
@@ -415,12 +448,7 @@ fn run(shared: Arc<Shared>, commands: mpsc::Receiver<Command>) {
                 shared.flush();
                 shared.publish(false, false, false, Some(format!("{error:#}")), 0);
             }
-            if command
-                .done
-                .send(result.map_err(|e| format!("{e:#}")))
-                .is_err()
-                && command.enabled
-            {
+            if command.done.send(result).is_err() && command.enabled {
                 let _gate = lock(&shared.gate);
                 if command.intent == shared.intent.load(Ordering::Acquire) {
                     shared.enabled.store(false, Ordering::Release);
@@ -487,7 +515,7 @@ fn run(shared: Arc<Shared>, commands: mpsc::Receiver<Command>) {
     shared.flush();
     shared.publish(false, false, false, None, 0);
     while let Ok(command) = commands.try_recv() {
-        let _ = command.done.send(Err("会话已结束".into()));
+        let _ = command.done.send(Err(PolicyFailure::not_allowed().into()));
     }
 }
 fn mute(device: &mut Option<(Bridge, Playout)>) -> Result<()> {

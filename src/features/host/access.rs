@@ -1018,6 +1018,11 @@ impl Lease {
     pub(crate) fn is_assistance(&self) -> bool {
         self.assistance.is_some()
     }
+    /// Explicit extra-display requests are account-only. This is separate
+    /// from resolution conversion, headless recovery and releasing a screen.
+    pub(crate) fn display_expansion_allowed(&self) -> bool {
+        self.requested() && !self.is_assistance()
+    }
     pub(crate) fn set_update_notice(&self, notice: Arc<super::peer::UpdateNotice>) {
         let mut state = lock(&self.handle.ownership);
         if self.current(&state) {

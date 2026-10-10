@@ -15,6 +15,7 @@ pub struct AssociationInternal {
     pub(crate) max_message_size: Arc<AtomicU32>,
     pub(crate) inflight_queue_length: Arc<AtomicUsize>,
     pub(crate) will_send_shutdown: Arc<AtomicBool>,
+    pub(crate) input_credit_changed: Arc<tokio::sync::Notify>,
     awake_write_loop_ch: Arc<mpsc::Sender<()>>,
 
     peer_verification_tag: u32,
@@ -135,6 +136,7 @@ impl AssociationInternal {
             max_message_size: Arc::new(AtomicU32::new(max_message_size)),
 
             will_send_shutdown: Arc::new(AtomicBool::default()),
+            input_credit_changed: Arc::new(tokio::sync::Notify::new()),
             awake_write_loop_ch,
             peer_verification_tag: 0,
             my_verification_tag: loop {
@@ -354,6 +356,7 @@ impl AssociationInternal {
     /// The caller should hold the association write lock.
     fn unregister_stream(&mut self, stream_identifier: u16) {
         let s = self.streams.remove(&stream_identifier);
+        self.input_credit_changed.notify_waiters();
         if let Some(s) = s {
             // NOTE: shutdown is not used here because it resets the stream.
             if !s.read_shutdown.swap(true, Ordering::SeqCst) {
@@ -737,6 +740,7 @@ impl AssociationInternal {
     /// set_state atomically sets the state of the Association.
     pub(crate) fn set_state(&self, new_state: AssociationState) {
         let old_state = AssociationState::from(self.state.swap(new_state as u8, Ordering::SeqCst));
+        self.input_credit_changed.notify_waiters();
         if new_state != old_state {
             log::debug!(
                 "[{}] state change: '{}' => '{}'",
@@ -750,6 +754,44 @@ impl AssociationInternal {
     /// get_state atomically returns the state of the Association.
     fn get_state(&self) -> AssociationState {
         self.state.load(Ordering::SeqCst).into()
+    }
+
+    pub(crate) fn input_pending_bytes(&self, stream_id: u16) -> Result<usize> {
+        let stream = self.streams.get(&stream_id).ok_or(Error::ErrStreamClosed)?;
+        if self.get_state() != AssociationState::Established
+            || stream.write_shutdown.load(Ordering::SeqCst)
+        {
+            return Err(Error::ErrStreamClosed);
+        }
+        let buffered = stream.buffered_amount.load(Ordering::SeqCst);
+        if stream.unordered.load(Ordering::SeqCst) {
+            return Ok(buffered);
+        }
+        // Gap-ACK releases resend storage before ordered delivery is possible.
+        // Only a hole on THIS stream blocks its later messages: a FILE/TEXT
+        // TSN hole must not manufacture head-of-line blocking for CONTROL.
+        let first_missing = self
+            .inflight_queue
+            .chunk_map
+            .values()
+            .filter(|c| c.stream_identifier == stream_id && !c.acked)
+            .map(|c| c.tsn)
+            .reduce(|a, b| if sna32lt(a, b) { a } else { b });
+        let Some(first) = first_missing else {
+            return Ok(buffered);
+        };
+        // The final fragment retains the message's reservation size after it
+        // leaves pending_queue and after gap ACK clears user_data. An ACKed
+        // final fragment is charged its whole reservation, conservatively;
+        // accounting is exact for the unfragmented input messages using this API.
+        let blocked = self
+            .inflight_queue
+            .chunk_map
+            .values()
+            .filter(|c| c.stream_identifier == stream_id && c.acked && sna32lt(first, c.tsn))
+            .map(|c| c.pending_queue_credit)
+            .sum::<usize>();
+        Ok(buffered + blocked)
     }
 
     async fn handle_init(&mut self, p: &Packet, i: &ChunkInit) -> Result<Vec<Packet>> {
@@ -1672,6 +1714,9 @@ impl AssociationInternal {
             if let Some(s) = self.streams.get_mut(si) {
                 s.on_buffer_released(*n_bytes_acked).await;
             }
+        }
+        if cum_tsn_ack_point_advanced || bytes_acked_per_stream.values().any(|n| *n > 0) {
+            self.input_credit_changed.notify_waiters();
         }
 
         // New rwnd value

@@ -557,6 +557,32 @@ impl RTCDataChannel {
         }
     }
 
+    /// Admission watermark for latency-sensitive ordered data. This includes
+    /// gap-ACKed messages still blocked by a missing earlier message on the
+    /// same stream; ordinary buffered_amount keeps its standard SACK semantics.
+    pub async fn wait_input_capacity(&self, limit: usize) -> Result<()> {
+        let closed = self.notify_tx.notified();
+        tokio::pin!(closed);
+        closed.as_mut().enable();
+        self.ensure_open()?;
+        let transport = self
+            .sctp_transport
+            .lock()
+            .await
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .ok_or(Error::ErrClosedPipe)?;
+        let association = transport.association().await.ok_or(Error::ErrClosedPipe)?;
+        tokio::select! {
+            biased;
+            _ = closed => Err(Error::ErrClosedPipe),
+            result = association.wait_stream_input_capacity(self.id(), limit) => {
+                result?;
+                self.ensure_open()
+            }
+        }
+    }
+
     /// buffered_amount_low_threshold represents the threshold at which the
     /// bufferedAmount is considered to be low. When the bufferedAmount decreases
     /// from above this threshold to equal or below it, the bufferedamountlow

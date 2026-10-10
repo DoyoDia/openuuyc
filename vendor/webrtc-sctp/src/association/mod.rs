@@ -626,6 +626,32 @@ impl Association {
         ai.open_stream(stream_identifier, default_payload_type)
     }
 
+    /// Wait for room without treating selective ACK of later ordered messages
+    /// as proof that they can be delivered past an earlier hole on this stream.
+    pub async fn wait_stream_input_capacity(&self, stream_id: u16, limit: usize) -> Result<()> {
+        let changed = self
+            .association_internal
+            .lock()
+            .await
+            .input_credit_changed
+            .clone();
+        loop {
+            let notified = changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self
+                .association_internal
+                .lock()
+                .await
+                .input_pending_bytes(stream_id)?
+                < limit
+            {
+                return Ok(());
+            }
+            notified.await;
+        }
+    }
+
     /// accept_stream accepts a stream
     pub async fn accept_stream(&self) -> Option<Arc<Stream>> {
         let mut accept_ch_rx = self.accept_ch_rx.lock().await;

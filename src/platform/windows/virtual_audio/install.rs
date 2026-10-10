@@ -20,6 +20,40 @@ pub(crate) fn status() -> Result<Status> {
 pub(crate) fn needs_package_update() -> Result<bool> {
     PACKAGE.needs_package_update()
 }
+pub(crate) fn bridge_open_error(error: windows::core::Error) -> anyhow::Error {
+    use windows::Win32::Foundation::{
+        ERROR_ACCESS_DENIED, ERROR_DEV_NOT_EXIST, ERROR_DEVICE_NOT_CONNECTED, ERROR_FILE_NOT_FOUND,
+        ERROR_PATH_NOT_FOUND, ERROR_SHARING_VIOLATION,
+    };
+    let missing = [
+        ERROR_FILE_NOT_FOUND,
+        ERROR_PATH_NOT_FOUND,
+        ERROR_DEV_NOT_EXIST,
+        ERROR_DEVICE_NOT_CONNECTED,
+    ]
+    .iter()
+    .any(|code| error.code() == code.to_hresult());
+    let reason = if missing {
+        match PACKAGE.unavailable_reason() {
+            Ok(Some(reason)) => {
+                format!("OpenUUYC 虚拟声卡不可用：{reason}；请在被控端连接设置中检查虚拟声卡")
+            }
+            Ok(None) => {
+                "OpenUUYC 虚拟声卡设备已启动，但音频接口不可用，请查看被控端诊断信息".into()
+            }
+            Err(status) => format!("OpenUUYC 虚拟声卡接口不可用，设备状态读取失败：{status:#}"),
+        }
+    } else if error.code() == ERROR_ACCESS_DENIED.to_hresult() {
+        "无法访问 OpenUUYC 虚拟声卡，请检查被控服务是否已安装并正常运行".into()
+    } else if error.code() == ERROR_SHARING_VIOLATION.to_hresult() {
+        "OpenUUYC 虚拟声卡正在被其他会话或进程使用，请结束占用后重试".into()
+    } else {
+        "无法打开 OpenUUYC 虚拟声卡接口，请查看被控端诊断信息".into()
+    };
+    // Preserve the original Windows error for policy classification and the
+    // installer's occupancy guard; the diagnostic text is not an error code.
+    anyhow::Error::new(error).context(reason)
+}
 fn idle() -> Result<()> {
     if status()?.installed {
         // If another process owns the bridge, open fails and the mutation is

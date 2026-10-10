@@ -264,8 +264,8 @@ pub(in crate::application::viewer) fn player_title_bar(
     let mic = bar.stream_control.microphone().snapshot();
     let mic_hint = if mic.pending {
         "麦克风：等待远端确认"
-    } else if mic.error.is_some() {
-        "麦克风错误（在高级设置中查看）"
+    } else if let Some(error) = mic.error.as_deref() {
+        error
     } else if mic.capturing {
         "正在将麦克风发送到远端，点击关闭"
     } else if mic.enabled {
@@ -285,8 +285,19 @@ pub(in crate::application::viewer) fn player_title_bar(
         .on_disabled_hover_text("请先连接支持麦克风的 Windows 设备并开启键鼠控制")
         .clicked()
     {
-        if let Err(error) = bar.stream_control.set_microphone_enabled(!mic.enabled) {
-            bar.stream_control_ui.local_error = Some(error.to_string());
+        crate::ui::controls::clear_notice(actions.ctx(), "microphone-request-error");
+        match bar.stream_control.set_microphone_enabled(!mic.enabled) {
+            // Reset after acceptance so an identical rejection arriving before
+            // the next frame is shown again. A local rejection must not re-arm
+            // an old asynchronous error that is still in the microphone state.
+            Ok(()) => crate::ui::controls::clear_notice(actions.ctx(), "microphone-error"),
+            Err(error) => crate::ui::controls::notice(
+                actions.ctx(),
+                "microphone-request-error",
+                "麦克风",
+                crate::ui::controls::DialogIcon::Error,
+                error.to_string(),
+            ),
         }
     }
     let enabled = control.mouse_mode != crate::features::remote_input::MouseMode::View
@@ -294,7 +305,7 @@ pub(in crate::application::viewer) fn player_title_bar(
     action.toggle_mouse = actions
         .add_enabled_ui(enabled || control.ready, |ui| {
             let hint = if bar.stream_control.mouse().transport_recovering() {
-                "连接暂时不畅，键鼠控制将在恢复后自动接续；点击取消".into()
+                "键鼠控制正在自动恢复；点击取消".into()
             } else if bar.stream_control.mouse().waiting_for_neutral() {
                 format!(
                     "等待松开全部键鼠；退出控制快捷键：{}",

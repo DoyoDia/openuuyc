@@ -138,6 +138,7 @@ impl StreamControlHandle {
         // independent of an earlier cursor request still awaiting its response.
         state.cursor_sync_needed = true;
         self.refresh_mouse_policy(&mut state);
+        tracing::debug!(?mode, user_choice, "remote input control mode changed");
         drop(state);
         self.mouse.repaint();
         Ok(())
@@ -315,10 +316,8 @@ impl StreamControlHandle {
     }
 
     pub(super) fn refresh_mouse_policy(&self, state: &mut StreamControlState) {
-        if !state.viewing_enabled
-            || state.mouse.mode() == MouseMode::View
-            || self.microphone.needs_cleanup()
-        {
+        let mode = state.mouse.policy_mode();
+        if !state.viewing_enabled || mode == MouseMode::View || self.microphone.needs_cleanup() {
             self.disable_microphone_locked(state);
         }
         let clipboard_ready = state.viewing_enabled
@@ -327,7 +326,7 @@ impl StreamControlHandle {
             && state.text_channel_open
             && state.mouse_transport_connected
             && state.peer_clipboard >= 1
-            && state.mouse.mode() != MouseMode::View;
+            && mode != MouseMode::View;
         // Clipboard sync is gated on seven separate conditions, and a session
         // that never syncs looks identical whichever one is missing.
         if clipboard_ready != state.clipboard_ready_reported {
@@ -340,7 +339,7 @@ impl StreamControlHandle {
                 text = state.text_channel_open,
                 mouse_transport = state.mouse_transport_connected,
                 peer = state.peer_clipboard,
-                mode = ?state.mouse.mode(),
+                mode = ?mode,
                 files_allowed = state.clipboard_files_allowed,
                 "剪贴板同步条件"
             );
@@ -359,7 +358,6 @@ impl StreamControlHandle {
         if !state.viewing_enabled {
             return;
         }
-        let mode = state.mouse.mode();
         let (relative, wanted) = mouse_policy(state, mode);
         // Relative motion is only correct while this client holds the pointer.
         // A window that could not take it says so, and absolute positioning is
@@ -388,7 +386,7 @@ impl StreamControlHandle {
 }
 
 pub(super) fn smart_mouse_requested(state: &StreamControlState) -> bool {
-    state.mouse.mode() == MouseMode::Smart
+    state.mouse.policy_mode() == MouseMode::Smart
 }
 
 pub(super) fn mouse_policy(state: &StreamControlState, mode: MouseMode) -> (bool, bool) {

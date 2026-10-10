@@ -41,6 +41,11 @@ impl Bridge {
     }
 }
 
+/// The bridge only fails to open because the component does not exist here.
+pub(crate) fn unavailable(_error: &anyhow::Error) -> bool {
+    true
+}
+
 #[derive(Default)]
 pub(crate) struct Routing;
 impl Routing {

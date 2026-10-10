@@ -3,7 +3,7 @@ mod defaults;
 mod defaults_watch;
 pub(crate) mod install;
 use super::host_service::pipe::Handle;
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 pub(crate) use defaults::{Defaults, Routing};
 use windows::{
     Win32::{
@@ -13,6 +13,23 @@ use windows::{
     },
     core::w,
 };
+
+/// Whether opening the bridge failed because the driver device is not there,
+/// as opposed to a driver that is present but failed to start.
+pub(crate) fn unavailable(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<windows::core::Error>()
+        .is_some_and(|e| {
+            [
+                ERROR_FILE_NOT_FOUND,
+                ERROR_PATH_NOT_FOUND,
+                ERROR_DEV_NOT_EXIST,
+                ERROR_DEVICE_NOT_CONNECTED,
+            ]
+            .iter()
+            .any(|code| e.code() == code.to_hresult())
+        })
+}
 
 pub(crate) const FRAMES: usize = 480;
 pub(crate) struct AudioPriority(HANDLE);
@@ -75,7 +92,7 @@ impl Bridge {
                     None,
                 )
             }
-            .context("无法打开虚拟音频驱动；需要已安装驱动及被控服务")?,
+            .map_err(install::bridge_open_error)?,
         );
         let event = Handle(unsafe { CreateEventW(None, true, false, None)? });
         let mut bridge = Self {

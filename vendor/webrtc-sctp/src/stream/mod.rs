@@ -441,22 +441,26 @@ impl Stream {
             return;
         }
 
-        let from_amount = self.buffered_amount.load(Ordering::SeqCst);
-        let new_amount = if from_amount < n_bytes_released as usize {
-            self.buffered_amount.store(0, Ordering::SeqCst);
+        // send() can add bytes concurrently with SACK processing. Use the
+        // actual atomic transition for the low-water notification; a separate
+        // load followed by subtraction can miss the crossing and strand a
+        // sender waiting for credit (or erase concurrently added bytes).
+        let released = n_bytes_released as usize;
+        let from_amount = self
+            .buffered_amount
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |amount| {
+                Some(amount.saturating_sub(released))
+            })
+            .expect("buffer release always supplies an updated amount");
+        let new_amount = from_amount.saturating_sub(released);
+        if from_amount < released {
             log::error!(
                 "[{}] released buffer size {} should be <= {}",
                 self.name,
                 n_bytes_released,
-                0,
+                from_amount,
             );
-            0
-        } else {
-            self.buffered_amount
-                .fetch_sub(n_bytes_released as usize, Ordering::SeqCst);
-
-            from_amount - n_bytes_released as usize
-        };
+        }
 
         let buffered_amount_low = self.buffered_amount_low.load(Ordering::SeqCst);
 

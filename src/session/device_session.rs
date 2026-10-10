@@ -31,6 +31,25 @@ enum Command {
 }
 
 type Completion = tokio::sync::oneshot::Sender<Result<NativeIdentity>>;
+
+// Registration's network failures use the existing retryable -1 outcome.
+// Preserve this classification before fan-out and resident IPC erase the
+// reqwest error type. Local identity/storage and malformed replies stay fatal.
+fn registration_error(error: anyhow::Error) -> anyhow::Error {
+    if error
+        .downcast_ref::<reqwest::Error>()
+        .is_some_and(|error| error.is_connect() || error.is_timeout())
+    {
+        ApiFailure {
+            code: -1,
+            message: format!("{error:#}"),
+        }
+        .into()
+    } else {
+        error
+    }
+}
+
 type Pending = FuturesUnordered<
     BoxFuture<'static, (Completion, Result<(DeviceInitResponse, NativeIdentity)>)>,
 >;
@@ -274,7 +293,11 @@ impl Initializer {
                                 s.reported_controllable = body.controllable;
                                 s.registration = "正在上报设备信息".into();
                             });
-                            Ok((api.init_windows_device(&body).await?.into_data()?, identity))
+                            let response = api
+                                .init_windows_device(&body)
+                                .await
+                                .map_err(registration_error)?;
+                            Ok((response.into_data()?, identity))
                         }
                         .await;
                         (completion, result)

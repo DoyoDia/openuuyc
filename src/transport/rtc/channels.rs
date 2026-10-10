@@ -403,27 +403,45 @@ pub(super) async fn send_remote_input(
     kcp: UuKcpControl,
     stream_control: StreamControlHandle,
 ) {
+    use crate::transport::uu_kcp::INPUT_SEND_BUDGET_BYTES;
     let mouse = stream_control.mouse().clone();
     let mut heartbeat = tokio::time::interval(Duration::from_millis(15));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut keyboard_submission_seen = false;
     loop {
-        let event = tokio::select! {
+        let work = tokio::select! {
             event = mouse.next() => event,
             _ = heartbeat.tick() => { mouse.heartbeat(); continue; }
+        };
+        let mut event = match work {
+            crate::features::remote_input::InputWork::Event(event) => event,
+            crate::features::remote_input::InputWork::Recovery(recovery) => {
+                stream_control.reconcile_mouse_failure();
+                recover_remote_input(&channel, &kcp, &mouse, recovery).await;
+                continue;
+            }
         };
         if !mouse.is_current(&event) {
             mouse.discard(&event);
             continue;
         }
         let mut timed_out = false;
+        let epoch = event.epoch;
         let result = tokio::select! {
             biased;
-            _ = mouse.epoch_cancelled(event.epoch) => Err(anyhow::anyhow!("鼠标连接代次已变更")),
+            _ = mouse.epoch_cancelled(epoch) => Err(anyhow::anyhow!("鼠标连接代次已变更")),
             result = tokio::time::timeout(event.event.send_timeout(),
                 async {
-                    let state=mouse.clone();let guarded=event.clone();
                     let release=matches!(event.event,crate::features::remote_input::InputEvent::Button{down:false,..}|crate::features::remote_input::InputEvent::Key{down:false,..}|crate::features::remote_input::InputEvent::AssistButton{down:false,..});
+                    if !release {
+                        if kcp.is_negotiated() {
+                            kcp.wait_input_capacity().await?;
+                        } else {
+                            channel.wait_input_capacity(INPUT_SEND_BUDGET_BYTES).await?;
+                        }
+                    }
+                    anyhow::ensure!(mouse.refresh_pending(&mut event), "input no longer current before submission");
+                    let state=mouse.clone();let guarded=event.clone();
                     if kcp.is_negotiated(){kcp.send_input(channel.id(),event.event.encode(),Arc::new(move||state.is_current(&guarded)),release).await}
                     else {kcp.send_control(&channel,event.event.encode()).await}
                 }) => result
@@ -433,10 +451,14 @@ pub(super) async fn send_remote_input(
                 } })
                 .and_then(|result| result.map(|_| ())),
         };
-        if timed_out && let Some(recovery) = mouse.pause_transport(&event) {
+        if let Err(error) = &result
+            && let Some(recovery) = mouse.pause_transport(&event)
+        {
             tracing::warn!(
+                %error,
+                timed_out,
                 worker_stage = kcp.worker_stage(),
-                "remote input send stalled; suspending until reliable release acknowledgement"
+                "remote input send interrupted; suspending until reliable release acknowledgement"
             );
             stream_control.reconcile_mouse_failure();
             recover_remote_input(&channel, &kcp, &mouse, recovery).await;

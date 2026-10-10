@@ -240,7 +240,7 @@ impl Microphone {
         s.confirmed = code == 0 && enabled;
         if code != 0 {
             s.enabled = false;
-            s.error = Some(format!("远端麦克风请求失败：{code:#x}"));
+            s.error = Some(crate::protocol::microphone::failure_message(code));
         }
         self.0.refresh(&s);
         tracing::info!(seq, code, enabled, "microphone policy reply");
@@ -377,11 +377,29 @@ impl Source for Microphone {
     }
 }
 
+#[derive(Default)]
+struct CaptureAttempt {
+    failed: AtomicBool,
+    progressed: AtomicBool,
+}
+impl CaptureAttempt {
+    fn update_failures(&self, failures: &mut usize, failed: bool) {
+        // Opening the API alone is not recovery. At least one complete valid
+        // PCM frame must have been delivered by this attempt.
+        if self.progressed.swap(false, Ordering::AcqRel) {
+            *failures = 0;
+        }
+        if failed {
+            *failures += 1;
+        }
+    }
+}
+
 fn capture_owner(shared: Arc<Shared>) {
     let _ = shared.owner.set(std::thread::current());
     let host = cpal::default_host();
     let origin = Instant::now();
-    let failed = Arc::new(AtomicBool::new(false));
+    let mut attempt = Arc::new(CaptureAttempt::default());
     let mut stream = None;
     let mut device_id = None;
     let mut generation = u64::MAX;
@@ -445,16 +463,20 @@ fn capture_owner(shared: Arc<Shared>) {
                 }
             }
             stream = None;
-            failed.store(false, Ordering::Release);
+            attempt = Arc::new(CaptureAttempt::default());
             failures = 0;
             device_id = id;
             generation = next;
             shared.capturing.store(false, Ordering::Release);
             shared.peak.store(0, Ordering::Relaxed);
         }
-        if failed.swap(false, Ordering::AcqRel) {
+        let stream_failed = attempt.failed.swap(false, Ordering::AcqRel);
+        if stream_failed {
             stream = None;
-            failures += 1;
+        }
+        // Join the failed stream before taking its final progress marker.
+        attempt.update_failures(&mut failures, stream_failed);
+        if stream_failed {
             match shared.generation.compare_exchange(
                 generation,
                 generation.wrapping_add(1),
@@ -469,6 +491,7 @@ fn capture_owner(shared: Arc<Shared>) {
         }
         if stream.is_none() && failures < 3 {
             shared.capturing.store(false, Ordering::Release);
+            attempt = Arc::new(CaptureAttempt::default());
             let result = device
                 .ok_or_else(|| {
                     if selection.is_some() {
@@ -481,7 +504,7 @@ fn capture_owner(shared: Arc<Shared>) {
                     open_input(
                         &device,
                         Arc::clone(&shared),
-                        Arc::clone(&failed),
+                        Arc::clone(&attempt),
                         generation,
                         origin,
                     )
@@ -522,7 +545,7 @@ fn capture_owner(shared: Arc<Shared>) {
 fn open_input(
     device: &cpal::Device,
     shared: Arc<Shared>,
-    failed: Arc<AtomicBool>,
+    attempt: Arc<CaptureAttempt>,
     generation: u64,
     origin: Instant,
 ) -> Result<cpal::Stream> {
@@ -532,19 +555,19 @@ fn open_input(
     let config = supported.config();
     let stream = match supported.sample_format() {
         cpal::SampleFormat::F32 => {
-            build_input::<f32>(device, config, shared.clone(), failed, generation, origin)
+            build_input::<f32>(device, config, shared.clone(), attempt, generation, origin)
         }
         cpal::SampleFormat::I16 => {
-            build_input::<i16>(device, config, shared.clone(), failed, generation, origin)
+            build_input::<i16>(device, config, shared.clone(), attempt, generation, origin)
         }
         cpal::SampleFormat::I24 => {
-            build_input::<cpal::I24>(device, config, shared.clone(), failed, generation, origin)
+            build_input::<cpal::I24>(device, config, shared.clone(), attempt, generation, origin)
         }
         cpal::SampleFormat::I32 => {
-            build_input::<i32>(device, config, shared.clone(), failed, generation, origin)
+            build_input::<i32>(device, config, shared.clone(), attempt, generation, origin)
         }
         cpal::SampleFormat::F64 => {
-            build_input::<f64>(device, config, shared.clone(), failed, generation, origin)
+            build_input::<f64>(device, config, shared.clone(), attempt, generation, origin)
         }
         format => Err(anyhow!("麦克风格式不受支持：{format}")),
     }?;
@@ -567,11 +590,46 @@ fn open_input(
     Ok(stream)
 }
 
+fn input_error(
+    shared: &Shared,
+    failed: &AtomicBool,
+    generation: u64,
+    discontinuities: &mut u64,
+    error: cpal::Error,
+) {
+    let mut state = lock(&shared.state);
+    if !shared.current(generation) {
+        return;
+    }
+    if error.kind() == cpal::ErrorKind::Xrun {
+        // WASAPI reports DATA_DISCONTINUITY and then delivers the current
+        // buffer. Rebuilding here discards that data and can repeat the same
+        // startup discontinuity until the device retry budget is exhausted.
+        // No missing-sample count is supplied: keep the valid callback data
+        // and the existing RTP clock rather than inventing samples or a gap.
+        *discontinuities = discontinuities.saturating_add(1);
+        let count = *discontinuities;
+        drop(state);
+        if count.is_power_of_two() {
+            tracing::warn!(
+                generation,
+                count,
+                "microphone capture discontinuity; stream retained"
+            );
+        }
+        return;
+    }
+    state.error = Some(format!("麦克风设备中断：{error}"));
+    failed.store(true, Ordering::Release);
+    drop(state);
+    shared.notify();
+}
+
 fn build_input<T: cpal::SizedSample + cpal::Sample>(
     device: &cpal::Device,
     config: cpal::StreamConfig,
     shared: Arc<Shared>,
-    failed: Arc<AtomicBool>,
+    attempt: Arc<CaptureAttempt>,
     generation: u64,
     origin: Instant,
 ) -> Result<cpal::Stream>
@@ -587,6 +645,8 @@ where
     let mut filled = 0;
     let mut timestamp = (origin.elapsed().as_secs_f64() * f64::from(RATE)) as u64 as u32;
     let errors = shared.clone();
+    let callback_attempt = attempt.clone();
+    let mut discontinuities = 0;
     device
         .build_input_stream(
             config,
@@ -643,6 +703,7 @@ where
                                     generation,
                                     created: Instant::now(),
                                 });
+                                callback_attempt.progressed.store(true, Ordering::Release);
                                 shared.wake.notify_one();
                                 timestamp = timestamp.wrapping_add(BLOCK as u32);
                                 filled = 0;
@@ -652,12 +713,13 @@ where
                 }
             },
             move |e| {
-                if !errors.current(generation) {
-                    return;
-                }
-                lock(&errors.state).error = Some(format!("麦克风设备中断：{e}"));
-                failed.store(true, Ordering::Release);
-                errors.notify();
+                input_error(
+                    &errors,
+                    &attempt.failed,
+                    generation,
+                    &mut discontinuities,
+                    e,
+                );
             },
             None,
         )

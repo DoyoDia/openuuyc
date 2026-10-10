@@ -562,7 +562,11 @@ fn qr_form(
         if overlay
             .add_enabled(
                 enabled,
-                login_button("刷新二维码")
+                login_button(if texture.is_some() {
+                    "刷新二维码"
+                } else {
+                    "重试登录"
+                })
                     .fill(BLUE)
                     .stroke(Stroke::NONE)
                     .min_size(button.size()),
