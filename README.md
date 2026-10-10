@@ -4,13 +4,13 @@
 
 OpenUUYC 是用 Rust 编写的 UU 远程第三方 Windows 客户端，支持主控、被控和远程协助。
 
-当前源码已进入 **v1.0.0-rc.1** 发布准备，继续完善 Windows 1.0 的兼容性、恢复和稳定性。**Windows 正式版完成后会适配 Linux 等其他平台。** 提前移植建议先通过 [Issue](https://github.com/djkcyl/openuuyc/issues) 沟通。
+Windows 1.0 已进入 **RC** 阶段，重点完善兼容性、恢复和稳定性。**Windows 正式版完成后会适配 Linux 等其他平台。** 提前移植建议先通过 [Issue](https://github.com/djkcyl/openuuyc/issues) 沟通。
 
 ## 下载与使用
 
 从 [Releases](https://github.com/djkcyl/openuuyc/releases) 下载 Windows x64 客户端，扫码或短信登录后连接设备，支持 UU 官方客户端；无需登录也可在登录页开启“接受远程协助”。
 
-最新稳定版为 [v0.7.0](https://github.com/djkcyl/openuuyc/releases/tag/v0.7.0)，最新预发布为 [v1.0.0-beta.3](https://github.com/djkcyl/openuuyc/releases/tag/v1.0.0-beta.3)。
+最新稳定版为 [v0.7.0](https://github.com/djkcyl/openuuyc/releases/tag/v0.7.0)，最新预发布为 [v1.0.0-rc.1](https://github.com/djkcyl/openuuyc/releases/tag/v1.0.0-rc.1)。
 
 接收测试版更新提醒：在“关于”中开启“允许测试版”（默认关闭）。
 
@@ -18,7 +18,7 @@ OpenUUYC 是用 Rust 编写的 UU 远程第三方 Windows 客户端，支持主�
 
 ## 能力表
 
-以下对应 **v1.0.0-beta.3**，功能取决于双方能力与权限。
+以下对应 **v1.0.0-rc.1**，功能取决于双方能力与权限。
 
 | 功能 | 主控端 | 被控端 | 说明 |
 | --- | --- | --- | --- |
