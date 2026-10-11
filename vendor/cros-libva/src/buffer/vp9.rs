@@ -435,6 +435,9 @@ impl EncPictureParameterBufferVP9 {
             number_skip_frames,
             skip_frames_size,
             va_reserved: Default::default(),
+            // libva 1.22+ 增加了 VP9 的这两个字段；用 ..Default::default() 兼容新旧版本。
+            // OpenUUYC 在 Linux 上只用 H.264/AV1 编解码，不经由此结构。
+            ..Default::default()
         }))
     }
 

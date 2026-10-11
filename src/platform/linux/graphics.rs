@@ -85,10 +85,17 @@ pub(crate) fn create_device() -> Result<Graphics> {
 
 fn create_graphics() -> Result<Graphics> {
     // Vulkan first, GL as the fallback for drivers or VMs without it.
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::VULKAN | wgpu::Backends::GL,
-        ..wgpu::InstanceDescriptor::new_without_display_handle_from_env()
-    });
+    // OPENUUYC_BACKEND=gl 可强制 OpenGL：虚拟机的 Intel Haswell Vulkan 与
+    // Wayland/X11 surface 的 queue family 不匹配，只能走 GL。
+    // 注意 new_without_display_handle_from_env() 内部会调 with_env()，
+    // 必须在其后覆盖 backends，否则 WGPU_BACKEND 会失效。
+    let mut desc = wgpu::InstanceDescriptor::new_without_display_handle_from_env();
+    desc.backends = match std::env::var("OPENUUYC_BACKEND").as_deref() {
+        Ok("gl") | Ok("gles") | Ok("opengl") => wgpu::Backends::GL,
+        Ok("vulkan") | Ok("vk") => wgpu::Backends::VULKAN,
+        _ => wgpu::Backends::VULKAN | wgpu::Backends::GL,
+    };
+    let instance = wgpu::Instance::new(desc);
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::HighPerformance,
         ..Default::default()
