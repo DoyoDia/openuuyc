@@ -380,9 +380,13 @@ mod virtual_keyboard {
     wayland_client::delegate_noop!(State: ignore keyboard::ZwpVirtualKeyboardV1);
     wayland_client::delegate_noop!(State: ignore wl_seat::WlSeat);
 
-    /// 第一个自定义键码；与 evdev 已用的键码重合，但虚拟键盘是独立设备，
-    /// 只用于文字输入，因此覆盖无妨。
-    const FIRST_CODE: u8 = 200;
+    /// 发送给合成器的第一个键码。协议里传的是 **evdev 风格**键码，合成器
+    /// 与客户端都会 `+8` 得到 xkb keycode（Hyprland `Keyboard.cpp`：
+    /// `updateXkbStateWithKey(event.key + 8, ...)`），所以 keymap 里声明的
+    /// 键码必须是 `FIRST_CODE + KEYCODE_OFFSET`。与 wtype 一致取 1。
+    const FIRST_CODE: u8 = 1;
+    /// evdev 键码到 xkb keycode 的固定偏移。
+    const KEYCODE_OFFSET: u8 = 8;
 
     pub(crate) struct Keyboard {
         connection: Connection,
@@ -399,15 +403,15 @@ mod virtual_keyboard {
             }
         }
         let mut out = String::from("xkb_keymap {\n  xkb_keycodes \"vk\" {\n");
-        out.push_str(&format!("    minimum = {FIRST_CODE};\n"));
+        out.push_str(&format!("    minimum = {};\n", FIRST_CODE + KEYCODE_OFFSET));
         out.push_str(&format!(
             "    maximum = {};\n",
-            FIRST_CODE as usize + chars.len().saturating_sub(1)
+            FIRST_CODE as usize + KEYCODE_OFFSET as usize + chars.len().saturating_sub(1)
         ));
         for index in 0..chars.len() {
             out.push_str(&format!(
                 "    <VK{index:02}> = {};\n",
-                FIRST_CODE as usize + index
+                FIRST_CODE as usize + KEYCODE_OFFSET as usize + index
             ));
         }
         out.push_str("  };\n  xkb_types \"vk\" { include \"complete\" };\n");
@@ -446,10 +450,13 @@ mod virtual_keyboard {
                 let seat: wl_seat::WlSeat =
                     globals.bind(&qh, 1..=8, ()).context("没有 Wayland seat")?;
                 let keyboard = manager.create_virtual_keyboard(&seat, &qh, ());
-                // keymap 必须在上报按键之前上传。
+                // keymap 必须在上报按键之前上传（否则合成器会报
+                // NO_KEYMAP）。这里同样要补 NUL 结尾。
                 let (keymap, _) = keymap_for(" ");
-                let fd = keymap_fd(keymap.as_bytes())?;
-                keyboard.keymap(1, fd.as_fd(), keymap.len() as u32);
+                let mut bytes = keymap.into_bytes();
+                bytes.push(0);
+                let fd = keymap_fd(&bytes)?;
+                keyboard.keymap(1, fd.as_fd(), bytes.len() as u32);
                 keyboard
             };
             queue.flush().context("提交虚拟键盘请求失败")?;
@@ -498,6 +505,7 @@ mod virtual_keyboard {
                         assigned
                     }
                 };
+                // 发送 evdev 风格键码；合成器与客户端会各自 +8 查 keymap。
                 let code = u32::from(FIRST_CODE + position);
                 self.keyboard.key(0, code, 1);
                 let _ = self.queue.roundtrip(&mut State);
