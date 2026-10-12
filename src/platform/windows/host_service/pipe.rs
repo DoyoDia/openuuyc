@@ -333,7 +333,11 @@ impl Pipe {
         let bytes = self.receive_raw(timeout, permitted)?;
         serde_json::from_slice(&bytes).map_err(|_| anyhow::anyhow!("被控服务消息无效"))
     }
-    pub(crate) fn receive_raw(&self, timeout: Duration, permitted: impl Fn() -> bool) -> Result<Vec<u8>> {
+    pub(crate) fn receive_raw(
+        &self,
+        timeout: Duration,
+        permitted: impl Fn() -> bool,
+    ) -> Result<Vec<u8>> {
         let deadline = Instant::now() + timeout;
         let mut size = [0; 4];
         if self.reader.borrow().is_some() {

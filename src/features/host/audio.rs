@@ -213,7 +213,10 @@ impl Audio {
         }
     }
     pub fn allowed(&self) -> bool {
-        self.0.media_allowed.load(Ordering::Acquire) && self.0.lease.requested() && self.encoding().is_some() && !self.0.cancel.is_cancelled()
+        self.0.media_allowed.load(Ordering::Acquire)
+            && self.0.lease.requested()
+            && self.encoding().is_some()
+            && !self.0.cancel.is_cancelled()
     }
     fn invalidate(&self) {
         self.0.active.store(false, Ordering::Release);

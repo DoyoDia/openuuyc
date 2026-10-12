@@ -905,15 +905,17 @@ pub(super) fn local_list(path: &str) -> Result<Vec<FileEntry>> {
                 })
             })
             .collect();
-        entries.extend(crate::platform::windows::file_locations::known_folders().into_iter().map(
-            |(path, name, icon)| FileEntry {
-                entry_type: 0,
-                name: name.into(),
-                full_path: path.to_string_lossy().into_owned(),
-                icon_type: icon.into(),
-                ..Default::default()
-            },
-        ));
+        entries.extend(
+            crate::platform::windows::file_locations::known_folders()
+                .into_iter()
+                .map(|(path, name, icon)| FileEntry {
+                    entry_type: 0,
+                    name: name.into(),
+                    full_path: path.to_string_lossy().into_owned(),
+                    icon_type: icon.into(),
+                    ..Default::default()
+                }),
+        );
         return Ok(entries);
     }
     let root = storage::canonical_dir(std::path::Path::new(path))?;
@@ -944,7 +946,9 @@ pub(super) fn local_list(path: &str) -> Result<Vec<FileEntry>> {
             icon_type: if m.is_dir() {
                 String::new()
             } else {
-                e.path().extension().filter(|v| !v.is_empty())
+                e.path()
+                    .extension()
+                    .filter(|v| !v.is_empty())
                     .map(|v| format!(".{}", v.to_string_lossy()))
                     .unwrap_or_default()
             },

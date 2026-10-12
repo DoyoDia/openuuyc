@@ -338,7 +338,10 @@ impl DecoderPool {
                 self.software_slot.clone(),
             ) {
                 Ok(mut decoder) => {
-                    decoder.describe_selection(self.preference, self.candidates.iter().any(|c| !c.enabled));
+                    decoder.describe_selection(
+                        self.preference,
+                        self.candidates.iter().any(|c| !c.enabled),
+                    );
                     {
                         self.software_slot = decoder.software_slot();
                     }

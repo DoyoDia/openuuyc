@@ -290,27 +290,46 @@ impl DeviceCenterApp {
                         .as_ref()
                         .is_none_or(|caps| caps.codecs.iter().any(|cap| settings.accepts(cap)))
             };
-            form_row(ui, "编码格式", if selected.codec == EncoderCodec::Automatic { "主控未指定时使用；重连后生效" } else { "已固定，可在高级限制中调整" }, |ui| {
-                if selected.codec != EncoderCodec::Automatic {
-                    ui.label(selected.codec.label());
+            form_row(
+                ui,
+                "编码格式",
+                if selected.codec == EncoderCodec::Automatic {
+                    "主控未指定时使用；重连后生效"
                 } else {
-                    egui::ComboBox::from_id_salt("host-codec-preferred")
-                        .width(238.)
-                        .selected_text(selected.preferred_codec.label())
-                        .show_ui(ui, |ui| {
-                            for codec in crate::media::CodecPreference::PREFERRED {
-                                ui.selectable_value(&mut selected.preferred_codec, codec, codec.label());
-                            }
-                        });
-                }
-            });
-            form_row(ui, "编码器", "不可用时自动回退；重连后生效", |ui| {
-                if selected.mode == EncoderMode::Software {
-                    ui.label("仅软件编码");
-                } else {
-                    self.media_inventory.draw(ui, "host-encoder-gpu", &mut selected.gpu, true);
-                }
-            });
+                    "已固定，可在高级限制中调整"
+                },
+                |ui| {
+                    if selected.codec != EncoderCodec::Automatic {
+                        ui.label(selected.codec.label());
+                    } else {
+                        egui::ComboBox::from_id_salt("host-codec-preferred")
+                            .width(238.)
+                            .selected_text(selected.preferred_codec.label())
+                            .show_ui(ui, |ui| {
+                                for codec in crate::media::CodecPreference::PREFERRED {
+                                    ui.selectable_value(
+                                        &mut selected.preferred_codec,
+                                        codec,
+                                        codec.label(),
+                                    );
+                                }
+                            });
+                    }
+                },
+            );
+            form_row(
+                ui,
+                "编码器",
+                "不可用时自动回退；重连后生效",
+                |ui| {
+                    if selected.mode == EncoderMode::Software {
+                        ui.label("仅软件编码");
+                    } else {
+                        self.media_inventory
+                            .draw(ui, "host-encoder-gpu", &mut selected.gpu, true);
+                    }
+                },
+            );
             let restriction = super::super::media_preferences::limits_title(
                 selected.mode,
                 (selected.codec != EncoderCodec::Automatic).then(|| selected.codec.label()),
@@ -324,21 +343,43 @@ impl DeviceCenterApp {
                             .selected_text(selected.mode.label())
                             .show_ui(ui, |ui| {
                                 for mode in EncoderMode::ALL {
-                                    ui.add_enabled_ui(available(EncodingSettings { mode, ..selected }), |ui| {
-                                        ui.selectable_value(&mut selected.mode, mode, mode.label());
-                                    });
+                                    ui.add_enabled_ui(
+                                        available(EncodingSettings { mode, ..selected }),
+                                        |ui| {
+                                            ui.selectable_value(
+                                                &mut selected.mode,
+                                                mode,
+                                                mode.label(),
+                                            );
+                                        },
+                                    );
                                 }
                             });
                     });
                     form_row(ui, "格式限制", "", |ui| {
                         egui::ComboBox::from_id_salt("host-encoder-codec")
                             .width(238.)
-                            .selected_text(if selected.codec == EncoderCodec::Automatic { "不限制" } else { selected.codec.label() })
+                            .selected_text(if selected.codec == EncoderCodec::Automatic {
+                                "不限制"
+                            } else {
+                                selected.codec.label()
+                            })
                             .show_ui(ui, |ui| {
                                 for codec in EncoderCodec::ALL {
-                                    ui.add_enabled_ui(available(EncodingSettings { codec, ..selected }), |ui| {
-                                        ui.selectable_value(&mut selected.codec, codec, if codec == EncoderCodec::Automatic { "不限制" } else { codec.label() });
-                                    });
+                                    ui.add_enabled_ui(
+                                        available(EncodingSettings { codec, ..selected }),
+                                        |ui| {
+                                            ui.selectable_value(
+                                                &mut selected.codec,
+                                                codec,
+                                                if codec == EncoderCodec::Automatic {
+                                                    "不限制"
+                                                } else {
+                                                    codec.label()
+                                                },
+                                            );
+                                        },
+                                    );
                                 }
                             });
                     });

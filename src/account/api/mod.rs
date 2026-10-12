@@ -39,8 +39,8 @@ mod assist;
 pub(crate) mod guest;
 mod host_assist;
 mod power;
-mod wol;
 pub(crate) mod wallpaper;
+mod wol;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Method {

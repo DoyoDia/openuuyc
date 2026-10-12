@@ -80,7 +80,8 @@ impl Manifest {
     }
 }
 pub(crate) fn root() -> Result<PathBuf> {
-    let adjacent = crate::application::bootstrap::resource_origin().unwrap_or(std::env::current_exe()?)
+    let adjacent = crate::application::bootstrap::resource_origin()
+        .unwrap_or(std::env::current_exe()?)
         .parent()
         .context("missing executable directory")?
         .join("plugins");

@@ -10,8 +10,8 @@ mod dialogs;
 pub(crate) use diagnostics::{
     diagnostics_action, diagnostics_empty, diagnostics_label, diagnostics_row, diagnostics_table,
 };
-mod inputs;
 mod host_notice;
+mod inputs;
 pub(crate) use host_notice::host_notice;
 mod input_rate;
 pub(crate) use input_rate::input_rate_warning;
@@ -21,8 +21,8 @@ pub(crate) use notices::{
     clear_notice, notice, observe_form_notice, observe_notice, observe_notice_action,
     progress_notice, show_notices,
 };
-pub(crate) mod files;
 pub(crate) mod file_icons;
+pub(crate) mod files;
 use dialogs::dialog_icon;
 pub(crate) use dialogs::{DialogAction, DialogIcon, dialog_actions, dialog_header};
 mod mapping;
@@ -33,7 +33,8 @@ pub(crate) use mapping::{
     MappingRow, MappingRowAction, mapping_empty, mapping_row, mapping_table_header,
 };
 pub(crate) use performance::{
-    PerformanceTrace, metric_pair, metric_pair_colored, performance_frame, performance_header, performance_trace,
+    PerformanceTrace, metric_pair, metric_pair_colored, performance_frame, performance_header,
+    performance_trace,
 };
 pub(crate) use updates::{update_actions, update_device_row, update_prepared_notice};
 pub(crate) use viewer_caption::{ViewerCaptionIcon, viewer_caption_button};

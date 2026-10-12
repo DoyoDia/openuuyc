@@ -15,13 +15,17 @@ use crate::decoder::align::{Align16, AlignedVec2, AlignedVec64};
 use crate::decoder::cdef::Rav1dCdefDSPContext;
 use crate::decoder::cdf::{CdfContext, CdfThreadContext};
 use crate::decoder::cpu::{rav1d_get_cpu_flags, CpuFlags};
-use crate::decoder::disjoint_mut::{DisjointImmutGuard, DisjointMut, DisjointMutArcSlice, DisjointMutGuard};
+use crate::decoder::disjoint_mut::{
+    DisjointImmutGuard, DisjointMut, DisjointMutArcSlice, DisjointMutGuard,
+};
 use crate::decoder::env::BlockContext;
 use crate::decoder::error::Rav1dError;
 use crate::decoder::include::common::bitdepth::{BitDepth, BitDepth16, BitDepth8, BPC};
 use crate::decoder::include::dav1d::common::Rav1dDataProps;
 use crate::decoder::include::dav1d::data::Rav1dData;
-use crate::decoder::include::dav1d::dav1d::{Rav1dDecodeFrameType, Rav1dEventFlags, Rav1dInloopFilterType};
+use crate::decoder::include::dav1d::dav1d::{
+    Rav1dDecodeFrameType, Rav1dEventFlags, Rav1dInloopFilterType,
+};
 use crate::decoder::include::dav1d::headers::{
     DRav1d, Dav1dFrameHeader, Dav1dSequenceHeader, Rav1dContentLightLevel, Rav1dFrameHeader,
     Rav1dITUTT35, Rav1dMasteringDisplay, Rav1dSequenceHeader, Rav1dWarpedMotionParams,

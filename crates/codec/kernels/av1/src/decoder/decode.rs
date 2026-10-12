@@ -62,7 +62,9 @@ use crate::decoder::msac::{
     MsacContext,
 };
 use crate::decoder::pal::Rav1dPalDSPContext;
-use crate::decoder::picture::{rav1d_picture_alloc_copy, rav1d_thread_picture_alloc, Rav1dThreadPicture};
+use crate::decoder::picture::{
+    rav1d_picture_alloc_copy, rav1d_thread_picture_alloc, Rav1dThreadPicture,
+};
 use crate::decoder::qm::DAV1D_QM_TBL;
 use crate::decoder::recon::debug_block_info;
 use crate::decoder::refmvs::{
@@ -79,7 +81,9 @@ use crate::decoder::tables::{
 use crate::decoder::thread_task::{
     rav1d_task_create_tile_sbrow, rav1d_task_frame_init, FRAME_ERROR, TILE_ERROR,
 };
-use crate::decoder::warpmv::{rav1d_find_affine_int, rav1d_get_shear_params, rav1d_set_affine_mv2d};
+use crate::decoder::warpmv::{
+    rav1d_find_affine_int, rav1d_get_shear_params, rav1d_set_affine_mv2d,
+};
 
 fn init_quant_tables(
     seq_hdr: &Rav1dSequenceHeader,
@@ -4051,7 +4055,11 @@ pub(crate) fn rav1d_decode_tile_sbrow(
         t.a = (off_2pass + col_sb128_start + tile_row * f.sb128w) as usize;
         for bx in (ts.tiling.col_start..ts.tiling.col_end).step_by(sb_step as usize) {
             t.b.x = bx;
-            if c.flush.load(Ordering::Acquire) || f.cancellation.as_ref().is_some_and(|flag|flag.load(Ordering::Acquire)) {
+            if c.flush.load(Ordering::Acquire)
+                || f.cancellation
+                    .as_ref()
+                    .is_some_and(|flag| flag.load(Ordering::Acquire))
+            {
                 return Err(());
             }
             decode_sb(
@@ -4088,7 +4096,11 @@ pub(crate) fn rav1d_decode_tile_sbrow(
     t.lf_mask = Some((sb128y * f.sb128w + col_sb128_start) as usize);
     for bx in (ts.tiling.col_start..ts.tiling.col_end).step_by(sb_step as usize) {
         t.b.x = bx;
-        if c.flush.load(Ordering::Acquire) || f.cancellation.as_ref().is_some_and(|flag|flag.load(Ordering::Acquire)) {
+        if c.flush.load(Ordering::Acquire)
+            || f.cancellation
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::Acquire))
+        {
             return Err(());
         }
         let cdef_idx = &f.lf.mask[t.lf_mask.unwrap()].cdef_idx;
@@ -4242,7 +4254,10 @@ pub(crate) fn rav1d_decode_frame_init(c: &Rav1dContext, fc: &Rav1dFrameContext) 
     let f = &mut *f;
 
     f.cancellation = c.cancellation.lock().clone();
-    if f.cancellation.as_ref().is_some_and(|flag|flag.load(Ordering::Acquire)) {
+    if f.cancellation
+        .as_ref()
+        .is_some_and(|flag| flag.load(Ordering::Acquire))
+    {
         return Err(Rav1dError::InvalidArgument);
     }
 

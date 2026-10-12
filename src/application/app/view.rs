@@ -13,13 +13,13 @@ mod device_details;
 mod device_visuals;
 mod devices;
 mod diagnostic_export;
-mod remote_diagnostics;
 mod diagnostics_panel;
 mod host_assist;
 mod host_settings;
 mod logs;
 mod port_mapping;
 mod power;
+mod remote_diagnostics;
 mod update_dialog;
 mod wol_setup;
 
@@ -352,7 +352,12 @@ fn form_row(ui: &mut egui::Ui, label: &str, hint: &str, content: impl FnOnce(&mu
     ui.separator();
 }
 
-fn form_row_content(ui: &mut egui::Ui, label: &str, hint: &str, content: impl FnOnce(&mut egui::Ui)) {
+fn form_row_content(
+    ui: &mut egui::Ui,
+    label: &str,
+    hint: &str,
+    content: impl FnOnce(&mut egui::Ui),
+) {
     ui.horizontal(|ui| {
         let label_width = (ui.available_width() - 258.0).max(160.0);
         ui.allocate_ui_with_layout(
@@ -564,9 +569,9 @@ fn qr_form(
                 } else {
                     "重试登录"
                 })
-                    .fill(BLUE)
-                    .stroke(Stroke::NONE)
-                    .min_size(button.size()),
+                .fill(BLUE)
+                .stroke(Stroke::NONE)
+                .min_size(button.size()),
             )
             .clicked()
         {
@@ -923,19 +928,28 @@ impl DeviceCenterApp {
             State::Current => (
                 current.clone(),
                 MUTED,
-                format!("当前版本 {current}，已是最新{}，点击重新检查", self.updates.release_label()),
+                format!(
+                    "当前版本 {current}，已是最新{}，点击重新检查",
+                    self.updates.release_label()
+                ),
                 None,
             ),
             State::Ahead => (
                 current.clone(),
                 MUTED,
-                format!("当前版本 {current} 高于 GitHub 最新{}，点击重新检查", self.updates.release_label()),
+                format!(
+                    "当前版本 {current} 高于 GitHub 最新{}，点击重新检查",
+                    self.updates.release_label()
+                ),
                 None,
             ),
             State::NoRelease => (
                 current.clone(),
                 MUTED,
-                format!("当前版本 {current}，暂无公开{}，点击重新检查", self.updates.release_label()),
+                format!(
+                    "当前版本 {current}，暂无公开{}，点击重新检查",
+                    self.updates.release_label()
+                ),
                 None,
             ),
             State::Failed(error) => (
@@ -944,7 +958,12 @@ impl DeviceCenterApp {
                 format!("当前版本 {current}\n检查更新失败：{error}\n点击重试"),
                 None,
             ),
-            State::Available { version, url, prerelease, .. } => {
+            State::Available {
+                version,
+                url,
+                prerelease,
+                ..
+            } => {
                 let label = format!("↑ v{version}");
                 (
                     if label.chars().count() <= 10 {
@@ -953,7 +972,14 @@ impl DeviceCenterApp {
                         "有新版本".into()
                     },
                     BLUE,
-                    format!("发现{} v{version}（当前 {current}）\n点击查看更新内容", if *prerelease { "测试版" } else { "新版本" }),
+                    format!(
+                        "发现{} v{version}（当前 {current}）\n点击查看更新内容",
+                        if *prerelease {
+                            "测试版"
+                        } else {
+                            "新版本"
+                        }
+                    ),
                     Some(url.clone()),
                 )
             }
@@ -1205,7 +1231,11 @@ impl DeviceCenterApp {
             form_row(
                 ui,
                 "编码格式",
-                if self.media.codec.restricted() { "已固定，可在高级限制中调整" } else { "不可用时自动回退；重连后生效" },
+                if self.media.codec.restricted() {
+                    "已固定，可在高级限制中调整"
+                } else {
+                    "不可用时自动回退；重连后生效"
+                },
                 |ui| {
                     if self.media.codec.restricted() {
                         ui.label(self.media.codec.label());
@@ -1221,16 +1251,29 @@ impl DeviceCenterApp {
                         });
                 },
             );
-            form_row(ui, "解码器", "仅影响本机播放；重连后生效", |ui| {
-                if self.media.decoder.mode.hardware() {
-                    self.media_inventory.draw(ui, "center-decoder-gpu", &mut self.media.decoder.gpu, false);
-                } else {
-                    ui.label("仅软件解码");
-                }
-            });
+            form_row(
+                ui,
+                "解码器",
+                "仅影响本机播放；重连后生效",
+                |ui| {
+                    if self.media.decoder.mode.hardware() {
+                        self.media_inventory.draw(
+                            ui,
+                            "center-decoder-gpu",
+                            &mut self.media.decoder.gpu,
+                            false,
+                        );
+                    } else {
+                        ui.label("仅软件解码");
+                    }
+                },
+            );
             let restriction = super::media_preferences::limits_title(
                 self.media.decoder.mode,
-                self.media.codec.restricted().then(|| self.media.codec.label()),
+                self.media
+                    .codec
+                    .restricted()
+                    .then(|| self.media.codec.label()),
             );
             egui::CollapsingHeader::new(restriction)
                 .id_salt("controller-codec-limits")
@@ -1241,20 +1284,35 @@ impl DeviceCenterApp {
                             .selected_text(self.media.decoder.mode.label())
                             .show_ui(ui, |ui| {
                                 for mode in crate::media::selection::ProcessingMode::ALL {
-                                    ui.selectable_value(&mut self.media.decoder.mode, mode, mode.label());
+                                    ui.selectable_value(
+                                        &mut self.media.decoder.mode,
+                                        mode,
+                                        mode.label(),
+                                    );
                                 }
                             });
                     });
                     form_row(ui, "格式限制", "", |ui| {
                         egui::ComboBox::from_id_salt("center-codec-only")
                             .width(238.)
-                            .selected_text(if self.media.codec.restricted() { self.media.codec.label() } else { "不限制" })
+                            .selected_text(if self.media.codec.restricted() {
+                                self.media.codec.label()
+                            } else {
+                                "不限制"
+                            })
                             .show_ui(ui, |ui| {
-                                if ui.selectable_label(!self.media.codec.restricted(), "不限制").clicked() {
+                                if ui
+                                    .selectable_label(!self.media.codec.restricted(), "不限制")
+                                    .clicked()
+                                {
                                     self.media.codec = CodecPreference::Auto;
                                 }
                                 for codec in CodecPreference::ONLY {
-                                    ui.selectable_value(&mut self.media.codec, codec, codec.label());
+                                    ui.selectable_value(
+                                        &mut self.media.codec,
+                                        codec,
+                                        codec.label(),
+                                    );
                                 }
                             });
                     });
@@ -1289,9 +1347,9 @@ impl DeviceCenterApp {
             self.center_ui.components.management(ui, active);
         });
         if self.media != original_media {
-            if let Err(error)=crate::media::preferences::save(self.media) {
-                self.media=original_media;
-                self.status=StatusMessage::error(format!("保存编解码设置失败：{error:#}"));
+            if let Err(error) = crate::media::preferences::save(self.media) {
+                self.media = original_media;
+                self.status = StatusMessage::error(format!("保存编解码设置失败：{error:#}"));
             }
         }
     }

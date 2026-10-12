@@ -144,13 +144,7 @@ impl NativeVideoDecoder {
         extra_data: Bytes,
     ) -> Result<Self> {
         Self::open_inner(
-            codec,
-            width,
-            height,
-            frame_rate,
-            preference,
-            extra_data,
-            None,
+            codec, width, height, frame_rate, preference, extra_data, None,
         )
     }
 
@@ -184,9 +178,7 @@ impl NativeVideoDecoder {
         surface_writer: Option<windows_surface::D3D11SurfaceWriter>,
     ) -> Result<Self> {
         let mut last_error = None;
-        for candidate in
-            DecoderCandidate::preferred(codec, preference, surface_writer.as_ref())
-        {
+        for candidate in DecoderCandidate::preferred(codec, preference, surface_writer.as_ref()) {
             match Self::open_candidate(
                 candidate,
                 codec,
@@ -295,18 +287,30 @@ impl NativeVideoDecoder {
     pub(crate) const fn candidate(&self) -> DecoderCandidate {
         self.candidate
     }
-    pub(crate) fn describe_selection(&mut self, preference: crate::media::selection::DecoderPreference, recovered: bool) {
+    pub(crate) fn describe_selection(
+        &mut self,
+        preference: crate::media::selection::DecoderPreference,
+        recovered: bool,
+    ) {
         use crate::media::selection::{ProcessingMode, resolve_gpu};
-        let note = if recovered { Some("原候选不可用，已回退") }
-        else if preference.mode == ProcessingMode::Software { None }
-        else if let Some(id) = preference.gpu {
+        let note = if recovered {
+            Some("原候选不可用，已回退")
+        } else if preference.mode == ProcessingMode::Software {
+            None
+        } else if let Some(id) = preference.gpu {
             match resolve_gpu(Some(id)) {
                 None => Some("首选显卡不可用，自动选择"),
-                Some(adapter) if self.candidate != (DecoderCandidate::WindowsD3d11 { adapter }) => Some("首选显卡不支持本次格式，已回退"),
+                Some(adapter) if self.candidate != (DecoderCandidate::WindowsD3d11 { adapter }) => {
+                    Some("首选显卡不支持本次格式，已回退")
+                }
                 _ => Some("首选显卡"),
             }
-        } else { None };
-        if let Some(note) = note { self.label.push_str(&format!("（{note}）")); }
+        } else {
+            None
+        };
+        if let Some(note) = note {
+            self.label.push_str(&format!("（{note}）"));
+        }
         tracing::info!(preference=?preference, actual=?self.candidate, reason=note.unwrap_or("selected"), "decoder preference resolved");
     }
 
@@ -353,7 +357,13 @@ impl NativeVideoDecoder {
             decoder: Box::new(backend),
             frame_reader: FrameReader::Windows(reader),
             candidate: DecoderCandidate::WindowsD3d11 { adapter },
-            label: format!("{} · DXVA11 硬解", crate::platform::capture::encoding_adapters().ok().and_then(|items| items.into_iter().find(|a| a.luid == adapter)).map_or_else(|| platform_label().into(), |a| a.name)),
+            label: format!(
+                "{} · DXVA11 硬解",
+                crate::platform::capture::encoding_adapters()
+                    .ok()
+                    .and_then(|items| items.into_iter().find(|a| a.luid == adapter))
+                    .map_or_else(|| platform_label().into(), |a| a.name)
+            ),
             software_slot: None,
         })
     }

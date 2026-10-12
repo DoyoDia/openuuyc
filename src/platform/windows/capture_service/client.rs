@@ -63,8 +63,13 @@ impl Client {
             reply.screen.identity == selected.identity && reply.screen.adapter == selected.adapter,
             "服务采集源身份不匹配"
         );
-        tracing::info!(verified_ms, device_ms, agent_ready_ms=ready_ms,
-            total_ms=opened_at.elapsed().as_millis(), "capture service preparation completed");
+        tracing::info!(
+            verified_ms,
+            device_ms,
+            agent_ready_ms = ready_ms,
+            total_ms = opened_at.elapsed().as_millis(),
+            "capture service preparation completed"
+        );
         Ok(Some(Self {
             pipe,
             device,

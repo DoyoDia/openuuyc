@@ -31,7 +31,7 @@ impl PerformancePanelMode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct DevicePreferences {
-    #[serde(skip_serializing_if="Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub codec: Option<crate::media::CodecPreference>,
     pub clipboard_sync: bool,
     pub clipboard_files: bool,
@@ -65,7 +65,10 @@ impl Default for DevicePreferences {
 }
 impl DevicePreferences {
     fn validate(self) -> Result<Self> {
-        anyhow::ensure!(!self.codec.is_some_and(|codec|codec.restricted()), "设备首选不能包含全局格式限制");
+        anyhow::ensure!(
+            !self.codec.is_some_and(|codec| codec.restricted()),
+            "设备首选不能包含全局格式限制"
+        );
         anyhow::ensure!(
             self.mouse_mode != crate::features::remote_input::MouseMode::View,
             "已保存的鼠标模式无效"

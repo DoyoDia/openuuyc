@@ -1,4 +1,5 @@
 /target/
+/artifacts/
 /temp/
 **/target/
 captures/

@@ -248,11 +248,17 @@ impl ResolvedConnection {
             }
         };
         self.profile.codec = self.default_codec;
-        if !self.default_codec.restricted() && let Some(store) = &store {
+        if !self.default_codec.restricted()
+            && let Some(store) = &store
+        {
             match cancellable(cancel, store.load_device()).await {
-                Ok(saved) => { if let Some(codec)=saved.codec { self.profile.codec=codec; } }
+                Ok(saved) => {
+                    if let Some(codec) = saved.codec {
+                        self.profile.codec = codec;
+                    }
+                }
                 Err(error) if cancel.is_cancelled() => return Err(error),
-                Err(error) => persistence_error=Some(error.to_string()),
+                Err(error) => persistence_error = Some(error.to_string()),
             }
         }
         self.summary.codec = self.profile.codec.label();

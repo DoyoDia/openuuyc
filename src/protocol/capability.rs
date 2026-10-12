@@ -33,7 +33,11 @@ pub(crate) struct DisplayCapability {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub(crate) struct DeviceCapability {
-    #[serde(default, rename = "openuuyc_preferred_codec", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "openuuyc_preferred_codec",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub preferred_codec: Option<i32>,
     /// Decoder AND presentation support SDR10 independently from HDR.
     /// Older receivers advertised ten-bit decode but rendered it as PQ.
@@ -173,8 +177,10 @@ impl DualCapability {
             }
         }
         Self {
-            preferred_codec: local.preferred_codec.filter(|c| matches!(c, 1|2|5))
-                .or(remote.preferred_codec.filter(|c| matches!(c, 1|2|5))),
+            preferred_codec: local
+                .preferred_codec
+                .filter(|c| matches!(c, 1 | 2 | 5))
+                .or(remote.preferred_codec.filter(|c| matches!(c, 1 | 2 | 5))),
             remote_display_info: remote.display_info,
             local_display_info: local.display_info.clone(),
             frame_quality_capability: rows,
@@ -219,7 +225,10 @@ impl DualCapability {
                 return row;
             }
         }
-        for row in order.into_iter().filter_map(|codec| self.exact(codec, chroma, hdr)) {
+        for row in order
+            .into_iter()
+            .filter_map(|codec| self.exact(codec, chroma, hdr))
+        {
             if row.valid() && row.max_frame_quality >= minimum {
                 return row;
             }
