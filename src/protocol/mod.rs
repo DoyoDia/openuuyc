@@ -9,3 +9,4 @@ pub(crate) mod annotation;
 pub(crate) mod drag_drop;
 pub(crate) mod microphone;
 pub(crate) mod peer_platform;
+pub(crate) mod keyboard;

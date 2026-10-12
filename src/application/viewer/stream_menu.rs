@@ -1012,7 +1012,7 @@ crate::ui::controls::observe_notice(ui.ctx(), "clipboard-error", "剪贴板同�
                                 let can_send = snapshot.ready
                                     && !snapshot.mouse_pending
                                     && snapshot.mouse_mode != MouseMode::View
-                                    && handle.mouse().keyboard_supported()
+                                    && handle.mouse().supports_ctrl_alt_del()
                                     && !handle.mouse().waiting_for_neutral();
                                 if menu_row(ui, "发送 Ctrl+Alt+Del", "", None, can_send, false)
                                     .on_hover_text(if can_send {

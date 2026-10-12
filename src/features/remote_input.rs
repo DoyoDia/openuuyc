@@ -2,6 +2,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
+use crate::protocol::keyboard::KeyboardKey;
 use anyhow::{Result, bail};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
@@ -9,6 +10,9 @@ use tokio::sync::Notify;
 pub(crate) mod polling;
 mod recovery;
 pub(crate) use recovery::{InputRecovery, InputWork};
+
+#[cfg(test)]
+mod tests;
 
 const MAX_EVENTS: usize = 512;
 const MOTION_JITTER: Duration = Duration::from_micros(100);
@@ -85,7 +89,7 @@ pub(crate) enum InputEvent {
         horizontal: bool,
     },
     Key {
-        key: u16,
+        key: KeyboardKey,
         down: bool,
         lock: Option<u8>,
         interrupt: bool,
@@ -138,22 +142,7 @@ impl InputEvent {
                 down,
                 lock,
                 interrupt,
-            } => {
-                let mut value = serde_json::json!({
-                    "action": if down { "kbd_press" } else { "kbd_release" }, "key": key
-                });
-                if interrupt {
-                    value["interrept"] = "i".into();
-                }
-                if let Some(status) = lock {
-                    value[if key == 144 {
-                        "lockkeysstatus"
-                    } else {
-                        "status_key_value"
-                    }] = status.into();
-                }
-                value
-            }
+            } => key.encode(down, lock, interrupt),
             Self::Heartbeat => serde_json::json!({"heartbeat":"kbd_heartbeat"}),
         };
         serde_json::to_vec(&value).expect("finite mouse events serialize")
@@ -194,10 +183,10 @@ struct State {
     // even an in-flight press, not just messages whose send() already returned.
     remote_held: [bool; 5],
     keys: BTreeMap<u16, Option<u8>>,
-    remote_keys: BTreeMap<u16, Option<u8>>,
+    remote_keys: BTreeMap<KeyboardKey, Option<u8>>,
     // Transport acceptance of UP is not acknowledgement of host injection.
     // Keep keys retired at an ownership boundary for session reconciliation.
-    release_checkpoint: BTreeSet<u16>,
+    release_checkpoint: BTreeSet<KeyboardKey>,
     keyboard_generation: u64,
     activation_generation: u64,
     waiting_for_neutral: bool,
@@ -324,6 +313,10 @@ impl RemoteInput {
     }
 
     pub fn keyboard_supported(&self) -> bool {
+        matches!(self.lock().keyboard_platform, 1 | 4)
+    }
+
+    pub fn supports_ctrl_alt_del(&self) -> bool {
         self.lock().keyboard_platform == 1
     }
 
@@ -349,7 +342,7 @@ impl RemoteInput {
             (162, false),
         ] {
             s.queue.push_back(InputEvent::Key {
-                key,
+                key: KeyboardKey::Windows(key),
                 down,
                 lock: None,
                 // A finite menu command has no physical key/heartbeat owner.
@@ -363,16 +356,12 @@ impl RemoteInput {
         Ok(())
     }
 
-    /// Native adapters supply Windows VKs only for a verified Windows peer.
-    /// Other target encodings are separate adapters, never a cast of local keys.
+    /// Native adapters supply local Windows VKs; the protocol owns target codes.
     pub fn key(&self, owner: u64, key: u16, down: bool, lock: Option<u8>) -> bool {
-        if !(1..=254).contains(&key) {
-            return false;
-        }
         let mut s = self.lock();
-        if s.keyboard_platform != 1 {
+        let Some(remote_key) = KeyboardKey::from_windows_vk(s.keyboard_platform, key) else {
             return false;
-        }
+        };
         if down {
             if !Self::claim(&mut s, owner) {
                 return false;
@@ -380,11 +369,15 @@ impl RemoteInput {
         } else if s.owner != Some(owner) || !s.keys.contains_key(&key) {
             return false;
         }
+        // The Mac host toggles Caps Lock on every DOWN, including repeats.
+        if down && remote_key == KeyboardKey::Mac(0x39) && s.keys.contains_key(&key) {
+            return true;
+        }
         let lock = lock.filter(|v| matches!(key, 20 | 144 | 145) && matches!(v, 0 | 128));
         let accepted = Self::push(
             &mut s,
             InputEvent::Key {
-                key,
+                key: remote_key,
                 down,
                 lock,
                 interrupt: true,
@@ -559,7 +552,7 @@ impl RemoteInput {
         // Release ordinary keys before modifiers; never synthesize new downs.
         for modifier in [false, true] {
             for &key in s.remote_keys.keys() {
-                if matches!(key, 16..=18 | 91..=92 | 160..=165) == modifier {
+                if key.is_modifier() == modifier {
                     s.queue.push_back(InputEvent::Key {
                         key,
                         down: false,
@@ -600,7 +593,7 @@ impl RemoteInput {
                 s.release_checkpoint.extend(keys.iter().copied());
                 for modifier in [false, true] {
                     for &key in &keys {
-                        if matches!(key,16..=18|91..=92|160..=165) == modifier {
+                        if key.is_modifier() == modifier {
                             s.queue.push_back(InputEvent::Key {
                                 key,
                                 down: false,
