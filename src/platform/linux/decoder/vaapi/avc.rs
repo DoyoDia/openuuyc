@@ -33,11 +33,40 @@ const PICTURE_LONG_TERM: u32 = cros_libva::VA_PICTURE_H264_LONG_TERM_REFERENCE;
 const PICTURE_INVALID: u32 = cros_libva::VA_PICTURE_H264_INVALID;
 const SLICE_DATA_FLAG_ALL: u32 = cros_libva::VA_SLICE_DATA_FLAG_ALL;
 
-/// One decoded picture, already copied out of its surface.
+/// Surfaces beyond the reference DPB and the picture being decoded, reserved
+/// for pictures whose dmabuf the renderer still holds.
+///
+/// The decoder runs ahead of presentation, and both the pending frame and the
+/// one on screen keep their surfaces leased, so a handful of extra slots keeps
+/// `take` from ever running dry. They cost one surface's worth of memory each.
+const DMABUF_SURFACE_HEADROOM: usize = 8;
+
+/// A picture the driver produced, either on the CPU or exported as a dmabuf.
+///
+/// The dmabuf variant keeps the surface alive through the [`SurfaceLease`] so
+/// the decoder cannot reuse it while the renderer still reads it. The lease is
+/// dropped (returning the surface) once the frame is released.
 pub(in crate::platform::linux::decoder) struct Frame {
     pub(in crate::platform::linux::decoder) width: u32,
     pub(in crate::platform::linux::decoder) height: u32,
-    pub(in crate::platform::linux::decoder) data: Vec<u8>,
+    pub(in crate::platform::linux::decoder) data: FrameData,
+}
+
+/// A decoded picture after the pool attached its surface lease.
+pub(in crate::platform::linux::decoder) enum FrameData {
+    /// Packed NV12 on the CPU: `width * height` luma then interleaved CbCr.
+    Cpu(Vec<u8>),
+    /// The surface exported as DRM PRIME, kept alive by its lease.
+    Dmabuf(crate::platform::linux::dmabuf::DmabufFrame),
+}
+
+/// A picture that came back from the driver, before the pool attaches a lease.
+pub(in crate::platform::linux::decoder) enum Decoded {
+    Cpu(Vec<u8>),
+    Dmabuf {
+        modifier: u64,
+        planes: [crate::platform::linux::dmabuf::Plane; 2],
+    },
 }
 
 /// A slice of the access unit being assembled.
@@ -222,6 +251,8 @@ impl Avc {
         .map_err(|_| DecodeError::InvalidInput)?;
 
         let pool = self.pool.as_mut().ok_or(DecodeError::Backend)?;
+        // Surfaces the renderer finished with since the last picture.
+        pool.drain_returned();
         let (index, surface) = pool.take()?;
         let surface_id = pool.id(index);
         let max_frame_num = 1u32 << (sps.log2_max_frame_num_minus4 + 4);
@@ -268,7 +299,7 @@ impl Avc {
             visible: (width, height),
         };
         let decoded = submit(&context, surface, buffers, self.timestamp, readback);
-        let (frame, surface) = match decoded {
+        let (width, height, decoded, surface) = match decoded {
             Ok(decoded) => decoded,
             Err(error) => {
                 // The failed picture took the surface with it, so the pool can
@@ -278,7 +309,25 @@ impl Avc {
             }
         };
         let pool = self.pool.as_mut().ok_or(DecodeError::Backend)?;
-        pool.put(index, surface);
+        // An exported picture keeps its surface reserved until the renderer
+        // releases the lease; a CPU picture frees the slot right away.
+        let data = match decoded {
+            Decoded::Cpu(bytes) => {
+                pool.put(index, surface);
+                FrameData::Cpu(bytes)
+            }
+            Decoded::Dmabuf { modifier, planes } => {
+                let lease = pool.put_leased(index, surface);
+                FrameData::Dmabuf(crate::platform::linux::dmabuf::DmabufFrame::new(
+                    modifier, planes, lease,
+                ))
+            }
+        };
+        let frame = Frame {
+            width,
+            height,
+            data,
+        };
 
         self.poc = poc_state;
         self.mmco5 = false;
@@ -361,8 +410,16 @@ impl Avc {
         if !display::supports(profile, width, height) {
             return Err(DecodeError::Unsupported);
         }
-        // One extra surface for the picture being decoded right now.
-        self.pool = Some(Pool::new(profile, width, height, dpb + 1)?);
+        // One extra surface for the picture being decoded right now, plus
+        // headroom for the pictures the renderer still holds as dmabufs. The
+        // decoder runs ahead of presentation, so without that headroom it would
+        // run out of free surfaces while the GPU still reads them.
+        let extra = if crate::platform::linux::dmabuf::enabled() {
+            DMABUF_SURFACE_HEADROOM
+        } else {
+            0
+        };
+        self.pool = Some(Pool::new(profile, width, height, dpb + 1 + extra)?);
         self.profile = profile;
         tracing::info!(profile, width, height, dpb, "VA-API H.264 session created");
         Ok(())
@@ -820,7 +877,7 @@ struct Readback {
     visible: (u32, u32),
 }
 
-/// Hand the picture to the driver and copy the result out.
+/// Hand the picture to the driver and copy or export the result.
 ///
 /// A failure before the sync point consumes the surface with the picture, so
 /// the caller must drop the whole pool rather than return the surface to it.
@@ -830,7 +887,7 @@ fn submit(
     buffers: Vec<BufferType>,
     timestamp: u64,
     readback: Readback,
-) -> Result<(Frame, Surface), DecodeError> {
+) -> Result<(u32, u32, Decoded, Surface), DecodeError> {
     // A driver-level failure is not worth retrying on the next keyframe; the
     // pool switches decoders immediately on HardwareFailure.
     let backend = |stage: &'static str| {
@@ -856,22 +913,79 @@ fn submit(
     let picture = picture
         .sync()
         .map_err(|(error, _)| backend("sync")(error))?;
-    // vaDeriveImage is optional and several drivers, including the NVIDIA
-    // one, refuse it; vaCreateImage + vaGetImage is the portable readback.
     let (width, height) = readback.visible;
-    let frame = picture
-        .create_image(readback.format, readback.coded, readback.visible)
-        .map_err(backend("create_image"))
-        .and_then(|image| output::pack_nv12(&image, width, height));
+    // Prefer exporting the surface: the renderer imports the dmabuf instead of
+    // the CPU copying the picture out and uploading it again. Drivers without
+    // PRIME 2 or a usable modifier fall back to the readback below.
+    let exported = if crate::platform::linux::dmabuf::enabled() {
+        export_nv12(picture.surface())
+    } else {
+        None
+    };
+    let decoded = match exported {
+        Some((modifier, planes)) => Decoded::Dmabuf { modifier, planes },
+        None => {
+            // vaDeriveImage is optional and several drivers, including the
+            // NVIDIA one, refuse it; vaCreateImage + vaGetImage is the
+            // portable readback.
+            let frame = picture
+                .create_image(readback.format, readback.coded, readback.visible)
+                .map_err(backend("create_image"))
+                .and_then(|image| output::pack_nv12(&image, width, height));
+            Decoded::Cpu(frame?)
+        }
+    };
     let surface = picture
         .take_surface()
         .unwrap_or_else(|_| unreachable!("the picture owns its surface alone"));
-    Ok((
-        Frame {
-            width,
-            height,
-            data: frame?,
+    Ok((width, height, decoded, surface))
+}
+
+/// Exports an NV12 surface as one dmabuf with a luma and a chroma plane.
+///
+/// Returns `None` when the driver cannot export it or the layout is not the
+/// single-buffer NV12 this renderer imports; the caller then reads back on the
+/// CPU. The handles are duplicated because the renderer's import consumes one
+/// per plane while the descriptor keeps the originals alive.
+fn export_nv12(
+    surface: &Surface,
+) -> Option<(u64, [crate::platform::linux::dmabuf::Plane; 2])> {
+    use crate::platform::linux::dmabuf::Plane;
+    let descriptor = match surface.export_prime() {
+        Ok(descriptor) => descriptor,
+        Err(error) => {
+            tracing::debug!(%error, "VA-API dmabuf export unavailable");
+            return None;
+        }
+    };
+    if descriptor.fourcc != cros_libva::VA_FOURCC_NV12 {
+        tracing::debug!(fourcc = descriptor.fourcc, "unexpected exported format");
+        return None;
+    }
+    let layer = descriptor.layers.first()?;
+    if descriptor.objects.len() != 1 || layer.num_planes != 2 {
+        // Only the single-buffer, two-plane layout maps onto two single-plane
+        // Vulkan images; anything else keeps the CPU path.
+        tracing::debug!(
+            objects = descriptor.objects.len(),
+            planes = layer.num_planes,
+            "dmabuf layout is not a single-buffer NV12"
+        );
+        return None;
+    }
+    let object = descriptor.objects.first()?;
+    let planes = [
+        Plane {
+            fd: object.fd.try_clone().ok()?,
+            offset: u64::from(layer.offset[0]),
+            stride: u64::from(layer.pitch[0]),
         },
-        surface,
-    ))
+        Plane {
+            fd: object.fd.try_clone().ok()?,
+            offset: u64::from(layer.offset[1]),
+            stride: u64::from(layer.pitch[1]),
+        },
+    ];
+    // The descriptor closes the original fd on drop; the planes own their own.
+    Some((object.drm_format_modifier, planes))
 }

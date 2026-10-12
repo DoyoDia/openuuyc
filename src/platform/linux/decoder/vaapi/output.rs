@@ -1,8 +1,8 @@
 //! Reading a decoded VA surface back into packed NV12.
 //!
-//! Zero-copy would export the surface as a dmabuf and import it into the
-//! renderer; until that exists, the picture is copied out once per frame and
-//! takes the same CPU path as the software decoder's output.
+//! This is the fallback for drivers that cannot export the surface as a dmabuf
+//! or for renderers that cannot import one. When both sides support it, the
+//! picture stays on the GPU and never takes this path.
 use cros_libva::Image;
 
 use crate::media::decode_api::DecodeError;

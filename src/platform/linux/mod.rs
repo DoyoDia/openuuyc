@@ -9,6 +9,7 @@ pub(crate) mod decoder;
 pub(crate) mod device_profile;
 pub(crate) mod display;
 pub(crate) mod display_hdr;
+pub(crate) mod dmabuf;
 pub(crate) mod drag_drop;
 pub(crate) mod encoder;
 pub(crate) mod file_locations;

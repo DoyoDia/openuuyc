@@ -12,7 +12,7 @@ use cros_libva::VAProfile;
 use crate::media::VideoCodec;
 use crate::media::decode_api::{DecodeError, VideoDecoderConfig};
 
-pub(super) use avc::Frame;
+pub(super) use avc::{Frame, FrameData};
 
 pub(super) struct Session {
     codec: Codec,

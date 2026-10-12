@@ -1,7 +1,9 @@
 //! Linux video decoding: VA-API in hardware, the Rust H.264/AV1 codecs in
 //! software.
-//! Both paths hand the picture over on the CPU; VA-API surfaces are copied
-//! out rather than shared with the renderer, so there is no zero-copy yet.
+//!
+//! VA-API normally hands the picture over as a dmabuf the renderer imports, so
+//! it never reaches the CPU. Drivers or renderers that cannot do that fall back
+//! to a CPU NV12 readback.
 #![cfg(not(windows))]
 use crate::media::VideoCodec;
 use crate::media::decode_api::{DecodeError, DecoderMode, DecoderNotification, VideoDecoderConfig};
@@ -24,12 +26,25 @@ pub struct CpuVideoFrame {
     pub data: Bytes,
 }
 
+/// A decoded picture exported as a dmabuf, for the renderer to import.
+///
+/// The planes alias the decoder's surface; the frame keeps it reserved until
+/// it is dropped, which is why the renderer must not hold it past the draw.
+pub struct DmabufVideoFrame {
+    pub pts: i64,
+    pub width: u32,
+    pub height: u32,
+    pub frame: crate::platform::linux::dmabuf::DmabufFrame,
+}
+
 /// VA-API opens its own display; the decoder shares no device with the
 /// renderer, so there is none to pass in.
 pub(crate) type GpuDevice = std::convert::Infallible;
 
 pub enum PlatformDecodedFrame {
     Cpu(CpuVideoFrame),
+    /// A zero-copy picture whose planes are still on the GPU.
+    Dmabuf(DmabufVideoFrame),
 }
 
 /// Whether the local VA-API driver decodes this format in hardware.
@@ -139,14 +154,26 @@ impl LinuxVideoDecoder {
         let decoder = match &mut self.backend {
             Backend::Hardware(session) => {
                 let frame = session.decode(payload, self.notification.cancellation())?;
-                self.pending
-                    .push_back(PlatformDecodedFrame::Cpu(CpuVideoFrame {
-                        pts: token,
-                        width: frame.width,
-                        height: frame.height,
-                        format: CpuFormat::Nv12,
-                        data: Bytes::from(frame.data),
-                    }));
+                let pending = match frame.data {
+                    vaapi::FrameData::Cpu(data) => {
+                        PlatformDecodedFrame::Cpu(CpuVideoFrame {
+                            pts: token,
+                            width: frame.width,
+                            height: frame.height,
+                            format: CpuFormat::Nv12,
+                            data: Bytes::from(data),
+                        })
+                    }
+                    vaapi::FrameData::Dmabuf(frame_data) => {
+                        PlatformDecodedFrame::Dmabuf(DmabufVideoFrame {
+                            pts: token,
+                            width: frame.width,
+                            height: frame.height,
+                            frame: frame_data,
+                        })
+                    }
+                };
+                self.pending.push_back(pending);
                 return Ok(());
             }
             Backend::Software(decoder) => decoder,

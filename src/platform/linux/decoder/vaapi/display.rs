@@ -132,6 +132,11 @@ pub(super) struct Pool {
     ids: Vec<VASurfaceID>,
     /// Surfaces still needed as references, by index.
     reserved: Vec<bool>,
+    /// Surfaces whose dmabuf the renderer still holds. The `Surface` stays in
+    /// `surfaces` so its `Rc` lives on, but `take` skips the slot.
+    leased: Vec<bool>,
+    /// Indices the renderer released; drained before the next decode.
+    returned: crate::platform::linux::dmabuf::ReturnedSurfaces,
     #[allow(dead_code, reason = "Owns the config for the context's lifetime.")]
     config: Config,
 }
@@ -195,6 +200,8 @@ impl Pool {
             height,
             nv12,
             reserved: vec![false; surfaces.len()],
+            leased: vec![false; surfaces.len()],
+            returned: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             surfaces: surfaces.into_iter().map(Some).collect(),
             ids,
             config,
@@ -207,11 +214,15 @@ impl Pool {
 
     /// Take a surface that is neither in flight nor holding a reference frame.
     pub(super) fn take(&mut self) -> Result<(usize, Surface<()>), DecodeError> {
+        // Slots whose dmabuf the renderer still holds are skipped: reusing one
+        // would overwrite the picture under the imported texture.
         let index = self
             .surfaces
             .iter()
             .enumerate()
-            .position(|(index, surface)| surface.is_some() && !self.reserved[index])
+            .position(|(index, surface)| {
+                surface.is_some() && !self.reserved[index] && !self.leased[index]
+            })
             .ok_or(DecodeError::Backend)?;
         let surface = self.surfaces[index].take().ok_or(DecodeError::Backend)?;
         Ok((index, surface))
@@ -219,6 +230,36 @@ impl Pool {
 
     pub(super) fn put(&mut self, index: usize, surface: Surface<()>) {
         self.surfaces[index] = Some(surface);
+    }
+
+    /// Returns a surface whose dmabuf is now held by the renderer.
+    ///
+    /// The slot stays occupied and is skipped by `take` until the lease drops,
+    /// at which point `drain_returned` frees it for reuse.
+    pub(super) fn put_leased(
+        &mut self,
+        index: usize,
+        surface: Surface<()>,
+    ) -> crate::platform::linux::dmabuf::SurfaceLease {
+        self.surfaces[index] = Some(surface);
+        self.leased[index] = true;
+        crate::platform::linux::dmabuf::SurfaceLease::new(
+            std::sync::Arc::clone(&self.returned),
+            index,
+        )
+    }
+
+    /// Frees the slots the renderer released since the last call.
+    pub(super) fn drain_returned(&mut self) {
+        let drained: Vec<usize> = match self.returned.lock() {
+            Ok(mut returned) => returned.drain(..).collect(),
+            Err(poisoned) => poisoned.into_inner().drain(..).collect(),
+        };
+        for index in drained {
+            if let Some(slot) = self.leased.get_mut(index) {
+                *slot = false;
+            }
+        }
     }
 
     /// Mark exactly the surfaces the reference lists still name.
