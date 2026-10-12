@@ -85,8 +85,7 @@ pub(crate) fn create_device() -> Result<Graphics> {
 
 fn create_graphics() -> Result<Graphics> {
     // Vulkan first, GL as the fallback for drivers or VMs without it.
-    // OPENUUYC_BACKEND=gl 可强制 OpenGL：虚拟机的 Intel Haswell Vulkan 与
-    // Wayland/X11 surface 的 queue family 不匹配，只能走 GL。
+    // OPENUUYC_BACKEND=gl 可强制 OpenGL：作为 Vulkan 不可用时的备用后端。
     // 注意 new_without_display_handle_from_env() 内部会调 with_env()，
     // 必须在其后覆盖 backends，否则 WGPU_BACKEND 会失效。
     let mut desc = wgpu::InstanceDescriptor::new_without_display_handle_from_env();
@@ -95,6 +94,16 @@ fn create_graphics() -> Result<Graphics> {
         Ok("vulkan") | Ok("vk") => wgpu::Backends::VULKAN,
         _ => wgpu::Backends::VULKAN | wgpu::Backends::GL,
     };
+    // Haswell/Broadwell 的 HasVK 驱动上报 conformance_version.major == 0（未通过
+    // Vulkan 认证），wgpu 会据此隐藏整个适配器，UI 便静默回落到 llvmpipe 软渲
+    // （Haswell 上空闲即烧掉一整个核心）。除非显式要求恢复 wgpu 默认行为，
+    // 否则允许使用非认证适配器，优先走硬件渲染。
+    if !matches!(
+        std::env::var("WGPU_ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER").as_deref(),
+        Ok("0") | Ok("false")
+    ) {
+        desc.flags |= wgpu::InstanceFlags::ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER;
+    }
     let instance = wgpu::Instance::new(desc);
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::HighPerformance,
