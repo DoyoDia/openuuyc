@@ -1341,7 +1341,13 @@ impl Player {
                 self.modifiers = modifiers.state();
                 false
             }
-            WindowEvent::KeyboardInput { event, .. } => {
+            WindowEvent::KeyboardInput {
+                event,
+                is_synthetic,
+                ..
+            } => {
+                // Focus changes can synthesize presses for keys already held
+                // outside this window. Track them for neutral detection only.
                 if event.repeat {
                     return false;
                 }
@@ -1367,7 +1373,7 @@ impl Player {
                     self.held_keys.retain(|held| *held != key);
                     return forward_key(self.input(), self.owner, key, false, true, consumed_by_ui);
                 }
-                if !self.focused || self.local_input_blocked || dragging {
+                if *is_synthetic || !self.focused || self.local_input_blocked || dragging {
                     return false;
                 }
                 if let Some(action) = viewer_shortcut(self.modifiers, event.physical_key) {
