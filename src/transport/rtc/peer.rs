@@ -1,7 +1,7 @@
 use super::channels::{DATA_CHANNEL_LABELS, DataChannels, official_data_channel_init};
 use super::clock::{RemoteNtpEstimator, observe_remote_ntp};
 use super::core::ConnectionCore;
-use super::feedback::{RTP_DEFAULT_RTT, send_picture_loss_indication};
+use super::feedback::{RTP_DEFAULT_RTT, send_full_intra_request, send_picture_loss_indication};
 use super::negotiation::{
     UU_LOCAL_SEND_START_BPS, candidate_is_relay, negotiated_mixed_kcp_version, register_uu_codecs,
     register_uu_header_extensions, remove_relay_candidates_from_sdp,
@@ -20,7 +20,7 @@ use crate::transport::rsfec::RsFecConfig;
 use crate::transport::rtcp_timing::RtcpTiming;
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, broadcast, mpsc, watch};
@@ -75,6 +75,8 @@ pub struct NativePeer {
     pub(super) ice_servers: Vec<IceServer>,
     pub(super) data_channels: DataChannels,
     pub(super) video_tracks: VideoTrackRegistry,
+    /// FIR 序号（RFC 5104 要求单调递增，host 用它去重）。
+    pub(super) fir_sequence: AtomicU8,
 }
 
 impl NativePeer {
@@ -309,6 +311,7 @@ impl NativePeer {
             ice_servers: configured_ice_servers,
             data_channels,
             video_tracks,
+            fir_sequence: AtomicU8::new(0),
         })
     }
 
@@ -511,7 +514,13 @@ impl NativePeer {
     }
 
     pub async fn set_remote_answer(&self, mut sdp: String, restart_ice: bool) -> Result<()> {
-        tracing::debug!(restart_ice, "installing remote SDP answer");
+        let fmtp_lines: Vec<&str> = sdp
+            .lines()
+            .filter(|line| {
+                line.starts_with("a=fmtp") || line.starts_with("a=rtpmap") || line.starts_with("m=video")
+            })
+            .collect();
+        tracing::debug!(restart_ice, sdp_fmtp = ?fmtp_lines, "installing remote SDP answer");
         let mixed_kcp_version = negotiated_mixed_kcp_version(&sdp)?;
         if self.p2p_only.load(Ordering::Acquire) {
             sdp = remove_relay_candidates_from_sdp(&sdp);
@@ -573,7 +582,15 @@ impl NativePeer {
     }
 
     pub async fn request_keyframe(&self, media_ssrc: u32) -> Result<()> {
-        send_picture_loss_indication(&self.core.connection, media_ssrc).await
+        // 同时发 PLI 与 FIR：部分 host（macOS）只对 FIR 生成关键帧。
+        let pli = send_picture_loss_indication(&self.core.connection, media_ssrc).await;
+        let fir = send_full_intra_request(&self.core.connection, media_ssrc, self.next_fir_sequence()).await;
+        pli.and(fir)
+    }
+
+    fn next_fir_sequence(&self) -> u8 {
+        self.fir_sequence
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
     pub async fn next_connection_state(&self) -> Option<RTCPeerConnectionState> {

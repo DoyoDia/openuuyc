@@ -570,6 +570,8 @@ pub(super) fn extract_parameter_sets(codec: VideoCodec, data: &[u8]) -> Option<B
     }
     let mut out = Vec::new();
     let mut cursor = 0usize;
+    let mut has_sps = false;
+    let mut has_pps = false;
     while cursor + 3 <= data.len() {
         if !nal_start(data, cursor) {
             cursor += 1;
@@ -589,9 +591,21 @@ pub(super) fn extract_parameter_sets(codec: VideoCodec, data: &[u8]) -> Option<B
             };
             if keep {
                 out.extend_from_slice(&data[cursor..end]);
+                if codec == VideoCodec::H264 {
+                    match header & 0x1f {
+                        7 => has_sps = true,
+                        8 => has_pps = true,
+                        _ => {}
+                    }
+                }
             }
         }
         cursor = end;
+    }
+    // H.264 需要 SPS 与 PPS 都齐备才算完整参数集：部分 host（macOS）
+    // 用单独的单 NAL 包分别下发二者，只拿到一半时打开解码器会失败。
+    if codec == VideoCodec::H264 && !(has_sps && has_pps) {
+        return None;
     }
     (!out.is_empty()).then(|| Bytes::from(out))
 }

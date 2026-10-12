@@ -406,7 +406,27 @@ impl StreamControlHandle {
                     }
                 }
             }
-            _ => {}
+            Some(PbPayload::CodecNegotiation(bytes)) => {
+                // 官方 host 可能用该消息带外下发 H.264 参数集（libstreamer 引用
+                // h264_sprop_parameter_sets.cc；macOS host 的 RTP 流里没有
+                // 带内 SPS/PPS）。先记录原始内容，确认后再解析。
+                tracing::debug!(
+                    ?source,
+                    seq = message.seq,
+                    bytes = bytes.len(),
+                    head = format!("{:02x?}", &bytes[..bytes.len().min(64)]),
+                    "official CodecNegotiation received"
+                );
+            }
+            Some(payload) => {
+                tracing::debug!(
+                    ?source,
+                    seq = message.seq,
+                    ?payload,
+                    "ignored UU control payload"
+                );
+            }
+            None => {}
         }
         self.maybe_send_initial_capture_sync(&mut state);
         self.drive_display_changes(&mut state);

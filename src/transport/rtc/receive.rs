@@ -2,7 +2,7 @@
 use super::clock::{RemoteNtpEstimator, frame_sender_timing};
 use super::feedback::{
     ACTIVE_STREAM_WINDOW, KEYFRAME_PACKET_WINDOW, NackRequester, RTP_NACK_PROCESS_INTERVAL,
-    RtcpFeedbackBuffer, send_picture_loss_indication,
+    RtcpFeedbackBuffer, send_full_intra_request, send_picture_loss_indication,
 };
 use super::ingress::{
     MediaRecoveryFlags, OrderedVideoIngress, PendingMediaPacket, RedPacket, VideoIngressOrigin,
@@ -320,6 +320,7 @@ pub(super) async fn forward_official_video_track(
     let mut pending_media = VecDeque::<PendingMediaPacket>::new();
     let mut configured_payload_type = track.payload_type();
     let mut rtcp_feedback = RtcpFeedbackBuffer::default();
+    let mut fir_sequence: u8 = 0;
     let rid_extension_id = track.header_extension_id(RTP_STREAM_ID_URI);
     let repaired_rid_extension_id = track.header_extension_id(REPAIRED_RTP_STREAM_ID_URI);
     let mut nack_interval = tokio::time::interval_at(
@@ -468,6 +469,7 @@ pub(super) async fn forward_official_video_track(
                     &remote_ntp,
                     &connection,
                     track.ssrc(),
+                    &mut fir_sequence,
                 )
                 .await;
             }
@@ -497,6 +499,7 @@ pub(super) async fn forward_official_video_track(
                     &remote_ntp,
                     &connection,
                     track.ssrc(),
+                    &mut fir_sequence,
                 )
                 .await;
             }
@@ -617,6 +620,27 @@ pub(super) async fn forward_official_video_track(
                 }
                 let sequence_number = media.packet.header.sequence_number;
                 let payload_type = media.packet.header.payload_type;
+                // 逐包诊断（seq b0 b1 s e type marker ts len）。默认关闭；
+                // 需要时 --log-level 'diagpkt=trace' 重新启用。
+                tracing::trace!(
+                    target: "diagpkt",
+                    "{sequence_number} {} {} {} {} {} {} {} {}",
+                    media.packet.payload.first().copied().unwrap_or(0),
+                    media.packet.payload.get(1).copied().unwrap_or(0),
+                    media.packet.payload.first().map_or(false, |b0| b0 & 31 == 28)
+                        .then(|| media.packet.payload.get(1).copied().unwrap_or(0) & 0x80 != 0)
+                        .unwrap_or(false) as u8,
+                    media.packet.payload.first().map_or(false, |b0| b0 & 31 == 28)
+                        .then(|| media.packet.payload.get(1).copied().unwrap_or(0) & 0x40 != 0)
+                        .unwrap_or(false) as u8,
+                    media.packet.payload
+                        .first()
+                        .map(|b0| if b0 & 31 == 28 { 0 } else { b0 & 31 })
+                        .unwrap_or(0),
+                    media.packet.header.marker as u8,
+                    media.packet.header.timestamp,
+                    media.packet.payload.len()
+                );
                 // A padded RTP datagram is not necessarily an empty packet:
                 // the packet parser has already removed its trailing padding.
                 let is_padding = media.packet.payload.is_empty();
@@ -768,6 +792,7 @@ pub(super) async fn forward_official_video_track(
                     &remote_ntp,
                     &connection,
                     track.ssrc(),
+                    &mut fir_sequence,
                 )
                 .await;
 
@@ -802,6 +827,7 @@ pub(super) async fn emit_official_receiver_result(
     remote_ntp: &StdMutex<RemoteNtpEstimator>,
     connection: &RTCPeerConnection,
     media_ssrc: u32,
+    fir_sequence: &mut u8,
 ) {
     if result.clear_nack {
         nack_requester.clear_pending();
@@ -813,6 +839,9 @@ pub(super) async fn emit_official_receiver_result(
     }
     if result.request_keyframe {
         let _ = send_picture_loss_indication(connection, media_ssrc).await;
+        // 部分 host（macOS）只对 FIR 生成关键帧，因此同时发送。
+        let _ = send_full_intra_request(connection, media_ssrc, *fir_sequence).await;
+        *fir_sequence = fir_sequence.wrapping_add(1);
     }
     performance.record_predecode_drops(result.predecode_drops);
     performance.set_frame_buffer_frames(result.frame_buffer_frames);
