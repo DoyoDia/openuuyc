@@ -157,6 +157,9 @@ enum Commands {
         /// 传输策略：auto、p2p 或 relay
         #[arg(long)]
         transport: Option<media::TransportChoice>,
+        /// 设备被残留会话占用时强制接管（断开现有连接）
+        #[arg(long)]
+        force_takeover: bool,
     },
 }
 
@@ -362,6 +365,7 @@ fn main() -> Result<()> {
             codec,
             hardware_decode,
             transport,
+            force_takeover,
         } => {
             let mut options = media::preferences::load()?;
             options.audio_only = audio_only;
@@ -379,7 +383,12 @@ fn main() -> Result<()> {
             if let Some(transport) = transport {
                 options.transport = transport;
             }
-            tokio::runtime::Runtime::new()?.block_on(connect_device(device, options, device_id))
+            tokio::runtime::Runtime::new()?.block_on(connect_device(
+                device,
+                options,
+                device_id,
+                force_takeover,
+            ))
         }
     };
     if let Err(error) = &result {
@@ -427,11 +436,13 @@ async fn connect_device(
     device: Option<String>,
     options: media::ConnectionMediaOptions,
     device_id: Option<String>,
+    force_takeover: bool,
 ) -> Result<()> {
     controller::run_saved_viewer_window(
         device.unwrap_or_else(|| device_id.clone().expect("clap requires a target")),
         options,
         device_id,
+        force_takeover,
     )
     .await
 }
