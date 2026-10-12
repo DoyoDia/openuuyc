@@ -177,18 +177,7 @@ impl Avc {
         }
         let coded_width = (sps.pic_width_in_mbs_minus1 + 1) * 16;
         let coded_height = (sps.pic_height_in_map_units_minus1 + 1) * 16;
-        let crop = sps.frame_cropping.as_ref();
-        let (left, right, top, bottom) = crop.map_or((0, 0, 0, 0), |crop| {
-            (crop.left, crop.right, crop.top, crop.bottom)
-        });
-        let width = coded_width
-            .checked_sub(left + right)
-            .filter(|width| *width > 0)
-            .ok_or(DecodeError::InvalidInput)?;
-        let height = coded_height
-            .checked_sub(top + bottom)
-            .filter(|height| *height > 0)
-            .ok_or(DecodeError::InvalidInput)?;
+        let visible = visible_rect((coded_width, coded_height), sps.frame_cropping.as_ref())?;
         let dpb = dpb_capacity(&sps)?;
         self.ensure_pool(&sps, coded_width, coded_height, dpb)?;
 
@@ -265,7 +254,7 @@ impl Avc {
         let readback = Readback {
             format: pool.nv12,
             coded: (pool.width, pool.height),
-            visible: (width, height),
+            visible,
         };
         let decoded = submit(&context, surface, buffers, self.timestamp, readback);
         let (frame, surface) = match decoded {
@@ -817,7 +806,121 @@ type Surface = cros_libva::Surface<()>;
 struct Readback {
     format: cros_libva::VAImageFormat,
     coded: (u32, u32),
-    visible: (u32, u32),
+    visible: output::VisibleRect,
+}
+
+/// This backend accepts only progressive 4:2:0: both SPS crop units are 2.
+fn visible_rect(
+    coded: (u32, u32),
+    crop: Option<&openuuyc_h264::syntax::sps::FrameCropping>,
+) -> Result<output::VisibleRect, DecodeError> {
+    let (left, right, top, bottom) =
+        crop.map_or((0, 0, 0, 0), |c| (c.left, c.right, c.top, c.bottom));
+    let pixels = |units: u32| units.checked_mul(2).ok_or(DecodeError::InvalidInput);
+    let (x, y) = (pixels(left)?, pixels(top)?);
+    let width = coded
+        .0
+        .checked_sub(x)
+        .and_then(|w| w.checked_sub(right.checked_mul(2)?))
+        .filter(|w| *w > 0)
+        .ok_or(DecodeError::InvalidInput)?;
+    let height = coded
+        .1
+        .checked_sub(y)
+        .and_then(|h| h.checked_sub(bottom.checked_mul(2)?))
+        .filter(|h| *h > 0)
+        .ok_or(DecodeError::InvalidInput)?;
+    Ok(output::VisibleRect {
+        x,
+        y,
+        width,
+        height,
+    })
+}
+
+#[cfg(test)]
+mod crop_tests {
+    use super::*;
+    use openuuyc_h264::syntax::sps::FrameCropping;
+
+    #[test]
+    #[ignore = "requires a VA-API H.264 decoder and render-node access"]
+    fn vaapi_decodes_1080p_cropped_fixture() {
+        let frame = Avc::new()
+            .decode(
+                include_bytes!("testdata/crop-1080.h264"),
+                &AtomicBool::new(false),
+            )
+            .expect("VA-API decode");
+        assert_eq!((frame.width, frame.height), (1920, 1080));
+        let plane = 1920 * 1080;
+        assert_eq!(frame.data.len(), plane * 3 / 2);
+        // All rows, including the cropped bottom edge, must be red rather
+        // than undefined macroblock padding. Allow driver rounding by 2.
+        assert!(frame.data[..plane].iter().all(|&y| (79..=83).contains(&y)));
+        for uv in frame.data[plane..].chunks_exact(2) {
+            assert!((88..=92).contains(&uv[0]));
+            assert!((238..=242).contains(&uv[1]));
+        }
+    }
+
+    #[test]
+    fn real_1080p_sps_crops_macroblock_padding() {
+        // One red frame generated with FFmpeg/libx264 at 1920x1080.
+        let mut parser = Headers::new();
+        for nal in openuuyc_h264::syntax::nal::AnnexBSplitter::new(include_bytes!(
+            "testdata/crop-1080.h264"
+        )) {
+            if let Some(slice) = parser.process(nal).unwrap() {
+                let sps = slice.sps;
+                let coded = (
+                    (sps.pic_width_in_mbs_minus1 + 1) * 16,
+                    (sps.pic_height_in_map_units_minus1 + 1) * 16,
+                );
+                assert_eq!(coded, (1920, 1088));
+                assert_eq!(
+                    visible_rect(coded, sps.frame_cropping.as_ref()).unwrap(),
+                    output::VisibleRect {
+                        x: 0,
+                        y: 0,
+                        width: 1920,
+                        height: 1080
+                    }
+                );
+                return;
+            }
+        }
+        panic!("fixture contains no H.264 slice");
+    }
+
+    #[test]
+    fn crop_keeps_left_and_top_origin_and_rejects_invalid_sizes() {
+        let mut crop = FrameCropping {
+            left: 1,
+            right: 2,
+            top: 3,
+            bottom: 4,
+        };
+        assert_eq!(
+            visible_rect((64, 48), Some(&crop)).unwrap(),
+            output::VisibleRect {
+                x: 2,
+                y: 6,
+                width: 58,
+                height: 34
+            }
+        );
+        crop.right = u32::MAX;
+        assert_eq!(
+            visible_rect((64, 48), Some(&crop)),
+            Err(DecodeError::InvalidInput)
+        );
+        crop.right = 31;
+        assert_eq!(
+            visible_rect((64, 48), Some(&crop)),
+            Err(DecodeError::InvalidInput)
+        );
+    }
 }
 
 /// Hand the picture to the driver and copy the result out.
@@ -858,11 +961,11 @@ fn submit(
         .map_err(|(error, _)| backend("sync")(error))?;
     // vaDeriveImage is optional and several drivers, including the NVIDIA
     // one, refuse it; vaCreateImage + vaGetImage is the portable readback.
-    let (width, height) = readback.visible;
+    let output::VisibleRect { width, height, .. } = readback.visible;
     let frame = picture
-        .create_image(readback.format, readback.coded, readback.visible)
+        .create_image(readback.format, readback.coded, readback.coded)
         .map_err(backend("create_image"))
-        .and_then(|image| output::pack_nv12(&image, width, height));
+        .and_then(|image| output::pack_nv12(&image, readback.visible));
     let surface = picture
         .take_surface()
         .unwrap_or_else(|_| unreachable!("the picture owns its surface alone"));
