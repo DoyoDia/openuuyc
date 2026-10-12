@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalPosition;
 use winit::event::WindowEvent;
+#[cfg(target_os = "linux")]
+use winit::event::{DeviceEvent, DeviceId};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 #[cfg(windows)]
 use winit::platform::windows::EventLoopBuilderExtWindows;
@@ -220,7 +222,9 @@ impl Runner {
             notification,
             floating: self.config.floating,
         });
-        if self.root {crate::application::bootstrap::ready();}
+        if self.root {
+            crate::application::bootstrap::ready();
+        }
         let state = self.state.as_mut().expect("created desktop state");
         state.render()?;
         state.app.0.on_focus_changed(state.window.has_focus());
@@ -586,6 +590,14 @@ impl ApplicationHandler<Event> for Windows {
             viewer.runner.window_event(event_loop, id, event);
         }
         self.retire(event_loop);
+    }
+    #[cfg(target_os = "linux")]
+    fn device_event(&mut self, event_loop: &ActiveEventLoop, device: DeviceId, event: DeviceEvent) {
+        // Raw motion has no WindowId. Only the focused viewer may send it;
+        // broadcasting it would move the pointer in several remote sessions.
+        if let Some(viewer) = self.viewers.values_mut().find(|v| v.runner.has_focus()) {
+            viewer.runner.device_event(event_loop, device, event);
+        }
     }
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: Event) {
         match event {

@@ -141,6 +141,12 @@ struct Shell {
 }
 
 impl ConnectingWindowsRunner {
+    pub(crate) fn has_focus(&self) -> bool {
+        self.window
+            .as_ref()
+            .is_some_and(|window| window.has_focus())
+    }
+
     pub(crate) fn new(
         config: ConnectingWindowsRunConfig,
         needs_display: bool,
@@ -738,7 +744,7 @@ impl Player {
             control_error: None,
             cursor: None,
             pointer_locked: false,
-            focused: true,
+            focused: window.has_focus(),
             motion_remainder: [0.0, 0.0],
             polling: Default::default(),
             polling_origin: Instant::now(),
@@ -1161,6 +1167,9 @@ impl Player {
         let DeviceEvent::MouseMotion { delta } = event else {
             return false;
         };
+        if !self.focused {
+            return false;
+        }
         let input = self.input();
         if input.mode() == MouseMode::View || input.waiting_for_neutral() {
             return false;
@@ -1559,6 +1568,9 @@ impl Player {
     }
 
     fn send_position(&mut self, position: PhysicalPosition<f64>) {
+        if !self.focused {
+            return;
+        }
         let input = self.input();
         if input.mode() == MouseMode::View || input.waiting_for_neutral() {
             return;
