@@ -1348,9 +1348,6 @@ impl Player {
             } => {
                 // Focus changes can synthesize presses for keys already held
                 // outside this window. Track them for neutral detection only.
-                if event.repeat {
-                    return false;
-                }
                 let down = event.state == ElementState::Pressed;
                 if let Some(key) =
                     crate::application::viewer_shortcuts::physical_key(event.physical_key)
@@ -1375,6 +1372,18 @@ impl Player {
                 }
                 if *is_synthetic || !self.focused || self.local_input_blocked || dragging {
                     return false;
+                }
+                if event.repeat {
+                    // Keep the compositor's delay/rate. A repeat can only extend
+                    // an accepted remote press, never execute a local shortcut
+                    // again or acquire a key held before control was enabled.
+                    return forward_repeat_key(
+                        self.input(),
+                        self.owner,
+                        key,
+                        false,
+                        consumed_by_ui,
+                    );
                 }
                 if let Some(action) = viewer_shortcut(self.modifiers, event.physical_key) {
                     self.run_shortcut(action, window);
@@ -1686,6 +1695,19 @@ fn forward_key(
     input.key(owner, key, down, None)
 }
 
+fn forward_repeat_key(
+    input: &crate::features::remote_input::RemoteInput,
+    owner: u64,
+    key: u16,
+    local_ui: bool,
+    consumed_by_ui: bool,
+) -> bool {
+    if local_ui || (consumed_by_ui && key != 9) {
+        return false;
+    }
+    input.repeat_key(owner, key)
+}
+
 #[cfg(test)]
 mod input_tests {
     use super::*;
@@ -1778,6 +1800,75 @@ mod input_tests {
         ));
         assert!(!input.owner_holds_key(OWNER, 65));
         assert!(!input.owner_holds_buttons(OWNER));
+    }
+
+    #[tokio::test]
+    async fn held_letters_backspace_and_arrows_send_repeated_presses_then_release() {
+        let input = ready_input();
+        for key in [65, 8, 37, 9] {
+            let consumed = key == 9;
+            assert!(forward_key(&input, OWNER, key, true, false, consumed));
+            for _ in 0..3 {
+                assert!(forward_repeat_key(&input, OWNER, key, false, consumed));
+            }
+            assert!(forward_key(&input, OWNER, key, false, false, consumed));
+            for down in [true, true, true, true, false] {
+                let event = submitted(&input).await;
+                let wire: serde_json::Value = serde_json::from_slice(&event.encode()).unwrap();
+                assert_eq!(wire["key"], key);
+                assert_eq!(
+                    wire["action"],
+                    if down { "kbd_press" } else { "kbd_release" }
+                );
+            }
+            assert!(!input.owner_holds_key(OWNER, key));
+            assert!(!forward_repeat_key(&input, OWNER, key, false, consumed));
+        }
+    }
+
+    #[tokio::test]
+    async fn repeat_cannot_acquire_or_revive_a_retired_key() {
+        let input = ready_input();
+        assert!(!forward_repeat_key(&input, OWNER, 65, false, false));
+        assert!(forward_key(&input, OWNER, 65, true, false, false));
+        submitted(&input).await;
+        assert!(!forward_repeat_key(&input, OWNER + 1, 65, false, false));
+        assert!(!forward_repeat_key(&input, OWNER, 65, true, false));
+        assert!(!forward_repeat_key(&input, OWNER, 65, false, true));
+        assert!(input.owner_holds_key(OWNER, 65));
+        input.pause_owner(OWNER);
+        assert!(matches!(
+            submitted(&input).await,
+            InputEvent::Key {
+                key: 65,
+                down: false,
+                ..
+            }
+        ));
+        assert!(!forward_repeat_key(&input, OWNER, 65, false, false));
+        assert!(forward_key(&input, OWNER, 65, true, false, false));
+        submitted(&input).await;
+        input.disable();
+        assert!(matches!(
+            submitted(&input).await,
+            InputEvent::Key {
+                key: 65,
+                down: false,
+                ..
+            }
+        ));
+        input.enable(MouseMode::Local, false).unwrap();
+        input.confirm_neutral(input.activation_generation());
+        assert!(!forward_repeat_key(&input, OWNER, 65, false, false));
+        // A fresh physical press is required after control is restored.
+        assert!(forward_key(&input, OWNER, 65, true, false, false));
+        assert!(forward_repeat_key(&input, OWNER, 65, false, false));
+        assert!(forward_key(&input, OWNER, 65, false, false, false));
+        for down in [true, true, false] {
+            assert!(
+                matches!(submitted(&input).await, InputEvent::Key { key: 65, down: d, .. } if d == down)
+            );
+        }
     }
 }
 

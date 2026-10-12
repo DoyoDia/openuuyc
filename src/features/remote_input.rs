@@ -420,6 +420,32 @@ impl RemoteInput {
         }
     }
 
+    /// Repeat an existing physical press without acquiring another window's
+    /// ownership or reviving a key retired by focus loss/control cancellation.
+    pub(crate) fn repeat_key(&self, owner: u64, key: u16) -> bool {
+        let mut s = self.lock();
+        if s.keyboard_platform != 1
+            || s.owner != Some(owner)
+            || !s.keys.contains_key(&key)
+            || !Self::claim(&mut s, owner)
+        {
+            return false;
+        }
+        let lock = s.keys[&key];
+        let accepted = Self::push(
+            &mut s,
+            InputEvent::Key {
+                key,
+                down: true,
+                lock,
+                interrupt: true,
+            },
+        );
+        drop(s);
+        self.wake.notify_one();
+        accepted
+    }
+
     pub fn subscribe(
         &self,
         callback: impl Fn() + Send + Sync + 'static,
