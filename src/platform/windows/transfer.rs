@@ -1,5 +1,6 @@
-//! Cross-adapter delivery: shared D3D12 heap, D3D11/12 fences, then staging.
+//! Device delivery: same-adapter shared texture or cross-adapter D3D12 heap.
 //! Busy slots drop an input; only an unavailable/failed GPU strategy reads back.
+mod local;
 use super::capture::Frame;
 use anyhow::{Context, Result, ensure};
 use std::{
@@ -32,9 +33,11 @@ impl Drop for Handle {
 pub(crate) struct Delivery {
     pub frame: Frame,
     retire: Option<(Arc<Slot>, u64)>,
+    local: Option<local::Lease>,
 }
 impl Drop for Delivery {
     fn drop(&mut self) {
+        drop(self.local.take());
         if let Some((slot, value)) = self.retire.take() {
             unsafe {
                 slot.retired.store(value, Ordering::Release);
@@ -59,6 +62,7 @@ pub(crate) struct Transfer {
     size: (u32, u32, DXGI_FORMAT),
 }
 enum Engine {
+    Local(local::Transfer),
     Shared(Gpu),
     Staging(Staging),
 }
@@ -68,13 +72,40 @@ impl Transfer {
         unsafe {
             frame.texture.GetDesc(&mut desc);
         }
-        let engine = match Gpu::new(source, destination, desc, true)
-            .or_else(|_| Gpu::new(source, destination, desc, false))
-        {
-            Ok(bridge) => Engine::Shared(bridge),
-            Err(error) => {
-                tracing::debug!(%error,"cross-adapter GPU bridge unavailable; selecting staging");
-                Engine::Staging(Staging::new(source, destination, desc)?)
+        let same_adapter = unsafe {
+            source
+                .cast::<IDXGIDevice>()?
+                .GetAdapter()?
+                .GetDesc()?
+                .AdapterLuid
+                == destination
+                    .cast::<IDXGIDevice>()?
+                    .GetAdapter()?
+                    .GetDesc()?
+                    .AdapterLuid
+        };
+        let engine = if same_adapter {
+            match local::Transfer::new(source, destination, desc) {
+                Ok(bridge) => {
+                    tracing::info!(
+                        "host texture delivery: same-adapter shared texture with GPU fences"
+                    );
+                    Engine::Local(bridge)
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "same-adapter GPU bridge unavailable; selecting staging");
+                    Engine::Staging(Staging::new(source, destination, desc)?)
+                }
+            }
+        } else {
+            match Gpu::new(source, destination, desc, true)
+                .or_else(|_| Gpu::new(source, destination, desc, false))
+            {
+                Ok(bridge) => Engine::Shared(bridge),
+                Err(error) => {
+                    tracing::debug!(%error,"cross-adapter GPU bridge unavailable; selecting staging");
+                    Engine::Staging(Staging::new(source, destination, desc)?)
+                }
             }
         };
         Ok(Self {
@@ -100,6 +131,12 @@ impl Transfer {
     }
     pub fn copy(&mut self, frame: &Frame) -> Result<Option<Delivery>> {
         match &mut self.engine {
+            Engine::Local(gpu) => match gpu.copy(frame) {
+                Ok(frame) => return Ok(frame),
+                Err(error) => {
+                    tracing::warn!(%error, "same-adapter GPU strategy failed; selecting staging")
+                }
+            },
             Engine::Shared(gpu) => match gpu.copy(frame) {
                 Ok(frame) => return Ok(frame),
                 Err(error) => {
@@ -184,6 +221,7 @@ impl Staging {
             Ok(Delivery {
                 frame,
                 retire: None,
+                local: None,
             })
         }
     }
@@ -533,6 +571,7 @@ impl Gpu {
             Ok(Some(Delivery {
                 frame: output,
                 retire: Some((slot.clone(), value)),
+                local: None,
             }))
         }
     }

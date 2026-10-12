@@ -126,8 +126,13 @@ pub(super) fn capture_loop(
             initial_auto = true;
             requested = Some(settings);
         }
-        let candidate = negotiated.candidate(&wanted, (screen.width,screen.height),
-            screen.render_adapter.unwrap_or(screen.adapter), &failed)
+        let candidate = negotiated
+            .candidate(
+                &wanted,
+                (screen.width, screen.height),
+                screen.render_adapter.unwrap_or(screen.adapter),
+                &failed,
+            )
             .context("本会话的协商编码候选已全部失败")?;
         let hardware =
             candidate.capability.backend != crate::features::host::format::Backend::Software;
@@ -343,26 +348,38 @@ pub(super) fn capture_loop(
         };
         let size = output_size(frame.width, frame.height, wanted.quality);
         let source_device = &desktop.as_ref().context("缺少采集源")?.device;
-        let device = if !hardware || candidate.capability.adapter == screen.adapter {
-            source_device.clone()
-        } else {
-            if encoding_device
-                .as_ref()
-                .is_none_or(|(adapter, _)| *adapter != candidate.capability.adapter)
-            {
-                match capture::create_device(candidate.capability.adapter) {
-                    Ok((device, _)) => {
-                        encoding_device = Some((candidate.capability.adapter, device))
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error,?candidate_id,"encoder adapter failed");
-                        failed.insert(candidate_id);
-                        continue;
+        // NVENC owns a separate D3D11 context even on the capture adapter.
+        // Transfer explicitly orders capture/preprocessing before encoding,
+        // instead of relying on NVENC's handling of the capture context.
+        let isolated_nvenc = hardware
+            && candidate.capability.backend == crate::features::host::format::Backend::Nvidia;
+        let device =
+            if !hardware || (!isolated_nvenc && candidate.capability.adapter == screen.adapter) {
+                source_device.clone()
+            } else {
+                if encoding_device
+                    .as_ref()
+                    .is_none_or(|(adapter, _)| *adapter != candidate.capability.adapter)
+                {
+                    match capture::create_device(candidate.capability.adapter) {
+                        Ok((device, _)) => {
+                            tracing::info!(
+                                source_adapter = screen.adapter,
+                                encoder_adapter = candidate.capability.adapter,
+                                isolated_nvenc,
+                                "host encoding device created independently of capture"
+                            );
+                            encoding_device = Some((candidate.capability.adapter, device))
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error,?candidate_id,"encoder adapter failed");
+                            failed.insert(candidate_id);
+                            continue;
+                        }
                     }
                 }
-            }
-            encoding_device.as_ref().unwrap().1.clone()
-        };
+                encoding_device.as_ref().unwrap().1.clone()
+            };
         if current.is_none_or(|(old_size, old_candidate)| {
             old_size != size || old_candidate != (candidate_id, wanted.color)
         }) {

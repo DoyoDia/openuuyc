@@ -1,5 +1,6 @@
 //! NVENC on the capture adapter. Raw desktop pixels stay in GPU memory.
 mod cuda_input;
+mod timing;
 use super::{
     format::{Backend, Codec, Format, Rate},
     gpu_conversion::Conversion,
@@ -138,6 +139,7 @@ impl Api {
 }
 
 pub(crate) struct Encoder {
+    diagnostics: timing::Diagnostics,
     frame_rate: super::encoder_rate::Controller,
     api: Api,
     session: *mut c_void,
@@ -236,6 +238,7 @@ impl Encoder {
             None
         };
         let mut encoder = Self {
+            diagnostics: timing::Diagnostics::default(),
             frame_rate: super::encoder_rate::Controller::new(Rate { quality: 0, ..rate }),
             api,
             session: ptr::null_mut(),
@@ -555,22 +558,35 @@ impl Encoder {
         timestamp_100ns: i64,
         keyframe: bool,
     ) -> Result<Vec<super::encoder::Encoded>> {
+        let mut timing = timing::Frame::new();
+        let result = self.encode_timed(texture, timestamp_100ns, keyframe, &mut timing);
+        self.diagnostics.record(timing, result.is_ok());
+        result
+    }
+
+    fn encode_timed(
+        &mut self,
+        texture: &ID3D11Texture2D,
+        timestamp_100ns: i64,
+        keyframe: bool,
+        timing: &mut timing::Frame,
+    ) -> Result<Vec<super::encoder::Encoded>> {
         self.frame_rate.input(timestamp_100ns);
-        self.conversion.convert(texture)?;
+        let converted = self.conversion.convert(texture);
+        timing.stage(0);
+        converted?;
         let _current = self.cuda.as_ref().map(|input| input.enter()).transpose()?;
-        if let Some(input) = &self.cuda {
-            input.copy()?;
-        }
+        let copied = self.cuda.as_ref().map(|input| input.copy()).transpose();
+        timing.stage(1);
+        copied?;
         unsafe {
             let f = &self.api.functions;
             let mut map = nv::NV_ENC_MAP_INPUT_RESOURCE::default();
             map.version = self.api.structure(4, false);
             map.registeredResource = self.registered;
-            self.api.check(
-                self.session,
-                f.nvEncMapInputResource.unwrap()(self.session, &mut map),
-                "MapInputResource",
-            )?;
+            let mapped = f.nvEncMapInputResource.unwrap()(self.session, &mut map);
+            timing.stage(2);
+            self.api.check(self.session, mapped, "MapInputResource")?;
             let _mapped = Mapped {
                 api: &self.api,
                 session: self.session,
@@ -597,6 +613,7 @@ impl Encoder {
                 picture.encodePicFlags = 6;
             }
             let status = f.nvEncEncodePicture.unwrap()(self.session, &mut picture);
+            timing.stage(3);
             if status == nv::NVENCSTATUS::NV_ENC_ERR_NEED_MORE_INPUT {
                 return Ok(Vec::new());
             }
@@ -607,11 +624,9 @@ impl Encoder {
                 self.api.level >= 0xc1,
             );
             bitstream.outputBitstream = self.bitstream;
-            self.api.check(
-                self.session,
-                f.nvEncLockBitstream.unwrap()(self.session, &mut bitstream),
-                "LockBitstream",
-            )?;
+            let locked = f.nvEncLockBitstream.unwrap()(self.session, &mut bitstream);
+            timing.stage(4);
+            self.api.check(self.session, locked, "LockBitstream")?;
             let _locked = Locked {
                 api: &self.api,
                 session: self.session,
