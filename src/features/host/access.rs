@@ -361,22 +361,35 @@ impl Handle {
             return Ok(());
         }
         tokio::task::spawn_blocking(super::displays::recovery::recover_abandoned).await??;
-        let screens = capture::screens()?;
-        let Some(screen) = screens
-            .iter()
-            .find(|s| s.primary)
-            .or(screens.first())
-            .cloned()
-        else {
-            return Ok(());
-        };
-        let owner = self.clone();
-        self.media
-            .prepare(screen, move || {
-                !cancel.is_cancelled() && lock(&owner.ownership).active
-            })
-            .await?;
-        Ok(())
+        #[cfg(target_os = "linux")]
+        {
+            // Opening capture can wait for interactive ScreenCast portal consent,
+            // including on X11 when another backend falls back to the portal.
+            // Controller login must not depend on sharing this desktop. Authorized
+            // incoming sessions still prepare capabilities in Lease::prepare_media.
+            let _ = cancel;
+            tracing::info!("Linux host media probe deferred until an authorized incoming session");
+            Ok(())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let screens = capture::screens()?;
+            let Some(screen) = screens
+                .iter()
+                .find(|s| s.primary)
+                .or(screens.first())
+                .cloned()
+            else {
+                return Ok(());
+            };
+            let owner = self.clone();
+            self.media
+                .prepare(screen, move || {
+                    !cancel.is_cancelled() && lock(&owner.ownership).active
+                })
+                .await?;
+            Ok(())
+        }
     }
     pub(crate) async fn invalidate_media(&self) {
         self.media.invalidate().await;
@@ -877,8 +890,7 @@ impl Handle {
         self.power.invalidate();
         self.assistance.unavailable();
         let mut state = lock(&self.ownership);
-        let clear_update =
-            !state.updating && !crate::platform::host_service::resident::managed();
+        let clear_update = !state.updating && !crate::platform::host_service::resident::managed();
         state.active = false;
         state.permission = state.permission.wrapping_add(1);
         finish_session(&mut state);
@@ -962,6 +974,29 @@ impl Handle {
         lock(&self.ownership)
             .last_controlled
             .map_or(-1, |at| at.elapsed().as_secs().min(i64::MAX as u64) as i64)
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod startup_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn linux_login_does_not_prepare_host_capture() {
+        // Both controller-only and host-enabled login must complete without
+        // interactive screen sharing or populating the host capability cache.
+        for allowed in [false, true] {
+            let handle = Handle::default();
+            lock(&handle.ownership).allowed = allowed;
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                handle.prepare_startup(tokio_util::sync::CancellationToken::new()),
+            )
+            .await
+            .expect("Linux startup must not wait for capture consent")
+            .expect("Linux startup preparation");
+            assert!(handle.media.snapshot().is_none());
+        }
     }
 }
 
