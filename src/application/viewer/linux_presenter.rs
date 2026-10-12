@@ -546,10 +546,19 @@ impl ApplicationHandler<UiEvent> for ConnectingWindowsRunner {
         let (Some(window), Some(shell)) = (self.window.clone(), self.shell.as_mut()) else {
             return;
         };
+        let previous_events = shell.input.egui_input_mut().events.len();
         let response = shell.input.on_window_event(&window, &event);
         let consumed = response.consumed;
         if let Stage::Playing(player) = &mut self.stage {
-            player.on_window_event(&window, &shell.context, &event, consumed);
+            let forwarded = player.on_window_event(&window, &shell.context, &event, consumed);
+            if forwarded && matches!(event, WindowEvent::KeyboardInput { .. }) {
+                // A remote Tab must not also focus a local toolbar button.
+                shell
+                    .input
+                    .egui_input_mut()
+                    .events
+                    .truncate(previous_events);
+            }
         }
         match event {
             WindowEvent::CloseRequested | WindowEvent::Destroyed => {
@@ -1655,7 +1664,8 @@ impl Player {
     }
 }
 
-/// Local UI blocks new presses; releases always reach the owner-aware queue.
+/// egui-winit always consumes Tab for local focus navigation, even when no
+/// local editor owns input. Releases always reach the owner-aware queue.
 fn forward_key(
     input: &crate::features::remote_input::RemoteInput,
     owner: u64,
@@ -1664,7 +1674,7 @@ fn forward_key(
     local_ui: bool,
     consumed_by_ui: bool,
 ) -> bool {
-    if down && (local_ui || consumed_by_ui) {
+    if down && (local_ui || (consumed_by_ui && key != 9)) {
         return false;
     }
     input.key(owner, key, down, None)
@@ -1696,6 +1706,24 @@ mod input_tests {
         let event = queued.event.clone();
         input.complete(&queued, Ok(()));
         event
+    }
+
+    #[tokio::test]
+    async fn remote_shift_tab_survives_egui_focus_navigation() {
+        let input = ready_input();
+        for (key, consumed) in [(16, false), (9, true)] {
+            assert!(forward_key(&input, OWNER, key, true, false, consumed));
+            assert!(
+                matches!(submitted(&input).await, InputEvent::Key { key: k, down: true, .. } if k == key)
+            );
+        }
+        for key in [9, 16] {
+            assert!(forward_key(&input, OWNER, key, false, true, true));
+            assert!(
+                matches!(submitted(&input).await, InputEvent::Key { key: k, down: false, .. } if k == key)
+            );
+            assert!(!input.owner_holds_key(OWNER, key));
+        }
     }
 
     #[tokio::test]
