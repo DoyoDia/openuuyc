@@ -532,20 +532,23 @@ pub(crate) struct DmabufPicture {
 /// `pw_stream_queue_buffer` is documented RT-safe and callable from a thread
 /// other than the one that dequeued, which is what lets the encoder hold the
 /// buffer across the conversion instead of copying the frame out first.
+///
+/// It holds the stream's [`Session`] rather than the raw handles, so a picture
+/// that outlives the [`Stream`] -- a cached one, or one kept across a backend
+/// change -- still returns its buffer to a live stream instead of a freed one.
 struct BufferLease {
-    api: &'static Api,
-    stream: *mut c_void,
+    session: Arc<Session>,
     buffer: *mut PwBuffer,
 }
 
-// SAFETY: the pointers are owned by the stream, which outlives every lease it
-// hands out; `pw_stream_queue_buffer` is the documented way to return a buffer
-// and is safe to call from another thread.
+// SAFETY: the session owns the stream and outlives every lease it hands out;
+// `pw_stream_queue_buffer` is the documented way to return a buffer and is safe
+// to call from another thread.
 unsafe impl Send for BufferLease {}
 
 impl Drop for BufferLease {
     fn drop(&mut self) {
-        unsafe { (self.api.stream_queue_buffer)(self.stream, self.buffer) };
+        unsafe { (self.session.api.stream_queue_buffer)(self.session.stream, self.buffer) };
     }
 }
 
@@ -561,6 +564,10 @@ struct State {
 struct Shared {
     state: Mutex<State>,
     changed: Condvar,
+    /// The stream's handles, so a callback can hand out a lease that keeps them
+    /// alive. Weak because the session owns the loop thread that runs the
+    /// callbacks: a strong reference here would be a cycle.
+    session: Mutex<std::sync::Weak<Session>>,
 }
 
 /// What the loop thread's callbacks reach through their `data` pointer.
@@ -645,7 +652,13 @@ unsafe extern "C" fn on_process(data: *mut c_void) {
     // the lease carries the queue call; everything else is read here and the
     // buffer goes straight back.
     let picture = format.and_then(|format| unsafe {
-        read_picture(api, callbacks.stream, (*newest).buffer, format)
+        read_picture(
+            api,
+            callbacks.stream,
+            &callbacks.shared,
+            (*newest).buffer,
+            format,
+        )
     });
     if !picture
         .as_ref()
@@ -669,6 +682,7 @@ unsafe extern "C" fn on_process(data: *mut c_void) {
 unsafe fn read_picture(
     api: &'static Api,
     stream: *mut c_void,
+    shared: &Shared,
     buffer: *mut SpaBuffer,
     negotiated: NegotiatedFormat,
 ) -> Option<Picture> {
@@ -682,7 +696,12 @@ unsafe fn read_picture(
         // A DMA-BUF arrived: it is a file descriptor, not mapped memory. The
         // compositor's buffer is handed over as-is and the encoder imports it,
         // which is what makes the GPU conversion possible.
-        return unsafe { read_dmabuf(api, stream, buffer, format, width, height, modifier?) };
+        let session = shared
+            .session
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .upgrade()?;
+        return unsafe { read_dmabuf(&session, buffer, format, width, height, modifier?) };
     }
     let buffer = unsafe { &*buffer };
     if buffer.n_datas == 0 || buffer.datas.is_null() {
@@ -790,8 +809,7 @@ fn drm_fourcc(format: u32) -> Option<u32> {
 /// `buffer` must be a buffer the stream just dequeued; the returned picture
 /// keeps it out of the pool until it is dropped.
 unsafe fn read_dmabuf(
-    api: &'static Api,
-    stream: *mut c_void,
+    session: &Arc<Session>,
     buffer: *mut SpaBuffer,
     format: u32,
     width: u32,
@@ -835,8 +853,7 @@ unsafe fn read_dmabuf(
         modifier,
         planes,
         _lease: BufferLease {
-            api,
-            stream,
+            session: Arc::clone(session),
             buffer: buffer.cast(),
         },
     }))
@@ -844,6 +861,18 @@ unsafe fn read_dmabuf(
 
 /// A video stream from one PipeWire node, on its own loop thread.
 pub(super) struct Stream {
+    session: Arc<Session>,
+    shared: Arc<Shared>,
+    delivered: u64,
+}
+
+/// The stream's PipeWire handles, shared with any buffer leases still out.
+///
+/// Teardown lives here rather than on [`Stream`] so that a picture holding a
+/// buffer keeps the stream alive until the buffer is returned. Destroying the
+/// stream while a lease is out would leave the lease calling into freed
+/// memory.
+struct Session {
     api: &'static Api,
     thread_loop: *mut c_void,
     context: *mut c_void,
@@ -852,12 +881,36 @@ pub(super) struct Stream {
     _hook: Box<SpaHook>,
     _events: Box<StreamEvents>,
     callbacks: *mut Callbacks,
-    shared: Arc<Shared>,
-    delivered: u64,
 }
 
 // The raw handles are only used under the thread loop's lock or after it stopped.
-unsafe impl Send for Stream {}
+unsafe impl Send for Session {}
+unsafe impl Sync for Session {}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        let api = self.api;
+        // SAFETY: teardown in reverse order of setup; the loop is stopped
+        // before the callback data it could still call into is freed.
+        unsafe {
+            (api.thread_loop_lock)(self.thread_loop);
+            if !self.stream.is_null() {
+                (api.stream_disconnect)(self.stream);
+                (api.stream_destroy)(self.stream);
+            }
+            if !self.core.is_null() {
+                (api.core_disconnect)(self.core);
+            }
+            (api.thread_loop_unlock)(self.thread_loop);
+            (api.thread_loop_stop)(self.thread_loop);
+            (api.context_destroy)(self.context);
+            (api.thread_loop_destroy)(self.thread_loop);
+            if !self.callbacks.is_null() {
+                drop(Box::from_raw(self.callbacks));
+            }
+        }
+    }
+}
 
 impl Stream {
     /// Connect to `node` on the PipeWire remote behind `fd` (from the portal).
@@ -867,6 +920,7 @@ impl Stream {
         let shared = Arc::new(Shared {
             state: Mutex::new(State::default()),
             changed: Condvar::new(),
+            session: Mutex::new(std::sync::Weak::new()),
         });
         let name = CString::new("openuuyc-capture")?;
         // SAFETY: the PipeWire calls follow the documented setup sequence; every
@@ -884,7 +938,7 @@ impl Stream {
                 (api.thread_loop_destroy)(thread_loop);
                 bail!("无法创建 PipeWire 上下文");
             }
-            let mut this = Self {
+            let mut this = Session {
                 api,
                 thread_loop,
                 context,
@@ -906,8 +960,6 @@ impl Stream {
                     trigger_done: None,
                 }),
                 callbacks: std::ptr::null_mut(),
-                shared: shared.clone(),
-                delivered: 0,
             };
             ensure!(
                 (api.thread_loop_start)(thread_loop) >= 0,
@@ -941,7 +993,7 @@ impl Stream {
                 this.callbacks = Box::into_raw(Box::new(Callbacks {
                     api,
                     stream: this.stream,
-                    shared,
+                    shared: Arc::clone(&shared),
                 }));
                 (api.stream_add_listener)(
                     this.stream,
@@ -972,7 +1024,16 @@ impl Stream {
                 Ok(())
             })();
             (api.thread_loop_unlock)(thread_loop);
-            result.map(|()| this)
+            result.map(|()| {
+                let session = Arc::new(this);
+                *shared.session.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Arc::downgrade(&session);
+                Stream {
+                    session,
+                    shared,
+                    delivered: 0,
+                }
+            })
         }
     }
 
@@ -1007,26 +1068,8 @@ impl Stream {
 
 impl Drop for Stream {
     fn drop(&mut self) {
-        let api = self.api;
-        // SAFETY: teardown in reverse order of setup; the loop is stopped
-        // before the callback data it could still call into is freed.
-        unsafe {
-            (api.thread_loop_lock)(self.thread_loop);
-            if !self.stream.is_null() {
-                (api.stream_disconnect)(self.stream);
-                (api.stream_destroy)(self.stream);
-            }
-            if !self.core.is_null() {
-                (api.core_disconnect)(self.core);
-            }
-            (api.thread_loop_unlock)(self.thread_loop);
-            (api.thread_loop_stop)(self.thread_loop);
-            (api.context_destroy)(self.context);
-            (api.thread_loop_destroy)(self.thread_loop);
-            if !self.callbacks.is_null() {
-                drop(Box::from_raw(self.callbacks));
-            }
-        }
+        // Teardown happens when the last buffer lease goes, which is in
+        // `Session::drop`.
     }
 }
 
