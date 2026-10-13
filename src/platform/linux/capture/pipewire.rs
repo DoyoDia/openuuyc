@@ -692,21 +692,28 @@ unsafe fn read_picture(
         height,
         modifier,
     } = negotiated;
-    if modifier.is_some() {
-        // A DMA-BUF arrived: it is a file descriptor, not mapped memory. The
-        // compositor's buffer is handed over as-is and the encoder imports it,
-        // which is what makes the GPU conversion possible.
+    let buffer_ref = unsafe { &*buffer };
+    if buffer_ref.n_datas == 0 || buffer_ref.datas.is_null() {
+        return None;
+    }
+    // The buffer's own type decides, not the format's modifier. The portal
+    // keeps the modifier property in the format even after it fails to allocate
+    // a DMA-BUF and falls back to shared memory, so a `modifier` alone says
+    // nothing about what the buffer actually is; reading the fallback as a
+    // DMA-BUF imports the wrong memory and produces a blank picture.
+    //
+    // A delivered buffer carries the single `spa_data_type`, not the bitmask
+    // the request used, so this compares the enum value directly.
+    let kind = unsafe { (*buffer_ref.datas).kind };
+    if kind == DATA_MEM_DMABUF {
         let session = shared
             .session
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .upgrade()?;
-        return unsafe { read_dmabuf(&session, buffer, format, width, height, modifier?) };
+        return unsafe { read_dmabuf(&session, buffer, format, width, height, modifier) };
     }
-    let buffer = unsafe { &*buffer };
-    if buffer.n_datas == 0 || buffer.datas.is_null() {
-        return None;
-    }
+    let buffer = buffer_ref;
     let data = unsafe { &*buffer.datas };
     if data.data.is_null() || data.chunk.is_null() {
         // A DMA-BUF was not mapped for the CPU. Asking the portal for one does
@@ -814,9 +821,19 @@ unsafe fn read_dmabuf(
     format: u32,
     width: u32,
     height: u32,
-    modifier: u64,
+    modifier: Option<u64>,
 ) -> Option<Picture> {
     let fourcc = drm_fourcc(format)?;
+    // A modifier the compositor never fixated tells the importer nothing about
+    // the layout, and guessing wrong reads the wrong bytes. `LINEAR` is the
+    // safe reading only when the portal says so; `INVALID` means it did not.
+    let modifier = match modifier {
+        Some(modifier) if modifier != DRM_MOD_INVALID => modifier,
+        _ => {
+            tracing::warn!(format, "DMA-BUF 未提供有效 modifier，跳过该画面");
+            return None;
+        }
+    };
     let buffer_ref = unsafe { &*buffer };
     if buffer_ref.n_datas == 0 || buffer_ref.datas.is_null() {
         return None;
