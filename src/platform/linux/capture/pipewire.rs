@@ -140,18 +140,10 @@ const VIDEO_BGRX: u32 = 8;
 const VIDEO_RGBA: u32 = 11;
 const VIDEO_BGRA: u32 = 12;
 
-/// DRM fourcc codes, spelled the way DRM does. Once a modifier is in play the
-/// `format` field carries one of these instead of a `spa_video_format`.
-const DRM_FORMAT_ARGB8888: u32 = u32::from_le_bytes(*b"AR24");
-const DRM_FORMAT_XRGB8888: u32 = u32::from_le_bytes(*b"XR24");
-const DRM_FORMAT_ABGR8888: u32 = u32::from_le_bytes(*b"AB24");
-const DRM_FORMAT_XBGR8888: u32 = u32::from_le_bytes(*b"XB24");
-
-/// `I915_FORMAT_MOD_Y_TILED`: what i965 exports and its encoder imports.
+/// DRM format modifiers, spelled the way DRM does. `I915_FORMAT_MOD_Y_TILED`
+/// is what i965 exports and its encoder imports.
 const DRM_MOD_Y_TILED: u64 = 0x0100_0000_0000_0002;
-/// `I915_FORMAT_MOD_X_TILED`.
 const DRM_MOD_X_TILED: u64 = 0x0100_0000_0000_0001;
-/// `DRM_FORMAT_MOD_LINEAR`.
 const DRM_MOD_LINEAR: u64 = 0;
 /// `DRM_FORMAT_MOD_INVALID`, which SPA reads as "let the compositor choose".
 const DRM_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
@@ -266,12 +258,6 @@ impl Pod {
         }
         self.pad();
     }
-    /// A `Long`, which SPA stores as eight bytes.
-    fn value_long(&mut self, value: u64) {
-        self.u32(8);
-        self.u32(TYPE_LONG);
-        self.u64(value);
-    }
     /// A choice of `Long` values, the form SPA uses for DRM modifiers.
     fn choice_long(&mut self, choice: u32, values: &[u64]) {
         self.u32((16 + values.len() * 8) as u32);
@@ -345,11 +331,17 @@ fn enum_format() -> Pod {
         // DMA-BUF, and omits it for the shared-memory formats below. The portal
         // reads the pair together, so a format with no modifier means
         // shared memory.
-        p.key_flags(FORMAT_VIDEO_MODIFIER, SPA_POD_PROP_FLAG_DONT_FIXATE);
-        p.choice_long(
-            CHOICE_ENUM,
-            &[DRM_MOD_INVALID, DRM_MOD_LINEAR, DRM_MOD_X_TILED, DRM_MOD_Y_TILED],
-        );
+        //
+        // It is opt-in because the frame still has to be imported from the file
+        // descriptor, and until that path exists a DMA-BUF is a frame the
+        // capture cannot read: the stream negotiates, then never produces one.
+        if dmabuf_requested() {
+            p.key_flags(FORMAT_VIDEO_MODIFIER, SPA_POD_PROP_FLAG_DONT_FIXATE);
+            p.choice_long(
+                CHOICE_ENUM,
+                &[DRM_MOD_INVALID, DRM_MOD_LINEAR, DRM_MOD_X_TILED, DRM_MOD_Y_TILED],
+            );
+        }
         // The format stays a `spa_video_format`: the compositor offers AR24 and
         // AB24 from wlr, and the portal reports those as `BGRx`/`RGBA`-family
         // enums with the modifier carrying the tiling. A DRM fourcc here is a
@@ -373,30 +365,12 @@ fn enum_format() -> Pod {
     })
 }
 
-/// The shared-memory format offer, used when the compositor will not do DMA-BUF.
-fn enum_format_shm() -> Pod {
-    Pod::object(OBJECT_FORMAT, PARAM_ENUM_FORMAT, |p| {
-        p.key(FORMAT_MEDIA_TYPE);
-        p.value(TYPE_ID, &[MEDIA_TYPE_VIDEO]);
-        p.key(FORMAT_MEDIA_SUBTYPE);
-        p.value(TYPE_ID, &[MEDIA_SUBTYPE_RAW]);
-        p.key(FORMAT_VIDEO_FORMAT);
-        p.choice(
-            CHOICE_ENUM,
-            TYPE_ID,
-            1,
-            &[VIDEO_BGRX, VIDEO_BGRX, VIDEO_BGRA, VIDEO_RGBX, VIDEO_RGBA],
-        );
-        p.key(FORMAT_VIDEO_SIZE);
-        p.choice(
-            CHOICE_RANGE,
-            TYPE_RECTANGLE,
-            2,
-            &[1920, 1080, 1, 1, 16384, 16384],
-        );
-        p.key(FORMAT_VIDEO_FRAMERATE);
-        p.choice(CHOICE_RANGE, TYPE_FRACTION, 2, &[60, 1, 0, 1, 1000, 1]);
-    })
+/// Whether to ask the compositor for DMA-BUF frames instead of shared memory.
+///
+/// Off by default: the import path is not finished, and a request that is
+/// honoured but unreadable leaves the capture with no frames at all.
+fn dmabuf_requested() -> bool {
+    std::env::var("OPENUUYC_CAPTURE_DMABUF").is_ok_and(|value| value != "0")
 }
 
 /// The buffer types to offer, which must agree with the negotiated format.
@@ -819,9 +793,9 @@ impl Stream {
                 // The buffer types go in with the connection, not only from
                 // `on_param_changed`: the portal allocates its buffers as soon
                 // as the stream starts, and by the time that callback runs it
-                // has already settled on a type. `enum_format` asks for a
-                // modifier, so the matching type here is DMA-BUF.
-                let buffers = buffers(true).aligned();
+                // has already settled on a type. The type has to match what
+                // `enum_format` asked for.
+                let buffers = buffers(dmabuf_requested()).aligned();
                 let mut params = [
                     format.as_ptr().cast::<c_void>(),
                     buffers.as_ptr().cast::<c_void>(),
@@ -915,7 +889,12 @@ mod tests {
         .aligned();
         assert_eq!(
             unsafe { parse_format(pod.as_ptr().cast()) },
-            Some((VIDEO_BGRX, 2560, 1440))
+            Some(NegotiatedFormat {
+                format: VIDEO_BGRX,
+                width: 2560,
+                height: 1440,
+                modifier: None,
+            })
         );
         let choices = enum_format().aligned();
         let size = unsafe { choices.as_ptr().cast::<u32>().read() } as usize;
