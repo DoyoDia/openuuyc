@@ -342,10 +342,11 @@ fn enum_format() -> Pod {
         // capture cannot read: the stream negotiates, then never produces one.
         if dmabuf_requested() {
             p.key_flags(FORMAT_VIDEO_MODIFIER, SPA_POD_PROP_FLAG_DONT_FIXATE);
-            p.choice_long(
-                CHOICE_ENUM,
-                &[DRM_MOD_INVALID, DRM_MOD_LINEAR, DRM_MOD_X_TILED, DRM_MOD_Y_TILED],
-            );
+            // Only modifiers whose layout the importer understands. Offering
+            // `DRM_FORMAT_MOD_INVALID` invites the portal to fixate to it, and
+            // an unfixed modifier says nothing about the tiling, so the import
+            // would read the wrong bytes.
+            p.choice_long(CHOICE_ENUM, &[DRM_MOD_LINEAR, DRM_MOD_X_TILED, DRM_MOD_Y_TILED]);
         }
         // The format stays a `spa_video_format`: the compositor offers AR24 and
         // AB24 from wlr, and the portal reports those as `BGRx`/`RGBA`-family
@@ -559,6 +560,9 @@ struct State {
     format: Option<NegotiatedFormat>,
     streaming: bool,
     error: Option<String>,
+    /// The buffer kind the stream last asked for: `Some(true)` for DMA-BUF,
+    /// `Some(false)` for shared memory, `None` before the first request.
+    buffers_requested: Option<bool>,
 }
 
 struct Shared {
@@ -616,12 +620,28 @@ unsafe extern "C" fn on_param_changed(data: *mut c_void, id: u32, param: *const 
     }
     let callbacks = unsafe { &*data.cast::<Callbacks>() };
     let format = unsafe { parse_format(param) };
-    lock(&callbacks.shared.state).format = format;
-    tracing::debug!(?format, "PipeWire screencast format negotiated");
-    // Ask for buffers of the type the format just settled on, and for the crop
-    // region. The type has to follow the format: a DMA-BUF format with a
-    // CPU-mapped buffer request cannot be allocated.
-    let buffers = buffers(format.is_some_and(|format| format.modifier.is_some())).aligned();
+    let mut state = lock(&callbacks.shared.state);
+    state.format = format;
+    // A modifier that was actually fixated means a DMA-BUF; the portal writes
+    // `DRM_FORMAT_MOD_INVALID` when it falls back to shared memory, and an
+    // unfixed modifier says nothing about the layout.
+    let dmabuf = format
+        .and_then(|format| format.modifier)
+        .is_some_and(|modifier| modifier != DRM_MOD_INVALID);
+    // The buffer types are only re-sent when the kind changes. Sending them on
+    // every format change makes the portal re-fixate the modifier, and when it
+    // cannot it falls back to shared memory, reports that as another format
+    // change, and the two sides loop: the portal logged over a thousand fixate
+    // attempts in a few seconds and the stream never settled.
+    if state.buffers_requested == Some(dmabuf) {
+        drop(state);
+        tracing::debug!(?format, dmabuf, "PipeWire screencast format renegotiated");
+        return;
+    }
+    state.buffers_requested = Some(dmabuf);
+    drop(state);
+    tracing::debug!(?format, dmabuf, "PipeWire screencast format negotiated");
+    let buffers = buffers(dmabuf).aligned();
     let meta = crop_meta().aligned();
     let mut params = [buffers.as_ptr().cast::<c_void>(), meta.as_ptr().cast()];
     unsafe {
@@ -1018,17 +1038,12 @@ impl Stream {
                     &*this._events,
                     this.callbacks.cast(),
                 );
+                // Only the format goes in with the connection. The buffer
+                // types follow from the format `on_param_changed` reports, and
+                // sending them before that is known risks asking for a DMA-BUF
+                // the portal then cannot fixate.
                 let format = enum_format().aligned();
-                // The buffer types go in with the connection, not only from
-                // `on_param_changed`: the portal allocates its buffers as soon
-                // as the stream starts, and by the time that callback runs it
-                // has already settled on a type. The type has to match what
-                // `enum_format` asked for.
-                let buffers = buffers(dmabuf_requested()).aligned();
-                let mut params = [
-                    format.as_ptr().cast::<c_void>(),
-                    buffers.as_ptr().cast::<c_void>(),
-                ];
+                let mut params = [format.as_ptr().cast::<c_void>()];
                 let connected = (api.stream_connect)(
                     this.stream,
                     DIRECTION_INPUT,
