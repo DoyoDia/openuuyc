@@ -1,0 +1,16 @@
+[Unit]
+Description=OpenUUYC GUI (UU Remote client)
+# The GUI must share the graphical session's D-Bus so the XDG ScreenCast portal
+# can show its consent dialog; a process started over SSH would hang instead.
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/openuuyc-launch gui
+Restart=no
+StandardOutput=append:%h/.local/state/openuuyc/gui.log
+StandardError=append:%h/.local/state/openuuyc/gui.log
+
+[Install]
+WantedBy=graphical-session.target

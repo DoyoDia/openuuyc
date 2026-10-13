@@ -1,0 +1,18 @@
+#!/bin/bash
+# Launch wrapper for OpenUUYC.
+#
+# When the GUI is started from a systemd user unit (or any process that did not
+# inherit the graphical session's environment) the Wayland/X11 variables are
+# missing, and both the windowing backend and display enumeration (RandR, which
+# Hyprland serves through XWayland) need them. Fill in sensible defaults and
+# leave anything already set untouched.
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+export WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-1}"
+export DISPLAY="${DISPLAY:-:0}"
+export XDG_SESSION_TYPE="${XDG_SESSION_TYPE:-wayland}"
+export XDG_CURRENT_DESKTOP="${XDG_CURRENT_DESKTOP:-Hyprland}"
+
+# OPENUUYC_BACKEND=gl|vulkan forces a wgpu backend; unset lets the program try
+# Vulkan first and fall back to OpenGL. Set it to `gl` on drivers whose Vulkan
+# cannot present to a Wayland surface.
+exec /usr/bin/OpenUUYC "$@"

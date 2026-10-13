@@ -21,6 +21,7 @@ captures/
 !/drivers/display/UPSTREAM.md
 !/drivers/audio/UPSTREAM.md
 !/src/platform/linux/probes/README.md
+!/packaging/aur/README.md
 !**/LICENSE*.md
 !**/COPYING*.md
 !**/NOTICE*.md

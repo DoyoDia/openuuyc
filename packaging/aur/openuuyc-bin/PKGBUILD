@@ -1,0 +1,70 @@
+# Maintainer: risent <shengqi542@gmail.com>
+#
+# Binary package built from the GitHub release of the Omarchy/Wayland fork.
+# Prefer this over openuuyc-git unless you want to track the branch.
+#
+# AUR submission: copy this directory to an AUR git checkout and run
+#   makepkg --printsrcinfo > .SRCINFO
+# then commit. See packaging/aur/README.md.
+
+pkgname=openuuyc-bin
+pkgver=1.0.0.omarchy.1
+pkgrel=1
+# The git tag keeps the hyphen that pkgver may not contain.
+_tag=v${pkgver/omarchy./omarchy-}
+pkgdesc="Third-party UU Remote client (Wayland/Hyprland host support)"
+arch=('x86_64')
+url="https://github.com/risent/openuuyc"
+license=('custom')
+depends=('gcc-libs' 'fuse3' 'libx11' 'libxcb' 'libxrandr' 'libxi' 'libxcursor'
+         'libxfixes' 'libxkbcommon' 'libxkbcommon-x11' 'wayland'
+         'vulkan-icd-loader' 'noto-fonts-cjk' 'gnome-keyring')
+optdepends=(
+    'libva: H.264 hardware decoding'
+    'libva-nvidia-driver: NVIDIA VA-API decoding'
+    'intel-media-driver: Intel VA-API decoding'
+    'libpulse: desktop audio capture and playback'
+    'pipewire: XDG ScreenCast capture on Wayland'
+    'xdg-desktop-portal-hyprland: ScreenCast portal on Hyprland'
+    'xdg-desktop-portal-gnome: ScreenCast portal on GNOME'
+    'xdg-desktop-portal-kde: ScreenCast portal on KDE'
+    'vulkan-swrast: software Vulkan for old GPUs and VMs'
+    'ethtool: remote power-on NIC check'
+)
+provides=('openuuyc')
+conflicts=('openuuyc' 'openuuyc-git')
+install=openuuyc-bin.install
+source=(
+    "OpenUUYC-$pkgver::${url}/releases/download/${_tag}/OpenUUYC"
+    "openuuyc.desktop::${url}/raw/${_tag}/packaging/linux/openuuyc.desktop"
+    "openuuyc-launch::${url}/raw/${_tag}/packaging/linux/openuuyc-launch"
+    "openuuyc-gui.service::${url}/raw/${_tag}/packaging/linux/openuuyc-gui.service"
+    "60-openuuyc-uinput.rules::${url}/raw/${_tag}/packaging/linux/60-openuuyc-uinput.rules"
+    "icon-256.png::${url}/raw/${_tag}/assets/icon-256.png"
+    "LICENSE::${url}/raw/${_tag}/LICENSE"
+    "THIRD_PARTY_NOTICES::${url}/raw/${_tag}/THIRD_PARTY_NOTICES"
+)
+sha256sums=('SKIP'
+            'SKIP'
+            'SKIP'
+            'SKIP'
+            'SKIP'
+            'SKIP'
+            'SKIP'
+            'SKIP')
+
+package() {
+    install -Dm755 "$srcdir/OpenUUYC-$pkgver" "$pkgdir/usr/bin/OpenUUYC"
+    install -Dm755 "$srcdir/openuuyc-launch" "$pkgdir/usr/bin/openuuyc-launch"
+    install -Dm644 "$srcdir/openuuyc.desktop" \
+        "$pkgdir/usr/share/applications/openuuyc.desktop"
+    install -Dm644 "$srcdir/icon-256.png" \
+        "$pkgdir/usr/share/icons/hicolor/256x256/apps/openuuyc.png"
+    install -Dm644 "$srcdir/openuuyc-gui.service" \
+        "$pkgdir/usr/lib/systemd/user/openuuyc-gui.service"
+    install -Dm644 "$srcdir/60-openuuyc-uinput.rules" \
+        "$pkgdir/usr/lib/udev/rules.d/60-openuuyc-uinput.rules"
+    install -Dm644 "$srcdir/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    install -Dm644 "$srcdir/THIRD_PARTY_NOTICES" \
+        "$pkgdir/usr/share/licenses/$pkgname/THIRD_PARTY_NOTICES"
+}
