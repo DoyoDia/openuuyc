@@ -96,6 +96,9 @@ pub(crate) struct Encoder {
     /// Only read by the throughput test.
     upload_time: std::time::Duration,
     encode_time: std::time::Duration,
+    /// `vaDeriveImage` and the colour conversion, split out of `upload_time`.
+    derive_time: std::time::Duration,
+    convert_time: std::time::Duration,
 }
 
 impl Encoder {
@@ -185,6 +188,8 @@ impl Encoder {
             parameter_sets,
             upload_time: std::time::Duration::ZERO,
             encode_time: std::time::Duration::ZERO,
+            derive_time: std::time::Duration::ZERO,
+            convert_time: std::time::Duration::ZERO,
         })
     }
 
@@ -252,12 +257,22 @@ impl Encoder {
         )
     }
 
+    /// The `vaDeriveImage` and conversion time, and resets them.
+    #[cfg(test)]
+    fn take_upload_breakdown(&mut self) -> (std::time::Duration, std::time::Duration) {
+        (
+            std::mem::take(&mut self.derive_time),
+            std::mem::take(&mut self.convert_time),
+        )
+    }
+
     /// Converts BGRA to NV12 and copies it into the surface.
     ///
     /// `vaDeriveImage` maps the surface directly, so this is the only copy of
     /// the frame; `vaCreateImage` + `vaGetImage` would read the surface back
     /// first, which is pure waste when every pixel is about to be overwritten.
     fn upload(&mut self, index: usize, pixels: &[u8], pitch: usize) -> Result<(), EncodeError> {
+        let derive_started = std::time::Instant::now();
         let surface = self.surfaces[index]
             .as_ref()
             .ok_or_else(|| EncodeError::Backend("编码表面已借出".into()))?;
@@ -273,6 +288,8 @@ impl Encoder {
         let (width, height) = (self.width as usize, self.height as usize);
         let (luma_offset, luma_pitch) = (info.offsets[0] as usize, info.pitches[0] as usize);
         let (chroma_offset, chroma_pitch) = (info.offsets[1] as usize, info.pitches[1] as usize);
+        let derive_done = std::time::Instant::now();
+        self.derive_time += derive_done - derive_started;
         let bytes = image.as_mut();
         bgra_to_nv12(
             pixels,
@@ -285,6 +302,7 @@ impl Encoder {
             chroma_offset,
             chroma_pitch,
         )?;
+        self.convert_time += derive_done.elapsed();
         // Dropping unmaps the derived view; the writes above went straight into
         // the surface, so there is nothing to copy back.
         drop(image);
@@ -770,9 +788,12 @@ mod tests {
             bytes / 1024
         );
         let (upload, encode) = encoder.take_stage_totals();
+        let (derive, convert) = encoder.take_upload_breakdown();
         println!(
-            "  upload {:.1} ms/frame, encode {:.1} ms/frame",
+            "  upload {:.1} ms/frame (derive {:.1}, convert {:.1}), encode {:.1} ms/frame",
             upload.as_secs_f64() * 1000.0 / f64::from(frames),
+            derive.as_secs_f64() * 1000.0 / f64::from(frames),
+            convert.as_secs_f64() * 1000.0 / f64::from(frames),
             encode.as_secs_f64() * 1000.0 / f64::from(frames),
         );
     }

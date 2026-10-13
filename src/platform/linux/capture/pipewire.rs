@@ -526,17 +526,32 @@ unsafe fn read_picture(
     }
     let source =
         unsafe { std::slice::from_raw_parts(data.data.cast::<u8>(), data.maxsize as usize) };
+    // Only the encoders read these pixels, and both convert with the colour
+    // channels alone: the alpha byte is never looked at. Writing it would cost
+    // a pass over the frame for nothing, so the buffer is left as the
+    // compositor sent it.
     let swap = matches!(format, VIDEO_RGBX | VIDEO_RGBA);
-    let mut pixels = Vec::with_capacity(w * h * 4);
-    for row in 0..h {
-        let start = base + (y + row) * stride + x * 4;
-        pixels.extend_from_slice(&source[start..start + w * 4]);
-    }
-    for pixel in pixels.chunks_exact_mut(4) {
-        if swap {
-            pixel.swap(0, 2);
+    let mut pixels = vec![0u8; w * h * 4];
+    if !swap {
+        // The common case is already BGRX, so each row is a straight copy.
+        for row in 0..h {
+            let start = base + (y + row) * stride + x * 4;
+            pixels[row * w * 4..(row + 1) * w * 4]
+                .copy_from_slice(&source[start..start + w * 4]);
         }
-        pixel[3] = 0xff;
+    } else {
+        // Swap red and blue while copying, so the result is BGRA either way.
+        for row in 0..h {
+            let start = base + (y + row) * stride + x * 4;
+            let source_row = &source[start..start + w * 4];
+            let target = &mut pixels[row * w * 4..(row + 1) * w * 4];
+            for (texel, out) in source_row.chunks_exact(4).zip(target.chunks_exact_mut(4)) {
+                out[0] = texel[2];
+                out[1] = texel[1];
+                out[2] = texel[0];
+                out[3] = texel[3];
+            }
+        }
     }
     Some(Picture {
         width: w as u32,
