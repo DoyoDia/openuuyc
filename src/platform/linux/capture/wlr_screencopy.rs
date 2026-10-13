@@ -11,6 +11,13 @@
 //! through shared memory. dma-buf pays off only once the conversion moves onto
 //! the GPU too, which the encoder does not do yet.
 //!
+//! The compositor copies its own framebuffer, not the picture the monitor
+//! shows: a rotated or flipped output arrives sideways, and the transform
+//! `wl_output.geometry` advertises has to be undone here, exactly as `grim`
+//! and every other screencopy client does. Left undone, a portrait monitor
+//! streams a landscape picture of a sideways desktop twice over — the shape
+//! is wrong and so is everything in it.
+//!
 //! `copy_with_damage` is used rather than `copy`: the compositor then holds the
 //! frame back until something has actually changed, which is what keeps an idle
 //! desktop from being encoded and sent over and over.
@@ -23,6 +30,7 @@ use anyhow::{Context, Result, bail, ensure};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::time::{Duration, Instant};
 use wayland_client::backend::WaylandError;
+use wayland_client::protocol::wl_output::Transform;
 use wayland_client::protocol::{wl_buffer, wl_output, wl_registry, wl_shm, wl_shm_pool};
 use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle};
 use wayland_protocols_wlr::screencopy::v1::client::{
@@ -37,7 +45,22 @@ const OUTPUT_VERSION: u32 = 4;
 struct Output {
     proxy: wl_output::WlOutput,
     name: Option<String>,
-    size: (u32, u32),
+    /// The mode the output is driving, before `transform` is applied.
+    mode: (u32, u32),
+    transform: Transform,
+}
+
+impl Output {
+    /// The size the desktop sees: the mode as the transform turns it, which is
+    /// what the caller's `Screen` describes and what a frame will come back as.
+    fn size(&self) -> (u32, u32) {
+        match self.transform {
+            Transform::_90 | Transform::_270 | Transform::Flipped90 | Transform::Flipped270 => {
+                (self.mode.1, self.mode.0)
+            }
+            _ => self.mode,
+        }
+    }
 }
 
 /// The shared memory every frame is copied into, and the buffer that names it.
@@ -63,27 +86,28 @@ impl Shm {
             && self.stride == stride
     }
 
-    /// The picture as tightly packed BGRA rows, without the stride padding.
-    fn picture(&self) -> Picture {
+    /// The picture as tightly packed BGRA rows, without the stride padding and
+    /// with the output's transform undone.
+    fn picture(&self, transform: Transform) -> Picture {
         let row = self.width as usize * 4;
         // Safe because the mapping is live for as long as `self` is, and the
         // compositor has finished with it: a `ready` event preceded this.
         let all = unsafe { std::slice::from_raw_parts(self.map, self.length) };
-        let pixels = if self.stride as usize == row {
-            all[..row * self.height as usize].to_vec()
+        let mut pixels = Vec::with_capacity(row * self.height as usize);
+        if self.stride as usize == row {
+            pixels.extend_from_slice(&all[..row * self.height as usize]);
         } else {
-            let mut out = Vec::with_capacity(row * self.height as usize);
             for line in all
                 .chunks_exact(self.stride as usize)
                 .take(self.height as usize)
             {
-                out.extend_from_slice(&line[..row]);
+                pixels.extend_from_slice(&line[..row]);
             }
-            out
-        };
+        }
+        let (pixels, width, height) = orient(pixels, self.width, self.height, transform);
         Picture {
-            width: self.width,
-            height: self.height,
+            width,
+            height,
             pixels,
             nv12: None,
         }
@@ -148,6 +172,8 @@ impl Grab {
         let output = pick(&state.outputs, screen)?;
         tracing::info!(
             output = screen.device_name,
+            mode = ?state.outputs[output].mode,
+            transform = ?state.outputs[output].transform,
             "host wlr-screencopy output selected"
         );
         Ok(Self {
@@ -174,7 +200,16 @@ impl Grab {
                 bail!("{error}");
             }
             if std::mem::take(&mut self.state.ready) {
-                let picture = self.state.shm_buffer.as_ref().map(Shm::picture);
+                let transform = self
+                    .state
+                    .outputs
+                    .get(self.output)
+                    .map_or(Transform::Normal, |output| output.transform);
+                let picture = self
+                    .state
+                    .shm_buffer
+                    .as_ref()
+                    .map(|shm| shm.picture(transform));
                 // Ask for the next frame before returning, so the compositor
                 // draws into the buffer while the caller encodes this one.
                 self.request()?;
@@ -255,6 +290,48 @@ impl Grab {
     }
 }
 
+/// Undoes the output's transform, which the compositor leaves to the client:
+/// what arrives is the framebuffer, and a monitor standing on its side shows up
+/// in it lying down. The mapping is `wl_output`'s own, read as "the framebuffer
+/// pixel this picture pixel is", and `Normal` — the one case that needs no work
+/// — passes the rows straight through.
+fn orient(source: Vec<u8>, width: u32, height: u32, transform: Transform) -> (Vec<u8>, u32, u32) {
+    if transform == Transform::Normal {
+        return (source, width, height);
+    }
+    let turned = matches!(
+        transform,
+        Transform::_90 | Transform::_270 | Transform::Flipped90 | Transform::Flipped270
+    );
+    let (out_width, out_height) = if turned {
+        (height, width)
+    } else {
+        (width, height)
+    };
+    let (last_x, last_y) = (width as i32 - 1, height as i32 - 1);
+    let source_at = |x: i32, y: i32| match transform {
+        Transform::_90 => (y, last_y - x),
+        Transform::_180 => (last_x - x, last_y - y),
+        Transform::_270 => (last_x - y, x),
+        Transform::Flipped => (last_x - x, y),
+        Transform::Flipped90 => (y, x),
+        Transform::Flipped180 => (x, last_y - y),
+        Transform::Flipped270 => (last_x - y, last_y - x),
+        // `Normal`, and any transform a later revision adds.
+        _ => (x, y),
+    };
+    let mut out = vec![0u8; out_width as usize * out_height as usize * 4];
+    for y in 0..out_height as i32 {
+        for x in 0..out_width as i32 {
+            let (from_x, from_y) = source_at(x, y);
+            let from = (from_y as usize * width as usize + from_x as usize) * 4;
+            let to = (y as usize * out_width as usize + x as usize) * 4;
+            out[to..to + 4].copy_from_slice(&source[from..from + 4]);
+        }
+    }
+    (out, out_width, out_height)
+}
+
 fn millis(timeout: Duration) -> i32 {
     timeout.as_millis().min(i32::MAX as u128) as i32
 }
@@ -274,7 +351,7 @@ fn pick(outputs: &[Output], screen: &Screen) -> Result<usize> {
     }
     if let Some(index) = outputs
         .iter()
-        .position(|output| output.name.is_none() && output.size == (screen.width, screen.height))
+        .position(|output| output.name.is_none() && output.size() == (screen.width, screen.height))
     {
         return Ok(index);
     }
@@ -331,7 +408,8 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                         (),
                     ),
                     name: None,
-                    size: (0, 0),
+                    mode: (0, 0),
+                    transform: Transform::Normal,
                 }),
                 _ => {}
             }
@@ -357,6 +435,13 @@ impl Dispatch<wl_output::WlOutput, ()> for State {
         };
         match event {
             wl_output::Event::Name { name } => entry.name = Some(name),
+            // The transform lives here and nowhere else: no later protocol
+            // revision reports it another way.
+            wl_output::Event::Geometry { transform, .. } => {
+                if let Ok(transform) = transform.into_result() {
+                    entry.transform = transform;
+                }
+            }
             wl_output::Event::Mode {
                 width,
                 height,
@@ -366,7 +451,7 @@ impl Dispatch<wl_output::WlOutput, ()> for State {
                 .into_result()
                 .is_ok_and(|flags| flags.contains(wl_output::Mode::Current)) =>
             {
-                entry.size = (width.max(0) as u32, height.max(0) as u32)
+                entry.mode = (width.max(0) as u32, height.max(0) as u32)
             }
             _ => {}
         }
@@ -497,4 +582,99 @@ fn allocate(
         height,
         stride,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::orient;
+    use wayland_client::protocol::wl_output::Transform;
+
+    /// A `width`x`height` BGRA picture whose pixels count up from 1, one value
+    /// per pixel repeated across its four bytes.
+    fn numbered(width: u32, height: u32) -> Vec<u8> {
+        (1..=(width * height))
+            .flat_map(|value| [value as u8; 4])
+            .collect()
+    }
+
+    /// The value of each pixel, in order.
+    fn values(pixels: &[u8]) -> Vec<u8> {
+        pixels.chunks_exact(4).map(|pixel| pixel[0]).collect()
+    }
+
+    #[test]
+    fn normal_leaves_the_rows_alone() {
+        let (pixels, width, height) = orient(numbered(2, 3), 2, 3, Transform::Normal);
+        assert_eq!((width, height), (2, 3));
+        assert_eq!(values(&pixels), vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn turning_swaps_the_shape_and_keeps_every_pixel() {
+        let source = numbered(4, 3);
+        let mut seen = Vec::new();
+        for transform in [
+            Transform::_90,
+            Transform::_180,
+            Transform::_270,
+            Transform::Flipped,
+            Transform::Flipped90,
+            Transform::Flipped180,
+            Transform::Flipped270,
+        ] {
+            let (pixels, width, height) = orient(source.clone(), 4, 3, transform);
+            let turned = matches!(
+                transform,
+                Transform::_90 | Transform::_270 | Transform::Flipped90 | Transform::Flipped270
+            );
+            assert_eq!(
+                (width, height),
+                if turned { (3, 4) } else { (4, 3) },
+                "{transform:?} size"
+            );
+            let mut sorted = values(&pixels);
+            sorted.sort_unstable();
+            assert_eq!(
+                sorted,
+                (1..=12).collect::<Vec<u8>>(),
+                "{transform:?} lost or duplicated a pixel"
+            );
+            seen.push(values(&pixels));
+        }
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), 7, "a transform repeats another one");
+    }
+
+    #[test]
+    fn a_quarter_turn_is_clockwise_and_270_undoes_it() {
+        let source = numbered(2, 3);
+        let (turned, width, height) = orient(source.clone(), 2, 3, Transform::_90);
+        assert_eq!((width, height), (3, 2));
+        assert_eq!(values(&turned), vec![5, 3, 1, 6, 4, 2]);
+        let (back, width, height) = orient(turned, 3, 2, Transform::_270);
+        assert_eq!((width, height), (2, 3));
+        assert_eq!(back, source);
+    }
+
+    #[test]
+    fn a_flipped_quarter_turn_is_the_plain_one_mirrored() {
+        let source = numbered(2, 3);
+        let (plain, _, _) = orient(source.clone(), 2, 3, Transform::_90);
+        let (flipped, _, _) = orient(source.clone(), 2, 3, Transform::Flipped90);
+        assert_eq!(values(&plain), vec![5, 3, 1, 6, 4, 2]);
+        assert_eq!(values(&flipped), vec![1, 3, 5, 2, 4, 6]);
+        let (plain, _, _) = orient(source.clone(), 2, 3, Transform::_270);
+        let (flipped, _, _) = orient(source, 2, 3, Transform::Flipped270);
+        assert_eq!(values(&plain), vec![2, 4, 6, 1, 3, 5]);
+        assert_eq!(values(&flipped), vec![6, 4, 2, 5, 3, 1]);
+    }
+
+    #[test]
+    fn flipping_mirrors_without_turning() {
+        let (pixels, _, _) = orient(numbered(3, 2), 3, 2, Transform::Flipped);
+        assert_eq!(values(&pixels), vec![3, 2, 1, 6, 5, 4]);
+        let (pixels, _, _) = orient(numbered(3, 2), 3, 2, Transform::Flipped180);
+        assert_eq!(values(&pixels), vec![4, 5, 6, 1, 2, 3]);
+    }
 }
