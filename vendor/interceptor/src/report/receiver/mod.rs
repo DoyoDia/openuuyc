@@ -103,10 +103,7 @@ impl RTCPWriter for ReceiverReportRtcpWriter {
                 let end = (index + 1..packets.len())
                     .find(|&next| feedback_ssrc(packets[next].as_ref()).is_some())
                     .unwrap_or(packets.len());
-                total += self
-                    .parent
-                    .write(&packets[index..end], attributes)
-                    .await?;
+                total += self.parent.write(&packets[index..end], attributes).await?;
                 index = end;
                 continue;
             };

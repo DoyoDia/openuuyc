@@ -254,7 +254,10 @@ impl Remote {
         let pipe = Pipe::server(&name, true)?;
         let agent = crate::platform::windows::host_service::user_backend::Lease::connect(
             crate::platform::windows::host_service::user_backend::Role::Annotation,
-            &name, session, || !cancel.is_cancelled())?;
+            &name,
+            session,
+            || !cancel.is_cancelled(),
+        )?;
         let until = Instant::now() + Duration::from_secs(2);
         pipe.accept(|| !cancel.is_cancelled() && agent.alive() && Instant::now() < until)?;
         ensure!(
@@ -282,8 +285,11 @@ pub(crate) fn run(name: &str, parent: u32) -> Result<()> {
         pipe.peer_pid(false)? == parent && pipe.peer_session(false)? == session,
         "批注父进程身份不匹配"
     );
-    let permitted = || crate::platform::windows::host_service::user_backend::permitted()
-        && process::active_session() == session && pipe.queued_bytes().is_ok();
+    let permitted = || {
+        crate::platform::windows::host_service::user_backend::permitted()
+            && process::active_session() == session
+            && pipe.queued_bytes().is_ok()
+    };
     let mut local = Local::new()?;
     let mut last_request = Instant::now();
     let mut last_idle = Instant::now();

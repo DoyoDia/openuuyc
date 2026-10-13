@@ -182,7 +182,7 @@ impl TryFrom<Dav1dSettings> for Rav1dSettings {
             decode_frame_type,
             reserved: _,
         } = value;
-        validate_input!((apply_grain==0,Rav1dError::UnsupportedBitstream))?;
+        validate_input!((apply_grain == 0, Rav1dError::UnsupportedBitstream))?;
         validate_input!((
             (0..=DAV1D_MAX_THREADS).contains(&n_threads),
             Rav1dError::InvalidArgument

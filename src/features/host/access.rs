@@ -877,8 +877,7 @@ impl Handle {
         self.power.invalidate();
         self.assistance.unavailable();
         let mut state = lock(&self.ownership);
-        let clear_update =
-            !state.updating && !crate::platform::host_service::resident::managed();
+        let clear_update = !state.updating && !crate::platform::host_service::resident::managed();
         state.active = false;
         state.permission = state.permission.wrapping_add(1);
         finish_session(&mut state);

@@ -24,7 +24,8 @@ impl DeviceCenterApp {
             self.updates.dialog_open = false;
             return;
         };
-        let (dismiss, download) = release_prompt(ctx, version, notes, published.as_deref(), *prerelease);
+        let (dismiss, download) =
+            release_prompt(ctx, version, notes, published.as_deref(), *prerelease);
         if download {
             ctx.open_url(egui::OpenUrl::new_tab(url));
         }
@@ -51,7 +52,11 @@ fn release_prompt(
             );
             dismiss = crate::ui::controls::dialog_header(
                 ui,
-                if prerelease { "发现测试版" } else { "发现新版本" },
+                if prerelease {
+                    "发现测试版"
+                } else {
+                    "发现新版本"
+                },
                 crate::ui::controls::DialogIcon::Required,
                 true,
             );

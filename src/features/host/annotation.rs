@@ -79,9 +79,9 @@ impl Receiver {
         }));
         let (input, incoming) = mpsc::sync_channel::<Work>(64);
         let state = binding.clone();
-        let activity=crate::platform::host_service::activity::Work::new();
+        let activity = crate::platform::host_service::activity::Work::new();
         let worker = tokio::task::spawn_blocking(move || {
-            let _activity=activity;
+            let _activity = activity;
             let mut backend = agent::Backend::default();
             let mut generation = 0;
             while !cancel.is_cancelled() {

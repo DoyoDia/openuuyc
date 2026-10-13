@@ -3,6 +3,8 @@
 //! input. Platforms supply the device (D3D11 on Windows, a CUDA context on
 //! Linux) and register their own input surface, so both encode with the same
 //! parameters.
+pub(crate) mod timing;
+
 use super::{Codec, Color, Format, Rate};
 use anyhow::{Context, Result, bail, ensure};
 use openuuyc_nvenc_sys as nv;
@@ -165,6 +167,7 @@ pub(crate) struct Registered(nv::NV_ENC_REGISTERED_PTR, u32);
 
 /// An initialized NVENC session with its output bitstream buffer.
 pub(crate) struct Session {
+    diagnostics: timing::Diagnostics,
     frame_rate: super::rate::Controller,
     api: Api,
     session: *mut c_void,
@@ -214,6 +217,7 @@ impl Session {
         // reconfigure would leave the old preset configuration in place.
         let (preset_guid, tuning) = api.preset(format.codec);
         let mut encoder = Self {
+            diagnostics: timing::Diagnostics::default(),
             frame_rate: super::rate::Controller::new(Rate { quality: 0, ..rate }),
             api,
             session: ptr::null_mut(),
@@ -533,12 +537,18 @@ impl Session {
         Ok(changed_quality)
     }
 
+    /// Record a frame's stage times; slow frames are logged at most every 5 s.
+    pub fn record(&mut self, timing: timing::Frame, success: bool) {
+        self.diagnostics.record(timing, success);
+    }
+
     /// Encode the picture currently in `input`.
     pub fn encode(
         &mut self,
         input: &Registered,
         timestamp_100ns: i64,
         keyframe: bool,
+        timing: &mut timing::Frame,
     ) -> Result<Vec<super::Encoded>> {
         self.frame_rate.input(timestamp_100ns);
         unsafe {
@@ -546,11 +556,9 @@ impl Session {
             let mut map = nv::NV_ENC_MAP_INPUT_RESOURCE::default();
             map.version = self.api.structure(4, false);
             map.registeredResource = input.0;
-            self.api.check(
-                self.session,
-                f.nvEncMapInputResource.unwrap()(self.session, &mut map),
-                "MapInputResource",
-            )?;
+            let mapped = f.nvEncMapInputResource.unwrap()(self.session, &mut map);
+            timing.stage(2);
+            self.api.check(self.session, mapped, "MapInputResource")?;
             let _mapped = Mapped {
                 api: &self.api,
                 session: self.session,
@@ -577,6 +585,7 @@ impl Session {
                 picture.encodePicFlags = 6;
             }
             let status = f.nvEncEncodePicture.unwrap()(self.session, &mut picture);
+            timing.stage(3);
             if status == nv::NVENCSTATUS::NV_ENC_ERR_NEED_MORE_INPUT {
                 return Ok(Vec::new());
             }
@@ -587,11 +596,9 @@ impl Session {
                 self.api.level >= 0xc1,
             );
             bitstream.outputBitstream = self.bitstream;
-            self.api.check(
-                self.session,
-                f.nvEncLockBitstream.unwrap()(self.session, &mut bitstream),
-                "LockBitstream",
-            )?;
+            let locked = f.nvEncLockBitstream.unwrap()(self.session, &mut bitstream);
+            timing.stage(4);
+            self.api.check(self.session, locked, "LockBitstream")?;
             let _locked = Locked {
                 api: &self.api,
                 session: self.session,

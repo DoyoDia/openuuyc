@@ -450,7 +450,9 @@ impl Screens {
             "被控许可已失效"
         );
         let requested_format = config.format;
-        self.slots[index].negotiated.source_gpu(screen.render_adapter.unwrap_or(screen.adapter));
+        self.slots[index]
+            .negotiated
+            .source_gpu(screen.render_adapter.unwrap_or(screen.adapter));
         let requested_hdr = config.color.is_hdr();
         self.slots[index].negotiated.apply(
             &mut config,

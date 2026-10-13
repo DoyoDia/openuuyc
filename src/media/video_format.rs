@@ -254,7 +254,10 @@ fn skip_h264_scaling_list(reader: &mut BitReader<'_>, size: usize) -> Option<()>
     let mut next_scale = 8i32;
     for _ in 0..size {
         if next_scale != 0 {
-            next_scale = (last_scale + reader.read_se()? + 256) % 256;
+            next_scale = last_scale
+                .checked_add(reader.read_se()?)?
+                .checked_add(256)?
+                % 256;
         }
         if next_scale != 0 {
             last_scale = next_scale;

@@ -8,6 +8,7 @@ use super::{
 };
 use crate::media::encoding::nvenc::{
     NV_ENC_BUFFER_FORMAT, NV_ENC_DEVICE_TYPE, NV_ENC_INPUT_RESOURCE_TYPE, Registered, Session,
+    timing,
 };
 use anyhow::{Result, ensure};
 use std::ffi::c_void;
@@ -144,13 +145,29 @@ impl Encoder {
         timestamp_100ns: i64,
         keyframe: bool,
     ) -> Result<Vec<super::encoder::Encoded>> {
-        self.conversion.convert(texture)?;
+        let mut timing = timing::Frame::new();
+        let result = self.encode_timed(texture, timestamp_100ns, keyframe, &mut timing);
+        self.session.record(timing, result.is_ok());
+        result
+    }
+
+    fn encode_timed(
+        &mut self,
+        texture: &ID3D11Texture2D,
+        timestamp_100ns: i64,
+        keyframe: bool,
+        timing: &mut timing::Frame,
+    ) -> Result<Vec<super::encoder::Encoded>> {
+        let converted = self.conversion.convert(texture);
+        timing.stage(0);
+        converted?;
         let _current = self.cuda.as_ref().map(|input| input.enter()).transpose()?;
-        if let Some(input) = &self.cuda {
-            input.copy()?;
-        }
+        let copied = self.cuda.as_ref().map(|input| input.copy()).transpose();
+        timing.stage(1);
+        copied?;
         let registered = self.registered.as_ref().expect("registered until drop");
-        self.session.encode(registered, timestamp_100ns, keyframe)
+        self.session
+            .encode(registered, timestamp_100ns, keyframe, timing)
     }
 }
 impl Drop for Encoder {

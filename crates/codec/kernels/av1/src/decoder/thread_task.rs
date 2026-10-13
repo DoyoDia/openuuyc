@@ -17,9 +17,8 @@ use crate::decoder::error::{Rav1dError, Rav1dResult};
 use crate::decoder::include::common::intops::iclip;
 use crate::decoder::include::dav1d::headers::Rav1dPixelLayout;
 use crate::decoder::internal::{
-    Rav1dContext, Rav1dFrameContext, Rav1dFrameContextTaskThread,
-    Rav1dFrameData, Rav1dTask, Rav1dTaskContext, Rav1dTaskContextTaskThread, TaskThreadData,
-    TaskType,
+    Rav1dContext, Rav1dFrameContext, Rav1dFrameContextTaskThread, Rav1dFrameData, Rav1dTask,
+    Rav1dTaskContext, Rav1dTaskContextTaskThread, TaskThreadData, TaskType,
 };
 use crate::decoder::iter::wrapping_iter;
 use crate::decoder::relaxed_atomic::RelaxedAtomic;
@@ -640,7 +639,6 @@ pub fn rav1d_worker_task(task_thread: Arc<Rav1dTaskContextTaskThread>) {
         }
 
         merge_pending(c);
-
 
         let (fc, t_idx, prev_t) = 'found: {
             if c.fc.len() > 1 {

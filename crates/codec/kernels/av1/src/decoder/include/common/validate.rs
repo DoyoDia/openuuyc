@@ -56,7 +56,9 @@ impl ValidatedIntoResult<(), ()> for bool {
 
 macro_rules! validate_input {
     ($condition:expr, $block:block) => {{
-        use $crate::decoder::include::common::validate::{debug_abort, func_name, ValidatedIntoResult};
+        use $crate::decoder::include::common::validate::{
+            debug_abort, func_name, ValidatedIntoResult,
+        };
 
         // Needs to be outside of the closure.
         let func_name = func_name!();

@@ -87,7 +87,8 @@ fn verify_service(service: &Sc) -> Result<bool> {
         let config = &*buffer.as_ptr().cast::<QUERY_SERVICE_CONFIGW>();
         let path = config.lpBinaryPathName.to_string()?;
         let current = path.eq_ignore_ascii_case(&command()?);
-        let previous = crate::platform::windows::components::migration::legacy_service_command(&path)?;
+        let previous =
+            crate::platform::windows::components::migration::legacy_service_command(&path)?;
         ensure!(
             config.dwServiceType == SERVICE_WIN32_OWN_PROCESS && (current || previous),
             "现有同名服务不属于本程序，已保留"
@@ -235,10 +236,17 @@ fn ensure_idle(service: &Sc) -> Result<()> {
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(0);
-    let display_agent = crate::platform::windows::components::migration::legacy_display_pid(state.dwProcessId)?.unwrap_or(0);
+    let display_agent =
+        crate::platform::windows::components::migration::legacy_display_pid(state.dwProcessId)?
+            .unwrap_or(0);
     if resident != 0 {
-        ensure!(matches!(super::resident::call(super::resident::Request::Quiescent)?.checked()?,
-            super::resident::Reply::Done), "后台会话尚未排空");
+        ensure!(
+            matches!(
+                super::resident::call(super::resident::Request::Quiescent)?.checked()?,
+                super::resident::Reply::Done
+            ),
+            "后台会话尚未排空"
+        );
     }
     let snapshot = super::pipe::Handle(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)? });
     let mut entry = PROCESSENTRY32W {

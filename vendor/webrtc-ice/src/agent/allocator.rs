@@ -44,14 +44,28 @@ pub(super) struct AllocationSession {
 
 impl AllocationSession {
     pub(super) async fn has_punch_network(&self, key: &str) -> bool {
-        self.sequences.lock().await.iter().any(|sequence| sequence.interface.network_key == key)
+        self.sequences
+            .lock()
+            .await
+            .iter()
+            .any(|sequence| sequence.interface.network_key == key)
     }
 
     pub(super) async fn attach_punch_port(&self, key: &str, port: &Arc<LocalPort>) {
-        if let Some(sequence) = self.sequences.lock().await.iter().find(|sequence| sequence.interface.network_key == key) {
+        if let Some(sequence) = self
+            .sequences
+            .lock()
+            .await
+            .iter()
+            .find(|sequence| sequence.interface.network_key == key)
+        {
             // 9891C registers fresh PortData even when the matched sequence
             // is already stopped; it is not ordinary Sequence::add_port.
-            sequence.ports.lock().expect("sequence ports poisoned").push(Arc::downgrade(port));
+            sequence
+                .ports
+                .lock()
+                .expect("sequence ports poisoned")
+                .push(Arc::downgrade(port));
         }
     }
     pub fn new(generation: u32) -> Arc<Self> {

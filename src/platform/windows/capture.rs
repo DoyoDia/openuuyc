@@ -267,10 +267,9 @@ pub(crate) fn create_device(luid: u64) -> Result<(ID3D11Device, ID3D11DeviceCont
             None,
             Some(&mut context),
         )?;
-        Ok((
-            device.context("创建图形设备失败")?,
-            context.context("创建图形上下文失败")?,
-        ))
+        let device = device.context("创建图形设备失败")?;
+        super::gpu_scheduling::configure_device(&device);
+        Ok((device, context.context("创建图形上下文失败")?))
     }
 }
 use super::adapter_type;
@@ -301,9 +300,14 @@ pub(crate) fn encoding_adapters() -> Result<Vec<EncodingAdapter>> {
                     continue;
                 }
                 result.push(EncodingAdapter {
-                    id: adapter_type::address(desc.AdapterLuid).map(|location| crate::media::selection::GpuId {
-                        vendor: desc.VendorId, device: desc.DeviceId, subsystem: desc.SubSysId,
-                        revision: desc.Revision, location,
+                    id: adapter_type::address(desc.AdapterLuid).map(|location| {
+                        crate::media::selection::GpuId {
+                            vendor: desc.VendorId,
+                            device: desc.DeviceId,
+                            subsystem: desc.SubSysId,
+                            revision: desc.Revision,
+                            location,
+                        }
                     }),
                     luid: (u64::from(desc.AdapterLuid.HighPart as u32) << 32)
                         | u64::from(desc.AdapterLuid.LowPart),
@@ -363,6 +367,7 @@ pub(crate) struct Desktop {
     // The privileged capture agent owns this when using the remote backend.
     // Keep it until after the native capture resources have been destroyed.
     _power: Option<power::Request>,
+    _gpu_scheduling: Option<super::gpu_scheduling::Lease>,
 }
 impl Desktop {
     pub fn open_selected(selected: &Screen) -> Result<Self> {
@@ -381,6 +386,7 @@ impl Desktop {
                 sampler: Default::default(),
                 cursor: None,
                 _power: None,
+                _gpu_scheduling: None,
             });
         }
         if let Some(remote) = super::capture_service::Client::connect(selected)? {
@@ -397,6 +403,7 @@ impl Desktop {
                 sampler: Default::default(),
                 cursor: None,
                 _power: None,
+                _gpu_scheduling: Some(super::gpu_scheduling::Lease::new()),
             });
         }
         Self::open_local(selected)
@@ -442,6 +449,7 @@ impl Desktop {
             sampler: Default::default(),
             cursor: None,
             _power: Some(power),
+            _gpu_scheduling: Some(super::gpu_scheduling::Lease::new()),
         })
     }
     pub fn backend_name(&self) -> &'static str {
@@ -681,6 +689,7 @@ impl Duplication {
                 Some(&mut context),
             )?;
             let device = device.context("未创建采集设备")?;
+            super::gpu_scheduling::configure_device(&device);
             let advanced = output
                 .cast::<IDXGIOutput6>()
                 .ok()

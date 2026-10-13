@@ -579,8 +579,7 @@ impl NetworkControllerInterface for GoogCcNetworkController {
             self.current_data_window,
         ) {
             (Some(congestion_window_pushback_controller), Some(current_data_window)) => {
-                congestion_window_pushback_controller
-                    .set_data_window(current_data_window)
+                congestion_window_pushback_controller.set_data_window(current_data_window)
             }
             _ => update.congestion_window = self.current_data_window,
         };

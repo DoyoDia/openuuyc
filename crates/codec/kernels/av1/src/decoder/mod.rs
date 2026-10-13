@@ -168,9 +168,8 @@ use crate::decoder::include::dav1d::dav1d::{
 use crate::decoder::include::dav1d::headers::Dav1dSequenceHeader;
 use crate::decoder::include::dav1d::picture::{Dav1dPicture, Rav1dPicture};
 use crate::decoder::internal::{
-    Rav1dContext, Rav1dContextFrameThread, Rav1dContextTaskThread,
-    Rav1dContextTaskType, Rav1dFrameContext, Rav1dState, Rav1dTaskContext,
-    Rav1dTaskContextTaskThread, TaskThreadData,
+    Rav1dContext, Rav1dContextFrameThread, Rav1dContextTaskThread, Rav1dContextTaskType,
+    Rav1dFrameContext, Rav1dState, Rav1dTaskContext, Rav1dTaskContextTaskThread, TaskThreadData,
 };
 use crate::decoder::iter::wrapping_iter;
 use crate::decoder::log::{Rav1dLog as _, Rav1dLogger};

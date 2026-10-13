@@ -16,19 +16,18 @@ use crate::decoder::include::dav1d::data::Rav1dData;
 use crate::decoder::include::dav1d::dav1d::Rav1dDecodeFrameType;
 use crate::decoder::include::dav1d::headers::{
     DRav1d, Dav1dSequenceHeader, Rav1dAdaptiveBoolean, Rav1dChromaSamplePosition,
-    Rav1dColorPrimaries, Rav1dColorRange, Rav1dContentLightLevel,
-    Rav1dFilterMode, Rav1dFrameHeader, Rav1dFrameHeaderCdef, Rav1dFrameHeaderDelta,
-    Rav1dFrameHeaderDeltaLF, Rav1dFrameHeaderDeltaQ,
-    Rav1dFrameHeaderLoopFilter, Rav1dFrameHeaderOperatingPoint, Rav1dFrameHeaderQuant,
-    Rav1dFrameHeaderRestoration, Rav1dFrameHeaderSegmentation, Rav1dFrameHeaderSuperRes,
-    Rav1dFrameHeaderTiling, Rav1dFrameSize, Rav1dFrameSkipMode, Rav1dFrameType, Rav1dITUTT35,
-    Rav1dLoopfilterModeRefDeltas, Rav1dMasteringDisplay, Rav1dMatrixCoefficients, Rav1dObuType,
-    Rav1dPixelLayout, Rav1dProfile, Rav1dRestorationType, Rav1dSegmentationData,
-    Rav1dSegmentationDataSet, Rav1dSequenceHeader, Rav1dSequenceHeaderOperatingParameterInfo,
-    Rav1dSequenceHeaderOperatingPoint, Rav1dTransferCharacteristics, Rav1dTxfmMode,
-    Rav1dWarpedMotionParams, Rav1dWarpedMotionType, RAV1D_MAX_CDEF_STRENGTHS,
-    RAV1D_MAX_OPERATING_POINTS, RAV1D_MAX_TILE_COLS, RAV1D_MAX_TILE_ROWS, RAV1D_PRIMARY_REF_NONE,
-    RAV1D_REFS_PER_FRAME,
+    Rav1dColorPrimaries, Rav1dColorRange, Rav1dContentLightLevel, Rav1dFilterMode,
+    Rav1dFrameHeader, Rav1dFrameHeaderCdef, Rav1dFrameHeaderDelta, Rav1dFrameHeaderDeltaLF,
+    Rav1dFrameHeaderDeltaQ, Rav1dFrameHeaderLoopFilter, Rav1dFrameHeaderOperatingPoint,
+    Rav1dFrameHeaderQuant, Rav1dFrameHeaderRestoration, Rav1dFrameHeaderSegmentation,
+    Rav1dFrameHeaderSuperRes, Rav1dFrameHeaderTiling, Rav1dFrameSize, Rav1dFrameSkipMode,
+    Rav1dFrameType, Rav1dITUTT35, Rav1dLoopfilterModeRefDeltas, Rav1dMasteringDisplay,
+    Rav1dMatrixCoefficients, Rav1dObuType, Rav1dPixelLayout, Rav1dProfile, Rav1dRestorationType,
+    Rav1dSegmentationData, Rav1dSegmentationDataSet, Rav1dSequenceHeader,
+    Rav1dSequenceHeaderOperatingParameterInfo, Rav1dSequenceHeaderOperatingPoint,
+    Rav1dTransferCharacteristics, Rav1dTxfmMode, Rav1dWarpedMotionParams, Rav1dWarpedMotionType,
+    RAV1D_MAX_CDEF_STRENGTHS, RAV1D_MAX_OPERATING_POINTS, RAV1D_MAX_TILE_COLS, RAV1D_MAX_TILE_ROWS,
+    RAV1D_PRIMARY_REF_NONE, RAV1D_REFS_PER_FRAME,
 };
 use crate::decoder::internal::{Rav1dContext, Rav1dState, Rav1dTileGroup, Rav1dTileGroupHeader};
 use crate::decoder::levels::ObuMetaType;
@@ -116,7 +115,9 @@ fn parse_seq_hdr(
     let profile =
         Rav1dProfile::from_repr(gb.get_bits(3) as usize).ok_or(Rav1dError::InvalidArgument)?;
     // This stream decoder supports Main/High 420/444 at 8/10 bits.
-    if profile == Rav1dProfile::Professional {return Err(Rav1dError::UnsupportedBitstream);}
+    if profile == Rav1dProfile::Professional {
+        return Err(Rav1dError::UnsupportedBitstream);
+    }
     debug.post(gb, "post-profile");
 
     let still_picture = gb.get_bit() as u8;
@@ -347,7 +348,9 @@ fn parse_seq_hdr(
         // Default initialization.
         monochrome = Default::default();
     }
-    if monochrome != 0 {return Err(Rav1dError::UnsupportedBitstream);}
+    if monochrome != 0 {
+        return Err(Rav1dError::UnsupportedBitstream);
+    }
     let color_description_present = gb.get_bit();
     let pri;
     let trc;
@@ -450,8 +453,8 @@ fn parse_seq_hdr(
     debug.post(gb, "colorinfo");
 
     let film_grain_present = gb.get_bit() as u8;
-    if film_grain_present != 0 || num_operating_points != 1
-        || operating_points[0].idc & !0x101 != 0 {
+    if film_grain_present != 0 || num_operating_points != 1 || operating_points[0].idc & !0x101 != 0
+    {
         return Err(Rav1dError::UnsupportedBitstream);
     }
     debug.post(gb, "filmgrain");
@@ -1865,7 +1868,6 @@ fn parse_frame_hdr(
     )?;
     let film_grain = Default::default();
 
-
     Ok(Rav1dFrameHeader {
         size,
         film_grain,
@@ -1974,7 +1976,9 @@ fn parse_obus(
         gb.get_bits(3); // reserved
     }
 
-    if temporal_id!=0 || spatial_id!=0 {return Err(Rav1dError::UnsupportedBitstream);}
+    if temporal_id != 0 || spatial_id != 0 {
+        return Err(Rav1dError::UnsupportedBitstream);
+    }
 
     // obu length field
     if has_length_field {

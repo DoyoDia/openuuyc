@@ -1,7 +1,10 @@
 use crate::media::selection::GpuId;
 use crate::platform::capture::EncodingAdapter;
 
-pub(super) fn limits_title(mode: crate::media::selection::ProcessingMode, codec: Option<&str>) -> String {
+pub(super) fn limits_title(
+    mode: crate::media::selection::ProcessingMode,
+    codec: Option<&str>,
+) -> String {
     let mut text = "高级限制".to_owned();
     if mode != crate::media::selection::ProcessingMode::Automatic {
         text.push_str(" · ");

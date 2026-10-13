@@ -173,14 +173,44 @@ impl DeviceCenterApp {
             },
         );
         let (message, color, destination) = match &self.updates.state {
-            State::Checking => (format!("正在检查最新{}…", self.updates.release_label()), MUTED, None),
-            State::Current => (format!("已是最新{}", self.updates.release_label()), GREEN, None),
-            State::Ahead => (format!("当前版本高于已发布的最新{}", self.updates.release_label()), MUTED, None),
-            State::NoRelease => (format!("暂无公开{}", self.updates.release_label()), MUTED, None),
+            State::Checking => (
+                format!("正在检查最新{}…", self.updates.release_label()),
+                MUTED,
+                None,
+            ),
+            State::Current => (
+                format!("已是最新{}", self.updates.release_label()),
+                GREEN,
+                None,
+            ),
+            State::Ahead => (
+                format!("当前版本高于已发布的最新{}", self.updates.release_label()),
+                MUTED,
+                None,
+            ),
+            State::NoRelease => (
+                format!("暂无公开{}", self.updates.release_label()),
+                MUTED,
+                None,
+            ),
             State::Failed(_) => ("未能检查更新".into(), MUTED, None),
-            State::Available { version, url, prerelease, .. } => {
-                (format!("发现{} v{version}", if *prerelease { "测试版" } else { "新版本" }), BLUE, Some(url.clone()))
-            }
+            State::Available {
+                version,
+                url,
+                prerelease,
+                ..
+            } => (
+                format!(
+                    "发现{} v{version}",
+                    if *prerelease {
+                        "测试版"
+                    } else {
+                        "新版本"
+                    }
+                ),
+                BLUE,
+                Some(url.clone()),
+            ),
         };
         let checking = matches!(self.updates.state, State::Checking);
         let wait = self.updates.retry_wait();
@@ -222,11 +252,16 @@ impl DeviceCenterApp {
             }
         }
         let mut allow = self.updates.allow_prerelease();
-        form_row_content(ui, "允许测试版", "检查 alpha、beta、rc 等测试版更新", |ui| {
-            if crate::ui::controls::switch(ui, &mut allow).changed() {
-                let _ = self.updates.set_allow_prerelease(allow, ui.ctx());
-            }
-        });
+        form_row_content(
+            ui,
+            "允许测试版",
+            "检查 alpha、beta、rc 等测试版更新",
+            |ui| {
+                if crate::ui::controls::switch(ui, &mut allow).changed() {
+                    let _ = self.updates.set_allow_prerelease(allow, ui.ctx());
+                }
+            },
+        );
         if let Some(error) = &self.updates.settings_error {
             ui.colored_label(AMBER, error);
         }

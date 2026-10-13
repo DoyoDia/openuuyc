@@ -12,8 +12,8 @@ pub(crate) mod video_format;
 
 mod profile;
 pub use profile::*;
-pub mod selection;
 pub mod preferences;
+pub mod selection;
 
 pub(crate) mod capture;
 pub(crate) mod encoding;

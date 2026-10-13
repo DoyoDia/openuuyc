@@ -147,8 +147,7 @@ async fn test_pair_priority() -> Result<()> {
             {
                 assert_eq!(
                     best_pair.to_string(),
-                    CandidatePair::new(host_local.clone(), remote.clone(), false)
-                    .to_string(),
+                    CandidatePair::new(host_local.clone(), remote.clone(), false).to_string(),
                     "Unexpected bestPair {best_pair} (expected remote: {remote})",
                 );
             } else {

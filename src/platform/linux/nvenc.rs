@@ -9,6 +9,7 @@ use super::capture::Image;
 use super::cuda::{Buffer, Context};
 use crate::media::encoding::nvenc::{
     NV_ENC_BUFFER_FORMAT, NV_ENC_DEVICE_TYPE, NV_ENC_INPUT_RESOURCE_TYPE, Registered, Session,
+    timing,
 };
 use crate::media::encoding::{Color, Encoded, Format, Rate};
 use anyhow::{Result, ensure};
@@ -80,13 +81,30 @@ impl Encoder {
             (width, height) == (self.input.width, self.input.height),
             "采集画面尺寸与编码器不一致"
         );
-        match image {
-            Image::Cpu { pixels, .. } => self.input.upload(pixels)?,
-            Image::Cuda(buffer) => self.input.copy_from_device(buffer.ptr, buffer.pitch)?,
-        }
+        let mut timing = timing::Frame::new();
+        let result = self.encode_timed(image, timestamp, keyframe, &mut timing);
+        self.session.record(timing, result.is_ok());
+        result
+    }
+
+    fn encode_timed(
+        &mut self,
+        image: &Image,
+        timestamp: i64,
+        keyframe: bool,
+        timing: &mut timing::Frame,
+    ) -> Result<Vec<Encoded>> {
+        // NVENC converts the BGRA itself, so there is no conversion stage.
+        timing.stage(0);
+        let copied = match image {
+            Image::Cpu { pixels, .. } => self.input.upload(pixels),
+            Image::Cuda(buffer) => self.input.copy_from_device(buffer.ptr, buffer.pitch),
+        };
+        timing.stage(1);
+        copied?;
         let _current = self.context.enter()?;
         let registered = self.registered.as_ref().expect("registered until drop");
-        self.session.encode(registered, timestamp, keyframe)
+        self.session.encode(registered, timestamp, keyframe, timing)
     }
 }
 

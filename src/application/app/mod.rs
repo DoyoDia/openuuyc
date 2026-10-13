@@ -63,8 +63,8 @@ pub fn run(options: GuiOptions) -> Result<()> {
         ),
     };
     let display_warning = match (display_warning, options.startup_warning) {
-        (Some(a),Some(b)) => Some(format!("{a}；{b}")),
-        (a,b) => a.or(b),
+        (Some(a), Some(b)) => Some(format!("{a}；{b}")),
+        (a, b) => a.or(b),
     };
     options
         .media

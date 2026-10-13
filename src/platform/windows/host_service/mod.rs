@@ -5,11 +5,11 @@ pub(crate) mod process;
 mod sas_policy;
 pub(crate) mod service;
 
+pub(crate) mod activity;
 pub(crate) mod resident;
 pub(crate) mod startup;
-pub(crate) mod vault;
 pub(crate) mod user_backend;
-pub(crate) mod activity;
+pub(crate) mod vault;
 
 /// The name reserving a device's presence room for one process machine-wide.
 /// This mutex is never acquired: its HANDLE only reserves the object name.

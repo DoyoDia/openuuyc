@@ -39,9 +39,9 @@ pub(crate) mod linux_keyboard;
 mod windows_keyboard;
 
 #[cfg(windows)]
-mod windows_mouse;
-#[cfg(windows)]
 mod windows_drag;
+#[cfg(windows)]
+mod windows_mouse;
 
 #[cfg(windows)]
 pub(crate) mod windows_presenter;

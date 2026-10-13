@@ -214,7 +214,9 @@ impl StreamControlHandle {
         payload: &[u8],
         source: PbMessageSource,
     ) -> Result<()> {
-        if source == PbMessageSource::Text && self.handle_native_annotation(payload)? { return Ok(()); }
+        if source == PbMessageSource::Text && self.handle_native_annotation(payload)? {
+            return Ok(());
+        }
         if payload.iter().find(|byte| !byte.is_ascii_whitespace()) == Some(&b'{') {
             if source == PbMessageSource::Text && self.handle_audio_quality(payload)? {
                 return Ok(());

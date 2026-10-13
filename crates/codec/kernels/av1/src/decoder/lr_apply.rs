@@ -13,7 +13,9 @@ use crate::decoder::include::dav1d::headers::{Rav1dPixelLayout, Rav1dRestoration
 use crate::decoder::include::dav1d::picture::Rav1dPictureDataComponentOffset;
 use crate::decoder::internal::{Rav1dContext, Rav1dFrameData};
 use crate::decoder::lf_mask::Av1RestorationUnit;
-use crate::decoder::looprestoration::{LooprestorationParams, LooprestorationParamsSgr, LrEdgeFlags};
+use crate::decoder::looprestoration::{
+    LooprestorationParams, LooprestorationParamsSgr, LrEdgeFlags,
+};
 use crate::decoder::strided::Strided as _;
 use crate::decoder::tables::DAV1D_SGR_PARAMS;
 

@@ -220,7 +220,9 @@ impl Runner {
             notification,
             floating: self.config.floating,
         });
-        if self.root {crate::application::bootstrap::ready();}
+        if self.root {
+            crate::application::bootstrap::ready();
+        }
         let state = self.state.as_mut().expect("created desktop state");
         state.render()?;
         state.app.0.on_focus_changed(state.window.has_focus());

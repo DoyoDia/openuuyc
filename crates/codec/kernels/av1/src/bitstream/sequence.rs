@@ -1,5 +1,5 @@
 //! Sequence metadata, parsed directly from AV1 section 5.5.
-use crate::bitstream::{Error, Result, bits::Bits, obu::Obu};
+use crate::bitstream::{bits::Bits, obu::Obu, Error, Result};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Chroma {
@@ -102,7 +102,11 @@ impl Sequence {
         }
         b.read(3)?; // super-resolution, CDEF, restoration
         let depth = if b.flag()? {
-            if profile == 2 && b.flag()? { 12 } else { 10 }
+            if profile == 2 && b.flag()? {
+                12
+            } else {
+                10
+            }
         } else {
             8
         };

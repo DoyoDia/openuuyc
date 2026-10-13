@@ -539,12 +539,19 @@ pub(super) fn show_stream_control_window(
         "audio-device-query-error",
         "音频设备检查失败",
         crate::ui::controls::DialogIcon::Error,
-        audio.output_devices().error.as_deref()
+        audio
+            .output_devices()
+            .error
+            .as_deref()
             .filter(|_| state.open && state.page == Page::Audio),
         "重新检查",
-    ) == Some(true) {
+    ) == Some(true)
+    {
         crate::ui::controls::clear_notice(ctx, "audio-device-query-error");
-        state.local_error = audio.refresh_output_devices().err().map(|error| error.to_string());
+        state.local_error = audio
+            .refresh_output_devices()
+            .err()
+            .map(|error| error.to_string());
     }
     let snapshot = handle.snapshot();
     crate::ui::controls::observe_notice(

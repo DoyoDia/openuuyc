@@ -73,17 +73,21 @@ impl Session {
             return Err(Error::Closed);
         }
         let mut sequence = None;
-        for unit in openuuyc_av1::bitstream::obu::Units::new(data).map_err(|_| Error::NeedKeyframe)? {
+        for unit in
+            openuuyc_av1::bitstream::obu::Units::new(data).map_err(|_| Error::NeedKeyframe)?
+        {
             let unit = unit.map_err(|_| Error::NeedKeyframe)?;
             if unit.spatial_id != 0 || unit.temporal_id != 0 {
                 return Err(Error::Unsupported);
             }
             if unit.kind == 1 {
-                let s = openuuyc_av1::bitstream::Sequence::parse(unit).map_err(|_| Error::NeedKeyframe)?;
+                let s = openuuyc_av1::bitstream::Sequence::parse(unit)
+                    .map_err(|_| Error::NeedKeyframe)?;
                 if !matches!(s.depth, 8 | 10)
                     || !matches!(
                         s.chroma,
-                        openuuyc_av1::bitstream::Chroma::Yuv420 | openuuyc_av1::bitstream::Chroma::Yuv444
+                        openuuyc_av1::bitstream::Chroma::Yuv420
+                            | openuuyc_av1::bitstream::Chroma::Yuv444
                     )
                 {
                     return Err(Error::Unsupported);

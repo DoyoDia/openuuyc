@@ -171,7 +171,10 @@ fn main() -> Result<()> {
         attach_parent_console();
     }
     let cli = parsed.unwrap_or_else(|error| error.exit());
-    if cli.bootstrap_version {println!("1");return Ok(())}
+    if cli.bootstrap_version {
+        println!("1");
+        return Ok(());
+    }
     let command = cli.command.unwrap_or(Commands::Gui {
         background: false,
         fps: None,
@@ -189,11 +192,22 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let _instance = if matches!(command, Commands::Gui { .. }) {
-        match if matches!(command, Commands::Gui { background:true, .. }) {
+        match if matches!(
+            command,
+            Commands::Gui {
+                background: true,
+                ..
+            }
+        ) {
             app::instance::acquire_background()?
-        } else { app::instance::acquire()? } {
+        } else {
+            app::instance::acquire()?
+        } {
             Some(instance) => Some(instance),
-            None => {openuuyc::application::bootstrap::handoff();return Ok(())},
+            None => {
+                openuuyc::application::bootstrap::handoff();
+                return Ok(());
+            }
         }
     } else {
         None
@@ -310,14 +324,30 @@ fn main() -> Result<()> {
         } => {
             let (mut options, startup_warning) = match media::preferences::load() {
                 Ok(options) => (options, None),
-                Err(error) => (Default::default(), Some(format!("读取编解码设置失败，暂用默认设置：{error:#}"))),
+                Err(error) => (
+                    Default::default(),
+                    Some(format!("读取编解码设置失败，暂用默认设置：{error:#}")),
+                ),
             };
-            if let Some(fps) = fps { options.frame_rate = fps; }
-            if let Some(codec) = codec { options.codec = codec; }
-            if let Some(hardware) = hardware_decode { options.decoder.mode = media::selection::DecoderPreference::from_hardware(hardware).mode; }
-            if let Some(transport) = transport { options.transport = transport; }
-            app::run(app::GuiOptions { background, media: options, startup_warning })
-        },
+            if let Some(fps) = fps {
+                options.frame_rate = fps;
+            }
+            if let Some(codec) = codec {
+                options.codec = codec;
+            }
+            if let Some(hardware) = hardware_decode {
+                options.decoder.mode =
+                    media::selection::DecoderPreference::from_hardware(hardware).mode;
+            }
+            if let Some(transport) = transport {
+                options.transport = transport;
+            }
+            app::run(app::GuiOptions {
+                background,
+                media: options,
+                startup_warning,
+            })
+        }
         Commands::Login => {
             tokio::runtime::Runtime::new()?.block_on(login::interactive_login())?;
             Ok(())
@@ -334,13 +364,23 @@ fn main() -> Result<()> {
             transport,
         } => {
             let mut options = media::preferences::load()?;
-            options.audio_only=audio_only; options.muted=mute;
-            if let Some(fps)=fps {options.frame_rate=fps;}
-            if let Some(codec)=codec {options.codec=codec;}
-            if let Some(hardware)=hardware_decode {options.decoder.mode=media::selection::DecoderPreference::from_hardware(hardware).mode;}
-            if let Some(transport)=transport {options.transport=transport;}
-            tokio::runtime::Runtime::new()?.block_on(connect_device(device,options,device_id))
-        },
+            options.audio_only = audio_only;
+            options.muted = mute;
+            if let Some(fps) = fps {
+                options.frame_rate = fps;
+            }
+            if let Some(codec) = codec {
+                options.codec = codec;
+            }
+            if let Some(hardware) = hardware_decode {
+                options.decoder.mode =
+                    media::selection::DecoderPreference::from_hardware(hardware).mode;
+            }
+            if let Some(transport) = transport {
+                options.transport = transport;
+            }
+            tokio::runtime::Runtime::new()?.block_on(connect_device(device, options, device_id))
+        }
     };
     if let Err(error) = &result {
         tracing::error!(target: "openuuyc", error = %format_args!("{error:#}"), "application stopped with an error");
