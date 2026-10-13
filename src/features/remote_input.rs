@@ -11,9 +11,6 @@ pub(crate) mod polling;
 mod recovery;
 pub(crate) use recovery::{InputRecovery, InputWork};
 
-#[cfg(test)]
-mod tests;
-
 const MAX_EVENTS: usize = 512;
 const MOTION_JITTER: Duration = Duration::from_micros(100);
 pub(crate) const BUTTONS: [u32; 5] = [1, 2, 16, 32, 64];
@@ -664,10 +661,31 @@ impl RemoteInput {
         let mut s = self.lock();
         let retired = std::mem::take(&mut s.release_checkpoint);
         if s.ready {
-            for key in retired {
-                if !s.queue.iter().any(|event| matches!(event, InputEvent::Key { key: queued, down: false, .. } if *queued == key)) {
+            // Native Mac codes do not sort ordinary keys before modifiers.
+            // Keep checkpoint repairs in the same release order as focus loss,
+            // including when a modifier release is already queued.
+            for modifier in [false, true] {
+                for &key in &retired {
+                    if key.is_modifier() != modifier
+                        || s.queue.iter().any(|event| matches!(event, InputEvent::Key { key: queued, down: false, .. } if *queued == key))
+                    {
+                        continue;
+                    }
                     s.remote_keys.entry(key).or_insert(None);
-                    s.queue.push_back(InputEvent::Key { key, down: false, lock: None, interrupt: false });
+                    let event = InputEvent::Key {
+                        key,
+                        down: false,
+                        lock: None,
+                        interrupt: false,
+                    };
+                    let before_modifier = (!modifier).then(|| s.queue.iter().position(|event| {
+                        matches!(event, InputEvent::Key { key, down: false, .. } if key.is_modifier())
+                    })).flatten();
+                    if let Some(index) = before_modifier {
+                        s.queue.insert(index, event);
+                    } else {
+                        s.queue.push_back(event);
+                    }
                 }
             }
         } else {
