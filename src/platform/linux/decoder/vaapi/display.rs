@@ -114,6 +114,31 @@ pub(super) fn supports(profile: VAProfile::Type, width: u32, height: u32) -> boo
         && within(VAConfigAttribType::VAConfigAttribMaxPictureHeight, height)
 }
 
+/// The shared display, so the encoder can open its own config on it.
+pub(super) fn display_handle() -> Result<Rc<Display>, crate::media::decode_api::DecodeError> {
+    display()
+}
+
+/// Whether the driver offers an H.264 encode entrypoint.
+pub(super) fn supports_encode() -> bool {
+    let Ok(display) = display() else {
+        return false;
+    };
+    [
+        VAProfile::VAProfileH264High,
+        VAProfile::VAProfileH264Main,
+        VAProfile::VAProfileH264ConstrainedBaseline,
+    ]
+    .iter()
+    .any(|profile| {
+        display
+            .query_config_entrypoints(*profile)
+            .is_ok_and(|entrypoints| {
+                entrypoints.contains(&VAEntrypoint::VAEntrypointEncSlice)
+            })
+    })
+}
+
 const fn attribute(kind: VAConfigAttribType::Type) -> VAConfigAttrib {
     VAConfigAttrib {
         type_: kind,

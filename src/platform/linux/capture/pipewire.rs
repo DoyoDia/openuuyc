@@ -131,6 +131,7 @@ const META_SIZE: u32 = 2;
 const META_VIDEO_CROP: u32 = 2;
 const DATA_MEM_PTR: u32 = 1;
 const DATA_MEM_FD: u32 = 2;
+const DATA_MEM_DMABUF: u32 = 4;
 const CHOICE_RANGE: u32 = 1;
 const CHOICE_ENUM: u32 = 3;
 const CHOICE_FLAGS: u32 = 4;
@@ -304,11 +305,14 @@ fn enum_format() -> Pod {
 fn buffers() -> Pod {
     Pod::object(OBJECT_PARAM_BUFFERS, PARAM_BUFFERS, |p| {
         p.key(BUFFERS_DATA_TYPE);
+        // DMA-BUF is requested first so a compositor that offers it needs no
+        // change here, but Hyprland's ScreenCast answers with MemFd only, so
+        // the CPU readback below is what actually runs today.
         p.choice(
             CHOICE_FLAGS,
             TYPE_INT,
             1,
-            &[(1 << DATA_MEM_PTR) | (1 << DATA_MEM_FD)],
+            &[(1 << DATA_MEM_DMABUF) | (1 << DATA_MEM_PTR) | (1 << DATA_MEM_FD)],
         );
     })
 }
@@ -484,7 +488,13 @@ unsafe fn read_picture(
     }
     let data = unsafe { &*buffer.datas };
     if data.data.is_null() || data.chunk.is_null() {
-        // DMA-BUF, which was not offered, or an empty buffer.
+        // A DMA-BUF was not mapped for the CPU. Asking the portal for one does
+        // not help: Hyprland's ScreenCast offers only MemFd, so this stays the
+        // path a GPU encoder would need to import through PipeWire directly.
+        tracing::debug!(
+            data_type = data.kind,
+            "PipeWire buffer is not CPU-mappable"
+        );
         return None;
     }
     let chunk = unsafe { &*data.chunk };

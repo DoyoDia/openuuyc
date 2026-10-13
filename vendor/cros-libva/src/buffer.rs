@@ -226,6 +226,15 @@ impl Buffer {
                     std::mem::size_of_val(wrapper.inner_mut()),
                 ),
             },
+
+            BufferType::EncPackedHeaderParameter(ref mut wrapper) => (
+                wrapper.inner_mut() as *mut _ as *mut std::ffi::c_void,
+                std::mem::size_of_val(wrapper.inner_mut()),
+            ),
+
+            BufferType::EncPackedHeaderData(ref mut data) => {
+                (data.as_mut_ptr() as *mut std::ffi::c_void, data.len())
+            }
         };
 
         // Safe because `self` represents a valid `VAContext`. `ptr` and `size` are also ensured to
@@ -294,6 +303,12 @@ pub enum BufferType {
     EncCodedBuffer(usize),
     /// Abstraction over `VAEncMiscParameterBuffer`.
     EncMiscParameter(EncMiscParameter),
+    /// Abstraction over `VAEncPackedHeaderParameterBufferType`. H.264 drivers
+    /// need this to emit SPS/PPS alongside the slice.
+    EncPackedHeaderParameter(EncPackedHeaderParameter),
+    /// Abstraction over `VAEncPackedHeaderDataBufferType`: the header bytes the
+    /// parameter buffer above describes.
+    EncPackedHeaderData(Vec<u8>),
 }
 
 impl BufferType {
@@ -325,6 +340,14 @@ impl BufferType {
             BufferType::EncCodedBuffer(_) => bindings::VABufferType::VAEncCodedBufferType,
 
             BufferType::EncMiscParameter(_) => bindings::VABufferType::VAEncMiscParameterBufferType,
+
+            BufferType::EncPackedHeaderParameter(_) => {
+                bindings::VABufferType::VAEncPackedHeaderParameterBufferType
+            }
+
+            BufferType::EncPackedHeaderData(_) => {
+                bindings::VABufferType::VAEncPackedHeaderDataBufferType
+            }
         }
     }
 }
@@ -515,4 +538,30 @@ pub enum EncMiscParameter {
     QualityLevel(EncMiscParameterBufferQualityLevel),
     /// Wrapper over `VAEncMiscParameterBuffer` with `VAEncMiscParameterQuantization`.
     Quantization(EncMiscParameterQuantization),
+}
+
+/// Wrapper over `VAEncPackedHeaderParameterBuffer`.
+///
+/// A packed header is submitted as two buffers: this one describes the type and
+/// bit length, and an `EncPackedHeaderData` buffer carries the bytes. H.264
+/// drivers need a zero-length sequence header to emit SPS/PPS of their own.
+pub struct EncPackedHeaderParameter(Box<bindings::VAEncPackedHeaderParameterBuffer>);
+
+impl EncPackedHeaderParameter {
+    /// A header of `type_` holding `bit_length` bits.
+    ///
+    /// `bit_length` of zero asks the driver to generate the header itself,
+    /// which is how SPS/PPS are produced without reimplementing the syntax.
+    pub fn new(type_: u32, bit_length: u32, has_emulation_bytes: bool) -> Self {
+        Self(Box::new(bindings::VAEncPackedHeaderParameterBuffer {
+            type_,
+            bit_length,
+            has_emulation_bytes: u8::from(has_emulation_bytes),
+            ..Default::default()
+        }))
+    }
+
+    pub(crate) fn inner_mut(&mut self) -> &mut bindings::VAEncPackedHeaderParameterBuffer {
+        self.0.as_mut()
+    }
 }

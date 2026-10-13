@@ -40,6 +40,11 @@ pub(crate) fn probe(
         }
     }
     candidates.push((Backend::Software, Format::AVC));
+    // The Intel entry is offered whenever the driver advertises the encode
+    // entrypoint; the probe below still has to produce a valid SPS to accept it.
+    if Encoder::vaapi_accepts(Format::AVC) {
+        candidates.insert(0, (Backend::Intel, Format::AVC));
+    }
     let rate = Rate {
         target: 2_000_000,
         peak: 2_000_000,
@@ -59,6 +64,8 @@ pub(crate) fn probe(
             let size = (frame.width, frame.height);
             let mut encoder = if backend == Backend::Software {
                 Encoder::software_format(&desktop.device, size, format, rate)?
+            } else if backend == Backend::Intel {
+                Encoder::vaapi_format(size, format, rate)?
             } else {
                 Encoder::hardware_format(&desktop.device, size, format, rate, Color::Sdr)?
             };
@@ -130,6 +137,7 @@ impl Runtime {
 
 pub(crate) enum Encoder {
     Nvidia(super::nvenc::Encoder),
+    Vaapi(Box<super::vaapi_encoder::Encoder>),
     Software(Box<super::software_encoder::Encoder>),
 }
 impl Encoder {
@@ -145,6 +153,29 @@ impl Encoder {
     ) -> Result<bool> {
         Ok(false)
     }
+
+    /// Whether the local VA-API driver offers an encode entrypoint for `format`.
+    ///
+    /// Cheap enough to call while building the candidate list: it only reads
+    /// the driver's advertised profiles.
+    pub(crate) fn vaapi_accepts(format: Format) -> bool {
+        super::vaapi_encoder::Encoder::accepts(format)
+            && super::decoder::encoder_available()
+    }
+
+    /// Opens the VA-API encoder on the display the decoder already owns.
+    pub(crate) fn vaapi_format(
+        size: (u32, u32),
+        format: Format,
+        rate: Rate,
+    ) -> Result<Self> {
+        let display = super::decoder::shared_display()
+            .map_err(|error| anyhow::anyhow!("VA-API 显示不可用：{error}"))?;
+        Ok(Self::Vaapi(Box::new(
+            super::vaapi_encoder::Encoder::new(&display, size, format, rate)?,
+        )))
+    }
+
     pub(crate) fn hardware_format(
         _device: &Device,
         size: (u32, u32),
@@ -176,18 +207,21 @@ impl Encoder {
     pub(crate) fn implementation(&self) -> i32 {
         match self {
             Self::Nvidia(_) => Backend::Nvidia.implementation(),
+            Self::Vaapi(_) => Backend::Intel.implementation(),
             Self::Software(_) => Backend::Software.implementation(),
         }
     }
     pub(crate) fn maximum_size(&self) -> (u32, u32) {
         match self {
             Self::Nvidia(encoder) => encoder.maximum_size(),
+            Self::Vaapi(encoder) => encoder.maximum_size(),
             Self::Software(encoder) => encoder.maximum_size(),
         }
     }
     pub(crate) fn configure_rate(&mut self, rate: Rate) -> Result<bool> {
         match self {
             Self::Nvidia(encoder) => encoder.configure_rate(rate),
+            Self::Vaapi(encoder) => Ok(encoder.configure_rate(rate)?),
             Self::Software(encoder) => encoder.configure(rate),
         }
     }
@@ -220,6 +254,11 @@ impl Encoder {
         );
         match self {
             Self::Nvidia(encoder) => encoder.encode(image, timestamp, keyframe),
+            Self::Vaapi(encoder) => {
+                let pixels = image.pixels()?;
+                let pitch = image.size().0 as usize * 4;
+                Ok(encoder.encode(&pixels, pitch, timestamp, keyframe)?)
+            }
             Self::Software(encoder) => encoder.encode(image, timestamp, keyframe, cancel),
         }
     }

@@ -5,3 +5,6 @@
 #include <va/va.h>
 #include <va/va_drm.h>
 #include <va/va_drmcommon.h>
+// The encode structures (packed headers, H.264 parameters) live here; va.h only
+// forward-declares the buffer types.
+#include <va/va_enc_h264.h>

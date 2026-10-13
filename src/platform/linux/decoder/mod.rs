@@ -10,6 +10,9 @@ use crate::media::decode_api::{DecodeError, DecoderMode, DecoderNotification, Vi
 use bytes::Bytes;
 
 mod vaapi;
+
+/// The shared VA display and encode capability, for the host encoder.
+pub(crate) use vaapi::{encoder_available, shared_display};
 use std::collections::VecDeque;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
