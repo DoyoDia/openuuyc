@@ -336,6 +336,10 @@ impl Encoder {
             drm_format: picture.fourcc,
             width: picture.width,
             height: picture.height,
+            // The compositor leaves `spa_data.maxsize` at zero for DMA-BUFs, so
+            // the extent comes from the plane geometry: the last row of the
+            // tallest plane plus its pitch.
+            buffer_size: picture.buffer_size(),
             modifier: picture.modifier,
             planes: picture
                 .planes

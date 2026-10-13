@@ -528,6 +528,22 @@ pub(crate) struct DmabufPicture {
     _lease: BufferLease,
 }
 
+impl DmabufPicture {
+    /// The extent of the buffer behind the planes, in bytes.
+    ///
+    /// A compositor leaves `spa_data.maxsize` at zero for DMA-BUFs -- its own
+    /// clients read `chunk->size` instead -- so the driver has to be told how
+    /// much memory there is. A single row is not enough: the import would then
+    /// cover one line of the picture.
+    pub(crate) fn buffer_size(&self) -> u32 {
+        self.planes
+            .iter()
+            .map(|(_, offset, pitch)| offset.saturating_add(pitch.saturating_mul(self.height)))
+            .max()
+            .unwrap_or(0)
+    }
+}
+
 /// Keeps a PipeWire buffer out of the compositor's pool until it is dropped.
 ///
 /// `pw_stream_queue_buffer` is documented RT-safe and callable from a thread

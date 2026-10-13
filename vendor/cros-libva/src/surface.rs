@@ -471,6 +471,8 @@ pub struct DrmPrimeImportDescriptor {
     pub drm_format: u32,
     pub width: u32,
     pub height: u32,
+    /// Total size of the buffer behind `planes`, in bytes.
+    pub buffer_size: u32,
     pub modifier: u64,
     /// Plane descriptors: `(fd, offset, pitch)`.
     pub planes: Vec<DrmPrimeImportPlane>,
@@ -501,12 +503,12 @@ impl ExternalBufferDescriptor for DrmPrimeImportDescriptor {
         if let Some(first) = first {
             desc.num_objects = 1;
             desc.objects[0].fd = first.fd;
-            desc.objects[0].size = self
-                .planes
-                .iter()
-                .map(|plane| plane.offset.saturating_add(plane.pitch))
-                .max()
-                .unwrap_or(0);
+            // The whole buffer, not one row: a compositor's `maxsize` is zero
+            // for DMA-BUFs (its clients read `chunk->size` instead), so the
+            // extent has to come from the plane geometry. Reporting a single
+            // row makes the driver import a fraction of the picture and every
+            // frame comes out black.
+            desc.objects[0].size = self.buffer_size;
             desc.objects[0].drm_format_modifier = self.modifier;
             desc.num_layers = 1;
             desc.layers[0].drm_format = self.drm_format;
