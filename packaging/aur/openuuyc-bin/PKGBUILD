@@ -10,8 +10,9 @@
 pkgname=openuuyc-bin
 pkgver=1.0.0.omarchy.1
 pkgrel=1
-# The git tag keeps the hyphen that pkgver may not contain.
-_tag=v${pkgver/omarchy./omarchy-}
+# The git tag keeps the hyphen and dot that pkgver may not contain:
+# 1.0.0.omarchy.1 -> v1.0.0-omarchy.1
+_tag=v${pkgver/.omarchy./-omarchy.}
 pkgdesc="Third-party UU Remote client (Wayland/Hyprland host support)"
 arch=('x86_64')
 url="https://github.com/risent/openuuyc"

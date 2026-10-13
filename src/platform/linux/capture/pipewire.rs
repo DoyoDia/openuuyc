@@ -96,13 +96,23 @@ struct SpaMetaRegion {
 const STREAM_EVENTS_VERSION: u32 = 2;
 const DIRECTION_INPUT: u32 = 0;
 const FLAG_AUTOCONNECT: u32 = 1 << 0;
-const FLAG_MAP_BUFFERS: u32 = 1 << 2;
+// `FLAG_MAP_BUFFERS` asks PipeWire to `mmap` every buffer into our address
+// space. That cannot work for DMA-BUF, whose contents live in a file
+// descriptor, and asking for it makes buffer allocation fail outright with
+// `error alloc buffers: Invalid argument`. Shared-memory buffers are mapped by
+// hand instead, from the fd the stream reports.
 const STATE_ERROR: c_int = -1;
 const STATE_UNCONNECTED: c_int = 0;
 const STATE_STREAMING: c_int = 3;
 
+/// `spa_pod_prop` flags. `DONT_FIXATE` on the modifier is how a client says
+/// "here is a list, you pick": the portal looks for exactly that before it
+/// will consider DMA-BUF (its log line is "DMA (No fixate)").
+const SPA_POD_PROP_FLAG_DONT_FIXATE: u32 = 1 << 4;
+
 const TYPE_ID: u32 = 3;
 const TYPE_INT: u32 = 4;
+const TYPE_LONG: u32 = 5;
 const TYPE_RECTANGLE: u32 = 10;
 const TYPE_FRACTION: u32 = 11;
 const TYPE_OBJECT: u32 = 15;
@@ -117,6 +127,11 @@ const PARAM_META: u32 = 6;
 const FORMAT_MEDIA_TYPE: u32 = 1;
 const FORMAT_MEDIA_SUBTYPE: u32 = 2;
 const FORMAT_VIDEO_FORMAT: u32 = 0x20001;
+/// The DRM format modifier. SPA documents it as "use only with DMA-BUF and
+/// omit for other buffer types", and that is the whole signal: the portal
+/// negotiates shared memory unless this key is present, however the
+/// buffer-type mask reads.
+const FORMAT_VIDEO_MODIFIER: u32 = 0x20002;
 const FORMAT_VIDEO_SIZE: u32 = 0x20003;
 const FORMAT_VIDEO_FRAMERATE: u32 = 0x20004;
 const MEDIA_TYPE_VIDEO: u32 = 2;
@@ -125,6 +140,22 @@ const VIDEO_RGBX: u32 = 7;
 const VIDEO_BGRX: u32 = 8;
 const VIDEO_RGBA: u32 = 11;
 const VIDEO_BGRA: u32 = 12;
+
+/// DRM fourcc codes, spelled the way DRM does. Once a modifier is in play the
+/// `format` field carries one of these instead of a `spa_video_format`.
+const DRM_FORMAT_ARGB8888: u32 = u32::from_le_bytes(*b"AR24");
+const DRM_FORMAT_XRGB8888: u32 = u32::from_le_bytes(*b"XR24");
+const DRM_FORMAT_ABGR8888: u32 = u32::from_le_bytes(*b"AB24");
+const DRM_FORMAT_XBGR8888: u32 = u32::from_le_bytes(*b"XB24");
+
+/// `I915_FORMAT_MOD_Y_TILED`: what i965 exports and its encoder imports.
+const DRM_MOD_Y_TILED: u64 = 0x0100_0000_0000_0002;
+/// `I915_FORMAT_MOD_X_TILED`.
+const DRM_MOD_X_TILED: u64 = 0x0100_0000_0000_0001;
+/// `DRM_FORMAT_MOD_LINEAR`.
+const DRM_MOD_LINEAR: u64 = 0;
+/// `DRM_FORMAT_MOD_INVALID`, which SPA reads as "let the compositor choose".
+const DRM_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
 const BUFFERS_DATA_TYPE: u32 = 6;
 const META_TYPE: u32 = 1;
 const META_SIZE: u32 = 2;
@@ -220,6 +251,9 @@ impl Pod {
     fn u32(&mut self, value: u32) {
         self.0.extend_from_slice(&value.to_ne_bytes());
     }
+    fn u64(&mut self, value: u64) {
+        self.0.extend_from_slice(&value.to_ne_bytes());
+    }
     fn pad(&mut self) {
         while self.0.len() % 8 != 0 {
             self.0.push(0);
@@ -230,6 +264,25 @@ impl Pod {
         self.u32(kind);
         for word in body {
             self.u32(*word);
+        }
+        self.pad();
+    }
+    /// A `Long`, which SPA stores as eight bytes.
+    fn value_long(&mut self, value: u64) {
+        self.u32(8);
+        self.u32(TYPE_LONG);
+        self.u64(value);
+    }
+    /// A choice of `Long` values, the form SPA uses for DRM modifiers.
+    fn choice_long(&mut self, choice: u32, values: &[u64]) {
+        self.u32((16 + values.len() * 8) as u32);
+        self.u32(TYPE_CHOICE);
+        self.u32(choice);
+        self.u32(0);
+        self.u32(8);
+        self.u32(TYPE_LONG);
+        for value in values {
+            self.u64(*value);
         }
         self.pad();
     }
@@ -259,8 +312,14 @@ impl Pod {
         pod
     }
     fn key(&mut self, key: u32) {
+        self.key_flags(key, 0);
+    }
+    /// A property key with `spa_pod_prop` flags. `DONT_FIXATE` is how a client
+    /// says "here is a list, you choose" -- the portal looks for exactly that on
+    /// the modifier before it will consider DMA-BUF.
+    fn key_flags(&mut self, key: u32, flags: u32) {
         self.u32(key);
-        self.u32(0);
+        self.u32(flags);
     }
     /// The bytes, copied into 8-byte aligned storage as SPA requires.
     fn aligned(&self) -> Vec<u64> {
@@ -278,6 +337,45 @@ impl Pod {
 }
 
 fn enum_format() -> Pod {
+    Pod::object(OBJECT_FORMAT, PARAM_ENUM_FORMAT, |p| {
+        p.key(FORMAT_MEDIA_TYPE);
+        p.value(TYPE_ID, &[MEDIA_TYPE_VIDEO]);
+        p.key(FORMAT_MEDIA_SUBTYPE);
+        p.value(TYPE_ID, &[MEDIA_SUBTYPE_RAW]);
+        // The modifier comes first: SPA treats its presence as the request for
+        // DMA-BUF, and omits it for the shared-memory formats below. The portal
+        // reads the pair together, so a format with no modifier means
+        // shared memory.
+        p.key_flags(FORMAT_VIDEO_MODIFIER, SPA_POD_PROP_FLAG_DONT_FIXATE);
+        p.choice_long(
+            CHOICE_ENUM,
+            &[DRM_MOD_INVALID, DRM_MOD_LINEAR, DRM_MOD_X_TILED, DRM_MOD_Y_TILED],
+        );
+        // The format stays a `spa_video_format`: the compositor offers AR24 and
+        // AB24 from wlr, and the portal reports those as `BGRx`/`RGBA`-family
+        // enums with the modifier carrying the tiling. A DRM fourcc here is a
+        // different, unused encoding and never matches.
+        p.key(FORMAT_VIDEO_FORMAT);
+        p.choice(
+            CHOICE_ENUM,
+            TYPE_ID,
+            1,
+            &[VIDEO_BGRA, VIDEO_RGBA, VIDEO_BGRX, VIDEO_RGBX],
+        );
+        p.key(FORMAT_VIDEO_SIZE);
+        p.choice(
+            CHOICE_RANGE,
+            TYPE_RECTANGLE,
+            2,
+            &[1920, 1080, 1, 1, 16384, 16384],
+        );
+        p.key(FORMAT_VIDEO_FRAMERATE);
+        p.choice(CHOICE_RANGE, TYPE_FRACTION, 2, &[60, 1, 0, 1, 1000, 1]);
+    })
+}
+
+/// The shared-memory format offer, used when the compositor will not do DMA-BUF.
+fn enum_format_shm() -> Pod {
     Pod::object(OBJECT_FORMAT, PARAM_ENUM_FORMAT, |p| {
         p.key(FORMAT_MEDIA_TYPE);
         p.value(TYPE_ID, &[MEDIA_TYPE_VIDEO]);
@@ -326,13 +424,29 @@ fn crop_meta() -> Pod {
     })
 }
 
-/// The negotiated `(video format, width, height)` from a Format object.
+/// The negotiated format from a Format object.
+///
+/// `modifier` is present only when the compositor agreed to DMA-BUF; a shared
+/// memory stream leaves it `None`. It is what decides which path the frame
+/// takes, not the format code, because a DRM fourcc can also arrive over
+/// shared memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct NegotiatedFormat {
+    pub format: u32,
+    pub width: u32,
+    pub height: u32,
+    pub modifier: Option<u64>,
+}
+
+/// The negotiated format from a Format object.
 ///
 /// # Safety
 /// `pod` must point at a valid SPA pod.
-unsafe fn parse_format(pod: *const c_void) -> Option<(u32, u32, u32)> {
+unsafe fn parse_format(pod: *const c_void) -> Option<NegotiatedFormat> {
     let read =
         |offset: usize| unsafe { pod.cast::<u8>().add(offset).cast::<u32>().read_unaligned() };
+    let read64 =
+        |offset: usize| unsafe { pod.cast::<u8>().add(offset).cast::<u64>().read_unaligned() };
     let size = read(0) as usize;
     if read(4) != TYPE_OBJECT || size < 8 {
         return None;
@@ -340,6 +454,7 @@ unsafe fn parse_format(pod: *const c_void) -> Option<(u32, u32, u32)> {
     let end = 8 + size;
     let mut offset = 16;
     let (mut format, mut width, mut height) = (None, None, None);
+    let mut modifier = None;
     while offset + 16 <= end {
         let key = read(offset);
         let value_size = read(offset + 8) as usize;
@@ -353,6 +468,7 @@ unsafe fn parse_format(pod: *const c_void) -> Option<(u32, u32, u32)> {
         }
         match (key, value_type) {
             (FORMAT_VIDEO_FORMAT, TYPE_ID) => format = Some(read(value)),
+            (FORMAT_VIDEO_MODIFIER, TYPE_LONG) => modifier = Some(read64(value)),
             (FORMAT_VIDEO_SIZE, TYPE_RECTANGLE) => {
                 width = Some(read(value));
                 height = Some(read(value + 4));
@@ -361,7 +477,12 @@ unsafe fn parse_format(pod: *const c_void) -> Option<(u32, u32, u32)> {
         }
         offset += 16 + value_size.next_multiple_of(8);
     }
-    Some((format?, width?, height?))
+    Some(NegotiatedFormat {
+        format: format?,
+        width: width?,
+        height: height?,
+        modifier,
+    })
 }
 
 // --- Stream ----------------------------------------------------------------------
@@ -377,7 +498,7 @@ pub(super) struct Picture {
 struct State {
     picture: Option<Picture>,
     sequence: u64,
-    format: Option<(u32, u32, u32)>,
+    format: Option<NegotiatedFormat>,
     streaming: bool,
     error: Option<String>,
 }
@@ -480,8 +601,20 @@ unsafe extern "C" fn on_process(data: *mut c_void) {
 /// `buffer` must be a buffer the stream just dequeued.
 unsafe fn read_picture(
     buffer: *mut SpaBuffer,
-    (format, width, height): (u32, u32, u32),
+    negotiated: NegotiatedFormat,
 ) -> Option<Picture> {
+    let NegotiatedFormat {
+        format,
+        width,
+        height,
+        modifier,
+    } = negotiated;
+    if modifier.is_some() {
+        // A DMA-BUF arrived: it is a file descriptor, not mapped memory, and
+        // importing it is a separate path from the copy below.
+        tracing::debug!(format, width, height, modifier = ?modifier, "DMA-BUF buffer offered");
+        return None;
+    }
     let buffer = unsafe { &*buffer };
     if buffer.n_datas == 0 || buffer.datas.is_null() {
         return None;
@@ -689,7 +822,7 @@ impl Stream {
                     this.stream,
                     DIRECTION_INPUT,
                     node,
-                    FLAG_AUTOCONNECT | FLAG_MAP_BUFFERS,
+                    FLAG_AUTOCONNECT,
                     params.as_mut_ptr(),
                     params.len() as u32,
                 );
