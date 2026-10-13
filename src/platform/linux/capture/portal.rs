@@ -11,8 +11,9 @@
 //! One portal session serves every captured monitor of this process, and its
 //! cursor mode is fixed when it starts; a desktop wanting the other mode gets
 //! its own session.
+use super::Picture;
 use super::Screen;
-use super::pipewire::{Picture, Stream};
+use super::pipewire::Stream;
 use anyhow::{Context, Result, bail};
 use ashpd::desktop::PersistMode;
 use ashpd::desktop::screencast::{
