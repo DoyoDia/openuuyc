@@ -184,6 +184,10 @@ wgpu = { version = "30.0", default-features = false, features = ["vulkan", "gles
 egui-winit = { version = "0.36.1", default-features = false, features = ["clipboard", "links", "x11", "wayland"] }
 winit = { version = "0.30.13", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen"] }
 arboard = { version = "3.6.1", default-features = false, features = ["image-data", "wayland-data-control"] }
+# Reading the clipboard's MIME types costs one Wayland round trip, where
+# `arboard`'s getters each open a connection and pull the whole payload. The
+# poll below checks the types first and only reads contents when they change.
+wl-clipboard-rs = { version = "0.9", default-features = false }
 # Wayland 文本输入：zwp_virtual_keyboard 允许自带 keymap，能输入键位表里没有的字符
 # （中文等）。XTest 只能影响 XWayland 客户端，uinput 又无法携带 keymap。
 wayland-client = { version = "0.31", default-features = false }

@@ -457,33 +457,30 @@ pub(super) fn capture_loop(
             // session solely for a size/candidate transition (T C2D840).
             drop(encoder.take());
             let close_ms = rebuilding.elapsed().as_secs_f64() * 1000.;
-            let created = if hardware {
-                encoder::Encoder::hardware_format(
+            let rate = crate::features::host::format::Rate {
+                target: bounds.initial.max(300_000),
+                peak: bounds.initial.max(300_000),
+                fps: wanted.fps,
+                quality: wanted.quality,
+                quality_target,
+            };
+            // The backend names which hardware path to open. Intel here is
+            // VA-API, not NVENC, so the old hardware/software split would send
+            // it looking for a CUDA driver.
+            let created = match candidate.capability.backend {
+                crate::features::host::format::Backend::Software => {
+                    encoder::Encoder::software_format(&device, size, wanted.format, rate)
+                }
+                crate::features::host::format::Backend::Intel => {
+                    encoder::Encoder::vaapi_format(size, wanted.format, rate)
+                }
+                _ => encoder::Encoder::hardware_format(
                     &device,
                     size,
                     wanted.format,
-                    crate::features::host::format::Rate {
-                        target: bounds.initial.max(300_000),
-                        peak: bounds.initial.max(300_000),
-                        fps: wanted.fps,
-                        quality: wanted.quality,
-                        quality_target,
-                    },
+                    rate,
                     wanted.color,
-                )
-            } else {
-                encoder::Encoder::software_format(
-                    &device,
-                    size,
-                    wanted.format,
-                    crate::features::host::format::Rate {
-                        target: bounds.initial.max(300_000),
-                        peak: bounds.initial.max(300_000),
-                        fps: wanted.fps,
-                        quality: wanted.quality,
-                        quality_target,
-                    },
-                )
+                ),
             };
             encoder = match created {
                 Ok(created) => {

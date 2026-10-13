@@ -609,9 +609,6 @@ fn invalid_picture() -> PictureH264 {
     )
 }
 
-fn clamp(value: i32) -> u8 {
-    value.clamp(0, 255) as u8
-}
 /// The packed-header modes the driver advertises for H.264 encode.
 ///
 /// `vaCreateConfig` must be told which of them to enable; the sequence mode is
