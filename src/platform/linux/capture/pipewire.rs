@@ -11,6 +11,7 @@
 //! picture; DMA-BUF import belongs with a GPU encoder.
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -153,7 +154,11 @@ const META_SIZE: u32 = 2;
 const META_VIDEO_CROP: u32 = 2;
 const DATA_MEM_PTR: u32 = 1;
 const DATA_MEM_FD: u32 = 2;
-const DATA_MEM_DMABUF: u32 = 4;
+// `SPA_DATA_DmaBuf` is the fourth variant, so the bit is `1 << 3`. Reading the
+// enum value as the shift would ask for `SPA_DATA_MemId` instead, which no
+// compositor offers: the buffer-type masks then have no intersection and the
+// link fails with `error alloc buffers: Invalid argument`.
+const DATA_MEM_DMABUF: u32 = 3;
 const CHOICE_RANGE: u32 = 1;
 const CHOICE_ENUM: u32 = 3;
 const CHOICE_FLAGS: u32 = 4;
@@ -367,10 +372,15 @@ fn enum_format() -> Pod {
 
 /// Whether to ask the compositor for DMA-BUF frames instead of shared memory.
 ///
-/// Off by default: the import path is not finished, and a request that is
-/// honoured but unreadable leaves the capture with no frames at all.
+/// Off unless `OPENUUYC_CAPTURE_DMABUF=1`. The request is also gated on the
+/// VA-API encoder being available, because that is the only encoder that can
+/// read a DMA-BUF: asking for one without it leaves the capture with no
+/// readable frames at all.
 fn dmabuf_requested() -> bool {
-    std::env::var("OPENUUYC_CAPTURE_DMABUF").is_ok_and(|value| value != "0")
+    if !std::env::var("OPENUUYC_CAPTURE_DMABUF").is_ok_and(|value| value != "0") {
+        return false;
+    }
+    super::super::encoder::Encoder::vaapi_accepts(crate::media::encoding::Format::AVC)
 }
 
 /// The buffer types to offer, which must agree with the negotiated format.
@@ -467,11 +477,76 @@ unsafe fn parse_format(pod: *const c_void) -> Option<NegotiatedFormat> {
 
 // --- Stream ----------------------------------------------------------------------
 
-/// One captured picture as the stream delivered it, converted to BGRA.
-pub(super) struct Picture {
+/// One captured picture as the stream delivered it.
+pub(super) enum Picture {
+    /// Tightly packed BGRA in system memory, `width * height * 4` bytes.
+    Shm {
+        width: u32,
+        height: u32,
+        pixels: Vec<u8>,
+    },
+    /// A DMA-BUF the encoder imports and converts on the GPU.
+    Dmabuf(DmabufPicture),
+}
+
+impl Picture {
+    pub(super) fn width(&self) -> u32 {
+        match self {
+            Self::Shm { width, .. } => *width,
+            Self::Dmabuf(picture) => picture.width,
+        }
+    }
+
+    pub(super) fn height(&self) -> u32 {
+        match self {
+            Self::Shm { height, .. } => *height,
+            Self::Dmabuf(picture) => picture.height,
+        }
+    }
+
+    /// Whether this picture keeps the PipeWire buffer out of the pool.
+    ///
+    /// A DMA-BUF is read later by the encoder, so its buffer must not be
+    /// recycled yet; the shared-memory copy is already made and the buffer can
+    /// go straight back.
+    fn holds_buffer(&self) -> bool {
+        matches!(self, Self::Dmabuf(_))
+    }
+}
+
+/// A picture the compositor handed over as a file descriptor.
+pub(crate) struct DmabufPicture {
     pub width: u32,
     pub height: u32,
-    pub pixels: Vec<u8>,
+    /// DRM fourcc of the buffer, which is what VA-API imports it as.
+    pub fourcc: u32,
+    pub modifier: u64,
+    /// Plane descriptors: `(fd, offset, pitch)`.
+    pub planes: Vec<(RawFd, u32, u32)>,
+    /// Returns the buffer to the compositor once the picture is dropped.
+    _lease: BufferLease,
+}
+
+/// Keeps a PipeWire buffer out of the compositor's pool until it is dropped.
+///
+/// `pw_stream_queue_buffer` is documented RT-safe and callable from a thread
+/// other than the one that dequeued, which is what lets the encoder hold the
+/// buffer across the conversion instead of copying the frame out first.
+struct BufferLease {
+    api: &'static Api,
+    stream: *mut c_void,
+    buffer: *mut PwBuffer,
+}
+
+// SAFETY: the pointers are owned by the stream, which outlives every lease it
+// hands out; `pw_stream_queue_buffer` is the documented way to return a buffer
+// and is safe to call from another thread.
+unsafe impl Send for BufferLease {}
+
+impl Drop for BufferLease {
+    fn drop(&mut self) {
+        unsafe { (self.api.stream_queue_buffer)(self.stream, self.buffer) };
+    }
 }
 
 #[derive(Default)]
@@ -566,8 +641,18 @@ unsafe extern "C" fn on_process(data: *mut c_void) {
         return;
     }
     let format = lock(&callbacks.shared.state).format;
-    let picture = format.and_then(|format| unsafe { read_picture((*newest).buffer, format) });
-    unsafe { (api.stream_queue_buffer)(callbacks.stream, newest) };
+    // A DMA-BUF picture keeps the buffer until the encoder is done with it, so
+    // the lease carries the queue call; everything else is read here and the
+    // buffer goes straight back.
+    let picture = format.and_then(|format| unsafe {
+        read_picture(api, callbacks.stream, (*newest).buffer, format)
+    });
+    if !picture
+        .as_ref()
+        .is_some_and(|picture| picture.holds_buffer())
+    {
+        unsafe { (api.stream_queue_buffer)(callbacks.stream, newest) };
+    }
     if let Some(picture) = picture {
         let mut state = lock(&callbacks.shared.state);
         state.picture = Some(picture);
@@ -577,11 +662,13 @@ unsafe extern "C" fn on_process(data: *mut c_void) {
     }
 }
 
-/// Copy a buffer's pixels out as tightly packed BGRA with opaque alpha.
+/// Copy a buffer's pixels out as tightly packed BGRA, or hand a DMA-BUF over.
 ///
 /// # Safety
 /// `buffer` must be a buffer the stream just dequeued.
 unsafe fn read_picture(
+    api: &'static Api,
+    stream: *mut c_void,
     buffer: *mut SpaBuffer,
     negotiated: NegotiatedFormat,
 ) -> Option<Picture> {
@@ -592,10 +679,10 @@ unsafe fn read_picture(
         modifier,
     } = negotiated;
     if modifier.is_some() {
-        // A DMA-BUF arrived: it is a file descriptor, not mapped memory, and
-        // importing it is a separate path from the copy below.
-        tracing::debug!(format, width, height, modifier = ?modifier, "DMA-BUF buffer offered");
-        return None;
+        // A DMA-BUF arrived: it is a file descriptor, not mapped memory. The
+        // compositor's buffer is handed over as-is and the encoder imports it,
+        // which is what makes the GPU conversion possible.
+        return unsafe { read_dmabuf(api, stream, buffer, format, width, height, modifier?) };
     }
     let buffer = unsafe { &*buffer };
     if buffer.n_datas == 0 || buffer.datas.is_null() {
@@ -675,11 +762,84 @@ unsafe fn read_picture(
             }
         }
     }
-    Some(Picture {
+    Some(Picture::Shm {
         width: w as u32,
         height: h as u32,
         pixels,
     })
+}
+
+/// The DRM fourcc a negotiated `spa_video_format` arrives as.
+///
+/// The portal maps the compositor's DRM fourcc to a SPA enum on the way out
+/// (`pwFromDrmFourcc`), so this is that mapping read backwards. The modifier
+/// rides along and says how the buffer is tiled.
+fn drm_fourcc(format: u32) -> Option<u32> {
+    Some(match format {
+        VIDEO_BGRA => u32::from_le_bytes(*b"AR24"),
+        VIDEO_BGRX => u32::from_le_bytes(*b"XR24"),
+        VIDEO_RGBA => u32::from_le_bytes(*b"AB24"),
+        VIDEO_RGBX => u32::from_le_bytes(*b"XB24"),
+        _ => return None,
+    })
+}
+
+/// Hand a compositor DMA-BUF to the encoder without touching the pixels.
+///
+/// # Safety
+/// `buffer` must be a buffer the stream just dequeued; the returned picture
+/// keeps it out of the pool until it is dropped.
+unsafe fn read_dmabuf(
+    api: &'static Api,
+    stream: *mut c_void,
+    buffer: *mut SpaBuffer,
+    format: u32,
+    width: u32,
+    height: u32,
+    modifier: u64,
+) -> Option<Picture> {
+    let fourcc = drm_fourcc(format)?;
+    let buffer_ref = unsafe { &*buffer };
+    if buffer_ref.n_datas == 0 || buffer_ref.datas.is_null() {
+        return None;
+    }
+    let mut planes = Vec::with_capacity(buffer_ref.n_datas as usize);
+    for index in 0..buffer_ref.n_datas as usize {
+        let data = unsafe { &*buffer_ref.datas.add(index) };
+        if data.fd < 0 || data.chunk.is_null() {
+            return None;
+        }
+        let chunk = unsafe { &*data.chunk };
+        let pitch = if chunk.stride > 0 {
+            chunk.stride as u32
+        } else {
+            width * 4
+        };
+        planes.push((data.fd as RawFd, chunk.offset, pitch));
+    }
+    if planes.is_empty() {
+        return None;
+    }
+    tracing::debug!(
+        fourcc,
+        width,
+        height,
+        modifier,
+        planes = planes.len(),
+        "DMA-BUF 画面已交付"
+    );
+    Some(Picture::Dmabuf(DmabufPicture {
+        width,
+        height,
+        fourcc,
+        modifier,
+        planes,
+        _lease: BufferLease {
+            api,
+            stream,
+            buffer: buffer.cast(),
+        },
+    }))
 }
 
 /// A video stream from one PipeWire node, on its own loop thread.

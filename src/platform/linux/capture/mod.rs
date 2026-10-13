@@ -15,6 +15,7 @@
 //! Frames are BGRA, in system memory or, from NvFBC, in CUDA device memory.
 mod nvfbc;
 mod pipewire;
+pub(crate) use pipewire::DmabufPicture;
 mod portal;
 mod x11;
 
@@ -76,12 +77,15 @@ pub(crate) enum Image {
     },
     /// A pitched CUDA allocation on the GPU driving the display.
     Cuda(Arc<super::cuda::Buffer>),
+    /// A compositor DMA-BUF the encoder imports and converts on the GPU.
+    Dmabuf(Arc<super::capture::pipewire::DmabufPicture>),
 }
 impl Image {
     pub fn size(&self) -> (u32, u32) {
         match self {
             Self::Cpu { width, height, .. } => (*width, *height),
             Self::Cuda(buffer) => (buffer.width, buffer.height),
+            Self::Dmabuf(picture) => (picture.width, picture.height),
         }
     }
     /// The pixels in system memory, read back from the GPU if need be.
@@ -89,6 +93,9 @@ impl Image {
         Ok(match self {
             Self::Cpu { pixels, .. } => std::borrow::Cow::Borrowed(pixels.as_slice()),
             Self::Cuda(buffer) => std::borrow::Cow::Owned(buffer.download()?),
+            Self::Dmabuf(_) => {
+                anyhow::bail!("DMA-BUF 画面只能由 VA-API 编码器导入")
+            }
         })
     }
 }
@@ -375,36 +382,17 @@ impl Desktop {
                     break Ok(None);
                 }
                 std::thread::sleep((deadline - now).min(Duration::from_millis(8)));
-            },
+            }
+            .map(|changed| changed.map(|(size, image)| portal_cpu_frame(self, size, image))),
             // PipeWire only delivers a picture when the monitor changed.
             Backend::Portal(grab) => grab
                 .next(deadline.saturating_duration_since(Instant::now()))
-                .map(|picture| {
-                    picture.map(|picture| {
-                        let size = output(picture.width, picture.height, quality, maximum);
-                        let image = scale(&picture.pixels, (picture.width, picture.height), size);
-                        (size, image)
-                    })
-                }),
+                .map(|picture| picture.map(|picture| portal_frame(self, picture, quality, maximum))),
         };
         match result {
-            Ok(Some((size, image))) => {
+            Ok(Some(frame)) => {
                 self.available = true;
-                let image = Arc::new(image);
-                self.last = Some(image.clone());
-                self.last_size = size;
-                Ok(Some(Frame {
-                    width: size.0,
-                    height: size.1,
-                    image: Image::Cpu {
-                        pixels: image,
-                        width: size.0,
-                        height: size.1,
-                    },
-                    captured: Instant::now(),
-                    is_new: true,
-                    hdr_metadata: None,
-                }))
+                Ok(Some(frame))
             }
             Ok(None) => {
                 self.available = true;
@@ -413,6 +401,62 @@ impl Desktop {
             Err(error) => {
                 self.available = false;
                 Err(error)
+            }
+        }
+    }
+}
+
+/// A shared-memory picture, scaled to the encoder's size and remembered for
+/// the change comparison X11 needs.
+fn portal_cpu_frame(screen: &mut Desktop, size: (u32, u32), image: Vec<u8>) -> Frame {
+    let image = Arc::new(image);
+    screen.last = Some(image.clone());
+    screen.last_size = size;
+    Frame {
+        width: size.0,
+        height: size.1,
+        image: Image::Cpu {
+            pixels: image,
+            width: size.0,
+            height: size.1,
+        },
+        captured: Instant::now(),
+        is_new: true,
+        hdr_metadata: None,
+    }
+}
+
+/// One picture from the ScreenCast portal, in whichever form it arrived.
+fn portal_frame(
+    screen: &mut Desktop,
+    picture: super::capture::pipewire::Picture,
+    quality: i32,
+    maximum: (u32, u32),
+) -> Frame {
+    use super::capture::pipewire::Picture;
+    match picture {
+        Picture::Shm {
+            width,
+            height,
+            pixels,
+        } => {
+            let size = output(width, height, quality, maximum);
+            portal_cpu_frame(screen, size, scale(&pixels, (width, height), size))
+        }
+        Picture::Dmabuf(picture) => {
+            // The encoder imports the buffer at its native size; the size the
+            // user asked for is applied by the encoder's own conversion, not by
+            // a CPU rescale.
+            let size = (picture.width, picture.height);
+            screen.last = None;
+            screen.last_size = size;
+            Frame {
+                width: size.0,
+                height: size.1,
+                image: Image::Dmabuf(Arc::new(picture)),
+                captured: Instant::now(),
+                is_new: true,
+                hdr_metadata: None,
             }
         }
     }

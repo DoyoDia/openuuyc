@@ -34,6 +34,11 @@ pub struct Buffer {
 }
 
 impl Buffer {
+    /// The driver id, needed by callers that submit the buffer themselves
+    /// through `vaRenderPicture`.
+    pub(crate) fn id(&self) -> bindings::VABufferID {
+        self.id
+    }
     /// Creates a new buffer by wrapping a `vaCreateBuffer` call. This is just a helper for
     /// [`Context::create_buffer`].
     pub(crate) fn new(context: Rc<Context>, mut type_: BufferType) -> Result<Self, VaError> {
@@ -235,6 +240,10 @@ impl Buffer {
             BufferType::EncPackedHeaderData(ref mut data) => {
                 (data.as_mut_ptr() as *mut std::ffi::c_void, data.len())
             }
+
+            BufferType::Raw { ref mut bytes, .. } => {
+                (bytes.as_mut_ptr() as *mut std::ffi::c_void, bytes.len())
+            }
         };
 
         // Safe because `self` represents a valid `VAContext`. `ptr` and `size` are also ensured to
@@ -309,11 +318,17 @@ pub enum BufferType {
     /// Abstraction over `VAEncPackedHeaderDataBufferType`: the header bytes the
     /// parameter buffer above describes.
     EncPackedHeaderData(Vec<u8>),
+    /// Raw bytes of a buffer type this crate does not model, such as the
+    /// `VAProcPipelineParameterBuffer` a video-processing context takes.
+    Raw {
+        type_: bindings::VABufferType::Type,
+        bytes: Vec<u8>,
+    },
 }
 
 impl BufferType {
     /// Returns the inner FFI buffer type.
-    pub(crate) fn inner(&self) -> bindings::VABufferType::Type {
+    pub fn inner(&self) -> bindings::VABufferType::Type {
         match self {
             BufferType::PictureParameter(_) => bindings::VABufferType::VAPictureParameterBufferType,
             BufferType::SliceParameter(_) => bindings::VABufferType::VASliceParameterBufferType,
@@ -348,6 +363,8 @@ impl BufferType {
             BufferType::EncPackedHeaderData(_) => {
                 bindings::VABufferType::VAEncPackedHeaderDataBufferType
             }
+
+            BufferType::Raw { type_, .. } => *type_,
         }
     }
 }

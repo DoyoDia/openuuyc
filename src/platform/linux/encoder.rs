@@ -60,6 +60,17 @@ pub(crate) fn probe(
         if !is_active() {
             bail!("被控准备已取消");
         }
+        // The probe frame is whatever the capture backend delivered. When the
+        // compositor handed over a DMA-BUF, only the encoder that can import
+        // one is worth trying: the others would reject it and report the
+        // encoder missing rather than the frame being unreadable.
+        if matches!(frame.image, Image::Dmabuf(_)) && backend != Backend::Intel {
+            tracing::debug!(
+                ?backend,
+                "host encoder skipped: capture frame is a DMA-BUF"
+            );
+            continue;
+        }
         let probe = (|| -> Result<Capability> {
             let size = (frame.width, frame.height);
             let mut encoder = if backend == Backend::Software {
@@ -255,6 +266,9 @@ impl Encoder {
         match self {
             Self::Nvidia(encoder) => encoder.encode(image, timestamp, keyframe),
             Self::Vaapi(encoder) => {
+                if let Image::Dmabuf(picture) = image {
+                    return Ok(encoder.encode_dmabuf(picture, timestamp, keyframe)?);
+                }
                 let pixels = image.pixels()?;
                 let pitch = image.size().0 as usize * 4;
                 Ok(encoder.encode(&pixels, pitch, timestamp, keyframe)?)

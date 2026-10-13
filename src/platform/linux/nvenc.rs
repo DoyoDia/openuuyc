@@ -99,6 +99,9 @@ impl Encoder {
         let copied = match image {
             Image::Cpu { pixels, .. } => self.input.upload(pixels),
             Image::Cuda(buffer) => self.input.copy_from_device(buffer.ptr, buffer.pitch),
+            Image::Dmabuf(_) => {
+                anyhow::bail!("NVENC 无法导入 DMA-BUF 采集画面")
+            }
         };
         timing.stage(1);
         copied?;

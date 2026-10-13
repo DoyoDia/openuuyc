@@ -16,12 +16,13 @@
 use std::rc::Rc;
 
 use cros_libva::{
-    BufferType, Context, Display, EncCodedBuffer, EncMiscParameter,
-    EncMiscParameterBufferMaxFrameSize, EncMiscParameterFrameRate, EncMiscParameterRateControl,
-    EncPackedHeaderParameter, EncPictureParameterBufferH264, EncSequenceParameterBufferH264,
-    EncSliceParameterBufferH264, H264EncPicFields, H264EncSeqFields, H264VuiFields,
-    MappedCodedBuffer, Picture, PictureH264, RcFlags, Surface, UsageHint, VAConfigAttrib,
-    VAConfigAttribType, VAEntrypoint, VAProfile, VASurfaceID,
+    BufferType, Config, Context, Display, DrmPrimeImportDescriptor, DrmPrimeImportPlane,
+    EncCodedBuffer, EncMiscParameter, EncMiscParameterBufferMaxFrameSize,
+    EncMiscParameterFrameRate, EncMiscParameterRateControl, EncPackedHeaderParameter,
+    EncPictureParameterBufferH264, EncSequenceParameterBufferH264, EncSliceParameterBufferH264,
+    H264EncPicFields, H264EncSeqFields, H264VuiFields, MappedCodedBuffer, Picture, PictureH264,
+    RcFlags, Surface, UsageHint, VAConfigAttrib, VAConfigAttribType, VAEntrypoint, VAProfile,
+    VASurfaceID, VideoProcessor,
 };
 
 use crate::media::encoding::{Encoded, Format, Rate};
@@ -49,6 +50,9 @@ const LOG2_MAX_FRAME_NUM_MINUS4: u32 = 11;
 /// `log2_max_pic_order_cnt_lsb_minus4`, 16-bit POC in the same sets.
 const LOG2_MAX_POC_LSB_MINUS4: u32 = 12;
 
+/// `VA_RT_FORMAT_RGB32`, the layout an imported compositor buffer is read as.
+const RT_FORMAT_RGB32: u32 = cros_libva::VA_RT_FORMAT_RGB32;
+
 /// Default quantiser. The rate controller moves it per frame.
 const INITIAL_QP: u8 = 26;
 
@@ -68,6 +72,16 @@ impl From<cros_libva::VaError> for EncodeError {
 
 pub(crate) struct Encoder {
     context: Rc<Context>,
+    /// The encode configuration the context was created against.
+    ///
+    /// It has to be kept alive: `Context` only stores the driver id, and the
+    /// id becomes reusable the moment the config is destroyed. Dropping it
+    /// lets the next `vaCreateConfig` (the video processor's, when a DMA-BUF
+    /// arrives) take the same id, after which the driver resolves this
+    /// context's entrypoint to that new config and rejects every encode
+    /// buffer as unsupported.
+    #[allow(dead_code, reason = "Owns the config for the context's lifetime.")]
+    config: Config,
     /// Taken out for the frame being encoded and put back afterwards, because
     /// `Picture::new` takes ownership of the surface.
     surfaces: Vec<Option<Surface<()>>>,
@@ -99,6 +113,13 @@ pub(crate) struct Encoder {
     /// `vaDeriveImage` and the colour conversion, split out of `upload_time`.
     derive_time: std::time::Duration,
     convert_time: std::time::Duration,
+    /// Converts an imported DMA-BUF to NV12 on the GPU. Opened on first use,
+    /// because a driver without `VAEntrypointVideoProc` still encodes the
+    /// shared-memory path fine.
+    vpp: Option<VideoProcessor>,
+    /// Set once the driver refused a processing context, so the import path is
+    /// not retried for every frame.
+    vpp_unavailable: bool,
 }
 
 impl Encoder {
@@ -174,6 +195,7 @@ impl Encoder {
         Ok(Self {
             ids: surfaces.iter().map(Surface::id).collect(),
             context,
+            config,
             surfaces: surfaces.into_iter().map(Some).collect(),
             next: 0,
             reference: None,
@@ -190,6 +212,8 @@ impl Encoder {
             encode_time: std::time::Duration::ZERO,
             derive_time: std::time::Duration::ZERO,
             convert_time: std::time::Duration::ZERO,
+            vpp: None,
+            vpp_unavailable: false,
         })
     }
 
@@ -248,6 +272,123 @@ impl Encoder {
         }])
     }
 
+    /// Encodes one compositor DMA-BUF, converting it to NV12 on the GPU.
+    ///
+    /// The frame never reaches system memory: the buffer is imported as a VA
+    /// surface and the video processor writes NV12 straight into the surface
+    /// the encoder is about to encode.
+    pub fn encode_dmabuf(
+        &mut self,
+        picture: &crate::platform::linux::capture::DmabufPicture,
+        timestamp: i64,
+        keyframe: bool,
+    ) -> Result<Vec<Encoded>, EncodeError> {
+        let started = std::time::Instant::now();
+        let index = self.next;
+        self.next = (self.next + 1) % self.surfaces.len();
+        self.convert_dmabuf(picture, index)?;
+        self.convert_time += started.elapsed();
+        // The pixels are already in the encoder's surface, so the driver's
+        // work starts at the slice.
+        let started = std::time::Instant::now();
+        let idr = keyframe || self.reference.is_none();
+        let encoded = self.encode_surface(index, idr, timestamp)?;
+        self.encode_time += started.elapsed();
+        self.reference = Some(index);
+        if idr {
+            self.idr_pic_id = self.idr_pic_id.wrapping_add(1);
+            self.sequence_dirty = true;
+        }
+        self.frame_num = self.frame_num.wrapping_add(1);
+        Ok(vec![Encoded {
+            data: encoded,
+            keyframe: idr,
+            timestamp_100ns: timestamp.saturating_mul(10),
+            is_new: true,
+            timing: None,
+            format: self.format,
+            color: crate::media::encoding::Color::Sdr.space(None),
+        }])
+    }
+
+    /// Imports `picture` and runs the video processor into slot `index`.
+    fn convert_dmabuf(
+        &mut self,
+        picture: &crate::platform::linux::capture::DmabufPicture,
+        index: usize,
+    ) -> Result<(), EncodeError> {
+        if self.vpp_unavailable {
+            return Err(EncodeError::Unsupported("驱动不支持视频处理转换".into()));
+        }
+        let display = self.context.display();
+        if self.vpp.is_none() {
+            match VideoProcessor::new(display, self.width, self.height) {
+                Ok(vpp) => self.vpp = Some(vpp),
+                Err(error) => {
+                    tracing::warn!(%error, "VA-API 视频处理不可用，退回共享内存路径");
+                    self.vpp_unavailable = true;
+                    return Err(EncodeError::Unsupported(error.to_string()));
+                }
+            }
+        }
+        let mut descriptor = DrmPrimeImportDescriptor {
+            fourcc: va_fourcc(picture.fourcc)?,
+            drm_format: picture.fourcc,
+            width: picture.width,
+            height: picture.height,
+            modifier: picture.modifier,
+            planes: picture
+                .planes
+                .iter()
+                .map(|(fd, offset, pitch)| DrmPrimeImportPlane {
+                    fd: *fd,
+                    offset: *offset,
+                    pitch: *pitch,
+                })
+                .collect(),
+        };
+        let imported = display
+            .create_surfaces(
+                RT_FORMAT_RGB32,
+                None,
+                picture.width,
+                picture.height,
+                Some(UsageHint::USAGE_HINT_ENCODER),
+                vec![descriptor.clone()],
+            )
+            .map_err(|error| EncodeError::Backend(format!("导入采集 DMA-BUF 失败：{error}")))?;
+        let _ = &mut descriptor;
+        let target = self.ids[index];
+        self.vpp
+            .as_ref()
+            .expect("opened above")
+            .process(&imported[0], target)
+            .map_err(|error| EncodeError::Backend(format!("视频处理失败：{error}")))?;
+        Ok(())
+    }
+}
+
+/// Maps a DRM fourcc to the `VA_FOURCC_*` spelling of the same layout.
+///
+/// The two are different constants for the same pixel order -- `ARGB8888` is
+/// `0x34325241` in DRM terms and `VA_FOURCC_ARGB` is `0x42475241` -- and the
+/// import descriptor wants the DRM spelling for its layer and the VA spelling
+/// for the surface.
+fn va_fourcc(drm: u32) -> Result<u32, EncodeError> {
+    Ok(match drm {
+        value if value == u32::from_le_bytes(*b"AR24") => cros_libva::VA_FOURCC_ARGB,
+        value if value == u32::from_le_bytes(*b"XR24") => cros_libva::VA_FOURCC_XRGB,
+        value if value == u32::from_le_bytes(*b"AB24") => cros_libva::VA_FOURCC_ABGR,
+        value if value == u32::from_le_bytes(*b"XB24") => cros_libva::VA_FOURCC_XBGR,
+        other => {
+            return Err(EncodeError::Unsupported(format!(
+                "不支持的采集格式 {other:#x}"
+            )))
+        }
+    })
+}
+
+impl Encoder {
     /// The accumulated upload and encode time, and resets them.
     #[cfg(test)]
     fn take_stage_totals(&mut self) -> (std::time::Duration, std::time::Duration) {
