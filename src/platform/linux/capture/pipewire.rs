@@ -305,9 +305,9 @@ fn enum_format() -> Pod {
 fn buffers() -> Pod {
     Pod::object(OBJECT_PARAM_BUFFERS, PARAM_BUFFERS, |p| {
         p.key(BUFFERS_DATA_TYPE);
-        // DMA-BUF is requested first so a compositor that offers it needs no
-        // change here, but Hyprland's ScreenCast answers with MemFd only, so
-        // the CPU readback below is what actually runs today.
+        // A flags choice holds one value: the mask. The count `SPA_CHOICE_FLAGS`
+        // writes is not part of the pod -- `SPA_POD_CHOICE_N_VALUES` derives it
+        // from the body size, which `choice` sets from the value count here.
         p.choice(
             CHOICE_FLAGS,
             TYPE_INT,
@@ -498,6 +498,13 @@ unsafe fn read_picture(
         return None;
     }
     let chunk = unsafe { &*data.chunk };
+    // The type the portal actually chose, which is the only way to tell whether
+    // a DMA-BUF request was honoured or quietly answered with shared memory.
+    tracing::debug!(
+        data_type = data.kind,
+        maxsize = data.maxsize,
+        "PipeWire buffer delivered"
+    );
     let stride = if chunk.stride > 0 {
         chunk.stride as usize
     } else {
@@ -668,14 +675,23 @@ impl Stream {
                     this.callbacks.cast(),
                 );
                 let format = enum_format().aligned();
-                let mut params = [format.as_ptr().cast::<c_void>()];
+                // The buffer types go in with the connection, not only from
+                // `on_param_changed`: the portal allocates its buffers as soon
+                // as the stream starts, and by the time that callback runs it
+                // has already settled on shared memory. Offering the formats
+                // up front is what lets it pick a DMA-BUF instead.
+                let buffers = buffers().aligned();
+                let mut params = [
+                    format.as_ptr().cast::<c_void>(),
+                    buffers.as_ptr().cast::<c_void>(),
+                ];
                 let connected = (api.stream_connect)(
                     this.stream,
                     DIRECTION_INPUT,
                     node,
                     FLAG_AUTOCONNECT | FLAG_MAP_BUFFERS,
                     params.as_mut_ptr(),
-                    1,
+                    params.len() as u32,
                 );
                 ensure!(connected >= 0, "连接 PipeWire 画面流失败：{connected}");
                 Ok(())
@@ -763,5 +779,28 @@ mod tests {
         let choices = enum_format().aligned();
         let size = unsafe { choices.as_ptr().cast::<u32>().read() } as usize;
         assert_eq!((size + 8) % 8, 0);
+    }
+
+    #[test]
+    fn buffers_offers_dmabuf_in_one_flags_choice() {
+        // The portal only offers DMA-BUF when the mask reaches it intact, and
+        // the value count is derived from the body size rather than stored, so
+        // a wrong word count silently produces a different number of values.
+        let pod = buffers().aligned();
+        let words: Vec<u32> = (0..14)
+            .map(|index| unsafe { pod.as_ptr().cast::<u32>().add(index).read() })
+            .collect();
+        // [size, TYPE_OBJECT, ParamBuffers, PARAM_BUFFERS, key, pad,
+        //  choice size, TYPE_CHOICE, CHOICE_FLAGS, 0, child size, TYPE_INT, mask]
+        assert_eq!(words[1], TYPE_OBJECT);
+        assert_eq!(words[2], OBJECT_PARAM_BUFFERS);
+        assert_eq!(words[3], PARAM_BUFFERS);
+        assert_eq!(words[4], BUFFERS_DATA_TYPE);
+        assert_eq!(words[7], TYPE_CHOICE);
+        assert_eq!(words[8], CHOICE_FLAGS);
+        assert_eq!(words[11], TYPE_INT);
+        let mask = words[12];
+        assert_eq!(mask & (1 << DATA_MEM_DMABUF), 1 << DATA_MEM_DMABUF);
+        assert_eq!(mask & (1 << DATA_MEM_PTR), 1 << DATA_MEM_PTR);
     }
 }
