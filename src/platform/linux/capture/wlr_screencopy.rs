@@ -24,8 +24,8 @@
 //!
 //! The copy carries no scaling: the buffer has to be exactly the output's size,
 //! and the caller scales afterwards like it does for the portal.
-use super::Screen;
 use super::Picture;
+use super::Screen;
 use anyhow::{Context, Result, bail, ensure};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::time::{Duration, Instant};
@@ -243,6 +243,13 @@ impl Grab {
             .get(self.output)
             .context("采集的输出已消失")?;
         self.state.wanted = None;
+        // wayland-client sends no destructor when a proxy is dropped, and a
+        // frame object serves one copy, so the frame of the previous request
+        // has to be destroyed here or every copy leaves an object behind on
+        // the compositor's side.
+        if let Some(frame) = self.state.frame.take() {
+            frame.destroy();
+        }
         self.state.frame =
             Some(manager.capture_output(i32::from(self.cursor), &output.proxy, &handle, ()));
         Ok(())
