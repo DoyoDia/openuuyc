@@ -96,11 +96,10 @@ struct SpaMetaRegion {
 const STREAM_EVENTS_VERSION: u32 = 2;
 const DIRECTION_INPUT: u32 = 0;
 const FLAG_AUTOCONNECT: u32 = 1 << 0;
-// `FLAG_MAP_BUFFERS` asks PipeWire to `mmap` every buffer into our address
-// space. That cannot work for DMA-BUF, whose contents live in a file
-// descriptor, and asking for it makes buffer allocation fail outright with
-// `error alloc buffers: Invalid argument`. Shared-memory buffers are mapped by
-// hand instead, from the fd the stream reports.
+// `FLAG_MAP_BUFFERS` maps every buffer except DMA-BUF, which is exactly the
+// split wanted: shared memory is mapped for the CPU copy, and DMA-BUF is left
+// as a file descriptor for the encoder to import.
+const FLAG_MAP_BUFFERS: u32 = 1 << 2;
 const STATE_ERROR: c_int = -1;
 const STATE_UNCONNECTED: c_int = 0;
 const STATE_STREAMING: c_int = 3;
@@ -400,18 +399,25 @@ fn enum_format_shm() -> Pod {
     })
 }
 
-fn buffers() -> Pod {
+/// The buffer types to offer, which must agree with the negotiated format.
+///
+/// libpipewire collapses a multi-bit mask to a single type, and `MemPtr` wins
+/// over everything else: offering it alongside `DmaBuf` makes the link
+/// negotiate CPU-mapped memory while the portal has already committed to a
+/// DMA-BUF, and buffer allocation then fails. So a DMA-BUF format asks for
+/// DMA-BUF alone.
+fn buffers(dmabuf: bool) -> Pod {
     Pod::object(OBJECT_PARAM_BUFFERS, PARAM_BUFFERS, |p| {
         p.key(BUFFERS_DATA_TYPE);
         // A flags choice holds one value: the mask. The count `SPA_CHOICE_FLAGS`
         // writes is not part of the pod -- `SPA_POD_CHOICE_N_VALUES` derives it
         // from the body size, which `choice` sets from the value count here.
-        p.choice(
-            CHOICE_FLAGS,
-            TYPE_INT,
-            1,
-            &[(1 << DATA_MEM_DMABUF) | (1 << DATA_MEM_PTR) | (1 << DATA_MEM_FD)],
-        );
+        let mask = if dmabuf {
+            1 << DATA_MEM_DMABUF
+        } else {
+            (1 << DATA_MEM_PTR) | (1 << DATA_MEM_FD)
+        };
+        p.choice(CHOICE_FLAGS, TYPE_INT, 1, &[mask]);
     })
 }
 
@@ -556,8 +562,10 @@ unsafe extern "C" fn on_param_changed(data: *mut c_void, id: u32, param: *const 
     let format = unsafe { parse_format(param) };
     lock(&callbacks.shared.state).format = format;
     tracing::debug!(?format, "PipeWire screencast format negotiated");
-    // Ask for buffers in memory the CPU can read, and for the crop region.
-    let buffers = buffers().aligned();
+    // Ask for buffers of the type the format just settled on, and for the crop
+    // region. The type has to follow the format: a DMA-BUF format with a
+    // CPU-mapped buffer request cannot be allocated.
+    let buffers = buffers(format.is_some_and(|format| format.modifier.is_some())).aligned();
     let meta = crop_meta().aligned();
     let mut params = [buffers.as_ptr().cast::<c_void>(), meta.as_ptr().cast()];
     unsafe {
@@ -811,9 +819,9 @@ impl Stream {
                 // The buffer types go in with the connection, not only from
                 // `on_param_changed`: the portal allocates its buffers as soon
                 // as the stream starts, and by the time that callback runs it
-                // has already settled on shared memory. Offering the formats
-                // up front is what lets it pick a DMA-BUF instead.
-                let buffers = buffers().aligned();
+                // has already settled on a type. `enum_format` asks for a
+                // modifier, so the matching type here is DMA-BUF.
+                let buffers = buffers(true).aligned();
                 let mut params = [
                     format.as_ptr().cast::<c_void>(),
                     buffers.as_ptr().cast::<c_void>(),
@@ -822,7 +830,7 @@ impl Stream {
                     this.stream,
                     DIRECTION_INPUT,
                     node,
-                    FLAG_AUTOCONNECT,
+                    FLAG_AUTOCONNECT | FLAG_MAP_BUFFERS,
                     params.as_mut_ptr(),
                     params.len() as u32,
                 );
@@ -915,11 +923,11 @@ mod tests {
     }
 
     #[test]
-    fn buffers_offers_dmabuf_in_one_flags_choice() {
+    fn buffers_offers_dmabuf_alone_in_one_flags_choice() {
         // The portal only offers DMA-BUF when the mask reaches it intact, and
         // the value count is derived from the body size rather than stored, so
         // a wrong word count silently produces a different number of values.
-        let pod = buffers().aligned();
+        let pod = buffers(true).aligned();
         let words: Vec<u32> = (0..14)
             .map(|index| unsafe { pod.as_ptr().cast::<u32>().add(index).read() })
             .collect();
@@ -932,8 +940,12 @@ mod tests {
         assert_eq!(words[7], TYPE_CHOICE);
         assert_eq!(words[8], CHOICE_FLAGS);
         assert_eq!(words[11], TYPE_INT);
-        let mask = words[12];
-        assert_eq!(mask & (1 << DATA_MEM_DMABUF), 1 << DATA_MEM_DMABUF);
-        assert_eq!(mask & (1 << DATA_MEM_PTR), 1 << DATA_MEM_PTR);
+        // DMA-BUF alone: `MemPtr` alongside it would win the collapse inside
+        // libpipewire and make allocation fail against a DMA-BUF format.
+        assert_eq!(words[12], 1 << DATA_MEM_DMABUF);
+        // The shared-memory offer still names a CPU-readable type.
+        let shm = buffers(false).aligned();
+        let mask = unsafe { shm.as_ptr().cast::<u32>().add(12).read() };
+        assert_eq!(mask, (1 << DATA_MEM_PTR) | (1 << DATA_MEM_FD));
     }
 }

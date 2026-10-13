@@ -30,6 +30,8 @@ optdepends=(
 makedepends=('cargo' 'rust' 'cmake' 'clang' 'nasm' 'pkg-config')
 provides=('openuuyc')
 conflicts=('openuuyc' 'openuuyc-bin')
+# The release profile keeps only debuginfo; nothing is left to split out.
+options=('!debug')
 install=openuuyc-git.install
 source=("$pkgname::git+${url}.git#branch=omarchy")
 sha256sums=('SKIP')

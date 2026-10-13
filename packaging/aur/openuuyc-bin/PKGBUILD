@@ -34,6 +34,8 @@ optdepends=(
 )
 provides=('openuuyc')
 conflicts=('openuuyc' 'openuuyc-git')
+# The binary is built with debuginfo stripped and there is nothing to split.
+options=('!debug')
 install=openuuyc-bin.install
 source=(
     "OpenUUYC-$pkgver::${url}/releases/download/${_tag}/OpenUUYC"
