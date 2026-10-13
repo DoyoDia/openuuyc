@@ -1357,17 +1357,28 @@ impl Player {
                     }
                     self.confirm_neutral();
                 }
+                let pressed = *state == ElementState::Pressed;
+                // egui answers `consumed_by_ui` from the pointer position of
+                // its last pass, so a click right after the pointer left the
+                // caption, a menu or a notice was kept for the UI and never
+                // reached the remote. Where the pointer is now, against the
+                // layers the user is looking at, decides instead; a widget
+                // already dragging keeps the pointer.
+                self.pointer_in_video = self.pointer_on_video(context);
+                let ui_dragging = context.dragged_id().is_some();
                 tracing::debug!(target: "openuuyc::viewer::input",
-                    ?button, pressed = *state == ElementState::Pressed,
-                    consumed_by_ui, in_video = self.pointer_in_video,
+                    ?button, pressed,
+                    consumed_by_ui, ui_dragging, in_video = self.pointer_in_video,
                     mode = ?self.input().mode(),
                     relative = self.input().relative_mode(),
                     neutral_wait = self.input().waiting_for_neutral(),
                     "mouse button");
-                if consumed_by_ui || dragging || self.input().mode() == MouseMode::View {
+                if dragging || self.input().mode() == MouseMode::View {
                     return false;
                 }
-                if !self.pointer_in_video && *state == ElementState::Pressed {
+                // A release always goes through: the remote only acts on it
+                // for a button it holds.
+                if pressed && (!self.pointer_in_video || ui_dragging) {
                     return false;
                 }
                 let Some(code) = mouse_button(*button) else {
@@ -1378,7 +1389,8 @@ impl Player {
                 true
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                if consumed_by_ui || dragging || !self.pointer_in_video {
+                self.pointer_in_video = self.pointer_on_video(context);
+                if dragging || !self.pointer_in_video || context.dragged_id().is_some() {
                     return false;
                 }
                 let (horizontal, amount) = match delta {
@@ -1469,6 +1481,12 @@ impl Player {
             shape = self.session.stream_control.remote_cursor().is_some(),
             in_video = self.pointer_in_video,
             "remote cursor");
+    }
+
+    /// Whether the pointer, where winit last reported it, is on the picture.
+    fn pointer_on_video(&self, context: &egui::Context) -> bool {
+        self.last_position
+            .is_some_and(|position| self.hit_video(context, position))
     }
 
     fn hit_video(&self, context: &egui::Context, position: PhysicalPosition<f64>) -> bool {
