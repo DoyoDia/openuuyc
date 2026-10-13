@@ -30,6 +30,11 @@ uninstall() {
         "$PREFIX/share/applications/openuuyc.desktop" \
         "$PREFIX/share/icons/hicolor/256x256/apps/openuuyc.png" \
         /usr/lib/udev/rules.d/60-openuuyc-uinput.rules
+    # Only remove the menu extension if it is the one we wrote.
+    menu="$HOME/.config/omarchy/extensions/omarchy-menu.jsonc"
+    if [[ -e $menu ]] && grep -q 'install.service.openuuyc' "$menu"; then
+        rm -f "$menu"
+    fi
     rm -f "$HOME/.config/systemd/user/openuuyc-gui.service"
     systemctl --user daemon-reload 2>/dev/null || true
     say "已移除。用户数据保留在 ~/.local/share/OpenUUYC/"
@@ -95,6 +100,20 @@ say "启用图形会话服务"
 systemctl --user daemon-reload
 systemctl --user enable --now openuuyc-gui.service
 
+# Omarchy only: add an Install → Service row so the app is discoverable there.
+if [[ -d $HOME/.config/omarchy ]]; then
+    say "添加 Omarchy 菜单项"
+    mkdir -p "$HOME/.config/omarchy/extensions"
+    target="$HOME/.config/omarchy/extensions/omarchy-menu.jsonc"
+    if [[ -e $target ]] && ! grep -q 'install.service.openuuyc' "$target"; then
+        warn "$target 已存在，未自动修改"
+        warn "请手动加入 packaging/omarchy/omarchy-menu.jsonc 里的条目"
+    else
+        cp packaging/omarchy/omarchy-menu.jsonc "$target"
+        say "菜单项已写入 $target（Quickshell 会自动重新加载）"
+    fi
+fi
+
 cat <<EOF
 
 完成。
@@ -102,6 +121,7 @@ cat <<EOF
   启动      应用菜单「UU 远程（OpenUUYC）」，或 openuuyc-launch gui
   服务      systemctl --user status openuuyc-gui.service
   日志      tail -f ~/.local/state/openuuyc/gui.log
+  菜单      Super + Space → Install → Service → UU Remote (OpenUUYC)
 
 下一步：扫码登录 → 连接设置 → 打开「允许被控」。
 

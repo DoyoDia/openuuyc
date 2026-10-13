@@ -118,6 +118,9 @@ Omarchy 用户还可以把下面一行加进 `~/.config/omarchy/extensions/omarc
 "install.service.openuuyc": {"icon":"󰒺","label":"UU Remote (OpenUUYC)","disabled":"omarchy-pkg-present openuuyc-bin","action":"omarchy-launch-floating-terminal-with-presentation omarchy-pkg-aur-add openuuyc-bin"},
 ```
 
+完整文件见 [`packaging/omarchy/omarchy-menu.jsonc`](packaging/omarchy/omarchy-menu.jsonc)；
+`install-omarchy.sh` 会在检测到 Omarchy 时自动安装。
+
 自建：
 
 ```bash
