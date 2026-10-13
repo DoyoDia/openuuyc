@@ -36,6 +36,8 @@ mod windows_cursor;
 mod linux_drag;
 #[cfg(not(windows))]
 pub(crate) mod linux_keyboard;
+#[cfg(not(windows))]
+mod linux_shortcuts;
 #[cfg(windows)]
 mod windows_keyboard;
 

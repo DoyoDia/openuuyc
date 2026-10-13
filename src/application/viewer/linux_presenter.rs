@@ -749,6 +749,9 @@ struct Player {
     diagnostics_at: [Option<Instant>; 2],
     /// When the remote first said its pointer was hidden, for [`CURSOR_HIDE_GRACE`].
     hidden_since: Option<Instant>,
+    /// Holds the compositor's own shortcuts back while this window has the
+    /// keyboard, so the keys the remote desktop wants arrive here instead.
+    shortcuts: Option<super::linux_shortcuts::Shortcuts>,
     /// Files dropped on the window, and drags carried out of it.
     drag: super::linux_drag::WindowDrag,
     /// Mouse mode of the previous frame, to notice control being dropped.
@@ -765,7 +768,12 @@ impl Player {
         let owner = u64::from(window.id());
         let wake = FrameWakeBridge::install(&session, proxy, window.id())?;
         let drag = super::linux_drag::WindowDrag::new(owner, &session.stream_control);
-        Ok(Self {
+        let shortcuts = super::linux_shortcuts::Shortcuts::new(window);
+        if shortcuts.is_none() {
+            tracing::debug!("this session cannot hold the compositor's shortcuts back");
+        }
+        let mut player = Self {
+            shortcuts,
             drag,
             _shortcuts: crate::application::viewer_shortcuts::Watcher::new()?,
             session,
@@ -797,7 +805,18 @@ impl Player {
             diagnostics_at: [None; 2],
             hidden_since: None,
             last_mouse_mode: MouseMode::View,
-        })
+        };
+        player.refresh_shortcuts();
+        Ok(player)
+    }
+
+    /// Whether the compositor should be holding its own shortcuts back right
+    /// now: only while this window is the one with the keyboard, and only when
+    /// the device's settings ask for it.
+    fn refresh_shortcuts(&mut self) {
+        if let Some(shortcuts) = self.shortcuts.as_mut() {
+            shortcuts.set_active(self.focused && self.intercept_shortcuts);
+        }
     }
 
     /// Control that failed updates cursor and clipboard policy; control
@@ -951,7 +970,10 @@ impl Player {
         // These choices are saved per device and shared by its viewer windows.
         let preferences = self.session.stream_control.device_preferences();
         self.performance_mode = preferences.performance_mode;
-        self.intercept_shortcuts = preferences.intercept_shortcuts;
+        if self.intercept_shortcuts != preferences.intercept_shortcuts {
+            self.intercept_shortcuts = preferences.intercept_shortcuts;
+            self.refresh_shortcuts();
+        }
         let mut view = super::stream_menu::LocalViewSettings {
             performance_mode: self.performance_mode,
             performance_always_visible: preferences.performance_always_visible,
@@ -981,6 +1003,7 @@ impl Player {
             self.session
                 .stream_control
                 .set_intercept_shortcuts(view.intercept_shortcuts);
+            self.refresh_shortcuts();
         }
         if view.send_ctrl_alt_del {
             let _ = self
@@ -1359,6 +1382,8 @@ impl Player {
 
     fn on_focus_changed(&mut self, window: &Arc<Window>, focused: bool) {
         self.focused = focused;
+        // The compositor only lets the focused window hold shortcuts back.
+        self.refresh_shortcuts();
         if !focused && self.control().drag_drop().handoff_pending() {
             // A drag being handed out of the window keeps its button state;
             // the handoff releases remote input itself.
