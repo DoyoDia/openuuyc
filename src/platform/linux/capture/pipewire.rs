@@ -148,6 +148,7 @@ const DRM_MOD_X_TILED: u64 = 0x0100_0000_0000_0001;
 const DRM_MOD_LINEAR: u64 = 0;
 /// `DRM_FORMAT_MOD_INVALID`, which SPA reads as "let the compositor choose".
 const DRM_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
+const BUFFERS_COUNT: u32 = 1;
 const BUFFERS_DATA_TYPE: u32 = 6;
 const META_TYPE: u32 = 1;
 const META_SIZE: u32 = 2;
@@ -393,6 +394,18 @@ fn dmabuf_requested() -> bool {
 /// DMA-BUF alone.
 fn buffers(dmabuf: bool) -> Pod {
     Pod::object(OBJECT_PARAM_BUFFERS, PARAM_BUFFERS, |p| {
+        // A DMA-BUF frame is held until the encoder is done with it, so the
+        // pool has to be deeper than the few the compositor would otherwise
+        // allocate. Running it dry makes the compositor log `Out of buffers`
+        // and retry the whole stream, which re-runs the modifier fixation until
+        // it gives up and falls back to shared memory -- at which point the
+        // frame rate collapses. The value is a range so the compositor can pick
+        // its own ceiling.
+        p.key(BUFFERS_COUNT);
+        // Eight is comfortably more than the compositor's own default of four,
+        // and the range lets it keep its ceiling.
+        let count = if dmabuf { 8 } else { 4 };
+        p.choice(CHOICE_RANGE, TYPE_INT, 1, &[count, 2, 32]);
         p.key(BUFFERS_DATA_TYPE);
         // A flags choice holds one value: the mask. The count `SPA_CHOICE_FLAGS`
         // writes is not part of the pod -- `SPA_POD_CHOICE_N_VALUES` derives it
@@ -692,16 +705,36 @@ unsafe extern "C" fn on_process(data: *mut c_void) {
             api,
             callbacks.stream,
             &callbacks.shared,
-            (*newest).buffer,
+            newest,
             format,
         )
     });
-    if !picture
+    let holds = picture
         .as_ref()
-        .is_some_and(|picture| picture.holds_buffer())
-    {
-        unsafe { (api.stream_queue_buffer)(callbacks.stream, newest) };
+        .is_some_and(|picture| picture.holds_buffer());
+    if holds {
+        // The compositor's pool is small, so at most one DMA-BUF may be held.
+        // Taking another while the last one is still waiting would drain the
+        // pool, after which the compositor logs `Out of buffers`, retries the
+        // whole stream, and every retry re-runs the modifier fixation until it
+        // gives up and falls back to shared memory. The picture that is already
+        // waiting is newer than nothing and is about to be taken; dropping this
+        // one costs a frame and keeps the stream alive.
+        let mut state = lock(&callbacks.shared.state);
+        if state.picture.is_some() {
+            drop(state);
+            // Dropping the picture returns its buffer through the lease, so
+            // there is nothing to queue here.
+            drop(picture);
+            return;
+        }
+        state.picture = picture;
+        state.sequence += 1;
+        drop(state);
+        callbacks.shared.changed.notify_all();
+        return;
     }
+    unsafe { (api.stream_queue_buffer)(callbacks.stream, newest) };
     if let Some(picture) = picture {
         let mut state = lock(&callbacks.shared.state);
         state.picture = Some(picture);
@@ -719,7 +752,7 @@ unsafe fn read_picture(
     api: &'static Api,
     stream: *mut c_void,
     shared: &Shared,
-    buffer: *mut SpaBuffer,
+    buffer: *mut PwBuffer,
     negotiated: NegotiatedFormat,
 ) -> Option<Picture> {
     let NegotiatedFormat {
@@ -728,7 +761,11 @@ unsafe fn read_picture(
         height,
         modifier,
     } = negotiated;
-    let buffer_ref = unsafe { &*buffer };
+    // The lease has to return the `pw_buffer`, not the `spa_buffer` inside it:
+    // `pw_stream_queue_buffer` looks up its own bookkeeping from the former and
+    // rejects anything else with `-EINVAL`.
+    let spa = unsafe { (*buffer).buffer };
+    let buffer_ref = unsafe { &*spa };
     if buffer_ref.n_datas == 0 || buffer_ref.datas.is_null() {
         return None;
     }
@@ -747,7 +784,7 @@ unsafe fn read_picture(
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .upgrade()?;
-        return unsafe { read_dmabuf(&session, buffer, format, width, height, modifier) };
+        return unsafe { read_dmabuf(&session, buffer, spa, format, width, height, modifier) };
     }
     let buffer = buffer_ref;
     let data = unsafe { &*buffer.datas };
@@ -853,7 +890,8 @@ fn drm_fourcc(format: u32) -> Option<u32> {
 /// keeps it out of the pool until it is dropped.
 unsafe fn read_dmabuf(
     session: &Arc<Session>,
-    buffer: *mut SpaBuffer,
+    buffer: *mut PwBuffer,
+    spa: *mut SpaBuffer,
     format: u32,
     width: u32,
     height: u32,
@@ -870,7 +908,7 @@ unsafe fn read_dmabuf(
             return None;
         }
     };
-    let buffer_ref = unsafe { &*buffer };
+    let buffer_ref = unsafe { &*spa };
     if buffer_ref.n_datas == 0 || buffer_ref.datas.is_null() {
         return None;
     }
@@ -907,7 +945,7 @@ unsafe fn read_dmabuf(
         planes,
         _lease: BufferLease {
             session: Arc::clone(session),
-            buffer: buffer.cast(),
+            buffer,
         },
     }))
 }
@@ -1158,24 +1196,28 @@ mod tests {
         // the value count is derived from the body size rather than stored, so
         // a wrong word count silently produces a different number of values.
         let pod = buffers(true).aligned();
-        let words: Vec<u32> = (0..14)
+        let words: Vec<u32> = (0..25)
             .map(|index| unsafe { pod.as_ptr().cast::<u32>().add(index).read() })
             .collect();
-        // [size, TYPE_OBJECT, ParamBuffers, PARAM_BUFFERS, key, pad,
-        //  choice size, TYPE_CHOICE, CHOICE_FLAGS, 0, child size, TYPE_INT, mask]
+        // [size, TYPE_OBJECT, ParamBuffers, PARAM_BUFFERS,
+        //  key(count), pad, choice size, TYPE_CHOICE, CHOICE_RANGE, 0,
+        //    child size, TYPE_INT, default, min, max,
+        //  key(dataType), pad, choice size, TYPE_CHOICE, CHOICE_FLAGS, 0,
+        //    child size, TYPE_INT, mask]
         assert_eq!(words[1], TYPE_OBJECT);
         assert_eq!(words[2], OBJECT_PARAM_BUFFERS);
         assert_eq!(words[3], PARAM_BUFFERS);
-        assert_eq!(words[4], BUFFERS_DATA_TYPE);
-        assert_eq!(words[7], TYPE_CHOICE);
-        assert_eq!(words[8], CHOICE_FLAGS);
-        assert_eq!(words[11], TYPE_INT);
+        assert_eq!(words[4], BUFFERS_COUNT);
+        assert_eq!(words[8], CHOICE_RANGE);
+        assert_eq!(words[12], 8, "DMA-BUF frames need a deeper pool than the default four");
+        assert_eq!(words[16], BUFFERS_DATA_TYPE);
+        assert_eq!(words[20], CHOICE_FLAGS);
         // DMA-BUF alone: `MemPtr` alongside it would win the collapse inside
         // libpipewire and make allocation fail against a DMA-BUF format.
-        assert_eq!(words[12], 1 << DATA_MEM_DMABUF);
+        assert_eq!(words[24], 1 << DATA_MEM_DMABUF);
         // The shared-memory offer still names a CPU-readable type.
         let shm = buffers(false).aligned();
-        let mask = unsafe { shm.as_ptr().cast::<u32>().add(12).read() };
+        let mask = unsafe { shm.as_ptr().cast::<u32>().add(24).read() };
         assert_eq!(mask, (1 << DATA_MEM_PTR) | (1 << DATA_MEM_FD));
     }
 }
