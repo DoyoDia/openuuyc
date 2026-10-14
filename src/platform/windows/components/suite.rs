@@ -140,6 +140,8 @@ pub(crate) fn request(
     removal: super::RemovalOptions,
     resume: bool,
 ) -> Result<bool> {
+    // Capture installation identity before elevation writes the receipt.
+    let first_install = operation == Operation::Install && receipt()?.is_none();
     if operation == Operation::Uninstall {
         crate::account::auth::restore_portable()?;
     }
@@ -177,7 +179,7 @@ pub(crate) fn request(
     };
     if operation == Operation::Install {
         crate::account::auth::enroll_resident()?;
-        host_service::startup::set(true)?;
+        host_service::startup::configure_installation(first_install)?;
         super::application::integrate_user()?;
         if resume {
             let _ = host_service::resident::call(host_service::resident::Request::Resume)?;
