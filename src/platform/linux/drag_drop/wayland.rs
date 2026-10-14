@@ -553,6 +553,14 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for State {
             _ => {}
         }
     }
+
+    // `data_offer` 是「创建子对象」的事件，wayland-client 要在这里说明新对象用
+    // 什么数据去建。少了这条，合成器真送来这个事件时会 panic，而那个 panic 要跨
+    // 过 C 回调、没法 unwinding，**整个进程直接 abort**。本地探针碰不到这条——
+    // 没有真的拖放就不会有 `data_offer`，只有真拖一次才踩得上。
+    wayland_client::event_created_child!(Self, wl_data_device::WlDataDevice, [
+        wl_data_device::EVT_DATA_OFFER_OPCODE => (wl_data_offer::WlDataOffer, ()),
+    ]);
 }
 
 impl Dispatch<wl_data_offer::WlDataOffer, ()> for State {
@@ -583,6 +591,25 @@ impl Dispatch<zxdg_output_v1::ZxdgOutputV1, ()> for State {
         if let zxdg_output_v1::Event::LogicalSize { width, height } = event {
             state.logical = Some((width, height));
         }
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 「创建子对象」的事件必须在 `Dispatch` 里给出特化，缺了会在合成器真送来
+    /// 事件时 panic，而那个 panic 直接 abort 整个进程。这条就是把这个坑钉住：
+    /// 不连真拖放也能查出来。
+    #[test]
+    fn data_offer_has_a_child_specialization() {
+        let connection = Connection::connect_to_env().expect("需要 Wayland 会话");
+        let queue = connection.new_event_queue::<State>();
+        let _ = <State as Dispatch<wl_data_device::WlDataDevice, ()>>::event_created_child(
+            0,
+            &queue.handle(),
+        );
     }
 }
 
