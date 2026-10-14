@@ -163,7 +163,10 @@ impl ParameterTracker {
         // 先记录带内 SPS/PPS。部分 host（macOS）用单独的单 NAL 包下发参数集，
         // 关键帧本身不再携带；libwebrtc 接收端同样会把先收到的参数集拼到
         // 关键帧前面，否则解码器拿不到 extradata。
-        Self::store_in_band_parameters(&mut self.h264_sps, &mut self.h264_pps, payload);
+        // Only packets that carry one are scanned: this runs for every packet.
+        if nalus.iter().any(|n| matches!(n.kind, 7 | 8)) {
+            Self::store_in_band_parameters(&mut self.h264_sps, &mut self.h264_pps, payload);
+        }
         let mut format = None;
         let mut prefix_pair = None;
         for nalu in nalus.iter() {

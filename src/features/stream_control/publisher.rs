@@ -66,18 +66,8 @@ pub(crate) fn display_request(bytes: &[u8]) -> Result<Option<&'static str>> {
     if bytes.first() == Some(&b'{') {
         return Ok(None);
     }
-    let bytes = match PbControlMessage::decode(bytes)?.payload {
-        Some(PbPayload::SimpleAction(action)) if matches!(action.action, 7 | 8) => {
-            // Capture selection belongs to the screen owner on CONTROL too.
-            // The per-track receive path cannot switch to another monitor.
-            return Ok(Some(if action.action == 7 {
-                "StopCapture"
-            } else {
-                "StartCapture"
-            }));
-        }
-        Some(PbPayload::RpcRequest(bytes)) => bytes,
-        _ => return Ok(None),
+    let Some(PbPayload::RpcRequest(bytes)) = PbControlMessage::decode(bytes)?.payload else {
+        return Ok(None);
     };
     Ok(match PbRpcRequest::decode(bytes.as_slice())?.payload {
         Some(PbRpcRequestPayload::CaptureSetting(_)) => Some("CaptureSetting"),
@@ -89,33 +79,6 @@ pub(crate) fn display_request(bytes: &[u8]) -> Result<Option<&'static str>> {
         Some(PbRpcRequestPayload::MouseSwitch(_)) => Some("MouseSwitch"),
         _ => None,
     })
-}
-
-#[cfg(test)]
-mod capture_routing_tests {
-    use super::*;
-
-    #[test]
-    fn capture_selection_routes_to_session_without_stealing_handshakes() {
-        for (action, expected) in [
-            (7, Some("StopCapture")),
-            (8, Some("StartCapture")),
-            (0, None),
-            (1, None),
-            (22, None),
-        ] {
-            let bytes = PbControlMessage {
-                payload: Some(PbPayload::SimpleAction(PbSimpleAction {
-                    action,
-                    args: "{\"screen_id\":1}".into(),
-                    ..Default::default()
-                })),
-                ..Default::default()
-            }
-            .encode_to_vec();
-            assert_eq!(display_request(&bytes).unwrap(), expected);
-        }
-    }
 }
 
 pub(crate) struct MicrophonePolicy {
