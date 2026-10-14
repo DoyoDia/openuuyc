@@ -1,6 +1,6 @@
 # Maintainer: risent <shengqi542@gmail.com>
 #
-# Source package tracking the Linux port's branch (DoyoDia/openuuyc linux-port).
+# Source package tracking the Linux port's branch (DoyoDia/openuuyc-linux linux-port).
 # Builds from source; expect 20-40 minutes and ~4 GB of RAM on first build.
 # Use openuuyc-bin if you just want the program.
 
@@ -10,7 +10,7 @@ pkgver=1.0.0.rc.2.r12.g574a090
 pkgrel=1
 pkgdesc="Third-party UU Remote client (Linux port, X11 and Wayland)"
 arch=('x86_64')
-url="https://github.com/DoyoDia/openuuyc"
+url="https://github.com/DoyoDia/openuuyc-linux"
 license=('custom')
 depends=('gcc-libs' 'fuse3' 'libx11' 'libxcb' 'libxrandr' 'libxi' 'libxcursor'
          'libxfixes' 'libxkbcommon' 'libxkbcommon-x11' 'wayland'

@@ -1,7 +1,7 @@
 # Maintainer: risent <shengqi542@gmail.com>
 #
 # Binary package built from a GitHub release of the Linux port
-# (DoyoDia/openuuyc), which linux-release.yml publishes for every v* tag.
+# (DoyoDia/openuuyc-linux), which linux-release.yml publishes for every v* tag.
 # Prefer this over openuuyc-git unless you want to track the branch.
 #
 # AUR submission: copy this directory to an AUR git checkout and run
@@ -16,7 +16,7 @@ pkgrel=1
 _tag=v${pkgver/.linux./-linux.}
 pkgdesc="Third-party UU Remote client (Linux port, X11 and Wayland)"
 arch=('x86_64')
-url="https://github.com/DoyoDia/openuuyc"
+url="https://github.com/DoyoDia/openuuyc-linux"
 license=('custom')
 depends=('gcc-libs' 'fuse3' 'libx11' 'libxcb' 'libxrandr' 'libxi' 'libxcursor'
          'libxfixes' 'libxkbcommon' 'libxkbcommon-x11' 'wayland'

@@ -4,8 +4,8 @@ Two packages for Arch and Omarchy users:
 
 | Package | Source | Build time |
 |---|---|---|
-| `openuuyc-bin` | Release archive of a `v*-linux.*` tag on DoyoDia/openuuyc | seconds |
-| `openuuyc-git` | `linux-port` branch of DoyoDia/openuuyc | 20–40 min |
+| `openuuyc-bin` | Release archive of a `v*-linux.*` tag on DoyoDia/openuuyc-linux | seconds |
+| `openuuyc-git` | `linux-port` branch of DoyoDia/openuuyc-linux | 20–40 min |
 
 Both install the same files: `/usr/bin/OpenUUYC`, the desktop entry, the
 icon, the uinput udev rule and the license texts. Login startup is the
@@ -14,7 +14,7 @@ ship no systemd unit.
 
 ## Releases
 
-A release is a tag `v<Cargo version>-linux.<n>` on DoyoDia/openuuyc, for
+A release is a tag `v<Cargo version>-linux.<n>` on DoyoDia/openuuyc-linux, for
 example `v1.0.1-linux.1`. Pushing it runs two workflows that attach to the
 same GitHub release:
 
