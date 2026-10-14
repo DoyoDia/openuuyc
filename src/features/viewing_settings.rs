@@ -31,6 +31,7 @@ impl PerformancePanelMode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct DevicePreferences {
+    pub display_aspect: crate::media::geometry::DisplayAspect,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub codec: Option<crate::media::CodecPreference>,
     pub clipboard_sync: bool,
@@ -50,6 +51,7 @@ fn is_true(value: &bool) -> bool {
 impl Default for DevicePreferences {
     fn default() -> Self {
         Self {
+            display_aspect: Default::default(),
             codec: None,
             clipboard_sync: false,
             clipboard_files: true,

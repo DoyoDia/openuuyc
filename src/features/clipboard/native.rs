@@ -1733,6 +1733,7 @@ impl IDataObject_Impl for RemoteData_Impl {
                 index: f.lindex as u32,
                 size: d.file_size,
                 position: Mutex::new(0),
+                cache: Mutex::new(None),
             }
             .into();
             return Ok(STGMEDIUM {
@@ -1989,6 +1990,33 @@ struct RemoteStream {
     index: u32,
     size: u64,
     position: Mutex<u64>,
+    cache: Mutex<Option<ReadCache>>,
+}
+static READ_CACHE_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+struct ReadCache {
+    offset: u64,
+    bytes: Vec<u8>,
+}
+impl ReadCache {
+    fn reserve(offset: u64) -> Option<Self> {
+        READ_CACHE_BYTES
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                n.checked_add(FILE_BLOCK).filter(|n| *n <= 16 * 1024 * 1024)
+            })
+            .ok()?;
+        Some(Self {
+            offset,
+            bytes: Vec::new(),
+        })
+    }
+    fn contains(&self, offset: u64) -> bool {
+        offset >= self.offset && offset - self.offset < self.bytes.len() as u64
+    }
+}
+impl Drop for ReadCache {
+    fn drop(&mut self) {
+        READ_CACHE_BYTES.fetch_sub(FILE_BLOCK, Ordering::AcqRel);
+    }
 }
 impl Drop for RemoteStream {
     fn drop(&mut self) {
@@ -2007,27 +2035,58 @@ impl ISequentialStream_Impl for RemoteStream_Impl {
         }
         let result = (|| -> Result<u32> {
             self.offer.valid()?;
+            // Serialize before taking the cursor: another Read may have moved
+            // it while this caller waited for the task's current RPC to finish.
+            let _busy = self.offer.enter_read()?;
             let pos = *lock(&self.position);
             if pos >= self.size || length == 0 {
                 return Ok(0);
             }
-            self.offer.list()?;
-            let _busy = self.offer.enter_read()?;
+            // GetData(FileContents) already established this stream's descriptor.
+            // Do not clone the entire directory manifest for every small read.
             let wanted = (length as u64).min(self.size - pos);
+            // Shell commonly asks for small reads. Reuse one ordinary protocol
+            // block locally, preserving task-only response correlation.
+            let mut cache = lock(&self.cache).take();
             let mut done = 0u64;
             while done < wanted {
-                let data = self.offer.session.read_file(
-                    self.offer.epoch,
-                    self.offer.task(),
-                    self.index,
-                    pos + done,
-                    (wanted - done).min(FILE_BLOCK as u64) as usize,
-                    2,
-                )?;
-                self.offer.valid()?;
-                if data.is_empty() {
-                    break;
+                let mut uncached = Vec::new();
+                let offset = pos + done;
+                if !cache.as_ref().is_some_and(|c| c.contains(offset)) {
+                    drop(cache.take());
+                    cache = ReadCache::reserve(offset);
+                    let length = (if cache.is_some() {
+                        FILE_BLOCK as u64
+                    } else {
+                        wanted - done
+                    })
+                    .min(FILE_BLOCK as u64)
+                    .min(self.size - offset) as usize;
+                    let data = self.offer.session.read_file(
+                        self.offer.epoch,
+                        self.offer.task(),
+                        self.index,
+                        offset,
+                        length,
+                        2,
+                    )?;
+                    self.offer.valid()?;
+                    if data.is_empty() {
+                        break;
+                    }
+                    if let Some(c) = cache.as_mut() {
+                        c.bytes = data;
+                    } else {
+                        uncached = data;
+                    }
                 }
+                let data = if let Some(cached) = cache.as_ref() {
+                    let start = (offset - cached.offset) as usize;
+                    &cached.bytes
+                        [start..start + ((wanted - done) as usize).min(cached.bytes.len() - start)]
+                } else {
+                    &uncached[..]
+                };
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         data.as_ptr(),
@@ -2046,6 +2105,7 @@ impl ISequentialStream_Impl for RemoteStream_Impl {
                     }
                 }
             }
+            *lock(&self.cache) = cache;
             Ok(done as u32)
         })();
         match result {
@@ -2086,6 +2146,12 @@ impl IStream_Impl for RemoteStream_Impl {
             .checked_add_signed(delta)
             .ok_or_else(|| windows::core::Error::from(E_INVALIDARG))?;
         *pos = new;
+        // Keep an adjacent seek inside the cached block, but do not retain an
+        // unrelated block when a consumer jumps to another part of the file.
+        let mut cache = lock(&self.cache);
+        if !cache.as_ref().is_some_and(|c| c.contains(new)) {
+            *cache = None;
+        }
         if !out.is_null() {
             unsafe {
                 *out = new;
@@ -2169,6 +2235,7 @@ impl IStream_Impl for RemoteStream_Impl {
             index: self.index,
             size: self.size,
             position: Mutex::new(*lock(&self.position)),
+            cache: Mutex::new(None),
         }
         .into())
     }

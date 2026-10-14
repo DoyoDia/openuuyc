@@ -7,6 +7,7 @@ const MAX_QUEUE: usize = 16;
 pub(super) struct Target {
     pub texture: ID3D11Texture2D,
     pub rtv: ID3D11RenderTargetView,
+    pub srv: ID3D11ShaderResourceView,
     pub size: PhysicalSize<u32>,
 }
 #[derive(Default)]
@@ -55,9 +56,12 @@ impl Pool {
         let texture = texture.context("effect texture")?;
         let mut rtv = None;
         unsafe { device.CreateRenderTargetView(&texture, None, Some(&mut rtv)) }?;
+        let mut srv = None;
+        unsafe { device.CreateShaderResourceView(&texture, None, Some(&mut srv)) }?;
         let target = Arc::new(Target {
             texture,
             rtv: rtv.context("effect RTV")?,
+            srv: srv.context("effect SRV")?,
             size,
         });
         self.targets.push(target.clone());
@@ -282,14 +286,7 @@ impl Engine {
                         );
                         let target = self.pool.get(device, size)?;
                         let previous = history.map_or(&picture.target, |h| &h.target);
-                        let mut previous_view = None;
-                        unsafe {
-                            device.CreateShaderResourceView(
-                                &previous.texture,
-                                None,
-                                Some(&mut previous_view),
-                            )
-                        }?;
+                        let previous_view = Some(previous.srv.clone());
                         let timing = [
                             *phase,
                             picture.target.size.width as f32,

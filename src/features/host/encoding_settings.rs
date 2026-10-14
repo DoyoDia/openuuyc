@@ -32,6 +32,9 @@ pub(crate) struct EncodingSettings {
     pub preferred_codec: crate::media::CodecPreference,
     #[serde(default)]
     pub gpu: Option<crate::media::selection::GpuId>,
+    /// Process-wide host GPU High instead of the default Realtime policy.
+    #[serde(default)]
+    pub gpu_compatibility: bool,
 }
 impl EncodingSettings {
     pub fn accepts(self, capability: &Capability) -> bool {

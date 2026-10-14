@@ -48,6 +48,7 @@ struct Session {
 }
 impl Session {
     fn new(device: &ID3D11Device) -> Result<Self> {
+        let started = std::time::Instant::now();
         unsafe {
             // QSV may use the immediate context as soon as SetHandle binds it.
             // Preparing this in Allocator::new is too late: that constructor
@@ -130,8 +131,41 @@ impl Session {
             }
             check(status, "SetD3D11Device")?;
             check(v::MFXSetPriority(result.session, 2), "SetPriority")?;
+            tracing::info!(
+                elapsed_ms = started.elapsed().as_secs_f64() * 1000.,
+                "QSV dispatcher session created"
+            );
             Ok(result)
         }
+    }
+}
+// Session is dropped before callback state, including construction failures.
+// Reuse this entire owner only after ENCODE_Close has quiesced the component.
+struct Resources {
+    session: Session,
+    allocator: Box<Allocator>,
+    _callbacks: Box<v::mfxFrameAllocator>,
+}
+impl Resources {
+    fn new(device: &ID3D11Device, bind_flags: u32) -> Result<Self> {
+        let session = Session::new(device)?;
+        let mut allocator = Allocator::new(device, bind_flags)?;
+        let callbacks = Box::new(allocator.callbacks());
+        let mut resources = Self {
+            session,
+            allocator,
+            _callbacks: callbacks,
+        };
+        check(
+            unsafe {
+                v::MFXVideoCORE_SetFrameAllocator(
+                    resources.session.session,
+                    &mut *resources._callbacks,
+                )
+            },
+            "SetFrameAllocator",
+        )?;
+        Ok(resources)
     }
 }
 impl Drop for Session {
@@ -242,17 +276,90 @@ impl Encoder {
             .context("QSV编码器已释放")?
             .configure(rate)
     }
+    pub fn reconfigure_stream(
+        &mut self,
+        device: &ID3D11Device,
+        size: (u32, u32),
+        format: Format,
+        rate: Rate,
+        color: super::format::Color,
+    ) -> Result<bool> {
+        let active = self.active.as_mut().context("QSV编码器已释放")?;
+        if device != &self.device || !active.initialized || active.surface.Data.Locked != 0 {
+            return Ok(false);
+        }
+        let started = std::time::Instant::now();
+        let previous = self.size;
+        let previous_format = self.format;
+        let previous_color = active.conversion.color;
+        let maximum = (format == self.format).then_some(active.maximum);
+        // A chroma/depth/codec change must select its own conversion path.
+        // In particular 4:4:4 uses pixel targets rather than the 4:2:0 UAVs.
+        let conversion = if format != self.format {
+            Conversion::aligned(device, size, format, 16, color)?
+        } else if active.conversion.is_compute() {
+            Conversion::compute(device, size, format, 16, color)?
+        } else {
+            Conversion::pixel(device, size, format, 16, color)?
+        };
+        let closing = std::time::Instant::now();
+        check(
+            unsafe { v::MFXVideoENCODE_Close(active.raw()) },
+            "Close before stream reconfiguration",
+        )?;
+        active.initialized = false;
+        let close_ms = closing.elapsed().as_secs_f64() * 1000.;
+        // The session and callback addresses stay valid while native surfaces
+        // are freed. Never recycle a session after failed encoding/driver loss.
+        let mut resources = active.resources.take().context("QSV会话已关闭")?;
+        resources
+            .allocator
+            .prepare_reinitialize(conversion.bind_flags())?;
+        drop(self.active.take());
+        self.active = Some(Active::create(
+            device,
+            size,
+            format,
+            rate,
+            conversion,
+            None,
+            Some((resources, maximum)),
+        )?);
+        self.size = size;
+        self.format = format;
+        tracing::info!(
+            ?previous,
+            ?size,
+            ?previous_format,
+            ?format,
+            ?previous_color,
+            ?color,
+            close_ms,
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.,
+            "QSV stream reconfigured with retained session"
+        );
+        Ok(true)
+    }
     pub fn encode(
         &mut self,
         texture: &ID3D11Texture2D,
         timestamp: i64,
         keyframe: bool,
+        cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<Vec<Encoded>> {
+        ensure!(
+            !cancel.load(std::sync::atomic::Ordering::Acquire),
+            "编码已取消"
+        );
         let active = self.active.as_mut().context("QSV编码器已释放")?;
         let compute = active.conversion.is_compute();
-        let result = active.encode(texture, timestamp, keyframe);
+        let result = active.encode(texture, timestamp, keyframe, cancel);
         match result {
-            Err(error) if compute && error.is::<EncodeFailure>() => {
+            Err(error)
+                if compute
+                    && error.is::<EncodeFailure>()
+                    && !cancel.load(std::sync::atomic::Ordering::Acquire) =>
+            {
                 let restored = (
                     active.params,
                     active.extensions.clone(),
@@ -272,6 +379,7 @@ impl Encoder {
                         rate,
                         Conversion::pixel(&self.device, self.size, self.format, 16, color)?,
                         Some(restored),
+                        None,
                     )
                 })()
                 .map_err(|error: anyhow::Error| {
@@ -281,7 +389,7 @@ impl Encoder {
                 self.active
                     .as_mut()
                     .unwrap()
-                    .encode(texture, timestamp, true)
+                    .encode(texture, timestamp, true, cancel)
                     .map_err(unwrap_encode_error)
             }
             result => result.map_err(unwrap_encode_error),
@@ -399,9 +507,7 @@ impl Extensions {
 }
 struct Active {
     size: (u32, u32),
-    session: Option<Session>,
-    _allocator: Box<Allocator>,
-    _callbacks: Box<v::mfxFrameAllocator>,
+    resources: Option<Resources>,
     extensions: Extensions,
     params: v::mfxVideoParam,
     surface: Box<v::mfxFrameSurface1>,
@@ -425,7 +531,7 @@ impl Active {
     ) -> Result<Self> {
         let conversion = Conversion::aligned(device, size, format, 16, color)?;
         let compute = conversion.is_compute();
-        match Self::create(device, size, format, rate, conversion, None) {
+        match Self::create(device, size, format, rate, conversion, None, None) {
             Ok(encoder) => Ok(encoder),
             Err(error) if compute => {
                 tracing::debug!(%error,"QSV compute path rejected; trying pixel path");
@@ -435,6 +541,7 @@ impl Active {
                     format,
                     rate,
                     Conversion::pixel(device, size, format, 16, color)?,
+                    None,
                     None,
                 )
             }
@@ -452,19 +559,20 @@ impl Active {
             Extensions,
             super::encoder_rate::Controller,
         )>,
+        reuse: Option<(Resources, Option<(u32, u32)>)>,
     ) -> Result<Self> {
+        let started = std::time::Instant::now();
         ensure!(
             format.valid() && size.0 > 0 && size.1 > 0 && size.0 <= 16384 && size.1 <= 16384,
             "QSV输入格式无效"
         );
         unsafe {
-            let session = Session::new(device)?;
-            let mut allocator = Allocator::new(device, conversion.bind_flags())?;
-            let mut callbacks = Box::new(allocator.callbacks());
-            check(
-                v::MFXVideoCORE_SetFrameAllocator(session.session, &mut *callbacks),
-                "SetFrameAllocator",
-            )?;
+            let reused_session = reuse.is_some();
+            let (resources, cached_maximum) = match reuse {
+                Some((resources, maximum)) => (resources, maximum),
+                None => (Resources::new(device, conversion.bind_flags())?, None),
+            };
+            let session = &resources.session;
             let mut version = v::mfxVersion::default();
             check(
                 v::MFXQueryVersion(session.session, &mut version),
@@ -549,12 +657,10 @@ impl Active {
             ensure!(request.NumFrameSuggested > 0, "QSV未返回输入纹理要求");
             let mut surface = Box::<v::mfxFrameSurface1>::default();
             surface.Info = params.__bindgen_anon_1.mfx.FrameInfo;
-            surface.Data.MemId = allocator.register(conversion.output.clone());
+            surface.Data.MemId = resources.allocator.register(conversion.output.clone());
             let mut this = Self {
                 size,
-                session: Some(session),
-                _allocator: allocator,
-                _callbacks: callbacks,
+                resources: Some(resources),
                 extensions,
                 params,
                 surface,
@@ -568,6 +674,8 @@ impl Active {
                 timestamps: Default::default(),
                 format,
             };
+            let prepared_ms = started.elapsed().as_secs_f64() * 1000.;
+            let init_started = std::time::Instant::now();
             let mut status = v::MFXVideoENCODE_Init(this.raw(), &mut this.params);
             if status < 0
                 && format.codec == Codec::H265
@@ -600,19 +708,30 @@ impl Active {
             this.buffer
                 .resize(output_capacity(size, format, &this.params)?, 0);
             report_rate("initialized", &this.params, &this.extensions, rate);
-            this.maximum = this.maximum_for_format(format).unwrap_or(size);
+            let init_ms = init_started.elapsed().as_secs_f64() * 1000.;
+            let capabilities = std::time::Instant::now();
+            this.maximum =
+                cached_maximum.unwrap_or_else(|| this.maximum_for_format(format).unwrap_or(size));
+            tracing::info!(
+                ?size,
+                reused_session,
+                prepared_ms,
+                init_ms,
+                capabilities_ms = capabilities.elapsed().as_secs_f64() * 1000.,
+                "QSV encoder component initialized"
+            );
             Ok(this)
         }
     }
     fn raw(&self) -> v::mfxSession {
-        self.session.as_ref().unwrap().session
+        self.resources.as_ref().unwrap().session.session
     }
     pub fn maximum_size(&self) -> (u32, u32) {
         self.maximum
     }
     fn maximum_for_format(&self, format: Format) -> Result<(u32, u32)> {
         unsafe {
-            let loader = self.session.as_ref().unwrap().loader;
+            let loader = self.resources.as_ref().unwrap().session.loader;
             let mut description = ptr::null_mut();
             check(
                 v::MFXEnumImplementations(loader, 0, 1, &mut description),
@@ -652,7 +771,7 @@ impl Active {
         }
     }
     pub fn configure(&mut self, rate: Rate) -> Result<bool> {
-        ensure!(self.session.is_some(), "QSV编码会话已关闭");
+        ensure!(self.resources.is_some(), "QSV编码会话已关闭");
         let Some(update) = self.frame_rate.decide(rate) else {
             return Ok(false);
         };
@@ -703,9 +822,14 @@ impl Active {
         texture: &ID3D11Texture2D,
         timestamp: i64,
         keyframe: bool,
+        cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<Vec<Encoded>> {
-        ensure!(self.session.is_some(), "QSV编码会话已关闭");
+        ensure!(self.resources.is_some(), "QSV编码会话已关闭");
         for attempt in 0..50 {
+            ensure!(
+                !cancel.load(std::sync::atomic::Ordering::Acquire),
+                "编码已取消"
+            );
             if self.surface.Data.Locked == 0 {
                 break;
             }
@@ -716,10 +840,15 @@ impl Active {
         }
         self.frame_rate.input(timestamp);
         self.conversion.convert(texture)?;
-        self.submit(timestamp, keyframe)
+        self.submit(timestamp, keyframe, cancel)
             .map_err(|error| EncodeFailure(error).into())
     }
-    fn submit(&mut self, timestamp: i64, keyframe: bool) -> Result<Vec<Encoded>> {
+    fn submit(
+        &mut self,
+        timestamp: i64,
+        keyframe: bool,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<Vec<Encoded>> {
         self.surface.Data.TimeStamp = (timestamp.max(0) as u64) * 9 / 1000;
         self.timestamps
             .push_back((self.surface.Data.TimeStamp, timestamp));
@@ -741,6 +870,10 @@ impl Active {
         let mut accepted = false;
         unsafe {
             for attempt in 0..50 {
+                ensure!(
+                    !cancel.load(std::sync::atomic::Ordering::Acquire),
+                    "编码已取消"
+                );
                 stream.Data = self.buffer.as_mut_ptr();
                 stream.MaxLength = self.buffer.len() as u32;
                 let status = v::MFXVideoENCODE_EncodeFrameAsync(
@@ -777,13 +910,34 @@ impl Active {
             if !accepted {
                 return Err(super::encoder::SwitchCandidate("QSV提交重试耗尽".into()).into());
             }
-            let status = v::MFXVideoCORE_SyncOperation(self.raw(), sync, 8000);
+            // Preserve the existing total timeout, but observe cancellation
+            // between bounded waits. The stack bitstream stays alive until
+            // either completion or the session is quiesced below.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+            let status = loop {
+                if cancel.load(std::sync::atomic::Ordering::Acquire) {
+                    break v::mfxStatus_MFX_ERR_ABORTED;
+                }
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    break v::mfxStatus_MFX_WRN_IN_EXECUTION;
+                }
+                let status = v::MFXVideoCORE_SyncOperation(
+                    self.raw(),
+                    sync,
+                    remaining.as_millis().clamp(1, 20) as u32,
+                );
+                if status != v::mfxStatus_MFX_WRN_IN_EXECUTION {
+                    break status;
+                }
+                std::thread::yield_now();
+            };
             if status != 0 {
                 // mfxBitstream is owned by the outstanding task. Quiesce the
                 // session while this stack object and its buffer are still alive.
                 v::MFXVideoENCODE_Close(self.raw());
                 self.initialized = false;
-                self.session.take();
+                self.resources.take();
                 return Err(
                     super::encoder::SwitchCandidate(format!("QSV同步未完成（{status}）")).into(),
                 );
@@ -938,7 +1092,7 @@ impl Drop for Active {
                 v::MFXVideoENCODE_Close(self.raw());
             }
             // Close the session before freeing callback state and its surface handles.
-            self.session.take();
+            self.resources.take();
         }
     }
 }

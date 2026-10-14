@@ -6,6 +6,7 @@ use super::super::encoder;
 use super::super::lock;
 use super::super::output_size;
 use super::Published;
+use crate::features::host::format::{Backend, Color, Format};
 use anyhow::Context as _;
 use anyhow::Result;
 use std::sync::Arc;
@@ -36,10 +37,10 @@ pub(super) fn capture_loop(
     pointer: Arc<Mutex<Option<crate::platform::windows::cursor_shape::Snapshot>>>,
 ) -> Result<()> {
     let _activity = crate::platform::windows::host_service::activity::Work::new();
-    let _runtime = encoder::Runtime::new()?;
+    let mut runtime = encoder::Runtime::new()?;
     let mut desktop = None;
-    let mut encoder = None;
-    let mut current = None;
+    let mut encoder = None::<encoder::Encoder>;
+    let mut current: Option<((u32, u32), ((u64, Backend, Format), Color))> = None;
     let mut next = Instant::now();
     let mut paced_fps = 0;
     let mut cached = None::<capture::Frame>;
@@ -56,6 +57,7 @@ pub(super) fn capture_loop(
     let mut frame_metadata = std::collections::BTreeMap::new();
     let mut last_diagnostics = None;
     let mut metrics = metrics::Metrics::default();
+    let mut paused_capture_at = None::<Instant>;
 
     while !cancel.is_cancelled() && handle.requested() {
         let iteration_started = Instant::now();
@@ -87,6 +89,7 @@ pub(super) fn capture_loop(
             // Nothing is kept warm outside this track's lease/cancellation scope.
             let opened_at = Instant::now();
             let connecting = !connected.load(Ordering::Acquire);
+            runtime.begin_gpu_work(negotiated.gpu_compatibility);
             desktop = Some(capture::Desktop::open_selected(&screen)?);
             generation = desktop.as_ref().unwrap().generation;
             tracing::info!(
@@ -239,6 +242,9 @@ pub(super) fn capture_loop(
                 });
             }
             cached = None;
+            if !wanted.capturing {
+                runtime.end_gpu_work();
+            }
             last_frame = None;
             keyframe.store(true, Ordering::Release);
             next = Instant::now();
@@ -258,8 +264,26 @@ pub(super) fn capture_loop(
             continue;
         }
         if desktop.is_none() {
+            runtime.begin_gpu_work(negotiated.gpu_compatibility);
             desktop = Some(capture::Desktop::open_selected(&screen)?);
             generation = desktop.as_ref().unwrap().generation;
+            // Readiness can change after the preparation gate above. Apply the
+            // same policy and reread settings after either native open path.
+            continue;
+        }
+        if transport.media_rate().min(bounds.maximum)
+            < crate::features::host::parameters::MIN_ENCODER_RATE
+        {
+            // Keep source/cursor/recovery observations alive during a transport
+            // pause, without preprocessing the desktop at the full video rate.
+            // Do not advance WindowAdmission: it counts actual candidate frames.
+            if paused_capture_at.is_some_and(|at| at.elapsed() < Duration::from_millis(100)) {
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            paused_capture_at = Some(Instant::now());
+        } else {
+            paused_capture_at = None;
         }
         let wait_ms = ((1000.0 / f64::from(wanted.fps)).round() as u32).max(1);
         let capture_started = Instant::now();
@@ -346,6 +370,19 @@ pub(super) fn capture_loop(
                 frame
             }
         };
+        let peak = transport.media_rate().min(bounds.maximum);
+        // A zero/tiny allocation is a transport pause, not an encoder failure.
+        // Do not fabricate bandwidth by clamping it back to a quality floor.
+        let codec_minimum = crate::features::host::parameters::MIN_ENCODER_RATE;
+        if peak < codec_minimum {
+            continue;
+        }
+        let (media_rate, discard_frame) =
+            admission.next(peak, codec_minimum, transport.cwnd_ratio());
+        if discard_frame {
+            metrics.admission_drops += 1;
+            continue;
+        }
         let size = output_size(frame.width, frame.height, wanted.quality);
         let source_device = &desktop.as_ref().context("缺少采集源")?.device;
         // NVENC owns a separate D3D11 context even on the capture adapter.
@@ -380,12 +417,46 @@ pub(super) fn capture_loop(
                 }
                 encoding_device.as_ref().unwrap().1.clone()
             };
+        if current.is_some_and(|(old_size, old_candidate)| {
+            (old_size != size || old_candidate != (candidate_id, wanted.color))
+                && old_candidate.0.0 == candidate_id.0
+                && old_candidate.0.1 == candidate_id.1
+        }) && let Some(active) = encoder.as_mut()
+        {
+            let rate = crate::features::host::format::Rate {
+                target: bounds.initial.max(300_000),
+                peak: bounds.initial.max(300_000),
+                fps: wanted.fps,
+                quality: wanted.quality,
+                quality_target,
+            };
+            match active.reconfigure_stream(&device, size, wanted.format, rate, wanted.color) {
+                Ok(true) => {
+                    handle.encoder(
+                        active.implementation(),
+                        active.maximum_size(),
+                        &screen,
+                        desktop.as_ref().context("缺少采集源")?.backend_name(),
+                    );
+                    current = Some((size, (candidate_id, wanted.color)));
+                    frame_metadata.clear();
+                    encode_errors = 0;
+                    keyframe.store(true, Ordering::Release);
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(%error, ?size, ?candidate_id, "host encoder stream reconfiguration rejected; rebuilding candidate")
+                }
+            }
+        }
         if current.is_none_or(|(old_size, old_candidate)| {
             old_size != size || old_candidate != (candidate_id, wanted.color)
         }) {
+            let rebuilding = Instant::now();
             // Release before replacement to avoid consuming a second driver
             // session solely for a size/candidate transition (T C2D840).
             drop(encoder.take());
+            let close_ms = rebuilding.elapsed().as_secs_f64() * 1000.;
             let created = if hardware {
                 encoder::Encoder::hardware_format(
                     &device,
@@ -416,6 +487,13 @@ pub(super) fn capture_loop(
             };
             encoder = match created {
                 Ok(created) => {
+                    tracing::info!(
+                        ?size,
+                        ?candidate_id,
+                        close_ms,
+                        elapsed_ms = rebuilding.elapsed().as_secs_f64() * 1000.,
+                        "host encoder replacement completed"
+                    );
                     handle.encoder(
                         created.implementation(),
                         created.maximum_size(),
@@ -439,19 +517,6 @@ pub(super) fn capture_loop(
             keyframe.store(true, Ordering::Release);
         }
         let active_encoder = encoder.as_mut().context("缺少编码器")?;
-        let peak = transport.media_rate().min(bounds.maximum);
-        // A zero/tiny allocation is a transport pause, not an encoder failure.
-        // Do not fabricate bandwidth by clamping it back to a quality floor.
-        let codec_minimum = crate::features::host::parameters::MIN_ENCODER_RATE;
-        if peak < codec_minimum {
-            continue;
-        }
-        let (media_rate, discard_frame) =
-            admission.next(peak, codec_minimum, transport.cwnd_ratio());
-        if discard_frame {
-            metrics.admission_drops += 1;
-            continue;
-        }
         let needs_transfer = device != *source_device;
         let transfer_started = Instant::now();
         let prepared = (|| -> Result<Option<crate::features::host::transfer::Delivery>> {
@@ -468,7 +533,10 @@ pub(super) fn capture_loop(
                     &frame,
                 )?);
             }
-            transfer.as_mut().unwrap().copy(&frame)
+            transfer
+                .as_mut()
+                .unwrap()
+                .copy(&frame, || !encode_cancel.load(Ordering::Acquire))
         })();
         if needs_transfer {
             metrics.transfer.record(transfer_started.elapsed());

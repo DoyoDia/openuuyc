@@ -17,6 +17,7 @@ use windows::{
 };
 
 const INTERFACE: GUID = GUID::from_u128(0x0340a7d5_63b2_4a81_80cd_6f6454875011);
+
 const fn ioctl(function: u32) -> u32 {
     (0x22 << 16) | (3 << 14) | (function << 2)
 }

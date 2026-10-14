@@ -13,6 +13,7 @@ use windows::core::Interface;
 use winit::dpi::PhysicalSize;
 
 pub(crate) struct VideoShaderRenderer {
+    display_aspect: Option<(u32, u32)>,
     input_layout: ID3D11InputLayout,
     vertex_shader: ID3D11VertexShader,
     yuv_pixel_shader: ID3D11PixelShader,
@@ -37,6 +38,7 @@ struct VideoShaderGeometry {
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 struct VideoGeometryKey {
+    display_aspect: Option<(u32, u32)>,
     visible_x: u32,
     visible_y: u32,
     coded_width: u32,
@@ -88,6 +90,9 @@ pub(crate) struct VideoTextureView {
 }
 
 impl VideoShaderRenderer {
+    pub(crate) fn set_display_aspect(&mut self, aspect: Option<(u32, u32)>) {
+        self.display_aspect = aspect;
+    }
     pub(crate) fn set_rgba_shader(&mut self, shader: ID3D11PixelShader) {
         self.rgba_pixel_shader = shader;
     }
@@ -215,6 +220,7 @@ impl VideoShaderRenderer {
             point_sampler: point_sampler.context("D3D11 did not return the point sampler")?,
             rasterizer: rasterizer.context("D3D11 did not return the video rasterizer")?,
             color_buffer: None,
+            display_aspect: None,
             geometry: None,
             views: VecDeque::with_capacity(OFFICIAL_SHARED_TEXTURE_CACHE_SIZE),
         })
@@ -237,6 +243,7 @@ impl VideoShaderRenderer {
         }
         let (plane_0, plane_1) = self.shader_views(device, texture, &view)?;
         let geometry_key = VideoGeometryKey {
+            display_aspect: self.display_aspect,
             visible_x: view.visible_x,
             visible_y: view.visible_y,
             coded_width: view.coded_width,
@@ -532,6 +539,9 @@ fn video_vertices(key: VideoGeometryKey) -> [VideoVertex; 4] {
     } else {
         (key.width, key.height)
     };
+    let (display_width, display_height) = key
+        .display_aspect
+        .unwrap_or((display_width, display_height));
     let mut destination = fit_rect(
         display_width,
         display_height,

@@ -113,6 +113,7 @@ pub(crate) struct Outgoing {
     pub data: Vec<u8>,
 }
 struct Shared {
+    output_ready: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     enabled: AtomicBool,
     ready: AtomicBool,
     peer_enabled: AtomicBool,
@@ -211,6 +212,7 @@ impl Endpoint {
     ) -> (Self, mpsc::Receiver<Outgoing>) {
         let stop = CancellationToken::new();
         let shared = Arc::new(Shared {
+            output_ready: Mutex::new(None),
             enabled: AtomicBool::new(false),
             ready: AtomicBool::new(false),
             peer_enabled: AtomicBool::new(role == Role::Host),
@@ -241,6 +243,10 @@ impl Endpoint {
             },
             outgoing,
         )
+    }
+    pub(crate) fn on_output(&self, notify: Arc<dyn Fn() + Send + Sync>) {
+        *lock(&self.shared.output_ready) = Some(notify.clone());
+        notify();
     }
     pub fn host_policy(&self, token: u64, enabled: bool, screens: Vec<Screen>) {
         self.shared.token.store(token, Ordering::Release);
@@ -493,6 +499,9 @@ impl Actor {
             payload: Some(payload),
         })?;
         tokio::select! { _=self.shared.stop.cancelled()=>{}, sent=self.output.send(Outgoing { token: self.token, bulk, data })=>{sent.map_err(|_| anyhow::anyhow!("拖放发送通道已关闭"))?;} }
+        if let Some(notify) = lock(&self.shared.output_ready).clone() {
+            notify();
+        }
         Ok(())
     }
     fn entry(

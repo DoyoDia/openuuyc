@@ -75,6 +75,7 @@ impl State {
         height: u32,
         lease: &Lease,
     ) -> Result<bool> {
+        let previous = self.journal.mode_changes.clone();
         self.intend_mode(&target.identity, width, height)?;
         match target.set_resolution(width, height, || lease.requested()) {
             Ok(()) => Ok(true),
@@ -87,6 +88,7 @@ impl State {
                 // Preflight did not modify Windows. Do not leave a fictitious
                 // desired mode for cleanup, or persist it as successfully applied.
                 self.journal.desired = None;
+                self.journal.mode_changes = previous;
                 self.save()?;
                 tracing::warn!(width, height, %error,
                     "initial display mode rejected; retaining current mode for connection");
@@ -185,39 +187,9 @@ impl State {
                 spec.identity = None;
                 self.create(spec, lease, false)?;
             }
-            // Only restore explicit settings for targets which still exist.
-            for saved in self.preferences.physical.clone() {
-                let topology = Topology::query(true)?;
-                if let Some(target) = topology
-                    .metadata()?
-                    .into_iter()
-                    .find(|t| t.identity == saved.identity)
-                {
-                    let same_resolution = topology.snapshot()?.targets.iter().any(|t| {
-                        t.identity == saved.identity
-                            && t.width == saved.width
-                            && t.height == saved.height
-                    });
-                    let change_resolution = !same_resolution
-                        && display::topology::modes(&target.source)?
-                            .iter()
-                            .any(|m| m.width == saved.width && m.height == saved.height);
-                    let change_dpi =
-                        saved.dpi > 0 && target.dpi.as_ref().is_none_or(|d| d.current != saved.dpi);
-                    if !change_resolution && !change_dpi {
-                        continue;
-                    }
-                    self.begin()?;
-                    if change_resolution {
-                        self.initial_resolution(&target, saved.width, saved.height, lease)?;
-                    }
-                    if change_dpi {
-                        self.intend_dpi(&target.identity, saved.dpi)?;
-                        target.set_dpi(saved.dpi, || lease.requested())?;
-                    }
-                    self.applied()?;
-                }
-            }
+            // Physical modes belong to the current desktop owner. Previous
+            // connections may remember virtual resources, but must not replay
+            // a physical resolution/DPI over a game or a local user's choice.
             Ok(())
         })();
         self.restoring = false;

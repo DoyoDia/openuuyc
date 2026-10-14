@@ -129,6 +129,7 @@ impl Peer {
         deferred: Option<screens::Deferred>,
         audio_control: bool,
         annotation_extension: bool,
+        display_geometry: bool,
         diagnostics_extension: bool,
         drag_extension: bool,
         controlling_features: Option<crate::account::feature_ability::FeatureCatalog>,
@@ -679,6 +680,7 @@ impl Peer {
             input.receiver().mouse_policy(),
             audio.clone(),
             microphone.receiver().status(),
+            display_geometry,
         ));
         let (control_receiver, control_responses) = ingress::ControlIngress {
             screen: screen.clone(),

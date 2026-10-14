@@ -11,6 +11,7 @@ pub(crate) fn screen_states(
     screens: &[ScreenInfo],
     tracks: &BTreeMap<i32, usize>,
     current: i32,
+    display_geometry: bool,
 ) -> Vec<u8> {
     let entries =
         screens
@@ -34,6 +35,19 @@ pub(crate) fn screen_states(
                 sizes.sort_unstable();
                 sizes.dedup();
                 PbScreen {
+                    openuuyc_geometry: display_geometry
+                        .then(|| {
+                            // A virtual monitor can also retain a 16:9 preferred
+                            // mode while a fullscreen game uses a 4:3 source.
+                            // Report the driver's preferred mode consistently.
+                            let size = info.target.as_ref().and_then(|t| t.preferred_mode);
+                            size.map(|(width, height)| super::super::wire::PbDisplayGeometry {
+                                version: 1,
+                                width,
+                                height,
+                            })
+                        })
+                        .flatten(),
                     id: screen.id,
                     fps: screen.fps.min(i32::MAX as u32) as i32,
                     resolutions: sizes.into_iter().map(|(w, h)| rect(w, h)).collect(),

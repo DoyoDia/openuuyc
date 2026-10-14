@@ -407,6 +407,7 @@ pub(super) async fn publish_state(
     >,
     audio: super::super::audio::Audio,
     mut microphone: tokio::sync::watch::Receiver<super::super::microphone::Status>,
+    display_geometry: bool,
 ) {
     use crate::features::stream_control::publisher;
     use std::sync::atomic::Ordering;
@@ -585,7 +586,7 @@ pub(super) async fn publish_state(
                 last_mouse_policy = Some(policy);
             }
         }
-        let screen = publisher::screen_states(&catalog, &mapping, current);
+        let screen = publisher::screen_states(&catalog, &mapping, current, display_geometry);
         if last_screen.as_ref() != Some(&screen)
             && send(routes.control_screens, screen.clone()).await
         {

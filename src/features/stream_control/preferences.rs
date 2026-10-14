@@ -4,6 +4,26 @@ use crate::features::viewing_settings::{DevicePreferences, PerformancePanelMode}
 use anyhow::Result;
 
 impl StreamControlHandle {
+    pub(crate) fn set_display_aspect(&self, aspect: crate::media::geometry::DisplayAspect) {
+        let mut state = lock(&self.shared);
+        if state.device_preferences.display_aspect != aspect {
+            state.device_preferences.display_aspect = aspect;
+            self.publish_device_preferences(&mut state);
+        }
+    }
+    pub(crate) fn display_aspect(&self, track: i32) -> Option<(u32, u32)> {
+        let state = lock(&self.shared);
+        let preferred = state
+            .screens
+            .iter()
+            .find(|s| s.video_track_index == track)
+            .and_then(|s| s.display.preferred);
+        state.device_preferences.display_aspect.ratio(preferred)
+    }
+    pub(crate) fn presentation_size(&self, track: i32, size: (u32, u32)) -> (u32, u32) {
+        self.display_aspect(track).unwrap_or(size)
+    }
+
     pub(crate) fn set_codec_preference(&self, codec: Option<crate::media::CodecPreference>) {
         let mut state = lock(&self.shared);
         if state.device_preferences.codec != codec {

@@ -111,7 +111,8 @@ impl Session {
             .transpose()?
             .flatten();
         let has_saved_preferences = preferences.is_some();
-        let preferences = preferences.unwrap_or_default();
+        let mut preferences = preferences.unwrap_or_default();
+        preferences.physical.clear();
         fallback::start_background();
         Ok(Arc::new(Self {
             lease,
@@ -119,6 +120,7 @@ impl Session {
             state: Arc::new(Mutex::new(State {
                 path: root.join("recovery").join(format!("{token}.json")),
                 journal: Journal {
+                    mode_changes: Some(Vec::new()),
                     owner_pid: std::process::id(),
                     owner_birth: display::recovery::current_birth()?,
                     retired: false,
@@ -227,6 +229,25 @@ impl Session {
             .iter()
             .any(|o| o.identity.as_deref() == Some(identity))
     }
+    pub(crate) fn observe_layout(&self, current: &SavedTopology) -> Result<()> {
+        let mut state = lock(&self.state);
+        let Some(changes) = state.journal.mode_changes.as_mut() else {
+            return Ok(());
+        };
+        let before = changes.len();
+        changes.retain(|c| {
+            c.pending
+                || recovery::same_target(
+                    current.targets.iter().find(|t| t.identity == c.identity),
+                    c.after.as_ref(),
+                )
+        });
+        if changes.len() != before && state.dirty {
+            tracing::info!("external display mode change released session restoration ownership");
+            state.save()?;
+        }
+        Ok(())
+    }
     pub(crate) async fn create(&self, resolutions: Vec<(u32, u32)>) -> Result<capture::Screen> {
         ensure!(
             self.lease.display_expansion_allowed(),
@@ -287,7 +308,7 @@ impl Session {
                 && current.targets[0].identity == identity
                 && !state.journal.baseline.targets.is_empty()
             {
-                state.restore_layout(&state.journal.baseline, &state.journal.dpi)?;
+                state.restore_layout(&state.journal.baseline, &state.journal.dpi, false)?;
             }
             let guid = uuid::Uuid::parse_str(&state.journal.owned[index].guid)?;
             lock(&state.driver()?.driver).remove(guid)?;
@@ -342,7 +363,13 @@ impl Session {
     }
     pub(crate) fn allows_fallback_retirement(&self) -> bool {
         let state = lock(&self.state);
-        state.journal.owned.is_empty() && state.journal.super_baseline.is_none()
+        state.journal.owned.is_empty()
+            && state.journal.super_baseline.is_none()
+            && state.fallback_pin.as_ref().is_some_and(|driver| {
+                driver
+                    .fallback_state()
+                    .is_ok_and(|(_, users)| users <= u32::from(driver.owns_fallback_pin()))
+            })
     }
     pub(crate) async fn retire_fallback(&self, replacement: String) -> Result<bool> {
         self.run(move |state, _| {
@@ -407,6 +434,11 @@ impl Session {
         height: u32,
     ) -> Result<capture::Screen> {
         self.run(move |state, lease| {
+            if let Ok(current) = find_screen(&target.identity) {
+                if (current.width, current.height) == (width, height) {
+                    return Ok(current);
+                }
+            }
             state.begin()?;
             if state
                 .journal
@@ -416,8 +448,19 @@ impl Session {
             {
                 return state.resize_virtual(target.identity, width, height, 0, lease);
             }
+            let previous = state.journal.mode_changes.clone();
             state.intend_mode(&target.identity, width, height)?;
-            target.set_resolution(width, height, || lease.requested())?;
+            if let Err(error) = target.set_resolution(width, height, || lease.requested()) {
+                if error
+                    .downcast_ref::<display::topology::ModeTestRejected>()
+                    .is_some()
+                {
+                    state.journal.mode_changes = previous;
+                    state.journal.desired = None;
+                    state.save()?;
+                }
+                return Err(error);
+            }
             state.applied()?;
             state.remember_physical(&target.identity, None)?;
             find_screen(&target.identity)
@@ -649,7 +692,9 @@ impl State {
     }
     fn save_preferences(&self) -> Result<()> {
         if let Some(path) = &self.preference_path {
-            store::write(path, &self.preferences)?;
+            let mut saved = self.preferences.clone();
+            saved.physical.clear();
+            store::write(path, &saved)?;
         }
         Ok(())
     }
@@ -697,7 +742,7 @@ impl State {
             dpi: screen.dpi_scale.unwrap_or(0),
             resolution_type,
         });
-        self.save_preferences()
+        Ok(())
     }
     fn applied(&mut self) -> Result<()> {
         // Only poll idempotent observations. A successful IOCTL/display request
@@ -729,8 +774,47 @@ impl State {
                 }
             }
         }
-        self.journal.applied = Some(snapshot);
-        self.journal.applied_dpi = dpi;
+        if let Some(changes) = self.journal.mode_changes.as_mut() {
+            for change in changes.iter_mut().filter(|c| c.pending) {
+                let observed = snapshot
+                    .targets
+                    .iter()
+                    .find(|t| t.identity == change.identity);
+                if let (Some(expected), Some(observed)) = (&change.after, observed) {
+                    if (
+                        expected.width,
+                        expected.height,
+                        expected.left,
+                        expected.top,
+                        expected.rotation,
+                    ) == (
+                        observed.width,
+                        observed.height,
+                        observed.left,
+                        observed.top,
+                        observed.rotation,
+                    ) {
+                        change.after = Some(observed.clone());
+                    }
+                }
+                change.pending = false;
+            }
+            changes.retain(|c| !recovery::same_target(c.before.as_ref(), c.after.as_ref()));
+        }
+        // Observation is not ownership: unrelated game/local changes must not
+        // become our expected modes merely because another operation completed.
+        if self.journal.desired.is_some() {
+            self.journal.applied = Some(snapshot);
+        }
+        for (id, expected) in &self.journal.desired_dpi {
+            if let Some(value) = dpi
+                .iter()
+                .find(|(key, value)| key == id && value == expected)
+            {
+                self.journal.applied_dpi.retain(|(key, _)| key != id);
+                self.journal.applied_dpi.push(value.clone());
+            }
+        }
         self.journal.desired = None;
         self.journal.desired_dpi.clear();
         self.save()
@@ -1038,7 +1122,21 @@ impl State {
     fn quit_super(&mut self, explicit: bool) -> Result<()> {
         if let Some(layout) = self.journal.super_baseline.clone() {
             if !layout.targets.is_empty() {
-                self.restore_layout(&layout, &self.journal.super_dpi)?;
+                let restored = self.restore_layout(&layout, &self.journal.super_dpi, true)?;
+                if let Some(changes) = self.journal.mode_changes.as_mut() {
+                    for change in changes
+                        .iter_mut()
+                        .filter(|c| restored.contains(&c.identity))
+                    {
+                        change.after = layout
+                            .targets
+                            .iter()
+                            .find(|t| t.identity == change.identity)
+                            .cloned();
+                        change.pending = false;
+                    }
+                    changes.retain(|c| !recovery::same_target(c.before.as_ref(), c.after.as_ref()));
+                }
             }
             let guids: Vec<_> = self
                 .journal
@@ -1066,7 +1164,7 @@ impl State {
             self.driver.take();
             return Ok(());
         }
-        self.restore_layout(&self.journal.baseline, &self.journal.dpi)?;
+        self.restore_layout(&self.journal.baseline, &self.journal.dpi, false)?;
         if !self.journal.owned.is_empty() && self.fallback_pin.is_some() {
             let leaving: Vec<_> = self
                 .journal
@@ -1088,6 +1186,9 @@ impl State {
         self.journal.super_baseline = None;
         self.driver.take();
         self.dirty = false;
+        self.journal.mode_changes = Some(Vec::new());
+        self.journal.desired = None;
+        self.journal.desired_dpi.clear();
         match std::fs::remove_file(&self.path) {
             Ok(()) => (),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),

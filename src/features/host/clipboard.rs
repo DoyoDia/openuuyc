@@ -2,6 +2,7 @@
 pub(crate) mod agent;
 mod frame;
 mod send;
+mod wake;
 
 use crate::features::clipboard::Clipboard;
 use crate::protocol::peer_platform::PeerPlatform;

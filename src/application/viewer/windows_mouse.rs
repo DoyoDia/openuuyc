@@ -142,6 +142,7 @@ impl Target {
         {
             return None;
         }
+        let (width, height) = self.control.presentation_size(self.track, (width, height));
         let rect = fit_rect(
             width,
             height,
@@ -220,6 +221,9 @@ impl RawRouter {
         } else {
             (width, height)
         };
+        let (width, height) = target
+            .control
+            .presentation_size(target.track, (width, height));
         let rect = fit_rect(
             width,
             height,
@@ -699,6 +703,7 @@ impl WindowMouse {
                 };
                 let size = window.inner_size();
                 let top = title_bar_height_pixels(window);
+                let (width, height) = control.presentation_size(track, (width, height));
                 let rect = fit_rect(
                     width,
                     height,
@@ -752,6 +757,7 @@ impl WindowMouse {
             } else {
                 (width, height)
             };
+            let (width, height) = control.presentation_size(track, (width, height));
             let rect = fit_rect(
                 width,
                 height,
@@ -819,6 +825,7 @@ impl WindowMouse {
                         } else {
                             (width, height)
                         };
+                        let (width, height) = control.presentation_size(track, (width, height));
                         let rect = fit_rect(
                             width,
                             height,

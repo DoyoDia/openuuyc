@@ -6,12 +6,14 @@ use windows::Win32::Graphics::{
 };
 
 pub(crate) struct Conversion {
+    timing: Option<super::gpu_diagnostics::Timing>,
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     engine: Engine,
     pub output: ID3D11Texture2D,
     pub color: Color,
     size: (u32, u32),
+    inputs: Vec<(ID3D11Texture2D, ID3D11ShaderResourceView)>,
 }
 enum Engine {
     Compute {
@@ -253,6 +255,8 @@ impl Conversion {
                 }
             };
             Ok(Self {
+                inputs: Vec::with_capacity(4),
+                timing: super::gpu_diagnostics::Timing::new(device, "encode conversion"),
                 device: device.clone(),
                 context: device.GetImmediateContext()?,
                 engine,
@@ -299,6 +303,8 @@ impl Conversion {
             let mut shader = None;
             device.CreateComputeShader(bytes, None, Some(&mut shader))?;
             Ok(Self {
+                inputs: Vec::with_capacity(4),
+                timing: super::gpu_diagnostics::Timing::new(device, "encode conversion"),
                 device: device.clone(),
                 context: device.GetImmediateContext()?,
                 engine: Engine::Compute {
@@ -311,7 +317,8 @@ impl Conversion {
             })
         }
     }
-    pub fn convert(&self, source: &ID3D11Texture2D) -> Result<()> {
+    pub fn convert(&mut self, source: &ID3D11Texture2D) -> Result<()> {
+        let _span = self.timing.as_mut().and_then(|timer| timer.begin());
         unsafe {
             let mut desc = D3D11_TEXTURE2D_DESC::default();
             source.GetDesc(&mut desc);
@@ -319,9 +326,23 @@ impl Conversion {
                 (desc.Width, desc.Height) == self.size,
                 "编码输入尺寸与协商不一致"
             );
-            let mut view = None;
-            self.device
-                .CreateShaderResourceView(source, None, Some(&mut view))?;
+            let view = if let Some((_, view)) =
+                self.inputs.iter().find(|(texture, _)| texture == source)
+            {
+                Some(view.clone())
+            } else {
+                let mut view = None;
+                self.device
+                    .CreateShaderResourceView(source, None, Some(&mut view))?;
+                let view = view.context("编码输入视图")?;
+                // Holding the resource prevents pointer reuse from aliasing an
+                // old cache entry. Four entries cover both transfer rings.
+                if self.inputs.len() == 4 {
+                    self.inputs.remove(0);
+                }
+                self.inputs.push((source.clone(), view.clone()));
+                Some(view)
+            };
             match &self.engine {
                 Engine::Compute { shader, views } => {
                     self.context.CSSetShader(shader, None);

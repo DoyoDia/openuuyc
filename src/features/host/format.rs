@@ -33,6 +33,7 @@ pub(crate) struct Negotiated {
     encoder_true_color: bool,
     sdr_10bit: bool,
     pub preferred_gpu: Option<u64>,
+    pub gpu_compatibility: bool,
     source_gpu: AtomicU64,
     requested_gpu: Option<crate::media::selection::GpuId>,
 }
@@ -48,6 +49,7 @@ impl Negotiated {
             encoder_true_color: false,
             sdr_10bit: false,
             preferred_gpu: None,
+            gpu_compatibility: false,
             source_gpu: AtomicU64::new(0),
             requested_gpu: None,
         }
@@ -60,6 +62,7 @@ impl Negotiated {
             encoder_true_color: self.encoder_true_color,
             sdr_10bit: self.sdr_10bit,
             preferred_gpu: self.preferred_gpu,
+            gpu_compatibility: self.gpu_compatibility,
             source_gpu: AtomicU64::new(self.source_gpu.load(Ordering::Relaxed)),
             requested_gpu: self.requested_gpu,
         }
@@ -168,6 +171,7 @@ impl Negotiated {
             encoder_true_color: local.iter().any(|c| c.format.chroma == 3),
             sdr_10bit: remote.openuuyc_sdr_10bit,
             preferred_gpu: crate::media::selection::resolve_gpu(requested_gpu),
+            gpu_compatibility: settings.gpu_compatibility,
             source_gpu: AtomicU64::new(source_gpu),
             requested_gpu,
         })

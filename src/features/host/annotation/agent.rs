@@ -1,34 +1,13 @@
-//! Ordinary-user overlay execution; privileged residents only forward bounded commands.
+//! Session-owned drawing on the interactive default desktop.
 use super::{Action, Context, model::Model};
-use crate::platform::windows::{
-    annotation::Overlay,
-    host_service::{pipe::Pipe, process, vault},
-};
-use anyhow::{Result, ensure};
-use serde::{Deserialize, Serialize};
+use crate::platform::windows::{annotation::Overlay, host_service::process};
+use anyhow::Result;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
-const PREFIX: &str = r"\\.\pipe\OpenUUYC.Annotation.";
-#[derive(Serialize, Deserialize)]
-struct Request {
-    context: Context,
-    command: Option<Action>,
-}
-
+#[derive(Default)]
 pub(super) struct Backend {
     local: Option<Local>,
-    remote: Option<Remote>,
-    system: Option<bool>,
-}
-impl Default for Backend {
-    fn default() -> Self {
-        Self {
-            local: None,
-            remote: None,
-            system: None,
-        }
-    }
 }
 impl Backend {
     pub fn interval(&self) -> Duration {
@@ -46,56 +25,34 @@ impl Backend {
     ) -> Result<i32> {
         if !context.allowed || cancel.is_cancelled() {
             self.local = None;
-            self.remote = None;
             return Ok(4);
         }
-        let active = process::active_session();
-        if self
-            .remote
-            .as_ref()
-            .is_some_and(|r| r.session != active || !r.agent.alive())
-        {
-            self.remote = None;
+        // The installed resident already owns this interactive session. Drawing
+        // here retains its UIAccess token without elevating the user backend
+        // that performs file and clipboard work. Never draw in Session 0.
+        let session = process::session(std::process::id())?;
+        if session == 0 || session != process::active_session() {
+            self.local = None;
+            return Ok(2);
         }
         let opening = command.as_ref().and_then(Action::toggle) == Some(true);
         let closing = command.as_ref().and_then(Action::toggle) == Some(false);
-        if self.local.is_none() && self.remote.is_none() && !opening {
+        if self.local.is_none() && !opening {
             return Ok(if closing || command.is_none() { 0 } else { 4 });
         }
-        let system = match self.system {
-            Some(v) => v,
-            None => {
-                let v = vault::sid(std::process::id())? == "S-1-5-18";
-                self.system = Some(v);
-                v
+        if self.local.is_none() {
+            if !logged_on(session) {
+                return Ok(2);
             }
-        };
-        let code = if system {
-            if self.remote.is_none() {
-                if !logged_on(active) {
-                    return Ok(2);
-                }
-                self.remote = Some(Remote::new(active, cancel)?);
-            }
-            let r = self.remote.as_ref().unwrap();
-            let permitted = || {
-                !cancel.is_cancelled() && r.agent.alive() && process::active_session() == r.session
-            };
-            r.pipe.send(&Request { context, command }, permitted)?;
-            r.pipe
-                .receive_timeout::<i32>(Duration::from_secs(2), permitted)?
-        } else {
-            if self.local.is_none() {
-                self.local = Some(Local::new()?);
-            }
-            self.local
-                .as_mut()
-                .unwrap()
-                .exchange(context, command.as_ref())?
-        };
+            self.local = Some(Local::new()?);
+        }
+        let code = self
+            .local
+            .as_mut()
+            .unwrap()
+            .exchange(context, command.as_ref())?;
         if closing {
             self.local = None;
-            self.remote = None;
         }
         Ok(code)
     }
@@ -158,7 +115,10 @@ impl Local {
         let visible = self.model.enabled && self.context.allowed && desktop == 0;
         if !visible {
             self.overlay.hide();
-        } else if !self.shown || self.revision != self.model.revision {
+        } else if !self.shown
+            || self.revision != self.model.revision
+            || self.overlay.needs_refresh()
+        {
             if !self.shown {
                 self.model
                     .dirty
@@ -172,6 +132,9 @@ impl Local {
                 Model::screen(&self.context, None),
             )?;
             self.model.dirty.clear();
+        }
+        if visible {
+            self.overlay.maintain_visibility()?;
         }
         self.shown = visible;
         self.revision = self.model.revision;
@@ -196,75 +159,4 @@ fn logged_on(session: u32) -> bool {
         }
         available
     }
-}
-struct Remote {
-    pipe: Pipe,
-    agent: crate::platform::windows::host_service::user_backend::Lease,
-    session: u32,
-}
-impl Remote {
-    fn new(session: u32, cancel: &CancellationToken) -> Result<Self> {
-        let name = format!("{PREFIX}{}", uuid::Uuid::new_v4().simple());
-        let pipe = Pipe::server(&name, true)?;
-        let agent = crate::platform::windows::host_service::user_backend::Lease::connect(
-            crate::platform::windows::host_service::user_backend::Role::Annotation,
-            &name,
-            session,
-            || !cancel.is_cancelled(),
-        )?;
-        let until = Instant::now() + Duration::from_secs(2);
-        pipe.accept(|| !cancel.is_cancelled() && agent.alive() && Instant::now() < until)?;
-        ensure!(
-            pipe.peer_pid(true)? == agent.pid && pipe.peer_session(true)? == session,
-            "批注用户进程身份不匹配"
-        );
-        Ok(Self {
-            pipe,
-            agent,
-            session,
-        })
-    }
-}
-
-pub(crate) fn run(name: &str, parent: u32) -> Result<()> {
-    ensure!(name.starts_with(PREFIX) && name.len() < 150, "批注管道无效");
-    ensure!(
-        vault::sid(std::process::id())? != "S-1-5-18",
-        "批注不能使用系统权限"
-    );
-    let pipe = Pipe::client(name)?.ok_or_else(|| anyhow::anyhow!("批注会话已结束"))?;
-    let session = process::session(std::process::id())?;
-    ensure!(
-        pipe.peer_pid(false)? == parent && pipe.peer_session(false)? == session,
-        "批注父进程身份不匹配"
-    );
-    let permitted = || {
-        crate::platform::windows::host_service::user_backend::permitted()
-            && process::active_session() == session
-            && pipe.queued_bytes().is_ok()
-    };
-    let mut local = Local::new()?;
-    let mut last_request = Instant::now();
-    let mut last_idle = Instant::now();
-    while permitted() {
-        local.overlay.pump();
-        if !pipe.available()? {
-            ensure!(
-                last_request.elapsed() < Duration::from_secs(3),
-                "批注会话心跳已停止"
-            );
-            // Keep HWNDs responsive and hide promptly on secure desktop changes.
-            if last_idle.elapsed() >= Duration::from_millis(16) {
-                local.exchange(local.context.clone(), None)?;
-                last_idle = Instant::now();
-            }
-            continue;
-        }
-        let request: Request = pipe.receive_timeout(Duration::from_secs(2), permitted)?;
-        ensure!(request.context.screens.len() <= 32, "批注显示器数量超限");
-        let code = local.exchange(request.context, request.command.as_ref())?;
-        pipe.send(&code, permitted)?;
-        last_request = Instant::now();
-    }
-    Ok(())
 }

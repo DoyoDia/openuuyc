@@ -22,12 +22,14 @@ pub enum Codec {
 pub enum Failure {
     Unsupported,
     HardwareFailure,
+    OutputBusy,
 }
 impl std::fmt::Display for Failure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::Unsupported => "unsupported DXVA stream configuration",
             Self::HardwareFailure => "DXVA device or surface operation failed",
+            Self::OutputBusy => "DXVA display surface temporarily busy",
         })
     }
 }
@@ -180,8 +182,14 @@ impl Drop for ThreadGuard<'_> {
 struct SyncGuard(Option<IDXGIKeyedMutex>);
 impl SyncGuard {
     fn acquire(sync: &Option<IDXGIKeyedMutex>) -> Result<Self> {
+        Self::acquire_for(sync, 100)
+    }
+    fn acquire_for(sync: &Option<IDXGIKeyedMutex>, timeout: u32) -> Result<Self> {
         if let Some(s) = sync {
-            let hr = unsafe { (s.vtable().AcquireSync)(s.as_raw(), 0, 100) };
+            let hr = unsafe { (s.vtable().AcquireSync)(s.as_raw(), 0, timeout) };
+            if timeout == 0 && hr.0 == windows::Win32::Foundation::WAIT_TIMEOUT.0 as i32 {
+                return Err(Failure::OutputBusy.into());
+            }
             ensure!(hr == HRESULT(0), "keyed mutex unavailable: {hr:?}");
         }
         Ok(Self(sync.clone()))
@@ -418,6 +426,9 @@ impl Pool {
                 });
             }
         }
+        if output {
+            return Err(Failure::OutputBusy.into());
+        }
         bail!("DXVA texture pool exhausted")
     }
     fn lock(&self) -> ThreadGuard<'_> {
@@ -431,7 +442,7 @@ impl Pool {
             return Ok(source);
         }
         let target = self.lease(true)?;
-        let sync = SyncGuard::acquire(&target.item().sync)?;
+        let sync = SyncGuard::acquire_for(&target.item().sync, 0)?;
         {
             let _lock = self.lock();
             unsafe {

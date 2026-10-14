@@ -2,6 +2,57 @@
 use super::*;
 use crate::platform::display::recovery as native;
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub(super) struct ModeChange {
+    pub identity: String,
+    pub before: Option<SavedTarget>,
+    pub after: Option<SavedTarget>,
+    pub pending: bool,
+}
+
+pub(super) fn same_target(a: Option<&SavedTarget>, b: Option<&SavedTarget>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => same_mode(a, b),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn record_changes(changes: &mut Vec<ModeChange>, current: &SavedTopology, desired: &SavedTopology) {
+    // An external writer ends the old lease, even if a later remote request
+    // happens to choose the same mode again.
+    changes.retain(|c| {
+        same_target(
+            current.targets.iter().find(|t| t.identity == c.identity),
+            c.after.as_ref(),
+        )
+    });
+    let ids: std::collections::BTreeSet<_> = current
+        .targets
+        .iter()
+        .chain(&desired.targets)
+        .map(|t| t.identity.clone())
+        .collect();
+    for identity in ids {
+        let before = current.targets.iter().find(|t| t.identity == identity);
+        let after = desired.targets.iter().find(|t| t.identity == identity);
+        if same_target(before, after) {
+            continue;
+        }
+        if let Some(change) = changes.iter_mut().find(|c| c.identity == identity) {
+            change.after = after.cloned();
+            change.pending = true;
+        } else {
+            changes.push(ModeChange {
+                identity,
+                before: before.cloned(),
+                after: after.cloned(),
+                pending: true,
+            });
+        }
+    }
+}
+
 fn same_mode(a: &SavedTarget, b: &SavedTarget) -> bool {
     (
         a.width,
@@ -24,49 +75,90 @@ fn same_mode(a: &SavedTarget, b: &SavedTarget) -> bool {
     )
 }
 
-impl State {
-    pub(super) fn restore_layout(
-        &self,
-        baseline: &SavedTopology,
-        dpi: &[(String, u32)],
-    ) -> Result<()> {
-        let current = Topology::query(true)?.snapshot()?;
-        let expected = self
-            .journal
-            .desired
-            .as_ref()
-            .or(self.journal.applied.as_ref());
-        let mut restore = SavedTopology::default();
-        for original in &baseline.targets {
-            let now = current
-                .targets
-                .iter()
-                .find(|t| t.identity == original.identity);
-            let after =
-                expected.and_then(|s| s.targets.iter().find(|t| t.identity == original.identity));
-            match (now, after) {
-                (Some(now), Some(after)) if !same_mode(now, after) => {
-                    let mut keep = now.clone();
-                    keep.source_group = format!("current/{}", keep.source_group);
-                    restore.targets.push(keep);
+fn plan_restore(
+    journal: &Journal,
+    baseline: &SavedTopology,
+    current: &SavedTopology,
+    temporary: bool,
+) -> (SavedTopology, Vec<String>) {
+    let expected = journal.desired.as_ref().or(journal.applied.as_ref());
+    let mut restore = SavedTopology::default();
+    let mut restored = Vec::new();
+    let changes = journal.mode_changes.as_deref();
+    for original in &baseline.targets {
+        let now = current
+            .targets
+            .iter()
+            .find(|t| t.identity == original.identity);
+        let after =
+            expected.and_then(|s| s.targets.iter().find(|t| t.identity == original.identity));
+        if let Some(changes) = changes {
+            let change = changes.iter().find(|c| c.identity == original.identity);
+            // A connection-start snapshot alone never grants restoration rights.
+            if let Some(change) = change.filter(|c| same_target(now, c.after.as_ref())) {
+                restored.push(change.identity.clone());
+                let original = if temporary {
+                    Some(original)
+                } else {
+                    change.before.as_ref()
+                };
+                if let Some(original) = original {
+                    restore.targets.push(original.clone());
                 }
-                (None, Some(_)) => (), // The user unplugged/disabled it after our change.
-                _ => restore.targets.push(original.clone()),
+            } else if let Some(now) = now {
+                let mut keep = now.clone();
+                keep.source_group = format!("current/{}", keep.source_group);
+                restore.targets.push(keep);
             }
+            continue;
         }
-        for now in &current.targets {
-            if !baseline.targets.iter().any(|t| t.identity == now.identity)
-                && !self
-                    .journal
-                    .owned
-                    .iter()
-                    .any(|o| o.identity.as_deref() == Some(now.identity.as_str()))
-            {
+        // Older recovery records have no exact target ledger. A mode that
+        // never differed from its baseline is not an owned modification.
+        match (now, after) {
+            (Some(now), Some(after)) if same_mode(original, after) => {
+                let mut keep = now.clone();
+                keep.source_group = format!("current/{}", keep.source_group);
+                restore.targets.push(keep);
+            }
+            (Some(now), Some(after)) if !same_mode(now, after) => {
+                let mut keep = now.clone();
+                keep.source_group = format!("current/{}", keep.source_group);
+                restore.targets.push(keep);
+            }
+            (None, Some(_)) => (), // The user unplugged/disabled it after our change.
+            (None, None) => restore.targets.push(original.clone()),
+            (Some(_), Some(_)) => restore.targets.push(original.clone()),
+            (Some(now), None) => {
                 let mut keep = now.clone();
                 keep.source_group = format!("current/{}", keep.source_group);
                 restore.targets.push(keep);
             }
         }
+    }
+    for now in &current.targets {
+        if !baseline.targets.iter().any(|t| t.identity == now.identity)
+            && !journal
+                .owned
+                .iter()
+                .any(|o| o.identity.as_deref() == Some(now.identity.as_str()))
+        {
+            let mut keep = now.clone();
+            keep.source_group = format!("current/{}", keep.source_group);
+            restore.targets.push(keep);
+        }
+    }
+    (restore, restored)
+}
+
+impl State {
+    pub(super) fn restore_layout(
+        &self,
+        baseline: &SavedTopology,
+        dpi: &[(String, u32)],
+        temporary: bool,
+    ) -> Result<Vec<String>> {
+        let current = Topology::query(true)?.snapshot()?;
+        let (restore, restored) = plan_restore(&self.journal, baseline, &current, temporary);
         let unchanged = restore.targets.len() == current.targets.len()
             && restore.targets.iter().all(|a| {
                 current
@@ -96,20 +188,52 @@ impl State {
                 if target
                     .dpi
                     .as_ref()
-                    .is_some_and(|d| Some(d.current) == expected || d.current == *original)
+                    .is_some_and(|d| Some(d.current) == expected && d.current != *original)
                 {
                     target.set_dpi(*original, || true)?;
                 }
             }
         }
-        Ok(())
+        Ok(restored)
     }
     pub(super) fn intend_layout(&mut self, layout: &SavedTopology) -> Result<()> {
+        let current = Topology::query(true)?.snapshot()?;
+        self.save_layout_intent(&current, layout)
+    }
+    fn save_layout_intent(
+        &mut self,
+        current: &SavedTopology,
+        layout: &SavedTopology,
+    ) -> Result<()> {
+        if let Some(changes) = self.journal.mode_changes.as_mut() {
+            record_changes(changes, current, layout);
+            // Targets first seen after connection start still need their actual
+            // pre-mutation baseline for explicit layout recovery.
+            for change in changes.iter() {
+                if let Some(before) = &change.before {
+                    if !self
+                        .journal
+                        .baseline
+                        .targets
+                        .iter()
+                        .any(|t| t.identity == change.identity)
+                        && !self
+                            .journal
+                            .owned
+                            .iter()
+                            .any(|o| o.identity.as_deref() == Some(change.identity.as_str()))
+                    {
+                        self.journal.baseline.targets.push(before.clone());
+                    }
+                }
+            }
+        }
         self.journal.desired = Some(layout.clone());
         self.save()
     }
     pub(super) fn intend_mode(&mut self, identity: &str, width: u32, height: u32) -> Result<()> {
-        let mut layout = Topology::query(true)?.snapshot()?;
+        let current = Topology::query(true)?.snapshot()?;
+        let mut layout = current.clone();
         let target = layout
             .targets
             .iter_mut()
@@ -117,9 +241,22 @@ impl State {
             .context("显示目标已断开")?;
         target.width = width;
         target.height = height;
-        self.intend_layout(&layout)
+        // Compare one snapshot with its one-target edit. A second inventory
+        // read must not turn another screen's concurrent game change into ours.
+        self.save_layout_intent(&current, &layout)
     }
     pub(super) fn intend_dpi(&mut self, identity: &str, dpi: u32) -> Result<()> {
+        if let Some((_, current)) = current_dpi()?.into_iter().find(|(id, _)| id == identity) {
+            if !self
+                .journal
+                .applied_dpi
+                .iter()
+                .any(|(id, value)| id == identity && *value == current)
+            {
+                self.journal.dpi.retain(|(id, _)| id != identity);
+                self.journal.dpi.push((identity.into(), current));
+            }
+        }
         self.journal.desired_dpi.retain(|(id, _)| id != identity);
         self.journal.desired_dpi.push((identity.into(), dpi));
         self.save()

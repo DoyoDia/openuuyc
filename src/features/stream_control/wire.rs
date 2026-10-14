@@ -471,6 +471,10 @@ pub(super) struct PbScreenSources {
 
 #[derive(Clone, PartialEq, prost::Message)]
 pub(super) struct PbScreen {
+    /// OpenUUYC display_geometry v1, sent only after explicit capability negotiation.
+    /// Never repurpose init_resolution: it is a connection snapshot, not the panel mode.
+    #[prost(message, optional, tag = "100")]
+    pub(super) openuuyc_geometry: Option<PbDisplayGeometry>,
     #[prost(int32, tag = "1")]
     pub(super) id: i32,
     #[prost(int32, tag = "2")]
@@ -497,6 +501,16 @@ pub(super) struct PbScreen {
     pub(super) video_track_index: i32,
     #[prost(int32, tag = "13")]
     pub(super) builtin_screen_type: i32,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub(super) struct PbDisplayGeometry {
+    #[prost(uint32, tag = "1")]
+    pub version: u32,
+    #[prost(uint32, tag = "2")]
+    pub width: u32,
+    #[prost(uint32, tag = "3")]
+    pub height: u32,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]

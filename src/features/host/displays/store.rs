@@ -41,6 +41,9 @@ pub(super) struct Physical {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct Journal {
+    /// None denotes a journal written before per-target mutation ownership.
+    #[serde(default)]
+    pub mode_changes: Option<Vec<super::recovery::ModeChange>>,
     pub owner_pid: u32,
     pub owner_birth: u64,
     pub retired: bool,

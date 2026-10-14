@@ -94,11 +94,9 @@ impl Encoder {
         unsafe {
             self.context.CopyResource(&self.staging, texture);
         }
-        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-        unsafe {
-            self.context
-                .Map(&self.staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
-        }
+        let mapped = super::gpu_readback::map(&self.context, &self.staging, || {
+            !cancel.load(std::sync::atomic::Ordering::Acquire)
+        })?;
         let prepared = (|| {
             let (row, rows) = openuuyc_codec::PixelFormat::Bgra
                 .layout(self.size.0 as usize, self.size.1 as usize)

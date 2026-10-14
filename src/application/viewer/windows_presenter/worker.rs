@@ -18,6 +18,7 @@ use windows::Win32::System::Threading::{
 use winit::dpi::PhysicalSize;
 
 pub(in crate::application::viewer) enum RenderCommand {
+    DisplayAspect(Option<(u32, u32)>),
     Resize(PhysicalSize<u32>),
     Occluded(bool),
     Stop,
@@ -44,6 +45,7 @@ impl RenderWorker {
         let started = Instant::now();
         let screen_id = session.screen_id();
         let stream_control = session.stream_control.clone();
+        let initial_display_aspect = stream_control.display_aspect(session.track_index);
         let plugins = crate::plugins::Controller::new(context.clone());
         let plugin_state = plugins.shared.clone();
         let frame_queue = Arc::clone(&session.frame_queue);
@@ -68,9 +70,14 @@ impl RenderWorker {
                 let mut current_frame = None::<DecodedVideoFrame>;
                 let mut redraw = false;
                 let mut occluded = false;
+                let mut display_aspect = initial_display_aspect;
                 'render: loop {
                     while let Ok(command) = command_receiver.try_recv() {
                         match command {
+                            RenderCommand::DisplayAspect(value) => {
+                                display_aspect = value;
+                                redraw = true;
+                            }
                             RenderCommand::Resize(new_size) => {
                                 size = new_size;
                                 redraw = true;
@@ -111,6 +118,21 @@ impl RenderWorker {
                         p.effect_revision != plugin_state.revision.load(Ordering::Acquire)
                     });
                     redraw |= chain_changed;
+                    if let Some(p) = presenter.as_mut() {
+                        match p.resize(size).and_then(|()| p.ready()) {
+                            Ok(true) => {},
+                            Ok(false) => {
+                                // Leave the newest-frame mailbox replaceable while
+                                // waiting, and service Stop/resize on every turn.
+                                continue;
+                            }
+                            Err(error) => {
+                                tracing::warn!(%error, "video presentation readiness failed");
+                                presenter.take();
+                                current_frame = None;
+                            }
+                        }
+                    }
                     let replacement = take_next_frame(&mut mutex_lock(&frame_queue), &performance);
                     let is_new_submission = replacement.is_some();
                     if (redraw || is_new_submission)
@@ -126,20 +148,41 @@ impl RenderWorker {
                         if changed {
                             presenter.take();
                         }
-                        let result = (|| {
-                            if presenter.is_none() {
-                                presenter = Some(
-                                    D3D11Presenter::for_frame(hwnd, size, frame, &cpu_device)
-                                        .map_err(VideoRenderError::prepare)?,
-                                );
-                                tracing::info!("initialized native video presentation pipeline");
+                        if presenter.is_none() {
+                            match D3D11Presenter::for_frame(hwnd, size, frame, &cpu_device) {
+                                Ok(p) => {
+                                    presenter = Some(p);
+                                    if let Some(frame) = replacement {
+                                        let mut queue = mutex_lock(&frame_queue);
+                                        if queue.is_none() {
+                                            *queue = Some(frame);
+                                            performance.set_presentation_queue_frames(1);
+                                        } else {
+                                            performance.record_dropped_present_frame();
+                                        }
+                                    }
+                                    redraw = true;
+                                    // First creation also crosses the readiness gate
+                                    // before choosing the latest available picture.
+                                    continue;
+                                }
+                                Err(error) => {
+                                    tracing::warn!(%error, "initialize native video presentation pipeline");
+                                    if is_new_submission { performance.record_dropped_present_frame(); }
+                                    current_frame = None;
+                                    std::thread::park_timeout(Duration::from_millis(10));
+                                    continue;
+                                }
                             }
+                        }
+                        let result = (|| {
                             let p = presenter.as_mut().expect("presenter initialized");
                             p.plugin_state = Some(plugin_state.clone());
                             if p.effect_revision != plugin_state.revision.load(Ordering::Acquire) {
                                 let fps = performance.snapshot().receive_fps;
                                 p.nominal_fps = if fps >= 15.0 { fps } else { 60.0 };
                             }
+                            p.video_renderer.set_display_aspect(display_aspect);
                             p.analysis_at = frame.received_at;
                             p.analysis_new = is_new_submission || chain_changed;
                             p.resize(size).map_err(VideoRenderError::prepare)?;
