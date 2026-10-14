@@ -107,9 +107,8 @@ pub(crate) struct Catcher;
 impl Catcher {
     pub fn start(
         _device: &str,
-        _fraction: (f64, f64),
         _allowed: Arc<dyn Fn() -> bool + Send + Sync>,
-        _notify: Arc<dyn Fn<portal::Event> + Send + Sync>,
+        _notify: Arc<dyn Fn(portal::Event) + Send + Sync>,
     ) -> Result<Self> {
         anyhow::bail!("Windows 不在指针底下接取拖放")
     }
