@@ -97,6 +97,16 @@ impl Display {
     ///
     /// `path` is the path to a DRM device that supports VAAPI, e.g. `/dev/dri/renderD128`.
     pub fn open_drm_display<P: AsRef<Path>>(path: P) -> Result<Rc<Self>, OpenDrmDisplayError> {
+        Self::open_drm_display_with_driver(path, None)
+    }
+
+    /// Like [`Display::open_drm_display`], but loads the named driver
+    /// (`vaSetDriverName`) instead of the one libva derives from the kernel
+    /// driver, for libva versions that do not know the device's mapping.
+    pub fn open_drm_display_with_driver<P: AsRef<Path>>(
+        path: P,
+        driver: Option<&std::ffi::CStr>,
+    ) -> Result<Rc<Self>, OpenDrmDisplayError> {
         let file = std::fs::File::options()
             .read(true)
             .write(true)
@@ -108,6 +118,16 @@ impl Display {
         let display = unsafe { bindings::vaGetDisplayDRM(file.as_raw_fd()) };
         if display.is_null() {
             return Err(OpenDrmDisplayError::VaGetDisplayDrm);
+        }
+
+        if let Some(driver) = driver {
+            // Safe because the display is valid and libva copies the name.
+            va_check(unsafe { bindings::vaSetDriverName(display, driver.as_ptr().cast_mut()) })
+                .map_err(|error| {
+                    // Safe because the display was never initialized or handed out.
+                    unsafe { bindings::vaTerminate(display) };
+                    OpenDrmDisplayError::VaInitialize(error)
+                })?;
         }
 
         let mut major = 0i32;

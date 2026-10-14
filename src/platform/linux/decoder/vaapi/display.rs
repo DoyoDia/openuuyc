@@ -41,7 +41,7 @@ fn open_display() -> Result<Rc<Display>, DecodeError> {
     }
     for index in 128..136u32 {
         let path = format!("/dev/dri/renderD{index}");
-        let Ok(display) = Display::open_drm_display(&path) else {
+        let Some(display) = open_render_node(&path) else {
             continue;
         };
         if decode_profiles(&display).is_empty() {
@@ -52,6 +52,28 @@ fn open_display() -> Result<Rc<Display>, DecodeError> {
         return Ok(display);
     }
     Err(DecodeError::Unsupported)
+}
+
+/// Opens one render node. libva before 2.15 cannot map the `nvidia-drm`
+/// kernel driver to its VA driver, so on an NVIDIA node a failed open is
+/// retried with nvidia-vaapi-driver named explicitly, as `LIBVA_DRIVER_NAME`
+/// would.
+fn open_render_node(path: &str) -> Option<Rc<Display>> {
+    match Display::open_drm_display(path) {
+        Ok(display) => Some(display),
+        Err(cros_libva::OpenDrmDisplayError::VaInitialize(_)) if nvidia_node(path) => {
+            let display = Display::open_drm_display_with_driver(path, Some(c"nvidia")).ok()?;
+            tracing::debug!(path, "VA-API driver named for the NVIDIA render node");
+            Some(display)
+        }
+        Err(_) => None,
+    }
+}
+
+fn nvidia_node(path: &str) -> bool {
+    let node = path.rsplit('/').next().unwrap_or_default();
+    std::fs::read_to_string(format!("/sys/class/drm/{node}/device/vendor"))
+        .is_ok_and(|vendor| vendor.trim() == "0x10de")
 }
 
 fn log_vendor(display: &Rc<Display>) {
