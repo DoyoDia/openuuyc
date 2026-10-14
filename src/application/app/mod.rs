@@ -1203,6 +1203,15 @@ impl crate::ui::App for DeviceCenterApp {
         });
     }
 
+    /// 收进托盘期间仍然要跑的：后台事件、通知卡片（含通知按钮的动作）与退出
+    /// 收尾。这些都不碰窗口，所以没有窗口也能跑。
+    fn tick(&mut self, context: &egui::Context) {
+        self.drain_events(context);
+        self.tick_notifications();
+        self.tick_power();
+        self.prepare_exit();
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         self.drain_events(&ctx);

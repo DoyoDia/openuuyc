@@ -143,7 +143,10 @@ fn create_graphics() -> Result<Graphics> {
 }
 
 pub(crate) struct UiPresenter {
-    surface: wgpu::Surface<'static>,
+    /// `None` 只在主窗口收进托盘期间出现：窗口要销毁，surface 得跟着放掉（它握着
+    /// 窗口的一个 `Arc`），但 egui 的纹理、管线与没画完的那一帧都留在 presenter 里，
+    /// 等托盘再打开的窗口接上继续用。
+    surface: Option<wgpu::Surface<'static>>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
@@ -161,27 +164,10 @@ pub(crate) struct UiPresenter {
 impl UiPresenter {
     pub(crate) fn new(window: Arc<Window>, graphics: &Graphics) -> Result<Self> {
         let size = nonzero_size(window.inner_size());
-        let surface = graphics
-            .instance
-            .create_surface(window)
-            .context("创建窗口绘制表面失败")?;
-        let capabilities = surface.get_capabilities(&graphics.adapter);
-        let format = surface_format(&capabilities);
-        let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format,
-            width: size.width,
-            height: size.height,
-            present_mode: present_mode(&capabilities),
-            desired_maximum_frame_latency: 2,
-            alpha_mode: alpha_mode(&capabilities),
-            color_space: wgpu::SurfaceColorSpace::Auto,
-            view_formats: Vec::new(),
-        };
-        surface.configure(&graphics.device, &config);
+        let (surface, config) = create_surface(&window, graphics)?;
         let renderer = egui_wgpu::Renderer::new(
             &graphics.device,
-            format,
+            config.format,
             egui_wgpu::RendererOptions {
                 msaa_samples: 1,
                 depth_stencil_format: None,
@@ -189,9 +175,9 @@ impl UiPresenter {
                 ..Default::default()
             },
         );
-        let video = super::video_layer::VideoLayer::new(&graphics.device, format);
+        let video = super::video_layer::VideoLayer::new(&graphics.device, config.format);
         Ok(Self {
-            surface,
+            surface: Some(surface),
             device: graphics.device.clone(),
             queue: graphics.queue.clone(),
             config,
@@ -203,6 +189,26 @@ impl UiPresenter {
             size,
             configured: true,
         })
+    }
+
+    /// 窗口要销毁了（主窗口收进托盘）：放掉 surface，绘制资源留下。
+    pub(crate) fn detach(&mut self) {
+        self.surface = None;
+        self.configured = false;
+    }
+
+    /// 托盘再打开时的窗口接上：同一个设备、同一套表面格式，绘制资源原样用。
+    pub(crate) fn attach(&mut self, window: Arc<Window>, graphics: &Graphics) -> Result<()> {
+        let (surface, config) = create_surface(&window, graphics)?;
+        anyhow::ensure!(
+            config.format == self.config.format,
+            "新窗口的绘制表面格式与保留的绘制资源不一致"
+        );
+        self.config = config;
+        self.size = nonzero_size(window.inner_size());
+        self.surface = Some(surface);
+        self.configured = true;
+        Ok(())
     }
 
     /// Replace the video frame drawn under the UI with packed RGBA8 pixels.
@@ -266,9 +272,12 @@ impl UiPresenter {
         if size.width == 0 || size.height == 0 || size == self.size {
             return Ok(());
         }
+        let Some(surface) = &self.surface else {
+            return Ok(());
+        };
         self.config.width = size.width;
         self.config.height = size.height;
-        self.surface.configure(&self.device, &self.config);
+        surface.configure(&self.device, &self.config);
         self.size = size;
         self.configured = true;
         Ok(())
@@ -284,7 +293,12 @@ impl UiPresenter {
         let Some(mut output) = self.pending_output.take() else {
             return Ok(UiFrame::Pending);
         };
-        let frame = match self.surface.get_current_texture() {
+        let Some(surface) = &self.surface else {
+            // 只有窗口不存在时才会走到这里，把这一帧留给下次。
+            self.pending_output = Some(output);
+            return Ok(UiFrame::Pending);
+        };
+        let frame = match surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) => frame,
             wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
                 // Still drawable; the next resize reconfigures it properly.
@@ -294,7 +308,7 @@ impl UiPresenter {
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 // The compositor dropped the swap chain, commonly on a monitor
                 // or scale change. Reconfigure and draw on the next repaint.
-                self.surface.configure(&self.device, &self.config);
+                surface.configure(&self.device, &self.config);
                 self.pending_output = Some(output);
                 self.flush_writes();
                 context.request_repaint();
@@ -439,6 +453,49 @@ impl Drop for UiPresenter {
         if let Some(mut pending) = self.pending_output.take() {
             pending.textures_delta.clear();
         }
+    }
+}
+
+/// 一个新窗口的绘制表面与配置。
+fn create_surface(
+    window: &Arc<Window>,
+    graphics: &Graphics,
+) -> Result<(wgpu::Surface<'static>, wgpu::SurfaceConfiguration)> {
+    let size = nonzero_size(window.inner_size());
+    let surface = graphics
+        .instance
+        .create_surface(Arc::clone(window))
+        .context("创建窗口绘制表面失败")?;
+    let capabilities = surface.get_capabilities(&graphics.adapter);
+    let config = wgpu::SurfaceConfiguration {
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        format: surface_format(&capabilities),
+        width: size.width,
+        height: size.height,
+        present_mode: present_mode(&capabilities),
+        desired_maximum_frame_latency: 2,
+        alpha_mode: alpha_mode(&capabilities),
+        color_space: wgpu::SurfaceColorSpace::Auto,
+        view_formats: Vec::new(),
+    };
+    surface.configure(&graphics.device, &config);
+    Ok((surface, config))
+}
+
+/// 窗口销毁重建之间留下的绘制资源。egui 的纹理和管线都在 presenter 里，丢了就
+/// 等于所有文字和图片都要重新上载一次，所以跟随应用一起留下。
+pub(crate) struct Retained(UiPresenter);
+
+impl Retained {
+    pub(crate) fn take(mut presenter: UiPresenter) -> Self {
+        presenter.detach();
+        Self(presenter)
+    }
+
+    pub(crate) fn reuse(self, window: Arc<Window>, graphics: &Graphics) -> Result<UiPresenter> {
+        let mut presenter = self.0;
+        presenter.attach(window, graphics)?;
+        Ok(presenter)
     }
 }
 

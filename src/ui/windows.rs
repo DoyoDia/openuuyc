@@ -1,4 +1,4 @@
-use super::gfx::{UiPresenter, create_device, split_output};
+use super::gfx::{Retained, UiPresenter, create_device, split_output};
 use super::window_manager::{self, Event, Repaint, Request};
 use super::{AppFactory, AppSession, WindowConfig};
 use crate::application::viewer::presenter::ConnectingWindowsRunner;
@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
-use winit::dpi::PhysicalPosition;
+use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::WindowEvent;
 #[cfg(target_os = "linux")]
 use winit::event::{DeviceEvent, DeviceId};
@@ -15,6 +15,10 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 #[cfg(windows)]
 use winit::platform::windows::EventLoopBuilderExtWindows;
 use winit::window::{Window, WindowId};
+
+/// 主窗口收进托盘期间的轮询间隔：那条路径上只有后台事件和通知动作要处理，
+/// 不渲染，所以这个频率的开销可以忽略。
+const HIDDEN_TICK: Duration = Duration::from_millis(250);
 
 pub(super) fn run(config: WindowConfig, factory: AppFactory) -> Result<()> {
     #[cfg_attr(not(windows), allow(unused_mut))]
@@ -29,6 +33,7 @@ pub(super) fn run(config: WindowConfig, factory: AppFactory) -> Result<()> {
             config,
             factory: Some(factory),
             state: None,
+            hidden: None,
             error: None,
             proxy: event_loop.create_proxy(),
             root: true,
@@ -55,8 +60,35 @@ struct Runner {
     config: WindowConfig,
     factory: Option<AppFactory>,
     state: Option<DesktopWindow>,
+    /// 主窗口收进托盘后留下的部分；这时 `state` 是 None。
+    hidden: Option<Hidden>,
     error: Option<String>,
     proxy: EventLoopProxy<Event>,
+}
+
+/// 主窗口收进托盘时留下的部分。被控端、观看会话与后台 worker 都挂在应用上，
+/// 应用持有的纹理绑在 egui 上下文上，所以窗口可以销毁，这两样不能。Wayland 没有
+/// 「隐藏窗口」，最后一个 `Arc<Window>` 落地就是真正的销毁。
+struct Hidden {
+    app: AppSession,
+    context: egui::Context,
+    tray: Option<super::tray::Tray>,
+    /// egui 的纹理和管线都在绘制资源里，丢了就等于所有文字都要重新上载一遍。
+    retained: Retained,
+    size: Option<PhysicalSize<u32>>,
+    /// Wayland 不向客户端提供窗口位置，那里拿不到值。
+    position: Option<PhysicalPosition<i32>>,
+}
+
+impl Hidden {
+    /// 收进托盘期间的轮询：不渲染，只跑应用里不碰窗口的那部分——后台事件、通知
+    /// 卡片与通知按钮的动作（其中的「打开」会把主窗口叫回来）。回报应用是否已
+    /// 经可以退出了。
+    fn tick(&mut self) -> bool {
+        let Hidden { app, context, .. } = self;
+        app.0.tick(context);
+        app.0.exit_ready()
+    }
 }
 
 struct DesktopWindow {
@@ -68,6 +100,8 @@ struct DesktopWindow {
     input: egui_winit::State,
     viewport: egui::ViewportInfo,
     close_requested: bool,
+    /// 关闭请求已经转成「收进托盘」，等这一帧结束由 [`Runner`] 拆掉窗口资源。
+    hide_requested: bool,
     tray: Option<super::tray::Tray>,
     exiting: bool,
     show_after_present: bool,
@@ -85,31 +119,85 @@ struct DesktopWindow {
     floating: bool,
 }
 
-impl Drop for DesktopWindow {
-    fn drop(&mut self) {
-        // UiPresenter detaches the composition tree in Drop. Hide the window
-        // first so its system background cannot appear during that interval.
-        self.window.set_visible(false);
-    }
-}
-
 impl Runner {
     fn fail(&mut self, event_loop: &ActiveEventLoop, error: anyhow::Error) {
         self.error = Some(format!("{error:#}"));
-        self.state.take();
+        self.release_window();
         self.closed = true;
         if self.root {
             event_loop.exit();
         }
     }
 
+    /// 退出窗口：先隐藏再拆合成树，中间这段间隔不能露出系统底色。
+    fn release_window(&mut self) {
+        if let Some(state) = self.state.take() {
+            state.window.set_visible(false);
+            drop(state);
+        }
+    }
+
+    /// 把主窗口收进托盘：窗口放掉，应用、egui 上下文、托盘与绘制资源留下。托盘再
+    /// 打开时按收起来之前的尺寸重建窗口，并把这些资源接到新窗口上。
+    fn hide_main(&mut self) {
+        let Some(state) = self.state.take() else {
+            return;
+        };
+        let size = Some(state.window.inner_size());
+        // Wayland 不给窗口位置，那里只有尺寸能还原。
+        let position = state.window.outer_position().ok();
+        state.window.set_visible(false);
+        let DesktopWindow {
+            app,
+            context,
+            tray,
+            presenter,
+            input,
+            window,
+            ..
+        } = state;
+        // 绘制资源里装着 egui 的全部纹理，跟应用一起留下；surface 则随窗口放掉。
+        let retained = Retained::take(presenter);
+        drop(input);
+        drop(window);
+        tracing::info!(?size, "主窗口已收进托盘");
+        self.hidden = Some(Hidden {
+            app,
+            context,
+            tray,
+            retained,
+            size,
+            position,
+        });
+    }
+
     fn create(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
         if self.state.is_some() {
             return Ok(());
         }
-        let context = egui::Context::default();
-        super::fonts::install(&context);
-        context.set_embed_viewports(true);
+        // 收进托盘过的主窗口沿用原来的应用、egui 上下文与绘制资源重建，其余才新建。
+        let (context, app, tray, retained, restore) = match self.hidden.take() {
+            Some(Hidden {
+                app,
+                context,
+                tray,
+                retained,
+                size,
+                position,
+            }) => (
+                context,
+                Some(app),
+                tray,
+                Some(retained),
+                Some((size, position)),
+            ),
+            None => {
+                let context = egui::Context::default();
+                super::fonts::install(&context);
+                context.set_embed_viewports(true);
+                (context, None, None, None, None)
+            }
+        };
         // WindowConfig sizes describe page content; the shared caption occupies
         // client space now, so preserve the page's requested and minimum size.
         let mut viewport_builder = self.config.viewport.clone();
@@ -140,7 +228,14 @@ impl Runner {
         } else {
             None
         };
-        if self.config.centered
+        let (restore_size, restore_position) = restore.unwrap_or_default();
+        if let Some(size) = restore_size {
+            // 还原用物理像素，不经过缩放换算。
+            let _ = window.request_inner_size(size);
+        }
+        if let Some(position) = restore_position {
+            window.set_outer_position(position);
+        } else if self.config.centered
             && let Some(monitor) = window.current_monitor()
         {
             let outer = window.outer_size();
@@ -152,7 +247,10 @@ impl Runner {
             ));
         }
         let graphics = create_device()?;
-        let presenter = UiPresenter::new(window.clone(), &graphics)?;
+        let presenter = match retained {
+            Some(retained) => retained.reuse(window.clone(), &graphics)?,
+            None => UiPresenter::new(window.clone(), &graphics)?,
+        };
         let input = egui_winit::State::new(
             context.clone(),
             egui::ViewportId::ROOT,
@@ -177,15 +275,31 @@ impl Runner {
                 }));
             }
         });
-        let factory = self
-            .factory
-            .take()
-            .context("desktop factory already consumed")?;
-        let app = AppSession(factory(&context, Some(graphics.label().to_owned())));
+        let app = match app {
+            Some(app) => app,
+            None => {
+                let factory = self
+                    .factory
+                    .take()
+                    .context("desktop factory already consumed")?;
+                AppSession(factory(&context, Some(graphics.label().to_owned())))
+            }
+        };
         let uses_tray = self.root && app.0.uses_tray();
-        if uses_tray {
-            crate::application::app::instance::register_window(&window)?;
-        }
+        // Without a notification area the window keeps its ordinary close
+        // behaviour rather than hiding where it cannot be reached.
+        let tray = match tray {
+            Some(tray) => Some(tray),
+            None if uses_tray => {
+                crate::application::app::instance::register_window(&window)?;
+                super::tray::Tray::new()
+                    .inspect_err(
+                        |error| tracing::warn!(error = %format!("{error:#}"), "tray unavailable"),
+                    )
+                    .ok()
+            }
+            None => None,
+        };
         let refresh = window
             .current_monitor()
             .and_then(|monitor| monitor.refresh_rate_millihertz())
@@ -198,19 +312,11 @@ impl Runner {
             input,
             viewport,
             close_requested: false,
-            // Without a notification area the window keeps its ordinary
-            // close behaviour rather than hiding where it cannot be reached.
-            tray: if uses_tray {
-                super::tray::Tray::new()
-                    .inspect_err(
-                        |error| tracing::warn!(error = %format!("{error:#}"), "tray unavailable"),
-                    )
-                    .ok()
-            } else {
-                None
-            },
+            hide_requested: false,
+            tray,
             exiting: false,
-            show_after_present: self.config.viewport.visible.unwrap_or(true),
+            // 重建出来的窗口总是要显示的。
+            show_after_present: restore.is_some() || self.config.viewport.visible.unwrap_or(true),
             focus_after_present: self.config.viewport.active.unwrap_or(true),
             window_move: Default::default(),
             window_resize: Default::default(),
@@ -233,6 +339,13 @@ impl Runner {
     }
 
     fn finish_close(&mut self, event_loop: &ActiveEventLoop) {
+        if self
+            .state
+            .as_ref()
+            .is_some_and(|state| state.hide_requested)
+        {
+            self.hide_main();
+        }
         if self
             .state
             .as_ref()
@@ -361,12 +474,22 @@ impl DesktopWindow {
         }
         // Both native CloseRequested/Alt+F4 and the custom caption command
         // reach this point before any resources or business windows are closed.
+        // 有托盘时，关闭按钮、Alt+F4 与 Mod+Q 的语义是收进托盘，不是结束程序；
+        // 托盘里的「退出」才会走 Request::Exit 的后台退出握手。
         if self.close_requested && self.tray.is_some() && !self.exiting && !self.app.0.exit_ready()
         {
             self.close_requested = false;
             self.show_after_present = false;
-            self.window.set_visible(false);
             self.app.0.on_focus_changed(false);
+            // Windows 的窗口能直接隐藏，而且必须留着：更新器和通知激活都按
+            // 控制中心 HWND 找进程。Wayland 的 set_visible 是空操作，只能销毁窗口
+            // 和它的 surface，等托盘再打开时重建。
+            #[cfg(windows)]
+            self.window.set_visible(false);
+            #[cfg(not(windows))]
+            {
+                self.hide_requested = true;
+            }
         }
         if self.close_requested && !self.app.0.on_close_requested() {
             self.close_requested = false;
@@ -511,12 +634,26 @@ impl ApplicationHandler<Event> for Runner {
             } else {
                 event_loop.set_control_flow(ControlFlow::Wait);
             }
+        } else if let Some(hidden) = &mut self.hidden {
+            let ready = hidden.tick();
+            if ready {
+                // 托盘的「退出」在隐藏状态下完成，不必再建一个窗口。
+                self.closed = true;
+                if self.root {
+                    event_loop.exit();
+                }
+                return;
+            }
+            event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + HIDDEN_TICK));
+        } else {
+            event_loop.set_control_flow(ControlFlow::Wait);
         }
         self.finish_close(event_loop);
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
-        self.state.take();
+        self.release_window();
+        self.hidden.take();
     }
 }
 
@@ -629,6 +766,10 @@ impl ApplicationHandler<Event> for Windows {
                     state.window.set_minimized(false);
                     state.window.focus_window();
                     state.context.request_repaint();
+                } else if self.main.hidden.is_some()
+                    && let Err(error) = self.main.create(event_loop)
+                {
+                    self.main.fail(event_loop, error);
                 }
             }
             Event::Request(Request::Exit) => {
@@ -637,6 +778,13 @@ impl ApplicationHandler<Event> for Windows {
                     state.close_requested = true;
                     if let Err(error) = state.render() {
                         self.main.fail(event_loop, error);
+                    }
+                } else if let Some(hidden) = &mut self.main.hidden {
+                    // 已经收进托盘：不必为了退出再建一个窗口，请后台开始收尾，
+                    // 退出事件循环的时机交给 about_to_wait 的等待循环。
+                    if hidden.app.0.on_close_requested() {
+                        self.main.closed = true;
+                        event_loop.exit();
                     }
                 }
                 self.main.finish_close(event_loop);
@@ -657,6 +805,8 @@ impl ApplicationHandler<Event> for Windows {
                     config,
                     factory: Some(factory),
                     state: None,
+                    // 只有控制中心主窗口会收进托盘。
+                    hidden: None,
                     error: None,
                     proxy: self.main.proxy.clone(),
                     root: false,
@@ -717,7 +867,9 @@ impl ApplicationHandler<Event> for Windows {
             viewer.finish(event_loop);
         }
         self.viewers.clear();
-        self.windows.clear();
+        for (_, mut window) in self.windows.drain() {
+            window.release_window();
+        }
         self.main.exiting(event_loop);
     }
 }

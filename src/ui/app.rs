@@ -7,6 +7,9 @@ pub(crate) trait App {
         true
     }
     fn ui(&mut self, ui: &mut egui::Ui);
+    /// 主窗口收进托盘期间的轮询：不渲染，只推进后台事件、通知卡片与通知按钮的
+    /// 动作。默认什么都不做。
+    fn tick(&mut self, _context: &egui::Context) {}
     fn on_focus_changed(&mut self, _focused: bool) {}
     /// Return false to keep the window alive (for example, while confirming exit).
     fn on_close_requested(&mut self) -> bool {
