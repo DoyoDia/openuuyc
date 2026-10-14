@@ -666,7 +666,16 @@ impl Actor {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         }
-        tracing::info!(drag = id, stage, "native file drag finished");
+        // 拖放失败时这里就是唯一能看出根因的地方：stage 只说结局，原因在 message 里，
+        // 而它此前根本没被记下来（stage=3 是「取消」，可能是对端撤的、也可能是本地
+        // 能力不够），reverse 则说明是哪一侧发起的。
+        tracing::info!(
+            drag = id,
+            stage,
+            reverse = self.entries.get(&id).is_some_and(|entry| entry.reverse),
+            message = %message,
+            "native file drag finished"
+        );
         let _ =
             self.shared
                 .source_held
