@@ -170,6 +170,8 @@ sudo pacman -S --needed xdg-desktop-portal-hyprland
 
 `cargo dist` 只用于 Windows 打包，Linux 直接用 `cargo build`。
 
+[`devtools/probes/`](devtools/probes/README.md) 里是验证 Linux 零拷贝与 GPU 颜色转换可行性的开发用探测程序（C 与一个独立的 Rust 小工程），不参与构建，用于在新驱动或新显卡上先确认 dmabuf 导出、Vulkan 导入和 VA-API 编码是否可用。
+
 Arch / EndeavourOS 的构建依赖：
 
 ```bash

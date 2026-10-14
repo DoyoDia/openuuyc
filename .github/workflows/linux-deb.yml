@@ -38,6 +38,16 @@ jobs:
       - name: Build
         run: cargo build --release --locked --bin OpenUUYC
 
+      - name: Check the developer probes still build
+        # They include the production VA-API encoder and GPU converter sources
+        # but are not part of the app, so only this step notices a break.
+        run: |
+          cargo check --locked --bins \
+            --manifest-path devtools/probes/gpu-conversion/Cargo.toml \
+            --target-dir target/probes
+          gcc -fsyntax-only -Wall devtools/probes/vaapi_export_probe.c
+          gcc -fsyntax-only -Wall devtools/probes/vulkan_dmabuf_probe.c
+
       - name: Package
         run: cargo deb --no-build
 
