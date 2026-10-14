@@ -648,10 +648,32 @@ fn compositor_desktop() -> Option<Desktop> {
     })
 }
 
-/// 由合成器解算的绝对指针：设备，以及它轴范围覆盖的那个桌面。
+/// 合成器接手一台刚建的 uinput 设备要多久。这段时间里写进去的绝对坐标谁都
+/// 收不到（evdev 只把 open 之后的事件交给读者），所以要反复补写。
+const FRESH_FOR: Duration = Duration::from_millis(1500);
+
+/// 上面那个窗口期里补写的间隔。
+const REPEAT_EVERY: Duration = Duration::from_millis(250);
+
+/// 一个还没被合成器接手的位置。
+///
+/// 补写不能写同一个值：内核会丢掉与设备当前值相同的绝对坐标，而这正是要补的
+/// 那个值。所以沿 x 偏一个单位写（桌面尺寸量级上的一格，肉眼看不见），窗口
+/// 结束时再把原值写一次。
+struct Repeat {
+    until: std::time::Instant,
+    at: std::time::Instant,
+    position: (i32, i32),
+    offset: i32,
+}
+
+/// 由合成器解算的绝对指针：设备、它轴范围覆盖的那个桌面，以及合成器接手它
+/// 之前要补写的位置。
 struct Absolute {
     device: uinput::Device,
     desktop: Desktop,
+    made: std::time::Instant,
+    repeat: Option<Repeat>,
 }
 
 impl Absolute {
@@ -661,6 +683,8 @@ impl Absolute {
         Ok(Self {
             device: uinput::Device::open_absolute(desktop)?,
             desktop,
+            made: std::time::Instant::now(),
+            repeat: None,
         })
     }
 
@@ -671,6 +695,40 @@ impl Absolute {
         self.device.move_absolute(local_x, local_y)
     }
 
+    /// 写一次，并在设备还新的时候开始补写。
+    fn aim(&mut self, x: i32, y: i32) -> Result<()> {
+        self.write(x, y)?;
+        if self.made.elapsed() < FRESH_FOR {
+            self.repeat = Some(Repeat {
+                until: self.made + FRESH_FOR,
+                at: std::time::Instant::now(),
+                position: (x, y),
+                offset: 0,
+            });
+        }
+        Ok(())
+    }
+
+    /// 补写：见 `Repeat`。
+    fn flush(&mut self) -> Result<()> {
+        let Some(repeat) = &mut self.repeat else {
+            return Ok(());
+        };
+        let now = std::time::Instant::now();
+        if now >= repeat.until {
+            let (x, y) = repeat.position;
+            self.repeat = None;
+            return self.write(x, y);
+        }
+        if now.duration_since(repeat.at) < REPEAT_EVERY {
+            return Ok(());
+        }
+        repeat.at = now;
+        repeat.offset ^= 1;
+        let (x, y) = repeat.position;
+        let offset = repeat.offset;
+        self.write(x + offset, y)
+    }
 }
 
 pub(crate) struct Injector {
@@ -867,7 +925,7 @@ impl Injector {
         // 坐标已经是合成器布局里的位置（引擎按 `Screen::logical` 算的），
         // 直接写进设备，由合成器解算。
         if let Some(absolute) = &mut self.absolute {
-            return absolute.write(x, y);
+            return absolute.aim(x, y);
         }
         if let Some(device) = &self.uinput {
             // 设备不声明 ABS 轴（否则会被 libinput 误分类），所以按当前
@@ -1134,7 +1192,11 @@ impl Injector {
             .next()
     }
 
-    pub fn flush(&self) -> Result<()> {
+    pub fn flush(&mut self) -> Result<()> {
+        // 合成器刚接手的设备上，位置可能要写上好几遍才有人收到。
+        if let Some(absolute) = &mut self.absolute {
+            absolute.flush()?;
+        }
         self.connection.flush()?;
         Ok(())
     }
