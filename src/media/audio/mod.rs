@@ -628,7 +628,10 @@ fn build_stream<T: cpal::SizedSample + cpal::FromSample<f32>>(
                 // Only an actual endpoint/stream error triggers rebuild; video is unaffected.
                 lock(&errors.status).1 = Some(format!("音频输出中断：{error}"));
                 errors.clear_levels();
-                failed.store(true, Ordering::Release);
+                // A backend may repeat the error until the owner drops the stream.
+                if !failed.swap(true, Ordering::AcqRel) {
+                    tracing::warn!(%error, "audio output stream failed; rebuilding");
+                }
                 errors.notify_output();
             },
             None,
@@ -664,7 +667,11 @@ fn output_worker(shared: Arc<Shared>) {
     // DeviceNotAvailable to the error callback. Wake this owner immediately;
     // the periodic check is only a fallback while no stream can report events.
     let _ = shared.output_thread.set(std::thread::current());
-    let host = cpal::default_host();
+    let mut host = cpal::default_host();
+    // The Linux PulseAudio host is one server connection for its lifetime;
+    // after a stream or enumeration failure the server may have restarted, so
+    // the next check connects again. Creating a WASAPI host is free.
+    let mut reconnect = false;
     let failed = Arc::new(AtomicBool::new(false));
     let mut stream = None;
     let mut current_id = None;
@@ -703,6 +710,10 @@ fn output_worker(shared: Arc<Shared>) {
             || generation != current_generation
             || (stream.is_none() && failures == 0 && shared.receiving.load(Ordering::Acquire))
         {
+            if reconnect || failed.load(Ordering::Acquire) {
+                host = cpal::default_host();
+                reconnect = false;
+            }
             let available = host.output_devices().map(|devices| {
                 devices
                     .filter_map(|device| {
@@ -719,11 +730,14 @@ fn output_worker(shared: Arc<Shared>) {
                     error: None,
                     loaded: true,
                 },
-                Err(error) => OutputDevices {
-                    error: Some(format!("读取输出设备失败：{error}")),
-                    loaded: true,
-                    ..Default::default()
-                },
+                Err(error) => {
+                    reconnect = true;
+                    OutputDevices {
+                        error: Some(format!("读取输出设备失败：{error}")),
+                        loaded: true,
+                        ..Default::default()
+                    }
+                }
             };
             let selection = lock(&shared.selected_output).clone();
             let device = match &selection {
@@ -778,7 +792,7 @@ fn output_worker(shared: Arc<Shared>) {
                             .map(|description| description.name().to_owned())
                             .unwrap_or_default();
                         *lock(&shared.status) = (name.clone(), None);
-                        tracing::info!(device = %name, "native Opus audio output started");
+                        tracing::info!(device = %name, host = ?host.id(), "native Opus audio output started");
                     }
                     Err(error) => {
                         lock(&shared.status).1 = Some(error.to_string());
