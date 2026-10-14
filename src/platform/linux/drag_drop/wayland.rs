@@ -44,6 +44,9 @@ fn now_ms() -> u32 {
 const SIDE: i32 = 512;
 /// 一直没等到拖放就安静收工。整体超时由 `tick` 管（30 秒），这里不必等那么久。
 const LIMIT: Duration = Duration::from_secs(20);
+/// 接住之后还要等原来那次拖动收场，等不到也最多等这么久：主控那头等的是这一句
+/// （见 `run` 末尾），一直不吭声它就一直卡在「正在准备文件」。
+const RELEASE: Duration = Duration::from_secs(2);
 /// 轮询间隔。合成器有事会立刻唤醒，这个只是兜底。
 const POLL: Duration = Duration::from_millis(2);
 /// 等合成器给尺寸、等对端写文件列表，各自的上限。
@@ -108,6 +111,11 @@ struct State {
     mimes: Vec<String>,
     /// 指针已经进到我们这块 surface 上。
     entered: bool,
+    /// 文件列表已经问到（`paths` 刚拿到，还没被取走）。
+    captured: bool,
+    /// 原来那次拖动收场了：`drop`（松开在我们这块上），或者 `leave`（拖着拖着
+    /// 离开了我们这块）。这两条是 Wayland 拖放里唯一能看到的「结束」。
+    ended: bool,
     /// 已经发出 `receive`，就等读。
     requested: Option<(String, OwnedFd, OwnedFd)>,
     paths: Option<Vec<PathBuf>>,
@@ -248,16 +256,44 @@ fn run(
                 bail!("{mime} 里没有本地路径");
             }
             state.paths = Some(paths);
+            state.captured = true;
             break;
         }
         wait(&mut queue, &mut state, &connection, POLL)?;
     }
 
+    let Some(paths) = state.paths.take() else {
+        shell.destroy();
+        surface.destroy();
+        return Ok(());
+    };
+    tracing::info!(files = paths.len(), "Wayland 拖放接住了");
+    notify(Event::Captured(paths, false));
+
+    // 光说「接住了」不够：主控那边要等我们再说一句「原来那次拖动结束了」，才
+    // 敢把物理按下从远端收回来交给本地 OLE（`returning::try_start_native` 卡着
+    // 的就是这一句），在那之前用户一直看着「正在准备文件」。
+    //
+    // 结束的时刻我们这边只看得到两个事件：`drop`（松开落在我们这块上）和
+    // `leave`（拖到别处去了）。两个都要等，所以这块 surface 现在还不能拆——拆
+    // 了就一个都收不到。等不到也最多等到 `RELEASE`：宁可早交一会儿，也不能让
+    // 主控干等（那时用户多半已经松手，整次拖放就废了）。
+    let deadline = Instant::now() + RELEASE;
+    while !state.ended
+        && !state.closed
+        && !stop.load(Ordering::Acquire)
+        && allowed()
+        && Instant::now() < deadline
+    {
+        dispatch(&mut queue, &mut state, &connection)?;
+        connection.flush().context("发送 Wayland 请求失败")?;
+        wait(&mut queue, &mut state, &connection, POLL)?;
+    }
+    tracing::info!(seen = state.ended, "Wayland 拖放交接结束");
     shell.destroy();
     surface.destroy();
-    if let Some(paths) = state.paths.take() {
-        tracing::info!(files = paths.len(), "Wayland 拖放接住了");
-        notify(Event::Captured(paths, false));
+    if !stop.load(Ordering::Acquire) && allowed() {
+        notify(Event::Released);
     }
     Ok(())
 }
@@ -631,7 +667,15 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for State {
                 state.entered = true;
                 request(state);
             }
-            wl_data_device::Event::Leave { .. } => state.entered = false,
+            // 拖起来的那次松开不会以 `wl_pointer.button` 的形式送到我们手上——
+            // 隐式抓取把它吃掉了，落点是谁就以 `drop` 告诉谁。
+            wl_data_device::Event::Drop => state.ended = true,
+            wl_data_device::Event::Leave { .. } => {
+                state.entered = false;
+                if state.captured {
+                    state.ended = true;
+                }
+            }
             _ => {}
         }
     }

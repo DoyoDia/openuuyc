@@ -799,6 +799,10 @@ impl Actor {
                         self.emit(id, Payload::Resumed(true), false).await?;
                     }
                     native::portal::Event::Released => {
+                        // 这一句就是主控接手的发令枪（见 `SourceReleased` 那条：
+                        // 它拿它当「原按下已经交还」的证据）。没有它，拖出会一直
+                        // 停在「正在准备文件」，所以两侧都记一笔。
+                        tracing::info!(drag = id, "原文件拖动已收场，交还主控");
                         let entry = self.entries.get_mut(&id).unwrap();
                         entry.source_released = true;
                         let _ = self.shared.pointer_owner.compare_exchange(
@@ -1392,6 +1396,11 @@ impl Actor {
                     .get_mut(&id)
                     .filter(|e| e.reverse && !e.sending)
                 {
+                    tracing::info!(
+                        drag = id,
+                        preserve = entry.preserve_source,
+                        "原文件拖动已收场，可以接手本地拖动了"
+                    );
                     entry.source_released = true;
                     if entry.preserve_source && !entry.committed && !entry.resuming {
                         entry.ticket.cancel();
