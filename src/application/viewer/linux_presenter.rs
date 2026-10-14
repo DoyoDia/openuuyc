@@ -670,12 +670,15 @@ impl ApplicationHandler<UiEvent> for ConnectingWindowsRunner {
             return;
         }
         if let Stage::Playing(player) = &mut self.stage {
+            let switching = player.poll_pending();
             match player.poll() {
                 Ok(true) => self.schedule_now(),
                 // Nothing decoded: egui asks for the repaints it needs and the
                 // wake bridge covers the next frame, so the loop can sleep.
                 // Repainting the whole UI at the display rate instead would
                 // leave an arriving frame waiting for the pass in progress.
+                // 切屏期间例外：没有画面可画却要等另一块屏就绪。
+                Ok(false) if switching => self.schedule_now(),
                 Ok(false) => {}
                 Err(error) => {
                     self.fail(event_loop, &error);
@@ -705,11 +708,37 @@ impl ApplicationHandler<UiEvent> for ConnectingWindowsRunner {
     }
 }
 
+/// 正在打开的一块屏：解码器还没就绪，tab 先显示等待态。
+struct PendingScreen {
+    id: i32,
+    /// 让 `ScreenPlayback` 申请对端开始推这块屏。丢掉这次等待就是把请求取消掉，
+    /// 所以句柄留着、Drop 里 abort（和 Windows 侧一致）。
+    task: Option<tokio::task::AbortHandle>,
+    result: tokio::sync::oneshot::Receiver<Result<Arc<NativeViewerSession>>>,
+}
+
+impl Drop for PendingScreen {
+    fn drop(&mut self) {
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
+}
+
 /// The playing half of the window: video, input forwarding and the menus.
 struct Player {
     /// Reloads shortcut settings changed in the control center while playing.
     _shortcuts: crate::application::viewer_shortcuts::Watcher,
-    session: NativeViewerSession,
+    /// 本窗口正在显示的那块屏的解码器。
+    session: Arc<NativeViewerSession>,
+    /// 这个连接上所有能看的屏，以及每块屏各自的解码器。多窗口时共用同一份。
+    screens: super::screens::ScreenPlayback,
+    /// 本窗口选中的屏（tab 条与「+」都改它）。
+    selected: i32,
+    /// 正在打开的那块屏。
+    pending: Option<PendingScreen>,
+    proxy: EventLoopProxy<UiEvent>,
+    window_id: WindowId,
     /// Keeps the decoder publishing frames and nudges the event loop; held for
     /// its lifetime, which is what registers this window with the session.
     #[allow(dead_code, reason = "Owned for its registration and its Drop.")]
@@ -769,19 +798,33 @@ struct Player {
 
 impl Player {
     fn new(
-        session: NativeViewerSession,
+        mut session: NativeViewerSession,
         window: &Arc<Window>,
         proxy: EventLoopProxy<UiEvent>,
     ) -> Result<Self> {
         session.ensure_running()?;
+        let selected = session.screen_id();
+        // 屏目录与每屏的解码器由 `ScreenPlayback` 统一持有：同一个设备连接上的
+        // 所有窗口共用它，才不会两块窗口各推一份同样的屏。
+        let screens = session
+            .take_screen_playback()
+            .context("screen playback owner unavailable")?;
+        let session = Arc::new(session);
+        screens.register(Arc::clone(&session));
         let owner = u64::from(window.id());
-        let wake = FrameWakeBridge::install(&session, proxy, window.id())?;
+        let window_id = window.id();
+        let wake = FrameWakeBridge::install(&session, proxy.clone(), window_id)?;
         let drag = super::linux_drag::WindowDrag::new(owner, &session.stream_control);
         Ok(Self {
             shortcuts: super::linux_shortcuts::Shortcuts::new(window),
             drag,
             _shortcuts: crate::application::viewer_shortcuts::Watcher::new()?,
             session,
+            screens,
+            selected,
+            pending: None,
+            proxy,
+            window_id,
             wake,
             owner,
             stream_control_ui: StreamControlUi::default(),
@@ -865,6 +908,112 @@ impl Player {
 
     fn input(&self) -> &crate::features::remote_input::RemoteInput {
         self.session.stream_control.mouse()
+    }
+
+    /// 切到另一块屏：开过解码器的直接换过去，没开过的请对端开始推这块屏。这中间
+    /// 窗口仍画着原来的画面，直到 [`Player::poll_pending`] 把新解码器接上。
+    fn select(&mut self, screen_id: i32) -> Result<()> {
+        if screen_id == self.selected {
+            return Ok(());
+        }
+        if let Some(session) = self.screens.decoder(screen_id) {
+            self.adopt(screen_id, session)?;
+            self.sync_screens();
+            return Ok(());
+        }
+        let cancelled = self.pending.as_ref().map(|pending| pending.id);
+        let repaint = self.repaint();
+        let (task, result) = self.screens.open(
+            screen_id,
+            ViewerDisplayHandle::default(),
+            Some(self.selected),
+            cancelled,
+            repaint,
+        );
+        self.pending = Some(PendingScreen {
+            id: screen_id,
+            task,
+            result,
+        });
+        self.selected = screen_id;
+        self.sync_screens();
+        Ok(())
+    }
+
+    /// 把窗口接到某块屏的解码器上，并把旧屏的画面缓存全部作废。
+    fn adopt(&mut self, screen_id: i32, session: Arc<NativeViewerSession>) -> Result<()> {
+        session.ensure_running()?;
+        self.wake = FrameWakeBridge::install(&session, self.proxy.clone(), self.window_id)?;
+        self.session = session;
+        self.selected = screen_id;
+        self.pending = None;
+        self.current = None;
+        self.video_size = None;
+        self.video_rect = None;
+        self.cursor = None;
+        // 对端按「选中」的那块屏送指针与输入，换屏就得告诉它。
+        self.screens.focus(screen_id);
+        Ok(())
+    }
+
+    /// 等正在打开的那块屏就绪，返回是否还在等。
+    fn poll_pending(&mut self) -> bool {
+        let Some(pending) = self.pending.as_mut() else {
+            return false;
+        };
+        match pending.result.try_recv() {
+            Ok(Ok(session)) => {
+                let id = pending.id;
+                if let Err(error) = self.adopt(id, session) {
+                    self.pending = None;
+                    self.control_error = Some(format!("无法显示显示器 {id}：{error:#}"));
+                }
+                self.sync_screens();
+                false
+            }
+            Ok(Err(error)) => {
+                let id = pending.id;
+                self.pending = None;
+                // 没切成：选中退回本窗口仍在显示的那块屏，别停在空屏上。
+                self.selected = self.session.screen_id();
+                self.control_error = Some(format!("无法打开显示器 {id}：{error:#}"));
+                self.sync_screens();
+                false
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => true,
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                self.pending = None;
+                self.selected = self.session.screen_id();
+                self.sync_screens();
+                false
+            }
+        }
+    }
+
+    /// 告诉对端现在要看哪几块屏：本窗口选中的那块，加上正在打开的那块。软解一次
+    /// 只跟得上一条流，换屏期间就不再要原来那块（与 Windows 侧同一条规则）。
+    fn sync_screens(&self) {
+        let switching = self.pending.as_ref().map(|pending| pending.id);
+        let mut visible = Vec::new();
+        if !(switching.is_some() && self.session.is_software()) {
+            visible.push(self.selected);
+        }
+        visible.extend(switching);
+        self.screens.set_visible(visible);
+    }
+
+    /// 让事件循环尽快再跑一轮：切屏期间要画等待态，也要及时接过新解码器。
+    fn repaint(&self) -> impl FnOnce() + Send + 'static {
+        let proxy = self.proxy.clone();
+        let window = self.window_id;
+        move || {
+            let _ = proxy.send_event(UiEvent::Repaint(UiRepaintEvent {
+                window,
+                generation: 0,
+                pass: 0,
+                when: Instant::now(),
+            }));
+        }
     }
 
     /// True when a decoded frame is waiting to go up.
@@ -1247,6 +1396,186 @@ impl Player {
                 )
                 .truncate(),
             );
+        }
+        // 右边那排按钮画完了，剩下的地方给屏标签与码流信息。
+        let free = egui::Rect::from_min_max(
+            rect.min,
+            egui::pos2((row.min_rect().left() - 6.0).max(rect.min.x), rect.max.y),
+        );
+        self.title_bar_screens(ui, free, window);
+    }
+
+    /// 顶栏中间的屏标签与码流信息：每块远端屏一个 tab（点一下切过去，右键是这块
+    /// 屏的显示器设置，虚拟屏可以关掉），右边一格写当前画面的「分辨率 · 帧率 ·
+    /// 编码」。Windows 的 caption 是同一套内容，只是那边的按钮是图标。
+    fn title_bar_screens(&mut self, ui: &mut egui::Ui, rect: egui::Rect, window: &Arc<Window>) {
+        // 与 Windows 同一个宽度，够放 "3840×1620 · 35 FPS · H.265"。
+        const METRICS_WIDTH: f32 = 184.0;
+        const MINIMUM: f32 = 60.0;
+        if rect.width() < MINIMUM {
+            return;
+        }
+        let metrics_rect = egui::Rect::from_min_max(
+            egui::pos2((rect.max.x - METRICS_WIDTH).max(rect.min.x), rect.min.y),
+            rect.max,
+        );
+        let tabs_rect = egui::Rect::from_min_max(
+            rect.min,
+            egui::pos2((metrics_rect.min.x - 6.0).max(rect.min.x), rect.max.y),
+        );
+        let stats = self.session.performance.snapshot();
+        let codec = if stats.video_codec.contains("AV1") {
+            "AV1"
+        } else if stats.video_codec.contains("265") || stats.video_codec.contains("HEVC") {
+            "H.265"
+        } else if stats.video_codec.contains("264") || stats.video_codec.contains("AVC") {
+            "H.264"
+        } else {
+            "—"
+        };
+        let parameters = stats.decoded_resolution.map_or_else(
+            || "等待画面".to_owned(),
+            |(width, height)| {
+                format!(
+                    "{width}×{height} · {:.0} FPS · {codec}",
+                    stats.actual_fps.max(1.0)
+                )
+            },
+        );
+        let mut metrics = ui.new_child(egui::UiBuilder::new().max_rect(metrics_rect).layout(
+            egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
+        ));
+        metrics.set_clip_rect(metrics_rect);
+        metrics
+            .add(
+                egui::Label::new(
+                    egui::RichText::new(parameters)
+                        .size(crate::ui::theme::TINY)
+                        .color(crate::ui::theme::MUTED),
+                )
+                .truncate(),
+            )
+            .on_hover_text(&stats.video_format);
+        if tabs_rect.width() < 40.0 {
+            return;
+        }
+        let catalog = self.screens.screens();
+        let control = self.session.stream_control.clone();
+        let snapshot = control.snapshot();
+        let selected = self.selected;
+        let pending = self.pending.as_ref().map(|pending| pending.id);
+        let software = self.session.is_software();
+        let mut open = None;
+        let mut message = None;
+        let mut tabs = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(tabs_rect)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        tabs.set_clip_rect(tabs_rect);
+        egui::ScrollArea::horizontal()
+            .id_salt("player-screen-tabs")
+            .auto_shrink([false, false])
+            .scroll_source(
+                egui::scroll_area::ScrollSource::SCROLL_BAR
+                    | egui::scroll_area::ScrollSource::MOUSE_WHEEL,
+            )
+            .show(&mut tabs, |ui| {
+                ui.horizontal_centered(|ui| {
+                    ui.spacing_mut().item_spacing.x = 3.0;
+                    for screen in &catalog {
+                        let id = screen.id;
+                        // 只有 UU 虚拟屏能这样关掉，物理屏要留着，否则等于拔掉
+                        // 对端的显示器。
+                        let closable = snapshot.ready
+                            && snapshot.dpi_settings_supported
+                            && catalog.len() > 1
+                            && (!snapshot.topology.pending || snapshot.topology.dismissed)
+                            && screen.display.screen_type == 1;
+                        let name = screen.label(&catalog);
+                        let (response, close_clicked) = ui
+                            .push_id(("player-screen-tab", id), |ui| {
+                                crate::ui::controls::screen_tab(
+                                    ui,
+                                    &name,
+                                    selected == id,
+                                    pending == Some(id) || control.display_change_pending(id),
+                                    !software,
+                                    closable,
+                                )
+                            })
+                            .inner;
+                        let response = response.on_hover_text(&name);
+                        if close_clicked {
+                            super::stream_menu::topology_menu::request(
+                                ui.ctx(),
+                                &control,
+                                id,
+                                crate::features::stream_control::DisplayTopologyAction::Remove {
+                                    screen_id: id,
+                                },
+                            );
+                        } else if response.clicked() {
+                            open = Some(id);
+                        }
+                        response.context_menu(|ui| {
+                            super::stream_menu::menu_style(ui);
+                            ui.set_width(crate::ui::theme::CONTEXT_MENU_WIDTH);
+                            if let Some(error) = super::stream_menu::tab_display_menu(
+                                ui,
+                                &control,
+                                id,
+                                window
+                                    .current_monitor()
+                                    .map(|monitor| (monitor.size().width, monitor.size().height)),
+                            ) {
+                                message = Some(error);
+                            }
+                        });
+                    }
+                    if snapshot.topology_support.create_visible
+                        && crate::ui::controls::screen_add(
+                            ui,
+                            snapshot.ready
+                                && snapshot.topology_support.create
+                                && (!snapshot.topology.pending || snapshot.topology.dismissed),
+                        )
+                        .on_hover_text("添加虚拟屏")
+                        .on_disabled_hover_text(
+                            snapshot
+                                .topology_support
+                                .create_unavailable
+                                .unwrap_or("正在处理显示器操作"),
+                        )
+                        .clicked()
+                    {
+                        let (width, height, _) =
+                            super::stream_menu::topology_menu::local_parameters(
+                                ui.ctx(),
+                                &control,
+                                window
+                                    .current_monitor()
+                                    .map(|monitor| (monitor.size().width, monitor.size().height)),
+                            );
+                        super::stream_menu::topology_menu::request(
+                            ui.ctx(),
+                            &control,
+                            selected,
+                            crate::features::stream_control::DisplayTopologyAction::Create {
+                                width,
+                                height,
+                            },
+                        );
+                    }
+                });
+            });
+        if let Some(error) = message {
+            self.control_error = Some(error);
+        }
+        if let Some(id) = open
+            && let Err(error) = self.select(id)
+        {
+            self.control_error = Some(format!("切到显示器 {id} 失败：{error:#}"));
         }
     }
 
