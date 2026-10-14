@@ -142,7 +142,7 @@ pub(crate) fn screens() -> Result<Vec<Screen>> {
 }
 
 /// Whether this is a Wayland session, where X11 sees only XWayland clients.
-pub(super) fn wayland_session() -> bool {
+pub(crate) fn wayland_session() -> bool {
     std::env::var_os("WAYLAND_DISPLAY").is_some()
         || std::env::var("XDG_SESSION_TYPE").is_ok_and(|kind| kind == "wayland")
 }

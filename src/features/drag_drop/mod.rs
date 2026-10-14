@@ -1348,38 +1348,43 @@ impl Actor {
                 });
                 let commands = self.input.clone();
                 let alive = entry.ticket.alive.clone();
-                entry.portal = Some(native::portal::Portal::start(
-                    position,
-                    self.shared.return_capable.load(Ordering::Acquire),
-                    guard.clone(),
-                    Arc::new({
-                        let commands = commands.clone();
-                        let alive = alive.clone();
-                        move |event| {
-                            if commands.try_send(Command::Portal(id, event)).is_err() {
-                                alive.store(false, Ordering::Release);
-                            }
-                        }
-                    }),
-                )?);
-                // Wayland 那边再摆一个我们自己的 surface。两个世界的拖放互相看不见
-                // （XWayland 不桥接 XDND，反过来也一样），所以两边一起等，谁接住算
-                // 谁的——就像剪贴板那边得往两个选择区都写一样。起不来只是少一条
-                // 路，不该让整个拖放失败。
-                match native::Catcher::start(
-                    &screen.device_name,
-                    (point.x, point.y),
-                    guard,
-                    Arc::new(move |event| {
+                let notify: Arc<dyn Fn(native::portal::Event) + Send + Sync> = Arc::new({
+                    let commands = commands.clone();
+                    let alive = alive.clone();
+                    move |event| {
                         if commands.try_send(Command::Portal(id, event)).is_err() {
                             alive.store(false, Ordering::Release);
                         }
-                    }),
-                ) {
-                    Ok(catcher) => entry.catch = Some(catcher),
-                    Err(error) => {
-                        tracing::debug!(error = format!("{error:#}"), "Wayland 拖放接取不可用")
                     }
+                });
+                // 两条路各管一个世界，而且只挑一条：两个世界的拖放互相看不见
+                // （XWayland 不桥接 XDND，反过来也一样，就像剪贴板那两座孤岛）。
+                //
+                // Wayland 会话里不能走 XDND 那条：`portal.rs` 要靠 XTEST 假装按下
+                // 鼠标去驱动那次交接，而这在 Wayland 上不可靠；它自己也会拒绝
+                // （`xdnd::connect`），问题是它拒绝的方式是报错——那会直接把整次
+                // 拖放判死，另一条路连机会都没有。
+                if crate::platform::capture::wayland_session() {
+                    match native::Catcher::start(
+                        &screen.device_name,
+                        (point.x, point.y),
+                        guard,
+                        notify,
+                    ) {
+                        Ok(catcher) => entry.catch = Some(catcher),
+                        // 起不来只是少一条路，不该让整个拖放失败：真没结果的话
+                        // `tick` 的超时会收场。
+                        Err(error) => {
+                            tracing::debug!(error = format!("{error:#}"), "Wayland 拖放接取不可用")
+                        }
+                    }
+                } else {
+                    entry.portal = Some(native::portal::Portal::start(
+                        position,
+                        self.shared.return_capable.load(Ordering::Acquire),
+                        guard,
+                        notify,
+                    )?);
                 }
                 self.entries.insert(id, entry);
             }
