@@ -101,13 +101,17 @@ pub(crate) fn mark_unsupported() {
     }
 }
 
-/// Whether the zero-copy path is enabled. Set `OPENUUYC_ZEROCOPY=0` to opt out.
+/// Whether the zero-copy path is enabled: opt in with `OPENUUYC_ZEROCOPY=1`.
+///
+/// Off by default until it is verified beyond the Intel (i965) machine it was
+/// written on: NVIDIA's VA driver exports differently tiled buffers, and a
+/// wrong import shows a corrupted picture rather than an error.
 pub(crate) fn enabled() -> bool {
     if UNSUPPORTED.load(Ordering::Relaxed) {
         return false;
     }
-    !matches!(
+    matches!(
         std::env::var("OPENUUYC_ZEROCOPY").as_deref(),
-        Ok("0") | Ok("false") | Ok("no")
+        Ok("1") | Ok("true") | Ok("yes")
     )
 }

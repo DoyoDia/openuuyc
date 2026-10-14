@@ -1,9 +1,9 @@
 //! Linux video decoding: VA-API in hardware, the Rust H.264/AV1 codecs in
 //! software.
 //!
-//! VA-API normally hands the picture over as a dmabuf the renderer imports, so
-//! it never reaches the CPU. Drivers or renderers that cannot do that fall back
-//! to a CPU NV12 readback.
+//! VA-API copies the picture out as CPU NV12. With `OPENUUYC_ZEROCOPY=1` it is
+//! handed over as a dmabuf the renderer imports instead, falling back to the
+//! copy where the driver or renderer cannot do that.
 #![cfg(not(windows))]
 use crate::media::VideoCodec;
 use crate::media::decode_api::{DecodeError, DecoderMode, DecoderNotification, VideoDecoderConfig};

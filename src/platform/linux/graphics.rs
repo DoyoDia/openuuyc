@@ -115,7 +115,7 @@ fn create_graphics() -> Result<Graphics> {
     // feature the renderer falls back to the CPU upload.
     let mut required_features = wgpu::Features::empty();
     let dmabuf_feature = wgpu::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF;
-    if adapter.features().contains(dmabuf_feature) {
+    if crate::platform::linux::dmabuf::enabled() && adapter.features().contains(dmabuf_feature) {
         required_features |= dmabuf_feature;
     }
     let (device, queue) = pollster::block_on(
@@ -371,7 +371,8 @@ impl UiPresenter {
             }
             self.renderer.render(&mut pass, &jobs, &descriptor);
         }
-        self.queue
+        let submission = self
+            .queue
             .submit(user_buffers.into_iter().chain(Some(encoder.finish())));
         // Freeing after submit keeps a texture alive while the frame still uses it.
         for id in &output.textures_delta.free {
@@ -390,11 +391,13 @@ impl UiPresenter {
         // When the picture aliases a decoder surface the wait must be real:
         // the next upload drops the lease and frees that surface for decoding,
         // which would overwrite it while the GPU is still sampling. Blocking
-        // here costs the tail of one frame and removes that race.
+        // here costs the tail of one frame and removes that race. The wait is
+        // bounded: a hung or lost device must not freeze the UI thread, and
+        // the worst a late frame can cost is one torn picture.
         let poll = if self.video.holds_dmabuf() {
             wgpu::PollType::Wait {
-                submission_index: None,
-                timeout: None,
+                submission_index: Some(submission),
+                timeout: Some(std::time::Duration::from_millis(250)),
             }
         } else {
             wgpu::PollType::Poll
