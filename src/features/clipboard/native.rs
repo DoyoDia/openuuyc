@@ -417,6 +417,9 @@ fn process(command: Command) {
             }
         }
         Command::PublishFiles(weak, epoch, files, reply) => {
+            if reply.is_closed() {
+                return;
+            }
             let result = (|| -> Result<()> {
                 let s = weak
                     .upgrade()

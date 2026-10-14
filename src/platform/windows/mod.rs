@@ -2,6 +2,7 @@
 mod adapter_type;
 pub(crate) mod amf;
 pub(crate) mod annotation;
+pub(crate) mod audio_thread;
 pub(crate) mod capture;
 pub(crate) mod capture_service;
 pub(crate) mod components;
@@ -24,6 +25,7 @@ pub(crate) mod input;
 pub(crate) mod loopback;
 pub(crate) mod notifications;
 pub(crate) mod nvenc;
+pub(crate) mod power_request;
 pub(crate) mod preprocess;
 pub(crate) mod qsv;
 pub(crate) mod qsv_allocator;

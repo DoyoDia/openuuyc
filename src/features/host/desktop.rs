@@ -71,7 +71,8 @@ async fn probe(
     gpu_compatibility: bool,
     active: impl Fn() -> bool + Send + 'static,
 ) -> Result<Capabilities> {
-    tokio::task::spawn_blocking(move || {
+    crate::lifecycle::blocking(move |cancel| {
+        let active = || active() && !cancel.is_cancelled();
         let started = std::time::Instant::now();
         ensure!(active(), "媒体准备已取消");
         let _runtime = encoder::Runtime::with_gpu_compatibility(gpu_compatibility)?;

@@ -66,7 +66,13 @@ fn counter() -> Result<(i64, i64)> {
     Ok((now, frequency))
 }
 pub(crate) fn serve(running: impl Fn() -> bool + Sync) -> Result<()> {
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let running = || running() && !stop.load(std::sync::atomic::Ordering::Acquire);
     std::thread::scope(|scope| -> Result<()> {
+        // Scope waits for children only after this guard has revoked their loop.
+        let _stop = crate::lifecycle::OnDrop::new(|| {
+            stop.store(true, std::sync::atomic::Ordering::Release)
+        });
         let mut workers = Vec::new();
         let mut listener = Pipe::listener(NAME, true, LIMIT, true)?;
         while running() {

@@ -325,11 +325,8 @@ impl NativePeer {
         }
     }
 
-    pub(crate) fn spawn_viewing_task(
-        &self,
-        task: impl std::future::Future<Output = ()> + Send + 'static,
-    ) {
-        self.data_channels.workers.spawn(task);
+    pub(crate) fn viewing_scope(&self) -> Arc<crate::lifecycle::TaskScope> {
+        self.data_channels.workers.child("viewing windows")
     }
 
     pub(crate) fn stream_control_handle(&self) -> StreamControlHandle {

@@ -652,6 +652,9 @@ impl ApplicationHandler<Event> for Windows {
                 }
             }
             Event::Request(Request::Viewer { key, config, done }) => {
+                if done.is_closed() {
+                    return;
+                }
                 if self.viewers.contains_key(&key) {
                     self.focus(&key);
                     let _ = done.send(Err(anyhow!("观看窗口已打开")));

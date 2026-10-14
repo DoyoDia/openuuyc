@@ -2,11 +2,15 @@
 use super::*;
 
 const IDENTITY: Contract = Contract {
+    retry: RetryPolicy::ConnectOnly,
     path: "/api/v1/device/share/info/refresh",
     method: Method::Post,
     ..DEVICE_LIST
 };
 const MODE: Contract = Contract {
+    // Official AD11F0/B2F790/AD1E50 use the shared recovery path. Replies
+    // retain their control_id and exact signed body across endpoint attempts.
+    retry: RetryPolicy::Replayable,
     path: "/api/v2/room/share/upload_control_mode",
     json_content_type: true,
     ..IDENTITY
@@ -63,7 +67,7 @@ impl NrdApi {
     }
     pub(crate) async fn host_assist_identity(&self) -> Result<ApiEnvelope<AssistIdentity>> {
         let contract = self.host_assist_contract(IDENTITY);
-        self.send_with_policy(contract, contract.path, Vec::new(), true)
+        self.send(contract, contract.path, Vec::new())
             .await
             .map(sanitize)
     }
@@ -75,7 +79,7 @@ impl NrdApi {
     ) -> Result<ApiEnvelope<serde_json::Value>> {
         let contract = self.host_assist_contract(contract);
         let mut reply: ApiEnvelope<serde_json::Value> = self
-            .send_with_policy(contract, contract.path, serde_json::to_vec(&body)?, true)
+            .send(contract, contract.path, serde_json::to_vec(&body)?)
             .await?;
         if reply.code == 0 && reply.data.is_none() {
             reply.data = Some(serde_json::Value::Null);

@@ -10,6 +10,7 @@ pub mod account;
 pub mod application;
 pub mod diagnostics;
 pub mod features;
+mod lifecycle;
 pub mod media;
 pub mod protocol;
 pub mod session;

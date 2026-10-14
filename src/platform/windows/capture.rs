@@ -18,7 +18,7 @@ use windows::{
 
 pub(crate) use crate::media::capture::{Screen, SourceGone};
 mod inventory;
-mod power;
+use super::power_request as power;
 mod recovery;
 mod session;
 
@@ -400,7 +400,7 @@ impl Desktop {
         Self::open_local(selected)
     }
     pub(super) fn open_local(selected: &Screen) -> Result<Self> {
-        let power = power::Request::new()?;
+        let power = power::Request::capture()?;
         let screen = refresh(selected)?;
         let backend = match Duplication::open(&screen.device_name) {
             Ok(capture) => {

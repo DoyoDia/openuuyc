@@ -730,6 +730,16 @@ fn output_worker(shared: Arc<Shared>) {
     // DeviceNotAvailable to the error callback. Wake this owner immediately;
     // the periodic check is only a fallback while no stream can report events.
     let _ = shared.output_thread.set(std::thread::current());
+    if let Err(error) = crate::platform::windows::audio_thread::initialize() {
+        let message = format!("初始化音频输出线程（COM MTA）失败：{error}");
+        tracing::warn!(error = %message,
+            com_apartment = %crate::platform::windows::audio_thread::description(),
+            "audio output COM initialization failed");
+        lock(&shared.status).failed(message, true);
+        return;
+    }
+    tracing::info!(com_apartment = %crate::platform::windows::audio_thread::description(),
+        "audio output COM apartment initialized");
     let host = cpal::default_host();
     let mut failed = Arc::new(OutputFailure::default());
     let mut stream = None;
@@ -894,6 +904,7 @@ fn output_worker(shared: Arc<Shared>) {
                         let message = format!("{error:#}");
                         tracing::warn!(device = %name, endpoint = ?current_id,
                             attempt = failures, exhausted = failures >= 3, error = %message,
+                            com_apartment = %crate::platform::windows::audio_thread::description(),
                             callback_error = ?failed.error.get(),
                             "audio output initialization failed");
                         // Failed initialization may have delivered a callback;

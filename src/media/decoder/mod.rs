@@ -473,8 +473,10 @@ fn poll_platform_decoder(
 
 pub(crate) fn detect_native_decoder_support(
     profile: ConnectionMediaProfile,
+    stop: tokio_util::sync::CancellationToken,
 ) -> Result<DeviceCapability> {
     std::thread::spawn(move || {
+        anyhow::ensure!(!stop.is_cancelled(), "native capability probe cancelled");
         let mut capabilities = Vec::new();
         if profile.decoder.mode.hardware()
             && let Ok(writers) = windows_surface::D3D11SurfaceWriter::available()
@@ -490,15 +492,20 @@ pub(crate) fn detect_native_decoder_support(
                 for chroma in [1, 3] {
                     for depth in [8, 10] {
                         for &(width, height) in QUALITY_DIMENSIONS[1..].iter().rev() {
+                            anyhow::ensure!(
+                                !stop.is_cancelled(),
+                                "native capability probe cancelled"
+                            );
                             if writers.iter().any(|writer| {
-                                WindowsVideoDecoder::probe_format(
-                                    writer.device_handle(),
-                                    codec,
-                                    width as u32,
-                                    height as u32,
-                                    depth,
-                                    chroma,
-                                )
+                                !stop.is_cancelled()
+                                    && WindowsVideoDecoder::probe_format(
+                                        writer.device_handle(),
+                                        codec,
+                                        width as u32,
+                                        height as u32,
+                                        depth,
+                                        chroma,
+                                    )
                             }) {
                                 capabilities.push(CodecCapability {
                                     video_codec: id,
@@ -533,6 +540,7 @@ pub(crate) fn detect_native_decoder_support(
             if let Ok(writer) = windows_surface::D3D11SurfaceWriter::new() {
                 for chroma in [1, 3] {
                     for depth in [8, 10] {
+                        anyhow::ensure!(!stop.is_cancelled(), "native capability probe cancelled");
                         // Advertise support independently of other codecs. Only
                         // the common capabilities can establish a usable hardware
                         // alternative; DualCapability selects that after negotiation.
@@ -551,6 +559,7 @@ pub(crate) fn detect_native_decoder_support(
             }
         }
 
+        anyhow::ensure!(!stop.is_cancelled(), "native capability probe cancelled");
         if capabilities.is_empty() {
             bail!("no decoder supports the selected codec and decoding mode");
         }
