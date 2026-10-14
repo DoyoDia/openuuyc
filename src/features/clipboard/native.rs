@@ -770,7 +770,11 @@ fn local_change() -> Result<()> {
             before - v.tasks.len()
         });
         if dropped != 0 {
-            tracing::info!(session = session.id, dropped, "本地剪贴板已换，作废发出去的文件清单");
+            tracing::info!(
+                session = session.id,
+                dropped,
+                "本地剪贴板已换，作废发出去的文件清单"
+            );
         }
         let links = formats::outgoing(
             &ids,
@@ -1282,8 +1286,8 @@ fn serve(s: &Arc<Inner>, epoch: u64, id: i64, kind: ClipboardRequestKind) -> Res
                 let explicit = STATE.with(|v| {
                     let mut v = v.borrow_mut();
                     let v = v.as_mut().unwrap();
-                    if let Some((_, files)) = v.tasks.get(&(s.id, r.task_id)) {
-                        return Some(Ok(files.clone()));
+                    if let Some((origin, files)) = v.tasks.get(&(s.id, r.task_id)) {
+                        return Some(Ok((*origin, files.clone())));
                     }
                     v.drag_sources.remove(&s.id).map(|(files, ticket)| {
                         if !ticket.valid() {
@@ -1304,11 +1308,11 @@ fn serve(s: &Arc<Inner>, epoch: u64, id: i64, kind: ClipboardRequestKind) -> Res
                             bail!("拖放文件提议已失效");
                         }
                         ticket.handed_off();
-                        Ok(files)
+                        Ok((Origin::Drag, files))
                     })
                 });
                 let (origin, files) = match explicit {
-                    Some(files) => (Origin::Drag, files?),
+                    Some(files) => files?,
                     None => (
                         Origin::Clipboard,
                         source
