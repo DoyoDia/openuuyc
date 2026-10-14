@@ -894,15 +894,18 @@ impl Player {
             intercept_shortcuts: self.intercept_shortcuts,
             send_ctrl_alt_del: false,
         };
-        let display_size = self.display_size();
         let screen_id = self.session.screen_id();
+        // "Follow local" asks for this monitor's size, as on Windows.
+        let local_size = window
+            .current_monitor()
+            .map(|monitor| (monitor.size().width, monitor.size().height));
         show_stream_control_window(
             ui.ctx(),
             &self.session.stream_control,
             &mut self.stream_control_ui,
             &mut view,
             screen_id,
-            display_size,
+            local_size,
         );
         self.set_performance_mode(view.performance_mode);
         self.session
