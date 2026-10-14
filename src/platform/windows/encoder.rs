@@ -110,6 +110,7 @@ pub(crate) fn probe(
             } else {
                 Encoder::hardware_format(
                     &device,
+                    backend,
                     (frame.width, frame.height),
                     format,
                     rate,
@@ -268,8 +269,12 @@ impl Encoder {
             _ => Ok(false),
         }
     }
+    /// The adapter's vendor picks the encoder; `_backend`, the candidate's,
+    /// was derived from that same adapter. Linux needs it to choose between
+    /// NVENC and VA-API on one display.
     pub(crate) fn hardware_format(
         device: &ID3D11Device,
+        _backend: super::format::Backend,
         size: (u32, u32),
         format: super::format::Format,
         rate: super::format::Rate,
