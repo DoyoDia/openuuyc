@@ -127,6 +127,35 @@ pub(super) fn safe_name(s: &str) -> bool {
                 )
         })
 }
+/// A file list as the Windows `FILEGROUPDESCRIPTORW` blob: a count, then one
+/// 592-byte `FILEDESCRIPTORW` per file.
+///
+/// Windows peers may ask for this instead of the descriptor list, and the
+/// official client does exactly that: it never follows up with a
+/// `FileDescListRequest`, so a producer that cannot answer this one leaves the
+/// paste stuck at its format probe. The inverse lives in `native.rs`
+/// (`parse_descriptors`), which only the Windows side ever needs.
+pub(super) fn descriptor_bytes(items: &[ClipboardFileDescriptor]) -> Result<Vec<u8>> {
+    ensure!(items.len() <= MAX_FILES, "文件数量过多");
+    let mut bytes = vec![0; 4 + items.len() * 592];
+    bytes[..4].copy_from_slice(&(items.len() as u32).to_le_bytes());
+    for (b, f) in bytes[4..].chunks_exact_mut(592).zip(items) {
+        ensure!(safe_name(&f.file_name), "不安全的文件名称");
+        // FD_ATTRIBUTES | FD_WRITESTIME | FD_FILESIZE | FD_PROGRESSUI
+        b[..4].copy_from_slice(&0x4064u32.to_le_bytes());
+        b[36..40].copy_from_slice(&f.file_attributes.to_le_bytes());
+        b[56..64].copy_from_slice(&f.last_write_time.to_le_bytes());
+        b[64..68].copy_from_slice(&((f.file_size >> 32) as u32).to_le_bytes());
+        b[68..72].copy_from_slice(&(f.file_size as u32).to_le_bytes());
+        for (out, c) in b[72..]
+            .chunks_exact_mut(2)
+            .zip(f.file_name.replace('/', "\\").encode_utf16())
+        {
+            out.copy_from_slice(&c.to_le_bytes());
+        }
+    }
+    Ok(bytes)
+}
 pub(super) fn file_format(id: u32, name: &str) -> bool {
     id == 15
         || [
@@ -146,7 +175,16 @@ pub(super) fn file_format(id: u32, name: &str) -> bool {
         .iter()
         .any(|s| s.eq_ignore_ascii_case(name))
 }
-pub(super) fn supported(id: u32, name: &str, files: bool) -> bool {
+/// Whether a format may pass, in either direction.
+///
+/// `copy_marker` says whether this side is willing to speak `Preferred DropEffect`,
+/// which is how Windows peers say whether a file clipboard holds a copy or a cut.
+/// Only the Linux producer sets it: it answers `DROPEFFECT_COPY` for the copies it
+/// publishes, where a Windows producer would put its own effect on the wire, and a
+/// Windows consumer would read the remote's effect and act on it (a MOVE would
+/// move the remote's files). Tying it to the platform instead would change what
+/// Windows sends and accepts, which is not this change's business.
+pub(super) fn supported(id: u32, name: &str, files: bool, copy_marker: bool) -> bool {
     if name.eq_ignore_ascii_case("OpenUUYC.Clipboard.Remote")
         || name.eq_ignore_ascii_case("DataObject")
         || name.eq_ignore_ascii_case("Ole Private Data")
@@ -155,10 +193,10 @@ pub(super) fn supported(id: u32, name: &str, files: bool) -> bool {
     }
     if file_format(id, name) {
         return files
-            && matches!(
+            && (matches!(
                 name,
                 "FileGroupDescriptorW" | "FileContents" | "public.file-url"
-            );
+            ) || (copy_marker && name.eq_ignore_ascii_case("Preferred DropEffect")));
     }
     matches!(
         id,
@@ -179,15 +217,20 @@ pub(super) fn incoming(f: ClipboardFormat, platform: i32, files: bool) -> Option
     } else {
         register(&f.name)
     };
-    if local == 0 || (!supported(local, &name(local), files) && platform != 4) {
+    if local == 0 || (!supported(local, &name(local), files, false) && platform != 4) {
         return None;
     }
     Some(Format { wire: f, local })
 }
-pub(super) fn outgoing(ids: &[(u32, String)], platform: i32, files: bool) -> Vec<Format> {
+pub(super) fn outgoing(
+    ids: &[(u32, String)],
+    platform: i32,
+    files: bool,
+    copy_marker: bool,
+) -> Vec<Format> {
     let mut out = Vec::new();
     for (id, n) in ids {
-        if !supported(*id, n, files) {
+        if !supported(*id, n, files, copy_marker) {
             continue;
         }
         if platform != 4 {
@@ -375,4 +418,48 @@ fn dib_to_bmp(d: &[u8]) -> Result<Vec<u8>> {
     out.extend_from_slice(&((14 + offset) as u32).to_le_bytes());
     out.extend_from_slice(d);
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 这一段布局是我们和 Windows Shell 之间唯一的约定：个数 + 每个 592 字节的
+    /// `FILEDESCRIPTORW` 定长槽位，字段位置写错不会报错，只会在对面表现成「粘出来
+    /// 的文件名是乱的/大小是 0」。所以位置要钉住。
+    #[test]
+    fn descriptor_blob_keeps_the_windows_slot_layout() {
+        let items = vec![ClipboardFileDescriptor {
+            file_name: "hello.txt".into(),
+            file_attributes: 0x80,
+            last_write_time: 0x1234_5678_9abc_def0,
+            file_size: 5,
+        }];
+        let bytes = descriptor_bytes(&items).expect("编码失败");
+        assert_eq!(bytes.len(), 4 + 592);
+        assert_eq!(u32::from_le_bytes(bytes[..4].try_into().unwrap()), 1);
+        // FD_ATTRIBUTES | FD_WRITESTIME | FD_FILESIZE | FD_PROGRESSUI
+        assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 0x4064);
+        assert_eq!(
+            u32::from_le_bytes(bytes[4 + 36..4 + 40].try_into().unwrap()),
+            0x80
+        );
+        assert_eq!(
+            u64::from_le_bytes(bytes[4 + 56..4 + 64].try_into().unwrap()),
+            0x1234_5678_9abc_def0
+        );
+        let size = u64::from(u32::from_le_bytes(
+            bytes[4 + 68..4 + 72].try_into().unwrap(),
+        )) | (u64::from(u32::from_le_bytes(
+            bytes[4 + 64..4 + 68].try_into().unwrap(),
+        )) << 32);
+        assert_eq!(size, 5);
+        let name: String = bytes[4 + 72..]
+            .chunks_exact(2)
+            .map(|p| u16::from_le_bytes([p[0], p[1]]))
+            .take_while(|c| *c != 0)
+            .map(|c| char::from_u32(u32::from(c)).unwrap())
+            .collect();
+        assert_eq!(name, "hello.txt");
+    }
 }

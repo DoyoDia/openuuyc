@@ -22,6 +22,11 @@ pub(super) use super::formats::safe_name;
 /// Anything larger is a transfer, not a clipboard paste.
 const MAX_CLIP: usize = 32 * 1024 * 1024;
 const POLL: Duration = Duration::from_millis(400);
+/// 剪贴板这条路上双方都用固定任务号 0：官方 Windows 客户端写死的，我们发
+/// `FileDescListRequest` 时也用这个。`accept_files` 按这个号读对面的清单，
+/// `descriptor_blob` 答自己的清单时登记在同一个号上，好让对面接下来的
+/// `FileContentsRequest` 找得到。
+const CLIPBOARD_TASK: u32 = 0;
 
 pub(super) enum Command {
     Activate(Weak<Inner>),
@@ -403,6 +408,12 @@ impl LocalSnapshot {
                 "FileGroupDescriptorW".into(),
             ));
             ids.push((formats::register("FileContents"), "FileContents".into()));
+            // Shell 靠这条判断粘过来是复制还是移动；不给的话官方客户端会一直
+            // 停在试探阶段（它也会先要 FileGroupDescriptorW，见 `serve`）。
+            ids.push((
+                formats::register("Preferred DropEffect"),
+                "Preferred DropEffect".into(),
+            ));
             return ids;
         }
         if self.text.is_some() {
@@ -432,7 +443,19 @@ impl LocalSnapshot {
                 })
                 .context("本地剪贴板没有文本"),
             8 => self.image.clone().context("本地剪贴板没有图片"),
-            _ => bail!("不支持的本地剪贴板格式"),
+            // 描述符块那条要展开整棵树、还要登记任务，所以留在 `serve` 里做
+            // （见 `descriptor_blob`）。
+            //
+            // 这一条只做复制（DROPEFFECT_COPY = 1）。答成移动会让文件管理器把
+            // 被控端的原文件搬走——这条不是可选的礼貌，是安全线。
+            _ if format
+                .wire
+                .name
+                .eq_ignore_ascii_case("Preferred DropEffect") =>
+            {
+                Ok(1u32.to_le_bytes().to_vec())
+            }
+            _ => bail!("不支持的本地剪贴板格式 {}", format.wire.name),
         }
     }
 }
@@ -585,6 +608,13 @@ struct State {
     /// File lists handed out per session and task, kept until the clipboard
     /// changes so a slow remote can keep reading the copy it started on.
     tasks: HashMap<(u64, u32), Arc<LocalFiles>>,
+    /// 本地那一批路径展开出来的清单，和 `local` 配套。
+    ///
+    /// 展开一次要整树遍历，而对方是按格式一个个来问的（描述符块还可能被问好几
+    /// 遍），每次都重走一遍就把剪贴板线程按住了。本地剪贴板一换它就作废，见
+    /// `retire`——包括「同一份又复制了一遍」那种：那时内容没变，可文件本身可能
+    /// 已经改过，重新走一遍才能拿到新的大小与改动时间。
+    local_files: Option<Arc<LocalFiles>>,
     /// The remote copy currently published locally, mounted for as long as the
     /// clipboard points at it.
     mounted: Option<super::fuse::Mount>,
@@ -601,6 +631,26 @@ struct State {
     /// Set once a Wayland watcher is posting `LocalChanged`, which makes the
     /// loop block instead of polling on a timer.
     watching: bool,
+}
+
+impl State {
+    /// 本地剪贴板这一份到此为止：发出去的文件清单和展开出来的树都跟着重来。
+    fn retire(&mut self) {
+        self.tasks.clear();
+        self.local_files = None;
+    }
+
+    /// 本地这份清单（按会话登记的任务用同一份）。展开过一次就留着，见
+    /// `local_files`。
+    fn local_files(&mut self) -> Result<Arc<LocalFiles>> {
+        if let Some(files) = &self.local_files {
+            return Ok(files.clone());
+        }
+        ensure!(!self.local.sources.is_empty(), "本地剪贴板没有文件");
+        let files = Arc::new(collect_files(&self.local.sources)?);
+        self.local_files = Some(files.clone());
+        Ok(files)
+    }
 }
 
 pub(super) fn start() -> Result<()> {
@@ -665,6 +715,7 @@ fn run(receiver: Receiver<Command>, watcher_sender: SyncSender<Command>) {
         published: HashMap::new(),
         local: LocalSnapshot::default(),
         tasks: HashMap::new(),
+        local_files: None,
         mounted: None,
         offer: None,
         drag_files: HashMap::new(),
@@ -859,6 +910,7 @@ fn process(state: &mut State, command: Command) {
                     &file_format_ids(),
                     session.platform.load(Ordering::Acquire),
                     true,
+                    true,
                 );
                 state
                     .drag_files
@@ -893,6 +945,7 @@ fn process(state: &mut State, command: Command) {
                 let links = formats::outgoing(
                     &file_format_ids(),
                     session.platform.load(Ordering::Acquire),
+                    true,
                     true,
                 );
                 state
@@ -1024,9 +1077,7 @@ fn offer_files(
 /// Only the list is fetched here. The contents follow one read at a time,
 /// through the filesystem, if and when something actually opens them.
 fn accept_files(state: &mut State, session: &Arc<Inner>, epoch: u64) -> Result<()> {
-    // The task id the official Windows client uses for an inbound offer.
-    const TASK: u32 = 0;
-    let descriptors = session.descriptors(epoch, TASK)?;
+    let descriptors = session.descriptors(epoch, CLIPBOARD_TASK)?;
     ensure!(!descriptors.is_empty(), "远端剪贴板文件列表为空");
     let tree = super::fuse::Tree::build(&descriptors)?;
     let parent = super::fuse::mount_parent()?;
@@ -1034,7 +1085,14 @@ fn accept_files(state: &mut State, session: &Arc<Inner>, epoch: u64) -> Result<(
         let session = Arc::downgrade(session);
         Arc::new(move |index: u32, offset: u64, length: usize| {
             let session = session.upgrade().context("剪贴板会话已结束")?;
-            session.read_file(epoch, TASK, index, offset, length.min(FILE_BLOCK), 2)
+            session.read_file(
+                epoch,
+                CLIPBOARD_TASK,
+                index,
+                offset,
+                length.min(FILE_BLOCK),
+                2,
+            )
         })
     };
     let mount = super::fuse::Mount::new(&parent, super::fuse::generation(), tree, reader)?;
@@ -1079,7 +1137,7 @@ fn write_text(state: &mut State, text: &str) -> Result<()> {
         text: Some(text.to_owned()),
         ..Default::default()
     };
-    state.tasks.clear();
+    state.retire();
     state.mounted = None;
     state.offer = None;
     Ok(())
@@ -1116,7 +1174,7 @@ fn write_files(state: &mut State, paths: &[PathBuf]) -> Result<()> {
         sources: paths.to_vec(),
         ..Default::default()
     };
-    state.tasks.clear();
+    state.retire();
     Ok(())
 }
 
@@ -1135,7 +1193,7 @@ fn write_image(state: &mut State, dib: &[u8]) -> Result<()> {
         image: Some(dib.to_vec()),
         ..Default::default()
     };
-    state.tasks.clear();
+    state.retire();
     state.mounted = None;
     state.offer = None;
     Ok(())
@@ -1237,7 +1295,7 @@ fn poll_local(state: &mut State) -> Result<()> {
     }
     state.local = snapshot;
     // The previous copy is gone; a read still in flight against it now fails.
-    state.tasks.clear();
+    state.retire();
     if state.local.is_empty() {
         state.published.clear();
         return Ok(());
@@ -1248,6 +1306,7 @@ fn poll_local(state: &mut State) -> Result<()> {
             &ids,
             session.platform.load(Ordering::Acquire),
             session.file_allowed(),
+            true,
         );
         if links.is_empty() {
             state.published.remove(&session.id);
@@ -1270,6 +1329,24 @@ fn poll_local(state: &mut State) -> Result<()> {
     Ok(())
 }
 
+/// 答一次 `FileGroupDescriptorW`。
+///
+/// 这个二进制块是官方 Windows 客户端唯一会问的描述符形态，而它问完就直接来要
+/// `FileContents`——不会先发 `FileDescListRequest`（对面那半见 `accept_files`）。
+/// 所以清单要在这里就登记成任务，否则下一步的 `FileContentsRequest` 会答
+/// 「文件任务已失效」。登记用的是双方约定好的固定任务号。
+fn descriptor_blob(state: &mut State, session: &Arc<Inner>) -> Result<Vec<u8>> {
+    tracing::info!("对面来问 FileGroupDescriptorW 描述符块");
+    let files = state.local_files()?;
+    if state.tasks.len() < 32 {
+        state
+            .tasks
+            .insert((session.id, CLIPBOARD_TASK), files.clone());
+    }
+    let descriptors: Vec<_> = files.items.iter().map(|file| file.desc.clone()).collect();
+    formats::descriptor_bytes(&descriptors)
+}
+
 fn serve(
     state: &mut State,
     session: &Arc<Inner>,
@@ -1280,17 +1357,42 @@ fn serve(
     match kind {
         ClipboardRequestKind::FormatDataAsk(ask) => {
             let result = (|| -> Result<Vec<u8>> {
-                let formats = state.published.get(&session.id).context("原剪贴板已失效")?;
-                let format = formats
+                let format = state
+                    .published
+                    .get(&session.id)
+                    .context("原剪贴板已失效")?
                     .iter()
                     .find(|format| {
                         format.wire.id == ask.format_id
                             && (ask.format_name.is_empty() || ask.format_name == format.wire.name)
                     })
-                    .context("未发布该剪贴板格式")?;
-                let data = state.local.data(format)?;
-                formats::convert(data, format, session.platform.load(Ordering::Acquire), true)
-            })();
+                    .context("未发布该剪贴板格式")?
+                    .clone();
+                // 官方 Windows 客户端不走 `FileDescListRequest`：它先按名字来问这个
+                // 二进制块（DWORD 个数 + N × 592 字节的 FILEDESCRIPTORW），答不上就
+                // 不再往下问 FileContents，粘贴永远不动。我们自己两个客户端之间看不
+                // 出这件事——我们走的是 FileDescList。
+                if format.wire.name == "FileGroupDescriptorW" {
+                    return descriptor_blob(state, session);
+                }
+                let data = state.local.data(&format)?;
+                formats::convert(
+                    data,
+                    &format,
+                    session.platform.load(Ordering::Acquire),
+                    true,
+                )
+            })()
+            .inspect_err(|error| {
+                // 官方客户端是逐个格式来问的，答不上哪一条只在这里看得出来；
+                // 之前这里一声不吭，「粘贴不动」在日志里什么都没有。
+                tracing::info!(
+                    format = %ask.format_name,
+                    format_id = ask.format_id,
+                    %error,
+                    "剪贴板格式答不上"
+                );
+            });
             match result {
                 Ok(data) if !data.is_empty() => {
                     session.enqueue(Outbound::Blocks(epoch, id, ask.block_key, data))
@@ -1309,6 +1411,12 @@ fn serve(
             }
         }
         ClipboardRequestKind::FileDescListRequest(ask) => {
+            // 对面走的是哪一条路，只有这里看得出来：官方客户端压根不发这一条
+            // （见 `descriptor_blob`），所以「它有没来过」本身就是证据。
+            tracing::info!(
+                task_id = ask.task_id,
+                "对面来问文件清单（FileDescListRequest）"
+            );
             let explicit = drag_list(state, session, ask.task_id);
             let dragged = explicit.is_some() || session.file_offers.is_some();
             let result = (|| -> Result<Arc<LocalFiles>> {
@@ -1388,6 +1496,14 @@ fn serve(
             session.enqueue(Outbound::Packets(epoch, messages))
         }
         ClipboardRequestKind::FileContentsRequest(ask) => {
+            // 和上一条配着看：不走 FileDescListRequest 的对面会直接来这里，
+            // task_id 也说明它是接着哪一次答的清单。
+            tracing::info!(
+                task_id = ask.task_id,
+                list_index = ask.list_index,
+                pos_offset = ask.pos_offset,
+                "对面来要文件内容（FileContentsRequest）"
+            );
             let result = if session.file_allowed() {
                 state
                     .tasks
