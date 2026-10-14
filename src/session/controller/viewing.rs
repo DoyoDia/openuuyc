@@ -63,6 +63,10 @@ pub(super) async fn run_viewer_window(
         .as_ref()
         .map(|h| (h.target.clone(), h.target.subscribe()))
         .unwrap_or_else(|| tokio::sync::watch::channel(None));
+    // Only a standalone `connect` process ends with its viewer. Once tokio
+    // listens for SIGTERM the default action is gone for the whole process,
+    // so a viewer hosted in the GUI must not, or the GUI would outlive it.
+    let terminate = owns_presence;
     let owner_task = tokio::spawn(async move {
         tokio::select! {
             biased;
@@ -80,6 +84,9 @@ pub(super) async fn run_viewer_window(
             // 数据通道正常关闭后主机立即释放会话，避免 ~40s 的
             // keepalive 超时锁导致重连被"设备正在被其他设备使用"拒绝。
             _ = async {
+                if !terminate {
+                    std::future::pending::<()>().await;
+                }
                 #[cfg(unix)]
                 {
                     match tokio::signal::unix::signal(
@@ -385,7 +392,7 @@ pub(super) async fn run_viewer_connection_owner(
                         // Revalidate the real ID while the old room continues playing.
                         let next = cancellable(cancel, resolve_connection_with_client(
                             Arc::clone(&resolved.client), &request.device.alias, options, None,
-                            Some(&request.device.device_id), request.takeover, force_takeover)).await;
+                            Some(&request.device.device_id), request.takeover, false)).await;
                         let next = match next {
                             Ok(next) => next,
                             Err(error) => {
