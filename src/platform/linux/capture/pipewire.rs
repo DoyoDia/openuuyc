@@ -11,7 +11,7 @@
 //! picture; DMA-BUF import belongs with a GPU encoder.
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -535,8 +535,11 @@ pub(crate) struct DmabufPicture {
     /// DRM fourcc of the buffer, which is what VA-API imports it as.
     pub fourcc: u32,
     pub modifier: u64,
-    /// Plane descriptors: `(fd, offset, pitch)`.
-    pub planes: Vec<(RawFd, u32, u32)>,
+    /// The buffer's extent in bytes, measured from the file descriptor.
+    pub buffer_size: Option<u32>,
+    /// Plane descriptors: `(fd, offset, pitch)`. The descriptor is owned, so
+    /// the buffer stays alive for as long as the picture does.
+    pub planes: Vec<(std::os::fd::OwnedFd, u32, u32)>,
     /// Returns the buffer to the compositor once the picture is dropped.
     _lease: BufferLease,
 }
@@ -546,16 +549,20 @@ impl DmabufPicture {
     ///
     /// A compositor leaves `spa_data.maxsize` at zero for DMA-BUFs -- its own
     /// clients read `chunk->size` instead -- so the driver has to be told how
-    /// much memory there is. A single row is not enough: the import would then
-    /// cover one line of the picture.
+    /// much memory there is. `lseek` on the file descriptor is authoritative;
+    /// `pitch * height` undercounts a tiled buffer, and reporting too little
+    /// makes the driver import only part of the picture.
     pub(crate) fn buffer_size(&self) -> u32 {
-        self.planes
-            .iter()
-            .map(|(_, offset, pitch)| offset.saturating_add(pitch.saturating_mul(self.height)))
-            .max()
-            .unwrap_or(0)
-    }
-}
+        self.buffer_size.unwrap_or_else(|| {
+            self.planes
+                .iter()
+                .map(|(_, offset, pitch)| {
+                    offset.saturating_add(pitch.saturating_mul(self.height))
+                })
+                .max()
+                .unwrap_or(0)
+        })
+    }}
 
 /// Keeps a PipeWire buffer out of the compositor's pool until it is dropped.
 ///
@@ -578,7 +585,10 @@ unsafe impl Send for BufferLease {}
 
 impl Drop for BufferLease {
     fn drop(&mut self) {
-        unsafe { (self.session.api.stream_queue_buffer)(self.session.stream, self.buffer) };
+        let result = unsafe { (self.session.api.stream_queue_buffer)(self.session.stream, self.buffer) };
+        if result != 0 {
+            tracing::warn!(result, "PipeWire buffer 归还失败");
+        }
     }
 }
 
@@ -650,27 +660,24 @@ unsafe extern "C" fn on_param_changed(data: *mut c_void, id: u32, param: *const 
     let callbacks = unsafe { &*data.cast::<Callbacks>() };
     let format = unsafe { parse_format(param) };
     let mut state = lock(&callbacks.shared.state);
+    // The portal announces the DMA-BUF format and the shared-memory format in
+    // turn, and only one of them is what the stream will actually use. The
+    // request is therefore made once, for DMA-BUF, and never revised: switching
+    // it back and forth makes the portal re-fixate the modifier each time, and
+    // its retry counter does not reset, so a handful of changes is enough for
+    // it to give up on DMA-BUF for the rest of the session.
+    let wants_dmabuf = dmabuf_requested();
+    let first = state.buffers_requested.is_none();
     state.format = format;
-    // A modifier that was actually fixated means a DMA-BUF; the portal writes
-    // `DRM_FORMAT_MOD_INVALID` when it falls back to shared memory, and an
-    // unfixed modifier says nothing about the layout.
-    let dmabuf = format
-        .and_then(|format| format.modifier)
-        .is_some_and(|modifier| modifier != DRM_MOD_INVALID);
-    // The buffer types are only re-sent when the kind changes. Sending them on
-    // every format change makes the portal re-fixate the modifier, and when it
-    // cannot it falls back to shared memory, reports that as another format
-    // change, and the two sides loop: the portal logged over a thousand fixate
-    // attempts in a few seconds and the stream never settled.
-    if state.buffers_requested == Some(dmabuf) {
+    if !first {
         drop(state);
-        tracing::debug!(?format, dmabuf, "PipeWire screencast format renegotiated");
+        tracing::debug!(?format, "PipeWire screencast format renegotiated");
         return;
     }
-    state.buffers_requested = Some(dmabuf);
+    state.buffers_requested = Some(wants_dmabuf);
     drop(state);
-    tracing::debug!(?format, dmabuf, "PipeWire screencast format negotiated");
-    let buffers = buffers(dmabuf).aligned();
+    tracing::debug!(?format, wants_dmabuf, "PipeWire screencast format negotiated");
+    let buffers = buffers(wants_dmabuf).aligned();
     let meta = crop_meta().aligned();
     let mut params = [buffers.as_ptr().cast::<c_void>(), meta.as_ptr().cast()];
     unsafe {
@@ -726,6 +733,7 @@ unsafe extern "C" fn on_process(data: *mut c_void) {
             // Dropping the picture returns its buffer through the lease, so
             // there is nothing to queue here.
             drop(picture);
+            tracing::debug!("PipeWire 画面：已有待取画面，丢弃本帧");
             return;
         }
         state.picture = picture;
@@ -929,12 +937,39 @@ unsafe fn read_dmabuf(
     if planes.is_empty() {
         return None;
     }
+    // The compositor reports `maxsize` as zero for DMA-BUFs, and `pitch *
+    // height` is not the allocation either: a tiled buffer is larger, because
+    // the layout pads and reorders it (2880x1800 at 11520 pitch is 19.8 MiB of
+    // pixels in a 24 MiB object). The driver needs the real extent, so ask the
+    // kernel rather than guess.
+    let buffer_size = unsafe { libc::lseek(planes[0].0, 0, libc::SEEK_END) };
+    let buffer_size = u32::try_from(buffer_size).ok().filter(|size| *size > 0);
+    // The descriptor is only borrowed: the compositor closes it when the buffer
+    // is removed, which happens on every renegotiation. Duplicating it keeps
+    // the buffer alive for as long as the picture is, so the encoder never
+    // imports through a descriptor number that has been closed and handed out
+    // again.
+    let planes: Vec<(std::os::fd::OwnedFd, u32, u32)> = planes
+        .into_iter()
+        .filter_map(|(fd, offset, pitch)| {
+            let duplicated = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+            if duplicated < 0 {
+                tracing::warn!(fd, "复制 DMA-BUF 描述符失败");
+                return None;
+            }
+            Some((unsafe { std::os::fd::OwnedFd::from_raw_fd(duplicated) }, offset, pitch))
+        })
+        .collect();
+    if planes.is_empty() {
+        return None;
+    }
     tracing::debug!(
         fourcc,
         width,
         height,
         modifier,
         planes = planes.len(),
+        buffer_size = ?buffer_size,
         "DMA-BUF 画面已交付"
     );
     Some(Picture::Dmabuf(DmabufPicture {
@@ -942,6 +977,7 @@ unsafe fn read_dmabuf(
         height,
         fourcc,
         modifier,
+        buffer_size,
         planes,
         _lease: BufferLease {
             session: Arc::clone(session),

@@ -13,6 +13,7 @@
 //!
 //! The driver owns the bitstream syntax. We supply the sequence and picture
 //! parameters; the driver emits SPS/PPS and slices.
+use std::os::fd::AsRawFd;
 use std::rc::Rc;
 
 use cros_libva::{
@@ -345,7 +346,7 @@ impl Encoder {
                 .planes
                 .iter()
                 .map(|(fd, offset, pitch)| DrmPrimeImportPlane {
-                    fd: *fd,
+                    fd: fd.as_raw_fd(),
                     offset: *offset,
                     pitch: *pitch,
                 })
