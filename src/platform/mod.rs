@@ -16,5 +16,17 @@ pub(crate) use linux::{
     encoder, file_locations, graphics, host_service, loopback, notifications, surface,
     system_power, transfer, virtual_audio, wol,
 };
+/// One output as the compositor lays it out, in the global space it resolves
+/// an absolute pointer position in. X11 and Windows have no such thing: their
+/// display rectangles are already the space a pointer is named in.
+#[derive(Clone, Debug)]
+pub(crate) struct CompositorOutput {
+    pub name: String,
+    pub left: i32,
+    pub top: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
 pub(crate) mod paths;
 pub(crate) mod wallpaper;

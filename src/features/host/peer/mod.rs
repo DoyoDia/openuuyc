@@ -446,16 +446,34 @@ impl Peer {
             input_policy,
             move || super::input::Geometry {
                 current: input_reports.current.load(Ordering::Acquire),
-                screens: lock(&input_reports.catalog)
-                    .iter()
-                    .map(|s| super::input::Screen {
-                        id: s.screen.id,
-                        left: s.screen.left,
-                        top: s.screen.top,
-                        width: s.screen.width,
-                        height: s.screen.height,
-                    })
-                    .collect(),
+                screens: {
+                    // A compositor resolves an absolute pointer position in its
+                    // own layout, which the display server's rectangles are not.
+                    let layout = crate::platform::display::compositor_layout();
+                    lock(&input_reports.catalog)
+                        .iter()
+                        .map(|s| super::input::Screen {
+                            id: s.screen.id,
+                            left: s.screen.left,
+                            top: s.screen.top,
+                            width: s.screen.width,
+                            height: s.screen.height,
+                            logical: layout
+                                .as_ref()
+                                .and_then(|layout| {
+                                    layout
+                                        .iter()
+                                        .find(|output| output.name == s.screen.device_name)
+                                })
+                                .map(|output| super::input::Rect {
+                                    left: output.left,
+                                    top: output.top,
+                                    right: output.left + output.width as i32,
+                                    bottom: output.top + output.height as i32,
+                                }),
+                        })
+                        .collect()
+                },
             },
         )?;
         let microphone =

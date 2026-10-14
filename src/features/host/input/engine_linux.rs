@@ -123,14 +123,18 @@ impl Engine {
         let mut restore = None;
         if mode == 2
             && let Ok(screen) = self.geometry.screen(None)
-            && let Ok(rect) = screen.rect()
+            && let Ok(rect) = self.absolute_rect(screen)
             && let Ok((x, y)) = self.injector.pointer()
             && (rect.left..rect.right).contains(&x)
             && (rect.top..rect.bottom).contains(&y)
         {
+            let (width, height) = (
+                f64::from(rect.right - rect.left),
+                f64::from(rect.bottom - rect.top),
+            );
             restore = Some([
-                f64::from(x - rect.left) / f64::from(screen.width),
-                f64::from(y - rect.top) / f64::from(screen.height),
+                f64::from(x - rect.left) / width,
+                f64::from(y - rect.top) / height,
             ]);
         }
         self.mouse_policy = super::config::MousePolicy {
@@ -138,10 +142,65 @@ impl Engine {
             restore,
         };
     }
+
+    /// The rectangle an absolute position on this screen is named in. A
+    /// compositor resolves the virtual devices' absolute axes in its own
+    /// layout, which is not what the display server's rectangles describe:
+    /// XWayland sizes each output in that output's own pixels while keeping the
+    /// compositor's logical position, so aiming with the X numbers lands short
+    /// or long by exactly the output's scale. X Test is resolved by X, in X's
+    /// rectangles.
+    fn absolute_rect(&self, screen: &super::geometry::Screen) -> Result<super::geometry::Rect> {
+        if self.injector.aims_in_compositor_layout()
+            && let Some(logical) = screen.logical
+        {
+            return Ok(logical);
+        }
+        screen.rect()
+    }
+
+    /// The bounding box of every screen, which is the desk an absolute position
+    /// is resolved against.
+    fn desktop(&self) -> native::Desktop {
+        let mut left = i32::MAX;
+        let mut top = i32::MAX;
+        let mut right = i32::MIN;
+        let mut bottom = i32::MIN;
+        for screen in &self.geometry.screens {
+            let Ok(rect) = self.absolute_rect(screen) else {
+                continue;
+            };
+            left = left.min(rect.left);
+            top = top.min(rect.top);
+            right = right.max(rect.right);
+            bottom = bottom.max(rect.bottom);
+        }
+        if left >= right || top >= bottom {
+            return native::Desktop {
+                left: 0,
+                top: 0,
+                width: 0,
+                height: 0,
+            };
+        }
+        native::Desktop {
+            left,
+            top,
+            width: (right - left) as u32,
+            height: (bottom - top) as u32,
+        }
+    }
+
     pub fn synchronize(&mut self, geometry: Geometry) -> Result<()> {
         if geometry != self.geometry {
             self.release()?;
             self.geometry = geometry;
+            // The backends that name a position rather than a displacement
+            // need the desk those positions are in. A backend that cannot make
+            // the device it needs is not worth losing the whole session over.
+            if let Err(error) = self.injector.set_geometry(self.desktop()) {
+                tracing::warn!(%error, "injector geometry unavailable");
+            }
         }
         self.observe_foreground();
         Ok(())
@@ -178,7 +237,7 @@ impl Engine {
         Ok(())
     }
     fn absolute(&mut self, screen: Option<i32>, x: f64, y: f64) -> Result<()> {
-        let r = self.geometry.screen(screen)?.rect()?;
+        let r = self.absolute_rect(self.geometry.screen(screen)?)?;
         let px = (f64::from(r.left) + f64::from(r.right - r.left) * x)
             .round()
             .clamp(f64::from(r.left), f64::from(r.right - 1));

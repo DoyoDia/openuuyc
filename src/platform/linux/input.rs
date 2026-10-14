@@ -52,6 +52,9 @@ impl Lock {
 /// Wayland 会话下 XTest 只能影响 XWayland 客户端，Hyprland 等合成器里的
 /// 原生客户端收不到；Wayland 会话有 `/dev/uinput` 时改用它注入。X11 仍保留
 /// 用于读取键位表、指针位置与锁定键状态。
+///
+/// 绝对定位另有一台带 `ABS_X`/`ABS_Y` 的设备，范围就是合成器自己布局的逻辑
+/// 尺寸：位置由合成器解算，不再经过 X，也就没有 XWayland 那套尺寸与缩放。
 mod uinput {
     use anyhow::{Context, Result, ensure};
     use std::fs::{File, OpenOptions};
@@ -61,12 +64,17 @@ mod uinput {
     const EV_SYN: u16 = 0x00;
     const EV_KEY: u16 = 0x01;
     const EV_REL: u16 = 0x02;
+    const EV_ABS: u16 = 0x03;
 
     const REL_X: u16 = 0x00;
     const REL_Y: u16 = 0x01;
     const REL_HWHEEL: u16 = 0x06;
     const REL_WHEEL: u16 = 0x08;
+    const ABS_X: u16 = 0x00;
+    const ABS_Y: u16 = 0x01;
     const SYN_REPORT: u16 = 0x00;
+    /// 绝对轴只受一根指针控制，而不是某一块屏上的坐标。
+    const INPUT_PROP_POINTER: u32 = 0;
 
     const BTN_LEFT: u16 = 0x110;
     const BTN_RIGHT: u16 = 0x111;
@@ -81,6 +89,9 @@ mod uinput {
     const UI_SET_EVBIT: libc::c_ulong = 0x4004_5564;
     const UI_SET_KEYBIT: libc::c_ulong = 0x4004_5565;
     const UI_SET_RELBIT: libc::c_ulong = 0x4004_5566;
+    const UI_SET_ABSBIT: libc::c_ulong = 0x4004_5567;
+    const UI_SET_PROPBIT: libc::c_ulong = 0x4004_556E;
+    const UI_ABS_SETUP: libc::c_ulong = 0x401c_5504;
 
     #[repr(C)]
     struct InputId {
@@ -94,6 +105,23 @@ mod uinput {
         id: InputId,
         name: [libc::c_char; 80],
         ff_effects_max: u32,
+    }
+    #[repr(C)]
+    #[derive(Default)]
+    struct InputAbsInfo {
+        value: i32,
+        minimum: i32,
+        maximum: i32,
+        fuzz: i32,
+        flat: i32,
+        resolution: i32,
+    }
+    #[repr(C)]
+    #[derive(Default)]
+    struct UinputAbsSetup {
+        code: u16,
+        pad: u16,
+        absinfo: InputAbsInfo,
     }
     #[repr(C)]
     struct InputEvent {
@@ -118,6 +146,27 @@ mod uinput {
         Ok(())
     }
 
+    /// 声明一条绝对轴以及它的范围：合成器就是按这个范围把轴上的值解算成
+    /// 全局位置的，范围不对落点就整体偏。
+    fn set_abs(fd: i32, axis: u16, maximum: i32) -> Result<()> {
+        set(fd, UI_SET_ABSBIT, axis.into())?;
+        let setup = UinputAbsSetup {
+            code: axis,
+            absinfo: InputAbsInfo {
+                maximum,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let rc = unsafe { libc::ioctl(fd, UI_ABS_SETUP, &setup as *const _) };
+        ensure!(
+            rc >= 0,
+            "设置绝对轴范围失败：{}",
+            std::io::Error::last_os_error()
+        );
+        Ok(())
+    }
+
     /// X 按键编号到 evdev 按键码（1 左、2 中、3 右、8 侧、9 扩展）。
     pub(crate) fn button_code(x_button: u8) -> Option<u16> {
         Some(match x_button {
@@ -131,27 +180,17 @@ mod uinput {
     }
 
     impl Device {
-        pub(crate) fn open() -> Result<Self> {
+        /// 打开 `/dev/uinput` 并注册一台设备，`capabilities` 声明它能报什么。
+        fn create(name: &str, capabilities: impl FnOnce(i32) -> Result<()>) -> Result<Self> {
             let file = OpenOptions::new()
                 .write(true)
                 .open("/dev/uinput")
                 .context("打开 /dev/uinput 失败（需要 input 组与 udev 规则）")?;
             let fd = file.as_raw_fd();
-            set(fd, UI_SET_EVBIT, EV_KEY.into())?;
-            set(fd, UI_SET_EVBIT, EV_REL.into())?;
-            // Keyboard keys (every code `evdev` maps to is below 256) and the
-            // mouse buttons only. Declaring BTN_TOUCH, BTN_TOOL_* or the
-            // joystick range makes udev and libinput classify the device as
-            // something else.
-            for code in (1..0x100u16).chain(BTN_LEFT..=BTN_EXTRA) {
-                set(fd, UI_SET_KEYBIT, code.into())?;
-            }
-            for bit in [REL_X, REL_Y, REL_WHEEL, REL_HWHEEL] {
-                set(fd, UI_SET_RELBIT, bit.into())?;
-            }
-            let mut name = [0 as libc::c_char; 80];
-            for (slot, byte) in name.iter_mut().zip(b"OpenUUYC virtual input".iter()) {
-                *slot = *byte as libc::c_char;
+            capabilities(fd)?;
+            let mut device_name = [0 as libc::c_char; 80];
+            for (slot, byte) in device_name.iter_mut().zip(name.bytes()) {
+                *slot = byte as libc::c_char;
             }
             let setup = UinputSetup {
                 id: InputId {
@@ -160,7 +199,7 @@ mod uinput {
                     product: 0x6666,
                     version: 1,
                 },
-                name,
+                name: device_name,
                 ff_effects_max: 0,
             };
             let rc = unsafe { libc::ioctl(fd, UI_DEV_SETUP, &setup as *const _) };
@@ -171,6 +210,46 @@ mod uinput {
             );
             set(fd, UI_DEV_CREATE, 0)?;
             Ok(Self { file })
+        }
+
+        /// 键鼠合一的相对设备，X 与合成器都能用。
+        pub(crate) fn open() -> Result<Self> {
+            Self::create("OpenUUYC virtual input", |fd| {
+                set(fd, UI_SET_EVBIT, EV_KEY.into())?;
+                set(fd, UI_SET_EVBIT, EV_REL.into())?;
+                // Keyboard keys (every code `evdev` maps to is below 256) and the
+                // mouse buttons only. Declaring BTN_TOUCH, BTN_TOOL_* or the
+                // joystick range makes udev and libinput classify the device as
+                // something else.
+                for code in (1..0x100u16).chain(BTN_LEFT..=BTN_EXTRA) {
+                    set(fd, UI_SET_KEYBIT, code.into())?;
+                }
+                for bit in [REL_X, REL_Y, REL_WHEEL, REL_HWHEEL] {
+                    set(fd, UI_SET_RELBIT, bit.into())?;
+                }
+                Ok(())
+            })
+        }
+
+        /// 绝对指针：`ABS_X`/`ABS_Y` 的范围就是合成器自己那套布局的逻辑尺寸，
+        /// 它拿这个范围把轴上的值解算成全局位置。
+        pub(crate) fn open_absolute(desktop: super::Desktop) -> Result<Self> {
+            let (width, height) = (desktop.width as i32 - 1, desktop.height as i32 - 1);
+            Self::create("OpenUUYC virtual absolute pointer", |fd| {
+                // 按钮也要声明：libinput 靠它认出这是一只鼠标，否则一条只有绝对
+                // 轴的设备会被归到触摸屏之类里去。
+                set(fd, UI_SET_EVBIT, EV_KEY.into())?;
+                for code in BTN_LEFT..=BTN_EXTRA {
+                    set(fd, UI_SET_KEYBIT, code.into())?;
+                }
+                set(fd, UI_SET_EVBIT, EV_ABS.into())?;
+                set_abs(fd, ABS_X, width)?;
+                set_abs(fd, ABS_Y, height)?;
+                // 指针而不是“直接设备”：INPUT_PROP_DIRECT 是在说坐标只落在
+                // 一块屏上，而这里描述的是整个桌面。
+                set(fd, UI_SET_PROPBIT, INPUT_PROP_POINTER.into())
+            })
+            .context("创建虚拟绝对鼠标失败")
         }
 
         fn emit(&self, kind: u16, code: u16, value: i32) -> Result<()> {
@@ -209,6 +288,13 @@ mod uinput {
         pub(crate) fn move_by(&self, dx: i32, dy: i32) -> Result<()> {
             self.emit(EV_REL, REL_X, dx)?;
             self.emit(EV_REL, REL_Y, dy)?;
+            self.sync()
+        }
+
+        /// 绝对位置，取的是设备轴上的值（桌面左上角为 0）。
+        pub(crate) fn move_absolute(&self, x: i32, y: i32) -> Result<()> {
+            self.emit(EV_ABS, ABS_X, x)?;
+            self.emit(EV_ABS, ABS_Y, y)?;
             self.sync()
         }
 
@@ -529,6 +615,64 @@ mod virtual_keyboard {
     }
 }
 
+/// 绝对坐标换算所在的桌面：左上角加尺寸。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Desktop {
+    pub left: i32,
+    pub top: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// 合成器自己布局的桌面边界。
+///
+/// 问不到合成器（X11 会话，或是不支持 xdg-output 的合成器）时返回 `None`，
+/// 绝对定位就还是 X 的矩形加 hyprctl 那条路。
+fn compositor_desktop() -> Option<Desktop> {
+    let layout = super::display::compositor_layout()?;
+    let left = layout.iter().map(|output| output.left).min()?;
+    let top = layout.iter().map(|output| output.top).min()?;
+    let right = layout
+        .iter()
+        .map(|output| output.left + output.width as i32)
+        .max()?;
+    let bottom = layout
+        .iter()
+        .map(|output| output.top + output.height as i32)
+        .max()?;
+    (right > left && bottom > top).then(|| Desktop {
+        left,
+        top,
+        width: (right - left) as u32,
+        height: (bottom - top) as u32,
+    })
+}
+
+/// 由合成器解算的绝对指针：设备，以及它轴范围覆盖的那个桌面。
+struct Absolute {
+    device: uinput::Device,
+    desktop: Desktop,
+}
+
+impl Absolute {
+    /// 按合成器自己的布局建一台绝对指针。轴范围是布局的逻辑尺寸：合成器
+    /// 就是拿它除的。
+    fn create(desktop: Desktop) -> Result<Self> {
+        Ok(Self {
+            device: uinput::Device::open_absolute(desktop)?,
+            desktop,
+        })
+    }
+
+    /// 把引擎算出的（合成器空间里的）位置写进设备轴。
+    fn write(&mut self, x: i32, y: i32) -> Result<()> {
+        let local_x = (x - self.desktop.left).clamp(0, self.desktop.width as i32 - 1);
+        let local_y = (y - self.desktop.top).clamp(0, self.desktop.height as i32 - 1);
+        self.device.move_absolute(local_x, local_y)
+    }
+
+}
+
 pub(crate) struct Injector {
     connection: RustConnection,
     root: Window,
@@ -536,6 +680,9 @@ pub(crate) struct Injector {
     max_keycode: Keycode,
     /// 可用时优先进到这里，X11 只负责读键位表与指针位置。
     uinput: Option<uinput::Device>,
+    /// 由合成器按它自己的全局布局解算的绝对指针。问得到合成器布局时才有，
+    /// 没有就退回下面这条相对路径。
+    absolute: Option<Absolute>,
     /// X11 矩形 → Hyprland 逻辑矩形的映射（按显示器名对齐）。
     screen_maps: Vec<(String, (i32, i32, i32, i32), (i32, i32, i32, i32))>,
     /// 原生 Wayland 客户端的文字输入（可携带自定义 keymap）。
@@ -597,15 +744,57 @@ impl Injector {
         } else {
             None
         };
-        Ok(Self {
+        let mut injector = Self {
             connection,
             root,
             min_keycode,
             max_keycode,
             uinput,
+            absolute: None,
             screen_maps,
             virtual_keyboard,
-        })
+        };
+        // 合成器接手一台刚建的 uinput 设备要几百毫秒，这段时间里写进去的绝对
+        // 坐标谁都收不到，所以趁早把它建出来，先让它被打开。XTest 一侧由 X
+        // 自己解算，用不着这台设备。
+        if injector.uinput.is_some()
+            && let Err(error) = injector.prime()
+        {
+            tracing::warn!(%error, "虚拟绝对鼠标不可用，绝对定位回退到相对移动");
+        }
+        Ok(injector)
+    }
+
+    /// 提前按合成器自己的布局把绝对指针建出来：轴范围在创建时固定，必须是
+    /// 合成器那一套逻辑尺寸——XWayland 报的矩形是另一种数（每个输出的位置
+    /// 是合成器的逻辑位置，尺寸却是它自己的像素），带缩放的屏上换算必然偏。
+    /// 问不到合成器布局时不建，绝对定位留给 hyprctl 那条路。
+    fn prime(&mut self) -> Result<()> {
+        let Some(desktop) = compositor_desktop() else {
+            return Ok(());
+        };
+        self.absolute = Some(Absolute::create(desktop)?);
+        Ok(())
+    }
+
+    /// 引擎报来桌面尺寸时调用。轴向的范围创建时就定死了，桌面变了就得换一台。
+    pub fn set_geometry(&mut self, desktop: Desktop) -> Result<()> {
+        // 没有绝对设备说明这个会话问不到合成器布局，引擎给的也就还是 X 的
+        // 矩形，拿它建出来的轴范围不是合成器要的那套数。
+        let Some(absolute) = &self.absolute else {
+            return Ok(());
+        };
+        if absolute.desktop == desktop {
+            return Ok(());
+        }
+        self.absolute = Some(Absolute::create(desktop)?);
+        Ok(())
+    }
+
+    /// 绝对坐标是否由合成器按自己的全局布局解算：虚拟设备是，XTest 不是
+    /// （后者由 X 在它自己的矩形里解算）。
+    pub fn aims_in_compositor_layout(&self) -> bool {
+        self.absolute.is_some()
     }
 
     /// 当前焦点窗口是否跑在 XWayland 里。
@@ -674,7 +863,12 @@ impl Injector {
     }
 
     /// Move to a root-window position.
-    pub fn move_to(&self, x: i32, y: i32) -> Result<()> {
+    pub fn move_to(&mut self, x: i32, y: i32) -> Result<()> {
+        // 坐标已经是合成器布局里的位置（引擎按 `Screen::logical` 算的），
+        // 直接写进设备，由合成器解算。
+        if let Some(absolute) = &mut self.absolute {
+            return absolute.write(x, y);
+        }
         if let Some(device) = &self.uinput {
             // 设备不声明 ABS 轴（否则会被 libinput 误分类），所以按当前
             // 指针位置换算成相对位移。位置以合成器为准：每次重新读取，
@@ -1145,7 +1339,7 @@ mod session_tests {
     #[test]
     #[ignore]
     fn pointer_moves_where_asked() {
-        let injector = super::Injector::open().unwrap();
+        let mut injector = super::Injector::open().unwrap();
         let before = injector.pointer().unwrap();
         injector.move_to(123, 234).unwrap();
         injector.flush().unwrap();

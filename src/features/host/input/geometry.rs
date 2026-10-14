@@ -4,7 +4,7 @@ use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 
 /// A half-open desktop rectangle: `right` and `bottom` are exclusive.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Rect {
     pub left: i32,
     pub top: i32,
@@ -19,6 +19,11 @@ pub(crate) struct Screen {
     pub top: i32,
     pub width: u32,
     pub height: u32,
+    /// The same screen as the compositor lays it out, for the sessions where a
+    /// position is named in that space instead. Empty where the display server
+    /// is the compositor.
+    #[serde(default)]
+    pub logical: Option<Rect>,
 }
 impl Screen {
     pub fn rect(&self) -> Result<Rect> {

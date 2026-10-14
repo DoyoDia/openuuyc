@@ -8,8 +8,43 @@ use display_info::DisplayInfo;
 pub(crate) mod recovery;
 pub(crate) mod topology;
 pub(crate) mod virtual_driver;
+pub(crate) mod wayland;
 
 pub(crate) use crate::media::capture::source_id;
+
+/// The compositor's own layout, by output name, when there is one to ask.
+///
+/// Cached because the input path asks on every batch of events while the layout
+/// only changes when a display does. A compositor that cannot describe its
+/// layout leaves the caller with the display server's rectangles, which is what
+/// it would use anyway.
+pub(crate) fn compositor_layout() -> Option<std::sync::Arc<Vec<crate::platform::CompositorOutput>>>
+{
+    static CACHE: std::sync::Mutex<
+        Option<(
+            std::time::Instant,
+            std::sync::Arc<Vec<crate::platform::CompositorOutput>>,
+        )>,
+    > = std::sync::Mutex::new(None);
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((at, layout)) = cache.as_ref()
+        && at.elapsed() < std::time::Duration::from_secs(1)
+    {
+        return Some(layout.clone());
+    }
+    match wayland::layout() {
+        Ok(outputs) => {
+            let layout = std::sync::Arc::new(outputs);
+            *cache = Some((std::time::Instant::now(), layout.clone()));
+            Some(layout)
+        }
+        Err(error) => {
+            *cache = None;
+            tracing::debug!(%error, "compositor layout unavailable");
+            None
+        }
+    }
+}
 
 pub fn detect_local_display() -> Result<LocalDisplayInfo> {
     let displays = DisplayInfo::all().context("failed to enumerate local displays")?;
