@@ -226,9 +226,19 @@ fn serve(
             _ => {}
         }
     }
-    // Releasing on the way out lets the next owner take over cleanly.
-    let _ = connection.set_selection_owner(x11rb::NONE, atoms.clipboard, x11rb::CURRENT_TIME);
-    let _ = connection.flush();
+    // 收尾时把手里的选择区交还出去——但只在它真的还是我们的时候。这个 offer 被
+    // 换掉（用户又复制了一次，新的 offer 已经抢走了所有权）或者本地用户在别的
+    // 程序里复制了东西之后，选择区早就易主；这时再置空就是替别人把剪贴板清掉，
+    // 刚上任的那一份也跟着没了。
+    let ours = connection
+        .get_selection_owner(atoms.clipboard)
+        .ok()
+        .and_then(|cookie| cookie.reply().ok())
+        .is_some_and(|reply| reply.owner == window);
+    if ours {
+        let _ = connection.set_selection_owner(x11rb::NONE, atoms.clipboard, x11rb::CURRENT_TIME);
+        let _ = connection.flush();
+    }
 }
 
 fn answer(

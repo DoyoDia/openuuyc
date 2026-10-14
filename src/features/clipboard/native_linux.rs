@@ -873,7 +873,7 @@ fn process(state: &mut State, command: Command) {
             {
                 // The notice shows the outermost line; the cause is only in
                 // the chain, and it is the part worth reading.
-                tracing::debug!(error = format!("{error:#}"), "接受远端剪贴板失败");
+                tracing::warn!(error = format!("{error:#}"), "接受远端剪贴板失败");
                 session.fail(error.to_string());
             }
         }
@@ -1097,7 +1097,9 @@ fn accept_files(state: &mut State, session: &Arc<Inner>, epoch: u64) -> Result<(
     };
     let mount = super::fuse::Mount::new(&parent, super::fuse::generation(), tree, reader)?;
     let paths = mount.paths();
-    tracing::debug!(
+    // 每次远端复制都会走到这里，而且只此一次：这条是「主控复制的那份到底有没有
+    // 落到本地剪贴板上」唯一的直接证据，所以留在 info。
+    tracing::info!(
         files = descriptors.len(),
         root = %mount.root().display(),
         "已挂载远端剪贴板文件"

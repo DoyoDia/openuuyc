@@ -207,9 +207,10 @@ impl ClipboardFs {
             } else {
                 fuser::FileType::RegularFile
             },
-            // Read only: this is someone else's copy, and nothing here can
-            // write back to it.
-            perm: if node.is_dir() { 0o555 } else { 0o444 },
+            // 这几个位保护不了任何东西：挂载本身是只读的，我们也没实现 `write`，
+            // 谁也写不回远端。但文件管理器粘贴时会照抄来源的权限，报 0444 粘出来
+            // 的文件就是只读的，用户还得自己 chmod 一遍。
+            perm: if node.is_dir() { 0o755 } else { 0o644 },
             nlink: if node.is_dir() { 2 } else { 1 },
             uid: self.uid,
             gid: self.gid,
