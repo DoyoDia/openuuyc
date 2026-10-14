@@ -269,7 +269,11 @@ pub(crate) struct CaptureParams {
 
 fn flags() -> PbFeatureFlag {
     PbFeatureFlag {
-        capture_setting: 6,
+        // 5 那一档是「分辨率转换 + DPI 设置 + 虚拟屏」整包，6 再加 HDR。本机
+        // （Linux）四样都没有：DPI 上报直接拒绝，虚拟屏没有驱动，Wayland 下改模式
+        // 也只是合成器的只读镜像，HDR 更谈不上。报高了主控会把这些按钮点亮然后
+        // 必然失败，所以只报到保得住自定义码率的 4。
+        capture_setting: if cfg!(windows) { 6 } else { 4 },
         clipboard: 3,
         system_metrics: 1,
         file_transfer_ftp: 2,
