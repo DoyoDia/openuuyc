@@ -38,6 +38,16 @@ pub(super) fn run(config: WindowConfig, factory: AppFactory) -> Result<()> {
         viewers: HashMap::new(),
     };
     window_manager::install(Some(event_loop.create_proxy()));
+    // Linux 上这个入口只用来开控制中心主窗口（观看窗口与通知窗口走别的 runner），
+    // 所以控制通道跟着它一起建立与撤销。
+    #[cfg(target_os = "linux")]
+    let _control = super::control::listen()
+        .inspect_err(|error| tracing::warn!(error = %format!("{error:#}"), "控制通道不可用"))
+        .ok();
+    #[cfg(target_os = "linux")]
+    if let Err(error) = super::shutdown::install() {
+        tracing::warn!(error = %format!("{error:#}"), "退出信号处理不可用");
+    }
     event_loop
         .run_app(&mut runner)
         .context("run desktop event loop")?;
