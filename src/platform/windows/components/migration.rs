@@ -411,7 +411,7 @@ pub(crate) fn finish_user() -> Result<bool> {
         "请由新版本完成安装迁移"
     );
     if !record.user_ready {
-        host_service::startup::set(true)?;
+        host_service::startup::configure_installation(false)?;
         application::integrate_user()?;
         crate::platform::windows::notifications::retarget_installed()?;
     }

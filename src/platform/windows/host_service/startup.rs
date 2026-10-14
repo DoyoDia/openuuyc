@@ -1,9 +1,93 @@
 //! Installing user's ordinary-permission tray startup; no Windows password.
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use windows::{
-    Win32::System::Registry::*,
+    Win32::{Foundation::ERROR_FILE_NOT_FOUND, System::Registry::*},
     core::{PCWSTR, w},
 };
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum State {
+    Disabled,
+    Enabled,
+    DisabledByWindows,
+}
+
+/// Registration and Windows approval are independent; installation only retargets
+/// the former and must never undo a user's decision in Startup Apps.
+fn registered() -> Result<bool> {
+    let mut size = 0u32;
+    let result = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!(r"Software\Microsoft\Windows\CurrentVersion\Run"),
+            w!("OpenUUYC"),
+            RRF_RT_REG_SZ,
+            None,
+            None,
+            Some(&mut size),
+        )
+    };
+    if result == ERROR_FILE_NOT_FOUND {
+        return Ok(false);
+    }
+    result.ok()?;
+    Ok(true)
+}
+
+pub(crate) fn state() -> Result<State> {
+    if !registered()? {
+        return Ok(State::Disabled);
+    }
+    let mut approval = [0u8; 12];
+    let mut size = approval.len() as u32;
+    let result = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!(r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run"),
+            w!("OpenUUYC"),
+            RRF_RT_REG_BINARY,
+            None,
+            Some(approval.as_mut_ptr().cast()),
+            Some(&mut size),
+        )
+    };
+    if result == ERROR_FILE_NOT_FOUND {
+        return Ok(State::Enabled);
+    }
+    result.ok().context("读取 Windows 启动应用状态失败")?;
+    ensure!(size == 12, "Windows 启动应用状态长度无效：{size}");
+    match u32::from_le_bytes(approval[..4].try_into().unwrap()) {
+        2 | 6 => Ok(State::Enabled),
+        3 | 7 => Ok(State::DisabledByWindows),
+        value => anyhow::bail!("无法识别 Windows 启动应用状态：{value}"),
+    }
+}
+
+/// First install keeps the existing default. Updates and migration recovery only
+/// retarget an existing registration, preserving both absence and system denial.
+pub(crate) fn configure_installation(first_install: bool) -> Result<()> {
+    if first_install || registered()? {
+        set(true)?;
+    }
+    Ok(())
+}
+/// The settings switch. Points at the installed program while the components
+/// are installed, otherwise at this copy, as enabling remote wake does.
+pub(crate) fn configure(enabled: bool) -> Result<()> {
+    if !enabled {
+        return set_image(false, std::path::Path::new(""));
+    }
+    let image = if super::resident::managed() {
+        crate::platform::windows::components::application::image()?
+    } else {
+        std::env::current_exe()?
+    };
+    set_image(true, &image)?;
+    ensure!(
+        state()? == State::Enabled,
+        "自启动项已登记，但 Windows 已禁用；请在 Windows 设置的“应用 → 启动”中启用 OpenUUYC"
+    );
+    Ok(())
+}
 pub(crate) fn set(enabled: bool) -> Result<()> {
     set_image(
         enabled,
