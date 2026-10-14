@@ -8,6 +8,3 @@
 // The encode structures (packed headers, H.264 parameters) live here; va.h only
 // forward-declares the buffer types.
 #include <va/va_enc_h264.h>
-// The video processing pipeline (`VAProcPipelineParameterBuffer`), used to
-// convert an imported DMA-BUF surface to NV12 on the GPU.
-#include <va/va_vpp.h>

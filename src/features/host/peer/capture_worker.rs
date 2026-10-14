@@ -352,13 +352,7 @@ pub(super) fn capture_loop(
         let frame = match captured {
             Some(frame) => {
                 metrics.new_frames += u64::from(frame.is_new);
-                // A DMA-BUF frame keeps a compositor buffer out of its pool, and
-                // the pool is small. Holding one here as a "last frame" would
-                // starve the stream -- the compositor logs `Out of buffers` and
-                // stops delivering -- so only copied frames are cached.
-                if !matches!(frame.image, capture::Image::Dmabuf(_)) {
-                    cached = Some(frame.clone());
-                }
+                cached = Some(frame.clone());
                 frame
             }
             None => {

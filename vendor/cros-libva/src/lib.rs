@@ -17,7 +17,6 @@ mod image;
 mod picture;
 mod surface;
 mod usage_hint;
-pub mod vpp;
 
 pub use bindings::_VADRMPRIMESurfaceDescriptor__bindgen_ty_1 as VADRMPRIMESurfaceDescriptorObject;
 pub use bindings::_VADRMPRIMESurfaceDescriptor__bindgen_ty_2 as VADRMPRIMESurfaceDescriptorLayer;
@@ -31,7 +30,6 @@ pub use image::*;
 pub use picture::*;
 pub use surface::*;
 pub use usage_hint::*;
-pub use vpp::*;
 
 use std::num::NonZeroI32;
 

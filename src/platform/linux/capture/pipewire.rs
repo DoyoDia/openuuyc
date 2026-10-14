@@ -11,7 +11,6 @@
 //! picture; DMA-BUF import belongs with a GPU encoder.
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -97,18 +96,16 @@ struct SpaMetaRegion {
 const STREAM_EVENTS_VERSION: u32 = 2;
 const DIRECTION_INPUT: u32 = 0;
 const FLAG_AUTOCONNECT: u32 = 1 << 0;
-// `FLAG_MAP_BUFFERS` maps every buffer except DMA-BUF, which is exactly the
-// split wanted: shared memory is mapped for the CPU copy, and DMA-BUF is left
-// as a file descriptor for the encoder to import.
-const FLAG_MAP_BUFFERS: u32 = 1 << 2;
+// Shared-memory buffers are mapped explicitly; DMA-BUF is imported through VA.
 const STATE_ERROR: c_int = -1;
 const STATE_UNCONNECTED: c_int = 0;
 const STATE_STREAMING: c_int = 3;
 
-/// `spa_pod_prop` flags. `DONT_FIXATE` on the modifier is how a client says
-/// "here is a list, you pick": the portal looks for exactly that before it
-/// will consider DMA-BUF (its log line is "DMA (No fixate)").
-const SPA_POD_PROP_FLAG_DONT_FIXATE: u32 = 1 << 4;
+// Keep the modifier mandatory so DMA-BUF cannot silently become SHM.
+// Let PipeWire fixate our supported choices normally. DONT_FIXATE here causes
+// xdg-desktop-portal-hyprland 1.4.1 to repeat its allocation negotiation until
+// its retry limit is exhausted, after which no new DMA-BUF frames arrive.
+const SPA_POD_PROP_FLAG_MANDATORY: u32 = 1 << 3;
 
 const TYPE_ID: u32 = 3;
 const TYPE_INT: u32 = 4;
@@ -141,24 +138,26 @@ const VIDEO_BGRX: u32 = 8;
 const VIDEO_RGBA: u32 = 11;
 const VIDEO_BGRA: u32 = 12;
 
-/// DRM format modifiers, spelled the way DRM does. `I915_FORMAT_MOD_Y_TILED`
-/// is what i965 exports and its encoder imports.
+/// DRM fourcc values, distinct from the negotiated SPA video format.
+const DRM_FORMAT_ARGB8888: u32 = u32::from_le_bytes(*b"AR24");
+const DRM_FORMAT_XRGB8888: u32 = u32::from_le_bytes(*b"XR24");
+const DRM_FORMAT_ABGR8888: u32 = u32::from_le_bytes(*b"AB24");
+const DRM_FORMAT_XBGR8888: u32 = u32::from_le_bytes(*b"XB24");
+
+/// `I915_FORMAT_MOD_Y_TILED`: what i965 exports and its encoder imports.
 const DRM_MOD_Y_TILED: u64 = 0x0100_0000_0000_0002;
+/// `I915_FORMAT_MOD_X_TILED`.
 const DRM_MOD_X_TILED: u64 = 0x0100_0000_0000_0001;
+/// `DRM_FORMAT_MOD_LINEAR`.
 const DRM_MOD_LINEAR: u64 = 0;
 /// `DRM_FORMAT_MOD_INVALID`, which SPA reads as "let the compositor choose".
 const DRM_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
-const BUFFERS_COUNT: u32 = 1;
 const BUFFERS_DATA_TYPE: u32 = 6;
 const META_TYPE: u32 = 1;
 const META_SIZE: u32 = 2;
 const META_VIDEO_CROP: u32 = 2;
 const DATA_MEM_PTR: u32 = 1;
 const DATA_MEM_FD: u32 = 2;
-// `SPA_DATA_DmaBuf` is the fourth variant, so the bit is `1 << 3`. Reading the
-// enum value as the shift would ask for `SPA_DATA_MemId` instead, which no
-// compositor offers: the buffer-type masks then have no intersection and the
-// link fails with `error alloc buffers: Invalid argument`.
 const DATA_MEM_DMABUF: u32 = 3;
 const CHOICE_RANGE: u32 = 1;
 const CHOICE_ENUM: u32 = 3;
@@ -264,6 +263,12 @@ impl Pod {
         }
         self.pad();
     }
+    /// A `Long`, which SPA stores as eight bytes.
+    fn value_long(&mut self, value: u64) {
+        self.u32(8);
+        self.u32(TYPE_LONG);
+        self.u64(value);
+    }
     /// A choice of `Long` values, the form SPA uses for DRM modifiers.
     fn choice_long(&mut self, choice: u32, values: &[u64]) {
         self.u32((16 + values.len() * 8) as u32);
@@ -305,9 +310,7 @@ impl Pod {
     fn key(&mut self, key: u32) {
         self.key_flags(key, 0);
     }
-    /// A property key with `spa_pod_prop` flags. `DONT_FIXATE` is how a client
-    /// says "here is a list, you choose" -- the portal looks for exactly that on
-    /// the modifier before it will consider DMA-BUF.
+    /// A property key with `spa_pod_prop` flags.
     fn key_flags(&mut self, key: u32, flags: u32) {
         self.u32(key);
         self.u32(flags);
@@ -337,18 +340,16 @@ fn enum_format() -> Pod {
         // DMA-BUF, and omits it for the shared-memory formats below. The portal
         // reads the pair together, so a format with no modifier means
         // shared memory.
-        //
-        // It is opt-in because the frame still has to be imported from the file
-        // descriptor, and until that path exists a DMA-BUF is a frame the
-        // capture cannot read: the stream negotiates, then never produces one.
-        if dmabuf_requested() {
-            p.key_flags(FORMAT_VIDEO_MODIFIER, SPA_POD_PROP_FLAG_DONT_FIXATE);
-            // Only modifiers whose layout the importer understands. Offering
-            // `DRM_FORMAT_MOD_INVALID` invites the portal to fixate to it, and
-            // an unfixed modifier says nothing about the tiling, so the import
-            // would read the wrong bytes.
-            p.choice_long(CHOICE_ENUM, &[DRM_MOD_LINEAR, DRM_MOD_X_TILED, DRM_MOD_Y_TILED]);
-        }
+        p.key_flags(FORMAT_VIDEO_MODIFIER, SPA_POD_PROP_FLAG_MANDATORY);
+        p.choice_long(
+            CHOICE_ENUM,
+            &[
+                DRM_MOD_LINEAR,
+                DRM_MOD_LINEAR,
+                DRM_MOD_X_TILED,
+                DRM_MOD_Y_TILED,
+            ],
+        );
         // The format stays a `spa_video_format`: the compositor offers AR24 and
         // AB24 from wlr, and the portal reports those as `BGRx`/`RGBA`-family
         // enums with the modifier carrying the tiling. A DRM fourcc here is a
@@ -372,50 +373,48 @@ fn enum_format() -> Pod {
     })
 }
 
-/// Whether to ask the compositor for DMA-BUF frames instead of shared memory.
-///
-/// Off unless `OPENUUYC_CAPTURE_DMABUF=1`. The request is also gated on the
-/// VA-API encoder being available, because that is the only encoder that can
-/// read a DMA-BUF: asking for one without it leaves the capture with no
-/// readable frames at all.
-fn dmabuf_requested() -> bool {
-    if !std::env::var("OPENUUYC_CAPTURE_DMABUF").is_ok_and(|value| value != "0") {
-        return false;
-    }
-    super::super::encoder::Encoder::vaapi_accepts(crate::media::encoding::Format::AVC)
+/// The shared-memory format offer, used when the compositor will not do DMA-BUF.
+fn enum_format_shm() -> Pod {
+    Pod::object(OBJECT_FORMAT, PARAM_ENUM_FORMAT, |p| {
+        p.key(FORMAT_MEDIA_TYPE);
+        p.value(TYPE_ID, &[MEDIA_TYPE_VIDEO]);
+        p.key(FORMAT_MEDIA_SUBTYPE);
+        p.value(TYPE_ID, &[MEDIA_SUBTYPE_RAW]);
+        p.key(FORMAT_VIDEO_FORMAT);
+        p.choice(
+            CHOICE_ENUM,
+            TYPE_ID,
+            1,
+            &[VIDEO_BGRX, VIDEO_BGRX, VIDEO_BGRA, VIDEO_RGBX, VIDEO_RGBA],
+        );
+        p.key(FORMAT_VIDEO_SIZE);
+        p.choice(
+            CHOICE_RANGE,
+            TYPE_RECTANGLE,
+            2,
+            &[1920, 1080, 1, 1, 16384, 16384],
+        );
+        p.key(FORMAT_VIDEO_FRAMERATE);
+        p.choice(CHOICE_RANGE, TYPE_FRACTION, 2, &[60, 1, 0, 1, 1000, 1]);
+    })
 }
 
-/// The buffer types to offer, which must agree with the negotiated format.
-///
-/// libpipewire collapses a multi-bit mask to a single type, and `MemPtr` wins
-/// over everything else: offering it alongside `DmaBuf` makes the link
-/// negotiate CPU-mapped memory while the portal has already committed to a
-/// DMA-BUF, and buffer allocation then fails. So a DMA-BUF format asks for
-/// DMA-BUF alone.
-fn buffers(dmabuf: bool) -> Pod {
+fn buffers() -> Pod {
     Pod::object(OBJECT_PARAM_BUFFERS, PARAM_BUFFERS, |p| {
-        // A DMA-BUF frame is held until the encoder is done with it, so the
-        // pool has to be deeper than the few the compositor would otherwise
-        // allocate. Running it dry makes the compositor log `Out of buffers`
-        // and retry the whole stream, which re-runs the modifier fixation until
-        // it gives up and falls back to shared memory -- at which point the
-        // frame rate collapses. The value is a range so the compositor can pick
-        // its own ceiling.
-        p.key(BUFFERS_COUNT);
-        // Eight is comfortably more than the compositor's own default of four,
-        // and the range lets it keep its ceiling.
-        let count = if dmabuf { 8 } else { 4 };
-        p.choice(CHOICE_RANGE, TYPE_INT, 1, &[count, 2, 32]);
         p.key(BUFFERS_DATA_TYPE);
         // A flags choice holds one value: the mask. The count `SPA_CHOICE_FLAGS`
         // writes is not part of the pod -- `SPA_POD_CHOICE_N_VALUES` derives it
         // from the body size, which `choice` sets from the value count here.
-        let mask = if dmabuf {
-            1 << DATA_MEM_DMABUF
-        } else {
-            (1 << DATA_MEM_PTR) | (1 << DATA_MEM_FD)
-        };
-        p.choice(CHOICE_FLAGS, TYPE_INT, 1, &[mask]);
+        p.choice(
+            CHOICE_FLAGS,
+            TYPE_INT,
+            1,
+            &[if dmabuf_requested() {
+                1 << DATA_MEM_DMABUF
+            } else {
+                (1 << DATA_MEM_PTR) | (1 << DATA_MEM_FD)
+            }],
+        );
     })
 }
 
@@ -489,107 +488,183 @@ unsafe fn parse_format(pod: *const c_void) -> Option<NegotiatedFormat> {
     })
 }
 
+fn dmabuf_requested() -> bool {
+    std::env::var("OPENUUYC_CAPTURE_DMABUF").is_ok_and(|value| value != "0")
+}
+
+/// Import into the baseline's owned BGRA picture while the PipeWire buffer is
+/// dequeued. No compositor buffer or fd is retained by the encoder/cache.
+fn read_dmabuf_picture(
+    buffer: &SpaBuffer,
+    data: &SpaData,
+    format: NegotiatedFormat,
+) -> Result<Picture> {
+    ensure!(
+        buffer.n_datas == 1 && data.fd >= 0 && !data.chunk.is_null(),
+        "DMA-BUF 要求一个有效 RGB 平面"
+    );
+    let chunk = unsafe { &*data.chunk };
+    ensure!(
+        chunk.stride > 0 && format.width > 0 && format.height > 0,
+        "DMA-BUF 尺寸或 stride 无效"
+    );
+    let size = unsafe { libc::lseek(data.fd as i32, 0, libc::SEEK_END) };
+    let size = u32::try_from(size).context("读取 DMA-BUF 真实大小失败")?;
+    ensure!(size > 0, "空 DMA-BUF");
+    let (va_fourcc, drm_fourcc) = match format.format {
+        VIDEO_BGRA => (cros_libva::VA_FOURCC_BGRA, u32::from_le_bytes(*b"AR24")),
+        VIDEO_BGRX => (cros_libva::VA_FOURCC_BGRX, u32::from_le_bytes(*b"XR24")),
+        VIDEO_RGBA => (cros_libva::VA_FOURCC_RGBA, u32::from_le_bytes(*b"AB24")),
+        VIDEO_RGBX => (cros_libva::VA_FOURCC_RGBX, u32::from_le_bytes(*b"XB24")),
+        _ => bail!("不支持的 DMA-BUF RGB 格式"),
+    };
+    thread_local! {
+        static IMPORT: std::cell::OnceCell<(std::rc::Rc<cros_libva::Display>, bool)> = const { std::cell::OnceCell::new() };
+    }
+    IMPORT.with(|cell| {
+        if cell.get().is_none() {
+            let display = cros_libva::Display::open().context("找不到 VA-API render node")?;
+            let mut config = display
+                .create_config(
+                    Vec::new(),
+                    cros_libva::VAProfile::VAProfileNone,
+                    cros_libva::VAEntrypoint::VAEntrypointVideoProc,
+                )
+                .map_err(|e| anyhow!(e.to_string()))?;
+            let types = config
+                .query_surface_attributes_by_type(
+                    cros_libva::VASurfaceAttribType::VASurfaceAttribMemoryType,
+                )
+                .map_err(|e| anyhow!(e.to_string()))?
+                .iter()
+                .fold(0u32, |mask, value| match value {
+                    cros_libva::GenericValue::Integer(value) => mask | *value as u32,
+                    _ => mask,
+                });
+            let prime2 = types & cros_libva::VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2 != 0;
+            ensure!(
+                prime2 || types & cros_libva::VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME != 0,
+                "驱动不支持 PRIME 导入"
+            );
+            tracing::info!(prime2, types, "DMA-BUF 基线采集导入类型已选择");
+            drop(config);
+            let _ = cell.set((display, prime2));
+        }
+        let (display, prime2) = cell.get().expect("initialized above");
+        let modifier = format.modifier.context("DMA-BUF 缺少 modifier")?;
+        ensure!(modifier != DRM_MOD_INVALID, "DMA-BUF modifier 未确定");
+        let descriptor = CaptureImport {
+            va_fourcc,
+            drm_fourcc,
+            width: format.width,
+            height: format.height,
+            size,
+            fd: data.fd as i32,
+            offset: chunk.offset,
+            pitch: chunk.stride as u32,
+            modifier,
+            prime2: *prime2,
+        };
+        let surfaces = display
+            .create_surfaces(
+                cros_libva::VA_RT_FORMAT_RGB32,
+                Some(va_fourcc),
+                format.width,
+                format.height,
+                None,
+                vec![descriptor],
+            )
+            .map_err(|e| anyhow!(e.to_string()))?;
+        let image = cros_libva::Image::derive_from(&surfaces[0], (format.width, format.height))
+            .map_err(|e| anyhow!(e.to_string()))?;
+        let info = image.image();
+        let pixel_format = match info.format.fourcc {
+            cros_libva::VA_FOURCC_BGRA | cros_libva::VA_FOURCC_BGRX => VIDEO_BGRA,
+            cros_libva::VA_FOURCC_RGBA | cros_libva::VA_FOURCC_RGBX => VIDEO_RGBA,
+            _ => bail!("导入后未提供 packed RGB 图像"),
+        };
+        copy_picture_pixels(
+            buffer,
+            image.as_ref(),
+            info.offsets[0] as usize,
+            info.pitches[0] as usize,
+            pixel_format,
+            format.width,
+            format.height,
+        )
+        .context("导入图像的尺寸或裁剪越界")
+    })
+}
+
+/// The effective uncommitted PRIME fix: choose the supported import API,
+/// map DRM/VA byte orders correctly, and keep descriptor storage alive.
+struct CaptureImport {
+    va_fourcc: u32,
+    drm_fourcc: u32,
+    width: u32,
+    height: u32,
+    size: u32,
+    fd: i32,
+    offset: u32,
+    pitch: u32,
+    modifier: u64,
+    prime2: bool,
+}
+impl cros_libva::SurfaceMemoryDescriptor for CaptureImport {
+    fn add_attrs(
+        &mut self,
+        attrs: &mut Vec<cros_libva::VASurfaceAttrib>,
+    ) -> Option<Box<dyn std::any::Any>> {
+        let mut memory =
+            cros_libva::VASurfaceAttrib::new_memory_type(cros_libva::MemoryType::DrmPrime2);
+        if self.prime2 {
+            let mut descriptor: Box<cros_libva::VADRMPRIMESurfaceDescriptor> = Box::default();
+            descriptor.fourcc = self.va_fourcc;
+            descriptor.width = self.width;
+            descriptor.height = self.height;
+            descriptor.num_objects = 1;
+            descriptor.objects[0].fd = self.fd;
+            descriptor.objects[0].size = self.size;
+            descriptor.objects[0].drm_format_modifier = self.modifier;
+            descriptor.num_layers = 1;
+            descriptor.layers[0].drm_format = self.drm_fourcc;
+            descriptor.layers[0].num_planes = 1;
+            descriptor.layers[0].offset[0] = self.offset;
+            descriptor.layers[0].pitch[0] = self.pitch;
+            attrs.push(memory);
+            attrs.push(cros_libva::VASurfaceAttrib::new_buffer_descriptor(
+                &mut *descriptor,
+            ));
+            Some(descriptor)
+        } else {
+            let fds = Box::new([self.fd as usize]);
+            let mut descriptor: Box<cros_libva::VASurfaceAttribExternalBuffers> = Box::default();
+            descriptor.pixel_format = self.va_fourcc;
+            descriptor.width = self.width;
+            descriptor.height = self.height;
+            descriptor.data_size = self.size;
+            descriptor.num_planes = 1;
+            descriptor.pitches[0] = self.pitch;
+            descriptor.offsets[0] = self.offset;
+            descriptor.buffers = fds.as_ptr() as *mut usize;
+            descriptor.num_buffers = 1;
+            memory.value.value.i = cros_libva::VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME as i32;
+            attrs.push(memory);
+            attrs.push(cros_libva::VASurfaceAttrib::new_buffer_descriptor(
+                &mut *descriptor,
+            ));
+            Some(Box::new((descriptor, fds)))
+        }
+    }
+}
+
 // --- Stream ----------------------------------------------------------------------
 
-/// One captured picture as the stream delivered it.
-pub(super) enum Picture {
-    /// Tightly packed BGRA in system memory, `width * height * 4` bytes.
-    Shm {
-        width: u32,
-        height: u32,
-        pixels: Vec<u8>,
-    },
-    /// A DMA-BUF the encoder imports and converts on the GPU.
-    Dmabuf(DmabufPicture),
-}
-
-impl Picture {
-    pub(super) fn width(&self) -> u32 {
-        match self {
-            Self::Shm { width, .. } => *width,
-            Self::Dmabuf(picture) => picture.width,
-        }
-    }
-
-    pub(super) fn height(&self) -> u32 {
-        match self {
-            Self::Shm { height, .. } => *height,
-            Self::Dmabuf(picture) => picture.height,
-        }
-    }
-
-    /// Whether this picture keeps the PipeWire buffer out of the pool.
-    ///
-    /// A DMA-BUF is read later by the encoder, so its buffer must not be
-    /// recycled yet; the shared-memory copy is already made and the buffer can
-    /// go straight back.
-    fn holds_buffer(&self) -> bool {
-        matches!(self, Self::Dmabuf(_))
-    }
-}
-
-/// A picture the compositor handed over as a file descriptor.
-pub(crate) struct DmabufPicture {
+/// One captured picture as the stream delivered it, converted to BGRA.
+pub(super) struct Picture {
     pub width: u32,
     pub height: u32,
-    /// DRM fourcc of the buffer, which is what VA-API imports it as.
-    pub fourcc: u32,
-    pub modifier: u64,
-    /// The buffer's extent in bytes, measured from the file descriptor.
-    pub buffer_size: Option<u32>,
-    /// Plane descriptors: `(fd, offset, pitch)`. The descriptor is owned, so
-    /// the buffer stays alive for as long as the picture does.
-    pub planes: Vec<(std::os::fd::OwnedFd, u32, u32)>,
-    /// Returns the buffer to the compositor once the picture is dropped.
-    _lease: BufferLease,
-}
-
-impl DmabufPicture {
-    /// The extent of the buffer behind the planes, in bytes.
-    ///
-    /// A compositor leaves `spa_data.maxsize` at zero for DMA-BUFs -- its own
-    /// clients read `chunk->size` instead -- so the driver has to be told how
-    /// much memory there is. `lseek` on the file descriptor is authoritative;
-    /// `pitch * height` undercounts a tiled buffer, and reporting too little
-    /// makes the driver import only part of the picture.
-    pub(crate) fn buffer_size(&self) -> u32 {
-        self.buffer_size.unwrap_or_else(|| {
-            self.planes
-                .iter()
-                .map(|(_, offset, pitch)| {
-                    offset.saturating_add(pitch.saturating_mul(self.height))
-                })
-                .max()
-                .unwrap_or(0)
-        })
-    }}
-
-/// Keeps a PipeWire buffer out of the compositor's pool until it is dropped.
-///
-/// `pw_stream_queue_buffer` is documented RT-safe and callable from a thread
-/// other than the one that dequeued, which is what lets the encoder hold the
-/// buffer across the conversion instead of copying the frame out first.
-///
-/// It holds the stream's [`Session`] rather than the raw handles, so a picture
-/// that outlives the [`Stream`] -- a cached one, or one kept across a backend
-/// change -- still returns its buffer to a live stream instead of a freed one.
-struct BufferLease {
-    session: Arc<Session>,
-    buffer: *mut PwBuffer,
-}
-
-// SAFETY: the session owns the stream and outlives every lease it hands out;
-// `pw_stream_queue_buffer` is the documented way to return a buffer and is safe
-// to call from another thread.
-unsafe impl Send for BufferLease {}
-
-impl Drop for BufferLease {
-    fn drop(&mut self) {
-        let result = unsafe { (self.session.api.stream_queue_buffer)(self.session.stream, self.buffer) };
-        if result != 0 {
-            tracing::warn!(result, "PipeWire buffer 归还失败");
-        }
-    }
+    pub pixels: Vec<u8>,
 }
 
 #[derive(Default)]
@@ -599,18 +674,12 @@ struct State {
     format: Option<NegotiatedFormat>,
     streaming: bool,
     error: Option<String>,
-    /// The buffer kind the stream last asked for: `Some(true)` for DMA-BUF,
-    /// `Some(false)` for shared memory, `None` before the first request.
-    buffers_requested: Option<bool>,
+    buffers_sent: bool,
 }
 
 struct Shared {
     state: Mutex<State>,
     changed: Condvar,
-    /// The stream's handles, so a callback can hand out a lease that keeps them
-    /// alive. Weak because the session owns the loop thread that runs the
-    /// callbacks: a strong reference here would be a cycle.
-    session: Mutex<std::sync::Weak<Session>>,
 }
 
 /// What the loop thread's callbacks reach through their `data` pointer.
@@ -660,29 +729,28 @@ unsafe extern "C" fn on_param_changed(data: *mut c_void, id: u32, param: *const 
     let callbacks = unsafe { &*data.cast::<Callbacks>() };
     let format = unsafe { parse_format(param) };
     let mut state = lock(&callbacks.shared.state);
-    // The portal announces the DMA-BUF format and the shared-memory format in
-    // turn, and only one of them is what the stream will actually use. The
-    // request is therefore made once, for DMA-BUF, and never revised: switching
-    // it back and forth makes the portal re-fixate the modifier each time, and
-    // its retry counter does not reset, so a handful of changes is enough for
-    // it to give up on DMA-BUF for the rest of the session.
-    let wants_dmabuf = dmabuf_requested();
-    let first = state.buffers_requested.is_none();
     state.format = format;
-    if !first {
-        drop(state);
-        tracing::debug!(?format, "PipeWire screencast format renegotiated");
+    if state.buffers_sent {
         return;
     }
-    state.buffers_requested = Some(wants_dmabuf);
+    state.buffers_sent = true;
     drop(state);
-    tracing::debug!(?format, wants_dmabuf, "PipeWire screencast format negotiated");
-    let buffers = buffers(wants_dmabuf).aligned();
+    // The portal must fixate the format before it receives a buffer request.
+    // Submit allocation and metadata parameters once after Format is received.
+    let buffers = buffers().aligned();
     let meta = crop_meta().aligned();
-    let mut params = [buffers.as_ptr().cast::<c_void>(), meta.as_ptr().cast()];
+    let mut params = [
+        buffers.as_ptr().cast::<c_void>(),
+        meta.as_ptr().cast::<c_void>(),
+    ];
     unsafe {
-        (callbacks.api.stream_update_params)(callbacks.stream, params.as_mut_ptr(), 2);
-    }
+        (callbacks.api.stream_update_params)(
+            callbacks.stream,
+            params.as_mut_ptr(),
+            params.len() as u32,
+        )
+    };
+    tracing::debug!(?format, "PipeWire screencast format negotiated");
 }
 
 unsafe extern "C" fn on_process(data: *mut c_void) {
@@ -704,44 +772,7 @@ unsafe extern "C" fn on_process(data: *mut c_void) {
         return;
     }
     let format = lock(&callbacks.shared.state).format;
-    // A DMA-BUF picture keeps the buffer until the encoder is done with it, so
-    // the lease carries the queue call; everything else is read here and the
-    // buffer goes straight back.
-    let picture = format.and_then(|format| unsafe {
-        read_picture(
-            api,
-            callbacks.stream,
-            &callbacks.shared,
-            newest,
-            format,
-        )
-    });
-    let holds = picture
-        .as_ref()
-        .is_some_and(|picture| picture.holds_buffer());
-    if holds {
-        // The compositor's pool is small, so at most one DMA-BUF may be held.
-        // Taking another while the last one is still waiting would drain the
-        // pool, after which the compositor logs `Out of buffers`, retries the
-        // whole stream, and every retry re-runs the modifier fixation until it
-        // gives up and falls back to shared memory. The picture that is already
-        // waiting is newer than nothing and is about to be taken; dropping this
-        // one costs a frame and keeps the stream alive.
-        let mut state = lock(&callbacks.shared.state);
-        if state.picture.is_some() {
-            drop(state);
-            // Dropping the picture returns its buffer through the lease, so
-            // there is nothing to queue here.
-            drop(picture);
-            tracing::debug!("PipeWire 画面：已有待取画面，丢弃本帧");
-            return;
-        }
-        state.picture = picture;
-        state.sequence += 1;
-        drop(state);
-        callbacks.shared.changed.notify_all();
-        return;
-    }
+    let picture = format.and_then(|format| unsafe { read_picture((*newest).buffer, format) });
     unsafe { (api.stream_queue_buffer)(callbacks.stream, newest) };
     if let Some(picture) = picture {
         let mut state = lock(&callbacks.shared.state);
@@ -752,58 +783,36 @@ unsafe extern "C" fn on_process(data: *mut c_void) {
     }
 }
 
-/// Copy a buffer's pixels out as tightly packed BGRA, or hand a DMA-BUF over.
+/// Copy a buffer's pixels out as tightly packed BGRA with opaque alpha.
 ///
 /// # Safety
 /// `buffer` must be a buffer the stream just dequeued.
-unsafe fn read_picture(
-    api: &'static Api,
-    stream: *mut c_void,
-    shared: &Shared,
-    buffer: *mut PwBuffer,
-    negotiated: NegotiatedFormat,
-) -> Option<Picture> {
+unsafe fn read_picture(buffer: *mut SpaBuffer, negotiated: NegotiatedFormat) -> Option<Picture> {
     let NegotiatedFormat {
         format,
         width,
         height,
-        modifier,
+        modifier: _,
     } = negotiated;
-    // The lease has to return the `pw_buffer`, not the `spa_buffer` inside it:
-    // `pw_stream_queue_buffer` looks up its own bookkeeping from the former and
-    // rejects anything else with `-EINVAL`.
-    let spa = unsafe { (*buffer).buffer };
-    let buffer_ref = unsafe { &*spa };
-    if buffer_ref.n_datas == 0 || buffer_ref.datas.is_null() {
+    let buffer = unsafe { &*buffer };
+    if buffer.n_datas == 0 || buffer.datas.is_null() {
         return None;
     }
-    // The buffer's own type decides, not the format's modifier. The portal
-    // keeps the modifier property in the format even after it fails to allocate
-    // a DMA-BUF and falls back to shared memory, so a `modifier` alone says
-    // nothing about what the buffer actually is; reading the fallback as a
-    // DMA-BUF imports the wrong memory and produces a blank picture.
-    //
-    // A delivered buffer carries the single `spa_data_type`, not the bitmask
-    // the request used, so this compares the enum value directly.
-    let kind = unsafe { (*buffer_ref.datas).kind };
-    if kind == DATA_MEM_DMABUF {
-        let session = shared
-            .session
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .upgrade()?;
-        return unsafe { read_dmabuf(&session, buffer, spa, format, width, height, modifier) };
-    }
-    let buffer = buffer_ref;
     let data = unsafe { &*buffer.datas };
+    if data.kind == DATA_MEM_DMABUF {
+        return match read_dmabuf_picture(buffer, data, negotiated) {
+            Ok(picture) => Some(picture),
+            Err(error) => {
+                tracing::warn!(%error, "DMA-BUF 导入失败");
+                None
+            }
+        };
+    }
     if data.data.is_null() || data.chunk.is_null() {
         // A DMA-BUF was not mapped for the CPU. Asking the portal for one does
         // not help: Hyprland's ScreenCast offers only MemFd, so this stays the
         // path a GPU encoder would need to import through PipeWire directly.
-        tracing::debug!(
-            data_type = data.kind,
-            "PipeWire buffer is not CPU-mappable"
-        );
+        tracing::debug!(data_type = data.kind, "PipeWire buffer is not CPU-mappable");
         return None;
     }
     let chunk = unsafe { &*data.chunk };
@@ -819,6 +828,21 @@ unsafe fn read_picture(
     } else {
         width as usize * 4
     };
+    let base = (chunk.offset % data.maxsize.max(1)) as usize;
+    let source =
+        unsafe { std::slice::from_raw_parts(data.data.cast::<u8>(), data.maxsize as usize) };
+    copy_picture_pixels(buffer, source, base, stride, format, width, height)
+}
+
+fn copy_picture_pixels(
+    buffer: &SpaBuffer,
+    source: &[u8],
+    base: usize,
+    stride: usize,
+    format: u32,
+    width: u32,
+    height: u32,
+) -> Option<Picture> {
     let (mut x, mut y, mut w, mut h) = (0usize, 0usize, width as usize, height as usize);
     for index in 0..buffer.n_metas as usize {
         let meta = unsafe { &*buffer.metas.add(index) };
@@ -835,13 +859,10 @@ unsafe fn read_picture(
             }
         }
     }
-    let base = (chunk.offset % data.maxsize.max(1)) as usize;
     let needed = base + (y + h).saturating_sub(1) * stride + (x + w) * 4;
-    if w == 0 || h == 0 || needed > data.maxsize as usize {
+    if w == 0 || h == 0 || needed > source.len() {
         return None;
     }
-    let source =
-        unsafe { std::slice::from_raw_parts(data.data.cast::<u8>(), data.maxsize as usize) };
     // Only the encoders read these pixels, and both convert with the colour
     // channels alone: the alpha byte is never looked at. Writing it would cost
     // a pass over the frame for nothing, so the buffer is left as the
@@ -852,8 +873,7 @@ unsafe fn read_picture(
         // The common case is already BGRX, so each row is a straight copy.
         for row in 0..h {
             let start = base + (y + row) * stride + x * 4;
-            pixels[row * w * 4..(row + 1) * w * 4]
-                .copy_from_slice(&source[start..start + w * 4]);
+            pixels[row * w * 4..(row + 1) * w * 4].copy_from_slice(&source[start..start + w * 4]);
         }
     } else {
         // Swap red and blue while copying, so the result is BGRA either way.
@@ -869,137 +889,15 @@ unsafe fn read_picture(
             }
         }
     }
-    Some(Picture::Shm {
+    Some(Picture {
         width: w as u32,
         height: h as u32,
         pixels,
     })
 }
 
-/// The DRM fourcc a negotiated `spa_video_format` arrives as.
-///
-/// The portal maps the compositor's DRM fourcc to a SPA enum on the way out
-/// (`pwFromDrmFourcc`), so this is that mapping read backwards. The modifier
-/// rides along and says how the buffer is tiled.
-fn drm_fourcc(format: u32) -> Option<u32> {
-    Some(match format {
-        VIDEO_BGRA => u32::from_le_bytes(*b"AR24"),
-        VIDEO_BGRX => u32::from_le_bytes(*b"XR24"),
-        VIDEO_RGBA => u32::from_le_bytes(*b"AB24"),
-        VIDEO_RGBX => u32::from_le_bytes(*b"XB24"),
-        _ => return None,
-    })
-}
-
-/// Hand a compositor DMA-BUF to the encoder without touching the pixels.
-///
-/// # Safety
-/// `buffer` must be a buffer the stream just dequeued; the returned picture
-/// keeps it out of the pool until it is dropped.
-unsafe fn read_dmabuf(
-    session: &Arc<Session>,
-    buffer: *mut PwBuffer,
-    spa: *mut SpaBuffer,
-    format: u32,
-    width: u32,
-    height: u32,
-    modifier: Option<u64>,
-) -> Option<Picture> {
-    let fourcc = drm_fourcc(format)?;
-    // A modifier the compositor never fixated tells the importer nothing about
-    // the layout, and guessing wrong reads the wrong bytes. `LINEAR` is the
-    // safe reading only when the portal says so; `INVALID` means it did not.
-    let modifier = match modifier {
-        Some(modifier) if modifier != DRM_MOD_INVALID => modifier,
-        _ => {
-            tracing::warn!(format, "DMA-BUF 未提供有效 modifier，跳过该画面");
-            return None;
-        }
-    };
-    let buffer_ref = unsafe { &*spa };
-    if buffer_ref.n_datas == 0 || buffer_ref.datas.is_null() {
-        return None;
-    }
-    let mut planes = Vec::with_capacity(buffer_ref.n_datas as usize);
-    for index in 0..buffer_ref.n_datas as usize {
-        let data = unsafe { &*buffer_ref.datas.add(index) };
-        if data.fd < 0 || data.chunk.is_null() {
-            return None;
-        }
-        let chunk = unsafe { &*data.chunk };
-        let pitch = if chunk.stride > 0 {
-            chunk.stride as u32
-        } else {
-            width * 4
-        };
-        planes.push((data.fd as RawFd, chunk.offset, pitch));
-    }
-    if planes.is_empty() {
-        return None;
-    }
-    // The compositor reports `maxsize` as zero for DMA-BUFs, and `pitch *
-    // height` is not the allocation either: a tiled buffer is larger, because
-    // the layout pads and reorders it (2880x1800 at 11520 pitch is 19.8 MiB of
-    // pixels in a 24 MiB object). The driver needs the real extent, so ask the
-    // kernel rather than guess.
-    let buffer_size = unsafe { libc::lseek(planes[0].0, 0, libc::SEEK_END) };
-    let buffer_size = u32::try_from(buffer_size).ok().filter(|size| *size > 0);
-    // The descriptor is only borrowed: the compositor closes it when the buffer
-    // is removed, which happens on every renegotiation. Duplicating it keeps
-    // the buffer alive for as long as the picture is, so the encoder never
-    // imports through a descriptor number that has been closed and handed out
-    // again.
-    let planes: Vec<(std::os::fd::OwnedFd, u32, u32)> = planes
-        .into_iter()
-        .filter_map(|(fd, offset, pitch)| {
-            let duplicated = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
-            if duplicated < 0 {
-                tracing::warn!(fd, "复制 DMA-BUF 描述符失败");
-                return None;
-            }
-            Some((unsafe { std::os::fd::OwnedFd::from_raw_fd(duplicated) }, offset, pitch))
-        })
-        .collect();
-    if planes.is_empty() {
-        return None;
-    }
-    tracing::debug!(
-        fourcc,
-        width,
-        height,
-        modifier,
-        planes = planes.len(),
-        buffer_size = ?buffer_size,
-        "DMA-BUF 画面已交付"
-    );
-    Some(Picture::Dmabuf(DmabufPicture {
-        width,
-        height,
-        fourcc,
-        modifier,
-        buffer_size,
-        planes,
-        _lease: BufferLease {
-            session: Arc::clone(session),
-            buffer,
-        },
-    }))
-}
-
 /// A video stream from one PipeWire node, on its own loop thread.
 pub(super) struct Stream {
-    session: Arc<Session>,
-    shared: Arc<Shared>,
-    delivered: u64,
-}
-
-/// The stream's PipeWire handles, shared with any buffer leases still out.
-///
-/// Teardown lives here rather than on [`Stream`] so that a picture holding a
-/// buffer keeps the stream alive until the buffer is returned. Destroying the
-/// stream while a lease is out would leave the lease calling into freed
-/// memory.
-struct Session {
     api: &'static Api,
     thread_loop: *mut c_void,
     context: *mut c_void,
@@ -1008,36 +906,12 @@ struct Session {
     _hook: Box<SpaHook>,
     _events: Box<StreamEvents>,
     callbacks: *mut Callbacks,
+    shared: Arc<Shared>,
+    delivered: u64,
 }
 
 // The raw handles are only used under the thread loop's lock or after it stopped.
-unsafe impl Send for Session {}
-unsafe impl Sync for Session {}
-
-impl Drop for Session {
-    fn drop(&mut self) {
-        let api = self.api;
-        // SAFETY: teardown in reverse order of setup; the loop is stopped
-        // before the callback data it could still call into is freed.
-        unsafe {
-            (api.thread_loop_lock)(self.thread_loop);
-            if !self.stream.is_null() {
-                (api.stream_disconnect)(self.stream);
-                (api.stream_destroy)(self.stream);
-            }
-            if !self.core.is_null() {
-                (api.core_disconnect)(self.core);
-            }
-            (api.thread_loop_unlock)(self.thread_loop);
-            (api.thread_loop_stop)(self.thread_loop);
-            (api.context_destroy)(self.context);
-            (api.thread_loop_destroy)(self.thread_loop);
-            if !self.callbacks.is_null() {
-                drop(Box::from_raw(self.callbacks));
-            }
-        }
-    }
-}
+unsafe impl Send for Stream {}
 
 impl Stream {
     /// Connect to `node` on the PipeWire remote behind `fd` (from the portal).
@@ -1047,7 +921,6 @@ impl Stream {
         let shared = Arc::new(Shared {
             state: Mutex::new(State::default()),
             changed: Condvar::new(),
-            session: Mutex::new(std::sync::Weak::new()),
         });
         let name = CString::new("openuuyc-capture")?;
         // SAFETY: the PipeWire calls follow the documented setup sequence; every
@@ -1065,7 +938,7 @@ impl Stream {
                 (api.thread_loop_destroy)(thread_loop);
                 bail!("无法创建 PipeWire 上下文");
             }
-            let mut this = Session {
+            let mut this = Self {
                 api,
                 thread_loop,
                 context,
@@ -1087,6 +960,8 @@ impl Stream {
                     trigger_done: None,
                 }),
                 callbacks: std::ptr::null_mut(),
+                shared: shared.clone(),
+                delivered: 0,
             };
             ensure!(
                 (api.thread_loop_start)(thread_loop) >= 0,
@@ -1120,7 +995,7 @@ impl Stream {
                 this.callbacks = Box::into_raw(Box::new(Callbacks {
                     api,
                     stream: this.stream,
-                    shared: Arc::clone(&shared),
+                    shared,
                 }));
                 (api.stream_add_listener)(
                     this.stream,
@@ -1128,17 +1003,18 @@ impl Stream {
                     &*this._events,
                     this.callbacks.cast(),
                 );
-                // Only the format goes in with the connection. The buffer
-                // types follow from the format `on_param_changed` reports, and
-                // sending them before that is known risks asking for a DMA-BUF
-                // the portal then cannot fixate.
-                let format = enum_format().aligned();
+                let format = if dmabuf_requested() {
+                    enum_format()
+                } else {
+                    enum_format_shm()
+                }
+                .aligned();
                 let mut params = [format.as_ptr().cast::<c_void>()];
                 let connected = (api.stream_connect)(
                     this.stream,
                     DIRECTION_INPUT,
                     node,
-                    FLAG_AUTOCONNECT | FLAG_MAP_BUFFERS,
+                    FLAG_AUTOCONNECT,
                     params.as_mut_ptr(),
                     params.len() as u32,
                 );
@@ -1146,16 +1022,7 @@ impl Stream {
                 Ok(())
             })();
             (api.thread_loop_unlock)(thread_loop);
-            result.map(|()| {
-                let session = Arc::new(this);
-                *shared.session.lock().unwrap_or_else(|e| e.into_inner()) =
-                    Arc::downgrade(&session);
-                Stream {
-                    session,
-                    shared,
-                    delivered: 0,
-                }
-            })
+            result.map(|()| this)
         }
     }
 
@@ -1190,8 +1057,26 @@ impl Stream {
 
 impl Drop for Stream {
     fn drop(&mut self) {
-        // Teardown happens when the last buffer lease goes, which is in
-        // `Session::drop`.
+        let api = self.api;
+        // SAFETY: teardown in reverse order of setup; the loop is stopped
+        // before the callback data it could still call into is freed.
+        unsafe {
+            (api.thread_loop_lock)(self.thread_loop);
+            if !self.stream.is_null() {
+                (api.stream_disconnect)(self.stream);
+                (api.stream_destroy)(self.stream);
+            }
+            if !self.core.is_null() {
+                (api.core_disconnect)(self.core);
+            }
+            (api.thread_loop_unlock)(self.thread_loop);
+            (api.thread_loop_stop)(self.thread_loop);
+            (api.context_destroy)(self.context);
+            (api.thread_loop_destroy)(self.thread_loop);
+            if !self.callbacks.is_null() {
+                drop(Box::from_raw(self.callbacks));
+            }
+        }
     }
 }
 
@@ -1218,7 +1103,7 @@ mod tests {
                 format: VIDEO_BGRX,
                 width: 2560,
                 height: 1440,
-                modifier: None,
+                modifier: None
             })
         );
         let choices = enum_format().aligned();
@@ -1227,33 +1112,57 @@ mod tests {
     }
 
     #[test]
-    fn buffers_offers_dmabuf_alone_in_one_flags_choice() {
+    fn imported_rgb_preserves_baseline_crop_channel_order_and_bounds() {
+        let mut region = SpaMetaRegion {
+            x: 1,
+            y: 1,
+            width: 1,
+            height: 1,
+        };
+        let mut meta = SpaMeta {
+            kind: META_VIDEO_CROP,
+            size: size_of::<SpaMetaRegion>() as u32,
+            data: (&mut region as *mut SpaMetaRegion).cast(),
+        };
+        let buffer = SpaBuffer {
+            n_metas: 1,
+            n_datas: 0,
+            metas: &mut meta,
+            datas: std::ptr::null_mut(),
+        };
+        let source = [
+            0, 0, 0, 0, 0, 0, 0, 0, 9, 9, 9, 9, 0, 0, 0, 0, 10, 20, 30, 255,
+        ];
+        let picture = copy_picture_pixels(&buffer, &source, 0, 12, VIDEO_RGBA, 2, 2).unwrap();
+        assert_eq!((picture.width, picture.height), (1, 1));
+        assert_eq!(picture.pixels, vec![30, 20, 10, 255]);
+        assert!(copy_picture_pixels(&buffer, &source[..19], 0, 12, VIDEO_RGBA, 2, 2).is_none());
+    }
+
+    #[test]
+    fn buffers_offers_dmabuf_in_one_flags_choice() {
         // The portal only offers DMA-BUF when the mask reaches it intact, and
         // the value count is derived from the body size rather than stored, so
         // a wrong word count silently produces a different number of values.
-        let pod = buffers(true).aligned();
-        let words: Vec<u32> = (0..25)
+        let pod = buffers().aligned();
+        let words: Vec<u32> = (0..14)
             .map(|index| unsafe { pod.as_ptr().cast::<u32>().add(index).read() })
             .collect();
-        // [size, TYPE_OBJECT, ParamBuffers, PARAM_BUFFERS,
-        //  key(count), pad, choice size, TYPE_CHOICE, CHOICE_RANGE, 0,
-        //    child size, TYPE_INT, default, min, max,
-        //  key(dataType), pad, choice size, TYPE_CHOICE, CHOICE_FLAGS, 0,
-        //    child size, TYPE_INT, mask]
+        // [size, TYPE_OBJECT, ParamBuffers, PARAM_BUFFERS, key, pad,
+        //  choice size, TYPE_CHOICE, CHOICE_FLAGS, 0, child size, TYPE_INT, mask]
         assert_eq!(words[1], TYPE_OBJECT);
         assert_eq!(words[2], OBJECT_PARAM_BUFFERS);
         assert_eq!(words[3], PARAM_BUFFERS);
-        assert_eq!(words[4], BUFFERS_COUNT);
-        assert_eq!(words[8], CHOICE_RANGE);
-        assert_eq!(words[12], 8, "DMA-BUF frames need a deeper pool than the default four");
-        assert_eq!(words[16], BUFFERS_DATA_TYPE);
-        assert_eq!(words[20], CHOICE_FLAGS);
-        // DMA-BUF alone: `MemPtr` alongside it would win the collapse inside
-        // libpipewire and make allocation fail against a DMA-BUF format.
-        assert_eq!(words[24], 1 << DATA_MEM_DMABUF);
-        // The shared-memory offer still names a CPU-readable type.
-        let shm = buffers(false).aligned();
-        let mask = unsafe { shm.as_ptr().cast::<u32>().add(24).read() };
-        assert_eq!(mask, (1 << DATA_MEM_PTR) | (1 << DATA_MEM_FD));
+        assert_eq!(words[4], BUFFERS_DATA_TYPE);
+        assert_eq!(words[7], TYPE_CHOICE);
+        assert_eq!(words[8], CHOICE_FLAGS);
+        assert_eq!(words[11], TYPE_INT);
+        let mask = words[12];
+        let expected = if dmabuf_requested() {
+            1 << DATA_MEM_DMABUF
+        } else {
+            (1 << DATA_MEM_PTR) | (1 << DATA_MEM_FD)
+        };
+        assert_eq!(mask, expected);
     }
 }
