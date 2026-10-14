@@ -35,6 +35,10 @@ recommends = "libpulse0, libpipewire-0.3-0, gnome-keyring | kwalletmanager"
 suggests = "ethtool"
 assets = [
     ["target/release/OpenUUYC", "usr/bin/", "755"],
+    # 被控端加虚拟屏要写 configfs，只有 root 能写，所以另有一个按需启动的系统服务。
+    ["target/release/openuuyc-vkms", "usr/bin/", "755"],
+    ["packaging/linux/openuuyc-vkms.socket", "usr/lib/systemd/system/", "644"],
+    ["packaging/linux/openuuyc-vkms.service", "usr/lib/systemd/system/", "644"],
     ["packaging/linux/openuuyc.desktop", "usr/share/applications/", "644"],
     ["assets/icon-256.png", "usr/share/icons/hicolor/256x256/apps/openuuyc.png", "644"],
     ["packaging/linux/60-openuuyc-uinput.rules", "usr/lib/udev/rules.d/", "644"],
