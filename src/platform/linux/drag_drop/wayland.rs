@@ -24,6 +24,19 @@ use wayland_client::protocol::{
 use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle};
 use wayland_protocols::xdg::xdg_output::zv1::client::{zxdg_output_manager_v1, zxdg_output_v1};
 use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
+use wayland_protocols_wlr::virtual_pointer::v1::client::{
+    zwlr_virtual_pointer_manager_v1, zwlr_virtual_pointer_v1,
+};
+
+/// 挪指针时用的时间戳。协议只要求单调，用进程自己的时钟就行。
+fn now_ms() -> u32 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_millis()
+        .min(u128::from(u32::MAX)) as u32
+}
 
 /// 接取用的方形 surface 边长，以指针为中心。用户拖着东西在动，指针每动一次合成器
 /// 就重新判定一次指针底下是谁，所以只要他还在这块里就一定会交给我们；开这么大是
@@ -47,15 +60,9 @@ pub(crate) struct Catcher {
     stop: Arc<AtomicBool>,
 }
 impl Catcher {
-    /// `fraction` 是光标在这块屏上的归一化位置（0..1）。
-    ///
-    /// 不能收采集那边给的像素：那是**物理**像素，而 layer surface 的边距是**逻辑**
-    /// 坐标——本机 DP-1 是 1.35 倍、DP-3 是 1.6 倍，照物理值摆出去方块会跑到
-    /// 1.35 倍远的地方（实测 2304 摆到了 3110）。归一化之后由这里乘逻辑尺寸，
-    /// 跟缩放是多少无关。
+    /// 摆在这块屏的正中，并且把指针也挪过去（见 `run` 里那段说明）。
     pub fn start(
         device: &str,
-        fraction: (f64, f64),
         allowed: Arc<dyn Fn() -> bool + Send + Sync>,
         notify: Arc<dyn Fn(Event) + Send + Sync>,
     ) -> Result<Self> {
@@ -67,7 +74,7 @@ impl Catcher {
             .spawn(move || {
                 // 失败不报给状态机：X11 那条还在跑，这里一次摆设不成功不该把整个
                 // 拖放判死。真的一直没结果，`tick` 的超时会收场。
-                if let Err(error) = run(&device, fraction, &ending, &allowed, &notify) {
+                if let Err(error) = run(&device, &ending, &allowed, &notify) {
                     tracing::debug!(error = format!("{error:#}"), "Wayland 拖放接取失败");
                 }
             })?;
@@ -87,11 +94,13 @@ struct State {
     manager: Option<wl_data_device_manager::WlDataDeviceManager>,
     /// 拖放事件的来源。要一直拿着，丢了就没有事件了。
     device: Option<wl_data_device::WlDataDevice>,
-    /// 逻辑尺寸（`zwlr_layer_surface_v1` 的边距按它算），只问目标那块屏。
     xdg: Option<zxdg_output_manager_v1::ZxdgOutputManagerV1>,
-    /// 目标那块屏的 xdg-output。要一直拿着，丢了就收不到逻辑尺寸了。
-    described: Option<zxdg_output_v1::ZxdgOutputV1>,
-    logical: Option<(i32, i32)>,
+    /// 每块屏的 xdg-output，顺序和 `outputs` 一致。要一直拿着，丢了就收不到尺寸。
+    described: Vec<zxdg_output_v1::ZxdgOutputV1>,
+    /// 每块屏的逻辑位置与尺寸，顺序同上。`layer_shell` 的边距按逻辑算，而虚拟指针
+    /// 的绝对位置要按整个布局的比例给——两样都得知道这些数才算得对。
+    logical: Vec<Option<((i32, i32), (i32, i32))>>,
+    pointer: Option<zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1>,
     /// 合成器的输出，以及它们报上来的名字（名字要等绑定之后再走一轮才到）。
     outputs: Vec<(wl_output::WlOutput, String)>,
     /// 这次拖放带的 offer，以及它报出来的类型。
@@ -108,7 +117,6 @@ struct State {
 
 fn run(
     device: &str,
-    fraction: (f64, f64),
     stop: &AtomicBool,
     allowed: &Arc<dyn Fn() -> bool + Send + Sync>,
     notify: &Arc<dyn Fn(Event) + Send + Sync>,
@@ -143,23 +151,35 @@ fn run(
             .context("合成器没有 wl_data_device_manager")?,
     );
 
-    // 逻辑尺寸只能问 xdg-output：`wl_output` 给的永远是物理尺寸，而两者之间差着
-    // 一个缩放（本机 DP-1 是 1.35 倍），边距却是按逻辑算的。
+    // 逻辑坐标只能问 xdg-output：`wl_output` 给的永远是物理尺寸，两者之间差着一个
+    // 缩放（本机 DP-1 是 1.35 倍、DP-3 是 1.6 倍），而 layer surface 的边距和虚拟
+    // 指针的位置都是按逻辑算的。每块屏都要问：虚拟指针的位置是按**整个布局**的比例
+    // 给的，只知道目标屏多大是换算不出来的。
     let xdg = state
         .xdg
         .clone()
         .context("合成器没有 zxdg_output_manager_v1")?;
-    state.described = Some(xdg.get_xdg_output(&target, &handle, ()));
+    state.described = state
+        .outputs
+        .iter()
+        .map(|(output, _)| xdg.get_xdg_output(output, &handle, ()))
+        .collect();
+    state.logical = vec![None; state.outputs.len()];
     let deadline = Instant::now() + SETUP;
-    while state.logical.is_none() && Instant::now() < deadline {
+    while state.logical.iter().any(Option::is_none) && Instant::now() < deadline {
         dispatch(&mut queue, &mut state, &connection)?;
         wait(&mut queue, &mut state, &connection, POLL)?;
     }
-    let (logical_width, logical_height) = state.logical.context("输出没有给出逻辑尺寸")?;
-    let local = (
-        (fraction.0 * f64::from(logical_width)).round() as i32,
-        (fraction.1 * f64::from(logical_height)).round() as i32,
-    );
+    let index = state
+        .outputs
+        .iter()
+        .position(|(bound, _)| bound == &target)
+        .context("目标输出不见了")?;
+    let (logical, (logical_width, logical_height)) =
+        state.logical[index].context("输出没有给出逻辑尺寸")?;
+    // 摆在这块屏的正中间，指针也挪过去。中间是最稳的地方：不会碰到别的层，
+    // 也离屏幕边缘最远。
+    let local = (logical_width / 2, logical_height / 2);
 
     let surface = compositor.create_surface(&handle, ());
     let shell = layer.get_layer_surface(
@@ -201,6 +221,13 @@ fn run(
 
     let data = manager.get_data_device(&seat, &handle, ());
     state.device = Some(data);
+    // 把光标挪到这块 surface 中间。
+    //
+    // 合成器只在收到 motion 事件时才会重新判定指针底下是谁，而用户把指针拖出窗口
+    // 之后被控端的指针就不动了——中途摆出来的 surface 于是永远收不到 `enter`。
+    // X11 那条路（`portal.rs`）同样为此用 XTEST 推一下指针。顺便这也把光标从屏幕
+    // 边缘挪开：按着键停在边缘会触发 niri 的边缘手势。
+    move_pointer(&mut state, &handle, &connection, local, (logical, (logical_width, logical_height)));
 
     let deadline = Instant::now() + LIMIT;
     while state.paths.is_none()
@@ -233,6 +260,54 @@ fn run(
         notify(Event::Captured(paths, false));
     }
     Ok(())
+}
+
+/// 用虚拟指针把光标挪到目标屏的正中（`local` 是这块屏内的逻辑坐标）。
+///
+/// 位置要按**整个布局**的比例给：`motion_absolute` 的 x/y 取值范围是 0..extent，
+/// 合成器再按布局的宽高换算，所以 extent 要给整个布局的包围盒，而不是这一块屏的。
+fn move_pointer(
+    state: &mut State,
+    handle: &QueueHandle<State>,
+    connection: &Connection,
+    local: (i32, i32),
+    target: ((i32, i32), (i32, i32)),
+) {
+    let Some(manager) = state.pointer.as_ref() else {
+        tracing::debug!("合成器没有 zwlr_virtual_pointer_manager_v1，指针不会挪");
+        return;
+    };
+    let Some(seat) = state.seat.as_ref() else {
+        return;
+    };
+    // 布局的包围盒：所有输出的逻辑矩形并起来。
+    let (mut left, mut top, mut right, mut bottom) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+    for entry in state.logical.iter().flatten() {
+        let ((x, y), (width, height)) = *entry;
+        left = left.min(x);
+        top = top.min(y);
+        right = right.max(x + width);
+        bottom = bottom.max(y + height);
+    }
+    if left >= right || top >= bottom {
+        return;
+    }
+    let ((origin_x, origin_y), _) = target;
+    let (x, y) = (
+        origin_x + local.0 - left,
+        origin_y + local.1 - top,
+    );
+    let pointer = manager.create_virtual_pointer(Some(seat), handle, ());
+    pointer.motion_absolute(
+        now_ms(),
+        x.max(0) as u32,
+        y.max(0) as u32,
+        (right - left) as u32,
+        (bottom - top) as u32,
+    );
+    // 这一版协议的 `frame` 不带时间戳。
+    pointer.frame();
+    let _ = connection.flush();
 }
 
 /// 读一遍待处理事件。
@@ -464,6 +539,13 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                     (),
                 ))
             }
+            "zwlr_virtual_pointer_manager_v1" => {
+                state.pointer = Some(registry.bind::<
+                    zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1,
+                    _,
+                    _,
+                >(name, version.min(2), handle, ()))
+            }
             "zxdg_output_manager_v1" => {
                 state.xdg = Some(registry.bind::<zxdg_output_manager_v1::ZxdgOutputManagerV1, _, _>(
                     name,
@@ -582,14 +664,25 @@ impl Dispatch<wl_data_offer::WlDataOffer, ()> for State {
 impl Dispatch<zxdg_output_v1::ZxdgOutputV1, ()> for State {
     fn event(
         state: &mut Self,
-        _: &zxdg_output_v1::ZxdgOutputV1,
+        output: &zxdg_output_v1::ZxdgOutputV1,
         event: zxdg_output_v1::Event,
         _: &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if let zxdg_output_v1::Event::LogicalSize { width, height } = event {
-            state.logical = Some((width, height));
+        let Some(index) = state.described.iter().position(|it| it == output) else {
+            return;
+        };
+        match event {
+            zxdg_output_v1::Event::LogicalPosition { x, y } => {
+                let entry = state.logical[index].get_or_insert(((0, 0), (0, 0)));
+                entry.0 = (x, y);
+            }
+            zxdg_output_v1::Event::LogicalSize { width, height } => {
+                let entry = state.logical[index].get_or_insert(((0, 0), (0, 0)));
+                entry.1 = (width, height);
+            }
+            _ => {}
         }
     }
 }
@@ -614,6 +707,8 @@ mod tests {
 }
 
 wayland_client::delegate_noop!(State: ignore zxdg_output_manager_v1::ZxdgOutputManagerV1);
+wayland_client::delegate_noop!(State: ignore zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1);
+wayland_client::delegate_noop!(State: ignore zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1);
 wayland_client::delegate_noop!(State: ignore wl_compositor::WlCompositor);
 wayland_client::delegate_noop!(State: ignore wl_shm::WlShm);
 wayland_client::delegate_noop!(State: ignore wl_shm_pool::WlShmPool);
