@@ -33,6 +33,7 @@ impl Cache {
     pub async fn prepare(
         &self,
         screen: capture::Screen,
+        gpu_compatibility: bool,
         active: impl Fn() -> bool + Send + 'static,
     ) -> Result<Arc<Capabilities>> {
         let mut cached = self.0.lock().await;
@@ -52,7 +53,7 @@ impl Cache {
             tracing::info!("host media capabilities reused");
             return Ok(capabilities);
         }
-        let capabilities = Arc::new(probe(screen, adapters, active).await?);
+        let capabilities = Arc::new(probe(screen, adapters, gpu_compatibility, active).await?);
         *cached = Some(capabilities.clone());
         Ok(capabilities)
     }
@@ -67,12 +68,13 @@ impl Cache {
 async fn probe(
     screen: capture::Screen,
     adapters: Vec<capture::EncodingAdapter>,
+    gpu_compatibility: bool,
     active: impl Fn() -> bool + Send + 'static,
 ) -> Result<Capabilities> {
     tokio::task::spawn_blocking(move || {
         let started = std::time::Instant::now();
         ensure!(active(), "媒体准备已取消");
-        let _runtime = encoder::Runtime::new()?;
+        let _runtime = encoder::Runtime::with_gpu_compatibility(gpu_compatibility)?;
         let mut desktop = capture::Desktop::open_selected(&screen)?;
         let codecs = encoder::probe(&mut desktop, &active)?;
         ensure!(active(), "媒体准备已取消");

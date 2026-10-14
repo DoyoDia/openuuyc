@@ -55,6 +55,19 @@ impl Allocator {
         lock(&self.state).surfaces.insert(key, surface);
         key as *mut c_void
     }
+    /// Only after ENCODE_Close, with the old input no longer in flight.
+    pub fn prepare_reinitialize(&mut self, bind_flags: u32) -> Result<()> {
+        let mut state = lock(&self.state);
+        ensure!(
+            state.allocations.is_empty(),
+            "QSV关闭后仍持有原生分配，不能复用会话"
+        );
+        state.surfaces.clear();
+        // The callback object and pthis remain stable; only future allocations
+        // change their resource bindings after all old native work is closed.
+        self.bind_flags = bind_flags;
+        Ok(())
+    }
 }
 fn ffi(body: impl FnOnce() -> Result<()>) -> v::mfxStatus {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {

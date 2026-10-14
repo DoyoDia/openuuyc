@@ -372,9 +372,11 @@ impl Handle {
         };
         let owner = self.clone();
         self.media
-            .prepare(screen, move || {
-                !cancel.is_cancelled() && lock(&owner.ownership).active
-            })
+            .prepare(
+                screen,
+                self.encoding_settings().gpu_compatibility,
+                move || !cancel.is_cancelled() && lock(&owner.ownership).active,
+            )
             .await?;
         Ok(())
     }
@@ -1073,11 +1075,12 @@ impl Lease {
     pub(crate) async fn prepare_media(
         &self,
         screen: capture::Screen,
+        gpu_compatibility: bool,
     ) -> anyhow::Result<Arc<super::desktop::Capabilities>> {
         let lease = self.clone();
         self.handle
             .media
-            .prepare(screen, move || lease.requested())
+            .prepare(screen, gpu_compatibility, move || lease.requested())
             .await
     }
     fn current(&self, state: &Ownership) -> bool {

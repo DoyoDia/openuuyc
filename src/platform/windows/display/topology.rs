@@ -65,6 +65,9 @@ pub(crate) struct Target {
     /// operations and session cleanup still verify the actual driver/owner.
     pub virtual_provider: Option<VirtualProvider>,
     pub modes: Vec<Mode>,
+    /// Driver-reported monitor preferred mode, oriented like the active desktop.
+    /// Independent of the current source mode and supported-mode maximum.
+    pub preferred_mode: Option<(u32, u32)>,
     pub dpi: Option<Dpi>,
 }
 pub(crate) struct Topology {
@@ -294,6 +297,7 @@ impl Topology {
                 identity,
                 name: text(&target.monitorFriendlyDeviceName),
                 modes: Vec::new(),
+                preferred_mode: active.then(|| preferred_mode(path)).flatten(),
                 dpi: if active {
                     dpi(path.sourceInfo.adapterId, path.sourceInfo.id).ok()
                 } else {
@@ -312,6 +316,34 @@ impl Topology {
         }
         Ok(targets)
     }
+}
+
+fn preferred_mode(path: &DISPLAYCONFIG_PATH_INFO) -> Option<(u32, u32)> {
+    let mut preferred = DISPLAYCONFIG_TARGET_PREFERRED_MODE {
+        header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
+            r#type: DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_PREFERRED_MODE,
+            size: size_of::<DISPLAYCONFIG_TARGET_PREFERRED_MODE>() as u32,
+            adapterId: path.targetInfo.adapterId,
+            id: path.targetInfo.id,
+        },
+        ..Default::default()
+    };
+    if unsafe { DisplayConfigGetDeviceInfo(&mut preferred.header) } != 0
+        || !(1..=16384).contains(&preferred.width)
+        || !(1..=16384).contains(&preferred.height)
+    {
+        return None;
+    }
+    Some(
+        if matches!(
+            path.targetInfo.rotation,
+            DISPLAYCONFIG_ROTATION_ROTATE90 | DISPLAYCONFIG_ROTATION_ROTATE270
+        ) {
+            (preferred.height, preferred.width)
+        } else {
+            (preferred.width, preferred.height)
+        },
+    )
 }
 
 fn target_identity(path: &DISPLAYCONFIG_PATH_INFO) -> Result<String> {

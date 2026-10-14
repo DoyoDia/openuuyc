@@ -119,6 +119,7 @@ impl Session {
             match error.downcast_ref::<dxva::Failure>() {
                 Some(dxva::Failure::Unsupported) => DecodeError::Unsupported,
                 Some(dxva::Failure::HardwareFailure) => DecodeError::HardwareFailure,
+                Some(dxva::Failure::OutputBusy) => DecodeError::NeedKeyframe,
                 None if error.downcast_ref::<windows::core::Error>().is_some() => {
                     DecodeError::HardwareFailure
                 }
@@ -127,28 +128,44 @@ impl Session {
         })
     }
     pub(super) fn poll(&mut self) -> Result<Option<WindowsDecodedFrame>, DecodeError> {
-        let Some(frame) = self.output.poll() else {
-            return Ok(None);
-        };
-        let picture = frame.picture;
-        // Keep queued pictures in the decode DPB. The smaller shared display
-        // pool is acquired only once the picture is actually ready for output.
-        let pool = std::sync::Arc::clone(&picture.surface.pool);
-        let surface = pool.display(picture.surface).map_err(|error| {
-            tracing::warn!(detail=%error, "Rust DXVA output transfer failed");
-            self.reset();
-            DecodeError::HardwareFailure
-        })?;
-        Ok(Some(WindowsDecodedFrame::Gpu(WindowsGpuVideoFrame {
-            texture: surface.texture().clone(),
-            subresource: surface.subresource(),
-            pts: frame.token,
-            visible_x: picture.left,
-            visible_y: picture.top,
-            width: picture.width,
-            height: picture.height,
-            _lease: surface,
-        })))
+        loop {
+            let Some(frame) = self.output.poll() else {
+                return Ok(None);
+            };
+            let picture = frame.picture;
+            // Keep queued pictures in the decode DPB. The smaller shared display
+            // pool is acquired only once the picture is actually ready for output.
+            let pool = std::sync::Arc::clone(&picture.surface.pool);
+            let surface = match pool.display(picture.surface) {
+                Ok(surface) => surface,
+                Err(error)
+                    if matches!(
+                        error.downcast_ref::<dxva::Failure>(),
+                        Some(dxva::Failure::OutputBusy)
+                    ) =>
+                {
+                    // Display pressure may drop a presentation, never a decoder
+                    // reference. Retire its token and keep the DPB/decoder intact.
+                    self.output.discard_token(frame.token);
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(detail=%error, "Rust DXVA output transfer failed");
+                    self.reset();
+                    return Err(DecodeError::HardwareFailure);
+                }
+            };
+            return Ok(Some(WindowsDecodedFrame::Gpu(WindowsGpuVideoFrame {
+                texture: surface.texture().clone(),
+                subresource: surface.subresource(),
+                pts: frame.token,
+                visible_x: picture.left,
+                visible_y: picture.top,
+                width: picture.width,
+                height: picture.height,
+                _lease: surface,
+            })));
+        }
     }
     pub(super) fn reset(&mut self) {
         self.output.reset();

@@ -11,6 +11,7 @@ pub(crate) struct Request {
 }
 
 pub(crate) struct Converter {
+    timing: Option<super::gpu_diagnostics::Timing>,
     vertex: ID3D11VertexShader,
     pixel: ID3D11PixelShader,
     sampler: ID3D11SamplerState,
@@ -56,6 +57,7 @@ impl Converter {
                 Some(&mut params),
             )?;
             Ok(Self {
+                timing: super::gpu_diagnostics::Timing::new(device, "capture preprocess"),
                 vertex: vertex.context("采集vertex shader")?,
                 pixel: pixel.context("采集pixel shader")?,
                 sampler: sampler.context("采集sampler")?,
@@ -79,6 +81,7 @@ impl Converter {
         request: Request,
         pointer: Option<(ID3D11ShaderResourceView, [f32; 8])>,
     ) -> Result<ID3D11Texture2D> {
+        let _span = self.timing.as_mut().and_then(|timer| timer.begin());
         unsafe {
             if self.source != (desc.Width, desc.Height, desc.Format) {
                 let mut copy = None;
@@ -110,6 +113,23 @@ impl Converter {
             let size = super::output_size(rotated.0, rotated.1, request.quality);
             let size = super::fit_size(size.0, size.1, request.maximum);
             let hdr = request.hdr;
+            let input = self.input.as_ref().context("采集转换输入缺失")?;
+            if input.0 != *texture {
+                context.CopyResource(&input.0, texture);
+            }
+            // Encode consumes RGB only (alpha is discarded by every backend).
+            // Keep our owned snapshot, never return the duplication resource.
+            if size == (desc.Width, desc.Height)
+                && matches!(
+                    rotation,
+                    DXGI_MODE_ROTATION_IDENTITY | DXGI_MODE_ROTATION_UNSPECIFIED
+                )
+                && !hdr
+                && desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM
+                && pointer.is_none()
+            {
+                return Ok(input.0.clone());
+            }
             if self.destination != (size.0, size.1, hdr) {
                 let mut output = None;
                 let mut target = None;
@@ -143,9 +163,6 @@ impl Converter {
             }
             let input = self.input.as_ref().context("采集转换输入缺失")?;
             let output = self.output.as_ref().context("采集转换输出缺失")?;
-            if input.0 != *texture {
-                context.CopyResource(&input.0, texture);
-            }
             let mut values = [0f32; 12];
             values[..4].copy_from_slice(&[
                 rotation.0 as f32,

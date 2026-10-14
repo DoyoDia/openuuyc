@@ -330,6 +330,40 @@ impl DeviceCenterApp {
                     }
                 },
             );
+            // Linux has no per-process GPU scheduling class to set.
+            if crate::platform::encoder::GPU_SCHEDULING {
+                form_row(
+                    ui,
+                    "GPU 调度",
+                    if selected.gpu_compatibility {
+                        "遇到显卡驱动冻结时使用；重连后生效"
+                    } else {
+                        "改善游戏满载时的串流流畅度；重连后生效"
+                    },
+                    |ui| {
+                        egui::ComboBox::from_id_salt("host-gpu-scheduling")
+                            .width(238.)
+                            .selected_text(if selected.gpu_compatibility {
+                                "兼容优先"
+                            } else {
+                                "流畅优先（推荐）"
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut selected.gpu_compatibility,
+                                    false,
+                                    "流畅优先（推荐）",
+                                );
+                                ui.selectable_value(
+                                    &mut selected.gpu_compatibility,
+                                    true,
+                                    "兼容优先",
+                                )
+                                .on_hover_text("降低 GPU 调度优先级以兼容部分显卡驱动，游戏满载时可能降低串流流畅度。");
+                            });
+                    },
+                );
+            }
             let restriction = super::super::media_preferences::limits_title(
                 selected.mode,
                 (selected.codec != EncoderCodec::Automatic).then(|| selected.codec.label()),

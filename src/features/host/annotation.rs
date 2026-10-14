@@ -125,7 +125,7 @@ impl Receiver {
                     let _ = work.reply.send(if valid && accepted { code } else { 4 });
                 }
             }
-            // Native windows and the service child job die before this worker completes.
+            // Session-owned native windows die before this worker completes.
         });
         (Self { binding, input }, worker)
     }

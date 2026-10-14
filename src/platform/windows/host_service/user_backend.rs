@@ -79,21 +79,18 @@ pub(crate) fn permitted() -> bool {
 pub(crate) enum Role {
     Clipboard,
     Files,
-    Annotation,
 }
 impl Role {
     fn prefix(self) -> &'static str {
         match self {
             Self::Clipboard => r"\\.\pipe\OpenUUYC.Clipboard.",
             Self::Files => r"\\.\pipe\OpenUUYC.Files.",
-            Self::Annotation => r"\\.\pipe\OpenUUYC.Annotation.",
         }
     }
     fn run(self, pipe: &str, parent: u32) -> Result<()> {
         match self {
             Self::Clipboard => crate::features::host::clipboard::agent::run(pipe, parent),
             Self::Files => crate::features::file_transfer::host::agent::run(pipe, parent),
-            Self::Annotation => crate::features::host::annotation::agent::run(pipe, parent),
         }
     }
 }

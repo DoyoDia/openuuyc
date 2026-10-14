@@ -670,6 +670,9 @@ struct Player {
     intercept_shortcuts: bool,
     current: Option<DecodedVideoFrame>,
     video_size: Option<(u32, u32, u16)>,
+    /// The device's local display aspect, which stretches the video and the
+    /// pointer mapping with it; `None` keeps the picture's own aspect.
+    display_aspect: Option<(u32, u32)>,
     /// Content area of the last frame, used to map pointer positions.
     video_rect: Option<egui::Rect>,
     pointer_in_video: bool,
@@ -727,6 +730,7 @@ impl Player {
             intercept_shortcuts: true,
             current: None,
             video_size: None,
+            display_aspect: None,
             video_rect: None,
             pointer_in_video: false,
             last_position: None,
@@ -822,14 +826,16 @@ impl Player {
         );
     }
 
-    /// Rotation swaps the aspect the video should be fitted to.
+    /// Rotation swaps the aspect the video should be fitted to, and the
+    /// device's local display aspect replaces it.
     fn display_size(&self) -> Option<(u32, u32)> {
         let (width, height, rotation) = self.video_size?;
-        Some(if matches!(rotation % 360, 90 | 270) {
+        let size = if matches!(rotation % 360, 90 | 270) {
             (height, width)
         } else {
             (width, height)
-        })
+        };
+        Some(self.display_aspect.unwrap_or(size))
     }
 
     fn draw(&mut self, ui: &mut egui::Ui, window: &Arc<Window>) -> Option<VideoPlacement> {
@@ -837,6 +843,17 @@ impl Player {
         // push the first rows of the picture underneath it.
         let content = ui.available_rect_before_wrap();
         self.video_rect = None;
+        let display_aspect = self
+            .session
+            .stream_control
+            .display_aspect(self.session.track_index);
+        if self.display_aspect != display_aspect {
+            // The same point now maps elsewhere on the remote, as on Windows.
+            if !self.control().drag_drop().handoff_pending() {
+                self.release_input(window);
+            }
+            self.display_aspect = display_aspect;
+        }
         let scale = ui.ctx().pixels_per_point();
         self.scale = scale;
         let placement = self.display_size().map(|(width, height)| {
@@ -1257,15 +1274,21 @@ impl Player {
         if !focused {
             // Reports resume from a fresh window after focus returns.
             self.polling.interrupt();
-            self.release_pointer(window);
             // A key released while another window has focus never reaches us.
-            self.release_keys();
-            self.physical_keys.clear();
-            self.physical_buttons = 0;
-            self.modifiers = winit::keyboard::ModifiersState::empty();
-            self.input().pause_owner(self.owner);
-            self.control().drag_drop().cancel_gesture(true);
+            self.release_input(window);
         }
+    }
+
+    /// Hand back everything held for the remote; control resumes on the next
+    /// click into the video.
+    fn release_input(&mut self, window: &Arc<Window>) {
+        self.release_pointer(window);
+        self.release_keys();
+        self.physical_keys.clear();
+        self.physical_buttons = 0;
+        self.modifiers = winit::keyboard::ModifiersState::empty();
+        self.input().pause_owner(self.owner);
+        self.control().drag_drop().cancel_gesture(true);
     }
 
     /// Returns true when the event was consumed by remote input.

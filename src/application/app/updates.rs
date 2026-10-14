@@ -6,9 +6,11 @@ use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 mod settings;
 
-const LATEST_RELEASE: &str = "https://api.github.com/repos/djkcyl/openuuyc/releases/latest";
-const RELEASE_LIST: &str = "https://api.github.com/repos/djkcyl/openuuyc/releases";
-const RELEASES: &str = "https://github.com/djkcyl/openuuyc/releases";
+// Repository identity survives the OpenUUYC -> Farwing rename. Name-based API
+// URLs return 301, while this client deliberately does not follow redirects.
+const LATEST_RELEASE: &str = "https://api.github.com/repositories/1364197594/releases/latest";
+const RELEASE_LIST: &str = "https://api.github.com/repositories/1364197594/releases";
+const RELEASES: &str = "https://github.com/djkcyl/farwing/releases";
 const RETRY_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Debug)]
@@ -152,7 +154,10 @@ impl UpdateCheck {
         };
         self.pending = None;
         self.cancel = None;
-        self.state = result.unwrap_or_else(|error| State::Failed(format!("{error:#}")));
+        self.state = result.unwrap_or_else(|error| {
+            tracing::warn!(error = %format!("{error:#}"), "release check failed");
+            State::Failed(format!("{error:#}"))
+        });
         if let State::Available { version, .. } = &self.state
             && self.notified_version.as_ref() != Some(version)
         {
@@ -245,6 +250,11 @@ async fn fetch(
             response
                 .error_for_status_ref()
                 .context("GitHub 更新检查失败")?;
+            ensure!(
+                response.status().is_success(),
+                "GitHub 更新接口返回意外 HTTP 状态：{}",
+                response.status()
+            );
         }
     }
     let mut body = Vec::new();

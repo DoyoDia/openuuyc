@@ -33,6 +33,7 @@ impl RemoteDisplayMode {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RemoteDisplayInfo {
+    pub preferred: Option<(u32, u32)>,
     pub current: RemoteDisplayMode,
     pub initial: Option<RemoteDisplayMode>,
     pub modes: Vec<RemoteDisplayMode>,
@@ -66,6 +67,15 @@ impl RemoteDisplayInfo {
         dpis.sort_unstable();
         dpis.dedup();
         Some(Self {
+            preferred: screen
+                .openuuyc_geometry
+                .as_ref()
+                .filter(|g| {
+                    g.version == 1
+                        && (1..=16384).contains(&g.width)
+                        && (1..=16384).contains(&g.height)
+                })
+                .map(|g| (g.width, g.height)),
             current: RemoteDisplayMode::parse(rect)?,
             initial: screen
                 .init_resolution

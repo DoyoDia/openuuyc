@@ -26,12 +26,15 @@ pub(crate) const TRACK_COUNT: usize = 5;
 pub(super) struct Inventory {
     targets: Vec<Target>,
     screens: Vec<capture::Screen>,
+    layout: crate::platform::display::topology::SavedTopology,
 }
 impl Inventory {
     pub fn read() -> Result<Self> {
+        let topology = Topology::query(false)?;
         Ok(Self {
-            targets: Topology::query(false)?.targets()?,
+            targets: topology.targets()?,
             screens: capture::screens()?,
+            layout: Topology::query(true)?.snapshot()?,
         })
     }
     pub async fn collect(cancel: &CancellationToken) -> Result<Option<Self>> {
@@ -167,7 +170,10 @@ impl Screens {
         };
         let preparation = async {
             let screen = self.displays.prepare(deferred.options.clone()).await?;
-            let media = self.lease.prepare_media(screen.clone()).await?;
+            let media = self
+                .lease
+                .prepare_media(screen.clone(), deferred.encoding.gpu_compatibility)
+                .await?;
             let capabilities = deferred.encoding.select(&media.codecs)?;
             let prepared = crate::features::host::desktop::Prepared::new(
                 &deferred.options,
@@ -317,7 +323,12 @@ impl Screens {
         self.inventory_revision
     }
     fn apply_inventory(&mut self, inventory: Inventory) -> Result<()> {
-        let Inventory { targets, screens } = inventory;
+        let Inventory {
+            targets,
+            screens,
+            layout,
+        } = inventory;
+        self.displays.observe_layout(&layout)?;
         let mut catalog = Vec::new();
         for mut screen in screens {
             let mut target = targets

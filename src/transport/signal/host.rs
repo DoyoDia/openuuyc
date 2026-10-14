@@ -373,6 +373,10 @@ impl Session {
                     streamer.get("openuuyc_diagnostics").and_then(Value::as_u64) == Some(1);
                 let annotation_extension =
                     streamer.get("openuuyc_annotation").and_then(Value::as_u64) == Some(1);
+                let display_geometry = streamer
+                    .get("openuuyc_display_geometry")
+                    .and_then(Value::as_u64)
+                    == Some(1);
                 let drag_extension =
                     streamer.get("openuuyc_drag_drop").and_then(Value::as_u64) == Some(1);
                 let audio_only = streamer
@@ -484,7 +488,7 @@ impl Session {
                             let screen = displays.prepare(options.clone()).await?;
                             display_ms = preparation_started.elapsed().as_millis();
                             let media_started = std::time::Instant::now();
-                            let media = lease.prepare_media(screen.clone()).await?;
+                            let media = lease.prepare_media(screen.clone(), encoding_settings.gpu_compatibility).await?;
                             media_ms = media_started.elapsed().as_millis();
                             anyhow::ensure!(lease.requested(), "本次被控许可已失效");
                             let capabilities = encoding_settings.select(&media.codecs)?;
@@ -535,6 +539,7 @@ impl Session {
                             deferred,
                             audio_control,
                             annotation_extension,
+                            display_geometry,
                             diagnostics_extension,
                             drag_extension,
                             configuration_client.controlling_features(),

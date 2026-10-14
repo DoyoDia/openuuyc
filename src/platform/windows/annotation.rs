@@ -9,10 +9,14 @@ use windows::{
         System::LibraryLoader::GetModuleHandleW,
         UI::{HiDpi::*, WindowsAndMessaging::*},
     },
-    core::w,
+    core::{BOOL, w},
 };
 
 mod brand;
+
+thread_local! {
+    static DISPLAY_REVISION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
 fn check(status: Status) -> Result<()> {
     ensure!(status == Ok, "批注绘制失败（GDI+ {}）", status.0);
@@ -50,11 +54,38 @@ impl Drop for Runtime {
 
 pub(crate) struct Overlay {
     layers: BTreeMap<i32, Layer>,
+    sources: Vec<Screen>,
+    live: Vec<Screen>,
+    display_revision: u64,
+    foreground: HWND,
     _runtime: Runtime,
 }
 impl Overlay {
     pub fn new() -> Result<Self> {
         let runtime = Runtime::new()?;
+        let ui_access = unsafe {
+            use windows::Win32::{Security::*, System::Threading::*};
+            let mut token = HANDLE::default();
+            if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_ok() {
+                let mut value = 0u32;
+                let mut length = 0;
+                let result = GetTokenInformation(
+                    token,
+                    TokenUIAccess,
+                    Some((&mut value as *mut u32).cast()),
+                    4,
+                    &mut length,
+                );
+                let _ = CloseHandle(token);
+                result.ok().map(|_| value != 0)
+            } else {
+                None
+            }
+        };
+        tracing::info!(
+            ?ui_access,
+            "host annotation overlay initialized on interactive desktop"
+        );
         static CLASS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         ensure!(
             *CLASS.get_or_init(|| unsafe {
@@ -70,6 +101,10 @@ impl Overlay {
         );
         Result::Ok(Self {
             layers: BTreeMap::new(),
+            sources: Vec::new(),
+            live: Vec::new(),
+            display_revision: DISPLAY_REVISION.get(),
+            foreground: HWND::default(),
             _runtime: runtime,
         })
     }
@@ -92,6 +127,19 @@ impl Overlay {
             }
         }
     }
+    pub fn needs_refresh(&self) -> bool {
+        self.display_revision != DISPLAY_REVISION.get()
+    }
+    pub fn maintain_visibility(&mut self) -> Result<()> {
+        let foreground = unsafe { GetForegroundWindow() };
+        if foreground != self.foreground {
+            self.foreground = foreground;
+            for layer in self.layers.values() {
+                layer.raise()?;
+            }
+        }
+        Result::Ok(())
+    }
     pub fn render(
         &mut self,
         screens: &[Screen],
@@ -100,6 +148,15 @@ impl Overlay {
         dirty: &std::collections::BTreeSet<i32>,
         selected: Option<i32>,
     ) -> Result<()> {
+        // Display notifications are independent of the media inventory timer.
+        // Bind by source name AND monitor identity, never nearest-monitor fallback.
+        let refresh = self.sources != screens || self.needs_refresh();
+        if refresh {
+            self.live = live_screens(screens)?;
+            self.sources = screens.to_vec();
+            self.display_revision = DISPLAY_REVISION.get();
+        }
+        let screens = &self.live;
         self.layers.retain(|id, layer| {
             screens.iter().any(|s| s.id == *id && layer.matches(s))
                 && (selected == Some(*id)
@@ -123,7 +180,7 @@ impl Overlay {
             {
                 continue;
             }
-            if self.layers.contains_key(&screen.id) && !dirty.contains(&screen.id) {
+            if self.layers.contains_key(&screen.id) && !dirty.contains(&screen.id) && !refresh {
                 continue;
             }
             if !self.layers.contains_key(&screen.id) {
@@ -146,6 +203,18 @@ unsafe extern "system" fn window_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match message {
+        WM_DISPLAYCHANGE | WM_DPICHANGED => {
+            DISPLAY_REVISION.set(DISPLAY_REVISION.get().wrapping_add(1));
+            LRESULT(0)
+        }
+        WM_PAINT => {
+            let mut paint = PAINTSTRUCT::default();
+            unsafe {
+                BeginPaint(hwnd, &mut paint);
+                let _ = EndPaint(hwnd, &paint);
+            }
+            LRESULT(0)
+        }
         WM_NCHITTEST => LRESULT(HTTRANSPARENT as isize),
         WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
         WM_ERASEBKGND => LRESULT(1),
@@ -163,6 +232,20 @@ struct Layer {
     brand: Option<brand::Brand>,
 }
 impl Layer {
+    fn raise(&self) -> Result<()> {
+        unsafe {
+            SetWindowPos(
+                self.hwnd,
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            )?;
+        }
+        Result::Ok(())
+    }
     fn matches(&self, s: &Screen) -> bool {
         self.screen.device_name == s.device_name
             && self.screen.identity == s.identity
@@ -318,10 +401,73 @@ impl Layer {
                 Some(&blend),
                 ULW_ALPHA,
             )?;
-            let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
+            self.raise()?;
         }
         Result::Ok(())
     }
+}
+
+fn live_screens(screens: &[Screen]) -> Result<Vec<Screen>> {
+    unsafe extern "system" fn collect(
+        monitor: HMONITOR,
+        _: HDC,
+        _: *mut RECT,
+        data: LPARAM,
+    ) -> BOOL {
+        let monitors = unsafe { &mut *(data.0 as *mut Vec<(String, RECT, Option<u32>)>) };
+        let mut info = MONITORINFOEXW::default();
+        info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+        if unsafe { GetMonitorInfoW(monitor, &mut info.monitorInfo) }.as_bool() {
+            let n = info
+                .szDevice
+                .iter()
+                .position(|v| *v == 0)
+                .unwrap_or(info.szDevice.len());
+            let (mut x, mut y) = (0, 0);
+            let dpi = unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut x, &mut y) }
+                .ok()
+                .filter(|_| x > 0)
+                .map(|_| (x * 100 + 48) / 96);
+            monitors.push((
+                String::from_utf16_lossy(&info.szDevice[..n]),
+                info.monitorInfo.rcMonitor,
+                dpi,
+            ));
+        }
+        BOOL(1)
+    }
+    let mut monitors = Vec::<(String, RECT, Option<u32>)>::new();
+    unsafe {
+        EnumDisplayMonitors(
+            None,
+            None,
+            Some(collect),
+            LPARAM((&mut monitors as *mut Vec<(String, RECT, Option<u32>)>) as isize),
+        )
+    }
+    .ok()?;
+    let mut live = Vec::new();
+    for source in screens {
+        let Some((_, rect, dpi)) = monitors
+            .iter()
+            .find(|(name, _, _)| name.eq_ignore_ascii_case(&source.device_name))
+        else {
+            continue;
+        };
+        if source.identity.is_some()
+            && super::capture::display_identity(&source.device_name) != source.identity
+        {
+            continue;
+        }
+        let mut screen = source.clone();
+        screen.left = rect.left;
+        screen.top = rect.top;
+        screen.width = u32::try_from(rect.right - rect.left)?;
+        screen.height = u32::try_from(rect.bottom - rect.top)?;
+        screen.dpi_scale = dpi.or(screen.dpi_scale);
+        live.push(screen);
+    }
+    Result::Ok(live)
 }
 impl Drop for Layer {
     fn drop(&mut self) {

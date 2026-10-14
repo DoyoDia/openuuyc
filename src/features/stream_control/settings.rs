@@ -179,16 +179,14 @@ impl StreamControlHandle {
                 StreamControlProtocol::CaptureSetting => {
                     let mut request = capture_setting_request(state.baseline)?;
                     if let Some(id) = screen {
-                        let screen = state
+                        let _screen = state
                             .screens
                             .iter()
                             .find(|s| s.id == id)
                             .ok_or_else(|| anyhow!("显示器已断开"))?;
                         request.screen_id = id;
-                        request.resolution_width = screen.width as i32;
-                        request.resolution_height = screen.height as i32;
-                        request.resolution_pixel_width = screen.pixel_width as i32;
-                        request.resolution_pixel_height = screen.pixel_height as i32;
+                        // Format/quality changes do not own the physical mode.
+                        // A cached ScreenSources size may predate a game's mode switch.
                     }
                     encode_capture_request(sequence, request)
                 }

@@ -15,7 +15,7 @@ impl Transfer {
     pub fn matches(&self, _source: &Device, _destination: &Device, _frame: &Frame) -> bool {
         match *self {}
     }
-    pub fn copy(&mut self, _frame: &Frame) -> Result<Option<Delivery>> {
+    pub fn copy(&mut self, _frame: &Frame, _active: impl Fn() -> bool) -> Result<Option<Delivery>> {
         match *self {}
     }
 }

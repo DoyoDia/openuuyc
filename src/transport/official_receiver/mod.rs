@@ -247,12 +247,16 @@ impl OfficialVideoReceiver {
             parsed.packet_keyframe,
             color_extension.as_deref(),
         );
+        // UU 的发送端在写 CVO 之前会把角度做一次 90↔270 互换（libstreamer 的
+        // streamer::capture::ReverseRotation），它自己的客户端按相反的约定解释，两边自洽。
+        // 我们按 WebRTC 的顺时针方向渲染，照抄上报值会让转过 90° 或 270° 的被控屏画面
+        // 整体差 180°（0° 和 180° 取反后不变），所以这里把角度反过来。
         parsed.rotation = self
             .extensions
             .orientation
             .and_then(|id| packet.header.get_extension(id))
             .and_then(|payload| payload.first().copied())
-            .map(|value| u16::from(value & 0x03) * 90);
+            .map(|value| (360 - u16::from(value & 0x03) * 90) % 360);
         parsed.content_type = self
             .extensions
             .content_type

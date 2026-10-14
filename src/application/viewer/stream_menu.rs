@@ -28,11 +28,13 @@ use crate::ui::theme::{ACCENT, HOVER, LINE, MUTED, TEXT};
 enum Page {
     #[default]
     Quality,
+    Codec,
     Custom,
     Advanced,
     Audio,
     Microphone,
     Mouse,
+    DisplayAspect,
     Display,
 }
 
@@ -40,11 +42,13 @@ impl Page {
     fn title(self) -> &'static str {
         match self {
             Self::Quality => "画质",
+            Self::Codec => "此设备编码偏好",
             Self::Custom => "自定义码率",
             Self::Advanced => "高级设置",
             Self::Audio => "音频",
             Self::Microphone => "麦克风",
             Self::Mouse => "鼠标模式",
+            Self::DisplayAspect => "本地显示比例",
             Self::Display => "显示设置",
         }
     }
@@ -630,7 +634,7 @@ pub(super) fn show_stream_control_window(
             ui.horizontal(|ui| {
                 if state.page != Page::Quality {
                     back =
-                        icon_button(ui, Icon::Back, if matches!(state.page, Page::Mouse | Page::Microphone) { "返回高级设置" } else { "返回画质菜单；未应用的修改会取消" }).clicked();
+                        icon_button(ui, Icon::Back, if matches!(state.page, Page::Mouse | Page::Microphone | Page::DisplayAspect) { "返回高级设置" } else { "返回画质菜单；未应用的修改会取消" }).clicked();
                 }
                 let title = if state.page == Page::Display {
                     "显示设置".to_owned()
@@ -666,25 +670,11 @@ pub(super) fn show_stream_control_window(
                             .id_salt("stream-settings-root")
                             .max_height((ctx.content_rect().height() - 150.0).max(140.0))
                             .show(ui, |ui| {
-                                let mut codec = handle.device_preferences().codec;
-                                let previous = codec;
-                                let label = codec.map_or_else(|| "此设备编码偏好".to_owned(), |c| format!("此设备编码偏好 · {}", c.label()));
-                                egui::CollapsingHeader::new(label)
-                                    .id_salt("device-codec-preferences")
-                                    .show(ui, |ui| {
-                                        egui::ComboBox::from_id_salt("device-codec-preference")
-                                            .width(220.)
-                                            .selected_text(codec.map_or("跟随全局", |c| c.label()))
-                                            .show_ui(ui, |ui| {
-                                                ui.selectable_value(&mut codec, None, "跟随全局");
-                                                for value in crate::media::CodecPreference::PREFERRED {
-                                                    ui.selectable_value(&mut codec, Some(value), value.label());
-                                                }
-                                            });
-                                        ui.label("重连后生效");
-                                    });
-                                if codec != previous { handle.set_codec_preference(codec); }
-                                ui.separator();
+                                let codec = handle.device_preferences().codec;
+                                if menu_row(ui, "此设备编码偏好", codec.map_or("跟随全局", |value| value.label()), None, true, true).clicked() {
+                                    state.page = Page::Codec;
+                                }
+                                section_separator(ui);
                                 for (quality, label, detail) in [
                                     (
                                         StreamQuality::Auto,
@@ -899,6 +889,21 @@ pub(super) fn show_stream_control_window(
                                 audio.set_settings(audio_settings);
                             });
                     }
+                    Page::Codec => {
+                        let codec = handle.device_preferences().codec;
+                        for value in std::iter::once(None)
+                            .chain(crate::media::CodecPreference::PREFERRED.into_iter().map(Some)) {
+                            if menu_row(ui, value.map_or("跟随全局", |value| value.label()), "", Some(codec == value), true, false).clicked()
+                                && codec != value {
+                                handle.set_codec_preference(value);
+                            }
+                        }
+                        section_separator(ui);
+                        ui.add(egui::Label::new(
+                            RichText::new("仅为此设备保存，重连后生效。")
+                                .size(crate::ui::theme::TINY).color(MUTED),
+                        ).wrap());
+                    }
                     Page::Audio => {
                         crate::ui::controls::remote_audio_quality(ui,handle);
                         section_separator(ui);
@@ -931,6 +936,18 @@ crate::ui::controls::observe_notice(ui.ctx(), "audio-output-disconnected", "音�
                             .id_salt("stream-settings-advanced")
                             .max_height((ctx.content_rect().height() - 150.0).max(140.0))
                             .show(ui, |ui| {
+                                let aspect = handle.device_preferences().display_aspect;
+                                let label = match aspect {
+                                    crate::media::geometry::DisplayAspect::Video => "保持画面比例",
+                                    crate::media::geometry::DisplayAspect::Display => "跟随目标显示器",
+                                    crate::media::geometry::DisplayAspect::Wide => "16:9",
+                                    crate::media::geometry::DisplayAspect::WideTen => "16:10",
+                                    crate::media::geometry::DisplayAspect::Standard => "4:3",
+                                    crate::media::geometry::DisplayAspect::UltraWide => "21:9",
+                                };
+                                if menu_row(ui, "本地显示比例", label, None, true, true).clicked() {
+                                    state.page = Page::DisplayAspect;
+                                }
                                 if menu_row(ui, "仅音频模式", "关闭画面", None, true, false).on_hover_text("关闭此设备会话的所有画面，继续播放声音").clicked() {
                                     handle.request_audio_only(true);
                                     state.open = false;
@@ -1019,7 +1036,7 @@ crate::ui::controls::observe_notice(ui.ctx(), "clipboard-error", "剪贴板同�
                                 let can_send = snapshot.ready
                                     && !snapshot.mouse_pending
                                     && snapshot.mouse_mode != MouseMode::View
-                                    && handle.mouse().keyboard_supported()
+                                    && handle.mouse().supports_ctrl_alt_del()
                                     && !handle.mouse().waiting_for_neutral();
                                 if menu_row(ui, "发送 Ctrl+Alt+Del", "", None, can_send, false)
                                     .on_hover_text(if can_send {
@@ -1032,6 +1049,35 @@ crate::ui::controls::observe_notice(ui.ctx(), "clipboard-error", "剪贴板同�
                                     view.send_ctrl_alt_del = true;
                                 }
                             });
+                    }
+                    Page::DisplayAspect => {
+                        let aspect = handle.device_preferences().display_aspect;
+                        let preferred = snapshot.screens.iter()
+                            .find(|screen| screen.id == screen_id)
+                            .and_then(|screen| screen.display.preferred);
+                        for value in crate::media::geometry::DisplayAspect::ALL {
+                            let available = value != crate::media::geometry::DisplayAspect::Display
+                                || preferred.is_some();
+                            if menu_row(ui, value.label(), "", Some(aspect == value), available, false).clicked() {
+                                handle.set_display_aspect(value);
+                            }
+                        }
+                        section_separator(ui);
+                        ui.add(egui::Label::new(
+                            RichText::new("仅调整本地画面比例，不修改远端分辨率。")
+                                .size(crate::ui::theme::TINY).color(MUTED),
+                        ).wrap());
+                        let description = if let Some((width, height)) = preferred {
+                            format!("目标显示器原始尺寸：{width} × {height}")
+                        } else if aspect == crate::media::geometry::DisplayAspect::Display {
+                            "对端未提供显示器原始比例，当前保持画面比例，可手动选择。".to_owned()
+                        } else {
+                            "对端未提供显示器原始比例，可手动选择。".to_owned()
+                        };
+                        ui.add(egui::Label::new(
+                            RichText::new(description)
+                                .size(crate::ui::theme::TINY).color(MUTED),
+                        ).wrap());
                     }
                     Page::Microphone => {
                         let microphone=handle.microphone();
@@ -1251,7 +1297,10 @@ crate::ui::controls::observe_notice(ui.ctx(), "clipboard-error", "剪贴板同�
         }
     }
     if back {
-        state.page = if matches!(state.page, Page::Mouse | Page::Microphone) {
+        state.page = if matches!(
+            state.page,
+            Page::Mouse | Page::Microphone | Page::DisplayAspect
+        ) {
             Page::Advanced
         } else {
             Page::Quality

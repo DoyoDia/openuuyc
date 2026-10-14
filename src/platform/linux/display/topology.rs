@@ -62,6 +62,9 @@ pub(crate) struct Target {
     pub available: bool,
     pub virtual_provider: Option<VirtualProvider>,
     pub modes: Vec<Mode>,
+    /// The output's preferred mode (RandR lists it first among `num_preferred`),
+    /// oriented like the active desktop; only for active outputs, as on Windows.
+    pub preferred_mode: Option<(u32, u32)>,
     /// X11 has no per-output scale; desktops that scale do it for the whole
     /// session, so no output offers a DPI choice.
     pub dpi: Option<Dpi>,
@@ -286,6 +289,18 @@ impl Topology {
                 // One entry per size: the fastest refresh the output offers there.
                 modes.sort_by(|a, b| (b.width, b.height, b.hz).cmp(&(a.width, a.height, a.hz)));
                 modes.dedup_by(|a, b| (a.width, a.height) == (b.width, b.height));
+                let preferred_mode = active
+                    .filter(|_| output.info.num_preferred > 0)
+                    .and_then(|_| output.info.modes.first())
+                    .and_then(|&id| self.mode(id))
+                    .map(|mode| {
+                        let (width, height) = (u32::from(mode.width), u32::from(mode.height));
+                        if swap {
+                            (height, width)
+                        } else {
+                            (width, height)
+                        }
+                    });
                 Target {
                     identity: output.identity(),
                     name: output.name.clone(),
@@ -299,6 +314,7 @@ impl Topology {
                     available: output.connected(),
                     virtual_provider: None,
                     modes,
+                    preferred_mode,
                     dpi: None,
                 }
             })
@@ -605,14 +621,4 @@ impl Target {
         ensure!(missing.is_empty(), "显示器在切换分辨率时断开");
         Ok(())
     }
-}
-
-/// The sizes the output named `source` offers, as `Target::modes` lists them.
-pub(crate) fn modes(source: &str) -> Result<Vec<Mode>> {
-    Ok(Topology::query(true)?
-        .targets()?
-        .into_iter()
-        .find(|target| target.source == source)
-        .map(|target| target.modes)
-        .unwrap_or_default())
 }

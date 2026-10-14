@@ -14,7 +14,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, WAIT_OBJECT_0};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
@@ -24,6 +24,7 @@ use windows::core::Interface;
 use winit::dpi::PhysicalSize;
 
 pub(super) struct D3D11Presenter {
+    ready: bool,
     pub(super) hwnd: HWND,
     pub(super) hdr_output: bool,
     pub(super) input_hdr: bool,
@@ -230,6 +231,7 @@ impl D3D11Presenter {
             adapter,
             context,
             swap_chain,
+            ready: false,
             frame_latency_waitable: frame_latency_waitable.0 as isize,
             render_target: Some(render_target),
             backbuffer: Some(backbuffer),
@@ -259,24 +261,33 @@ impl D3D11Presenter {
         })
     }
 
-    pub(super) fn begin_frame(&self) -> Result<std::time::Duration> {
-        let waiting_started = Instant::now();
-        if self.frame_latency_waitable != 0 {
+    pub(super) fn ready(&mut self) -> Result<bool> {
+        if !self.ready && self.frame_latency_waitable != 0 {
             let wait = unsafe {
                 WaitForSingleObjectEx(
                     HANDLE(self.frame_latency_waitable as *mut std::ffi::c_void),
-                    500,
-                    true,
+                    10,
+                    false,
                 )
             };
-            if wait != WAIT_OBJECT_0 {
-                tracing::warn!(
-                    status = wait.0,
-                    "DXGI frame-latency wait was not signaled within 500 ms"
-                );
+            match wait {
+                WAIT_OBJECT_0 => {}
+                WAIT_TIMEOUT => return Ok(false),
+                _ => {
+                    return Err(windows::core::Error::from_thread())
+                        .context("poll video frame readiness");
+                }
             }
         }
-        let waited = waiting_started.elapsed();
+        self.ready = true;
+        Ok(true)
+    }
+
+    pub(super) fn begin_frame(&self) -> Result<std::time::Duration> {
+        anyhow::ensure!(
+            self.ready,
+            "video frame submitted before swap chain readiness"
+        );
         let target = self
             .render_target
             .as_ref()
@@ -285,7 +296,7 @@ impl D3D11Presenter {
             self.context
                 .ClearRenderTargetView(target, &[0.0, 0.0, 0.0, 1.0]);
         }
-        Ok(waited)
+        Ok(Duration::ZERO)
     }
 
     pub(super) fn reset_video_resources(&mut self) {
@@ -656,6 +667,9 @@ impl D3D11Presenter {
     }
 
     pub(super) fn present(&mut self) -> Result<()> {
+        // All source reads (including plugin taps) have been submitted. The
+        // keyed mutex orders those reads; Present only consumes the backbuffer.
+        self.release_active_input_sync();
         let flags = if self.allow_tearing {
             DXGI_PRESENT_ALLOW_TEARING
         } else {
@@ -663,6 +677,7 @@ impl D3D11Presenter {
         };
         let started = Instant::now();
         let status = unsafe { self.swap_chain.Present(0, flags) };
+        self.ready = false;
         let elapsed = started.elapsed();
         if elapsed >= Duration::from_millis(50) || status != windows::core::HRESULT(0) {
             tracing::warn!(

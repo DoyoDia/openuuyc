@@ -7,5 +7,6 @@ pub(crate) mod audio_control;
 
 pub(crate) mod annotation;
 pub(crate) mod drag_drop;
+pub(crate) mod keyboard;
 pub(crate) mod microphone;
 pub(crate) mod peer_platform;

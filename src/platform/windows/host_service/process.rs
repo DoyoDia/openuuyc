@@ -194,6 +194,19 @@ impl Agent {
                     (&session as *const u32).cast(),
                     4,
                 )?;
+                if role == "host-resident" {
+                    // Only the already privileged interactive resident draws
+                    // host overlays. GUI/files/clipboard keep their user token.
+                    let enabled = 1u32;
+                    if let Err(error) = SetTokenInformation(
+                        primary.0,
+                        TokenUIAccess,
+                        (&enabled as *const u32).cast(),
+                        4,
+                    ) {
+                        tracing::warn!(%error, "host overlay UIAccess unavailable; fullscreen annotations may be occluded");
+                    }
+                }
             }
             primary
         };

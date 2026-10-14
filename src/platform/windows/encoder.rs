@@ -126,7 +126,7 @@ pub(crate) fn probe(
                     anyhow::bail!("被控准备已取消");
                 }
                 let delivery = if let Some(transfer) = transfer.as_mut() {
-                    match transfer.copy(frame)? {
+                    match transfer.copy(frame, &is_active)? {
                         Some(frame) => Some(frame),
                         None => {
                             std::thread::sleep(std::time::Duration::from_millis(1));
@@ -206,7 +206,12 @@ pub(super) fn retry_pause(attempt: usize) {
     }
 }
 
-pub(crate) struct Runtime;
+/// Whether the host settings offer the GPU scheduling choice.
+pub(crate) const GPU_SCHEDULING: bool = true;
+
+pub(crate) struct Runtime {
+    _scheduling: Option<super::gpu_scheduling::Lease>,
+}
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
 pub(crate) struct SwitchCandidate(pub String);
@@ -215,11 +220,26 @@ impl Runtime {
         unsafe {
             CoInitializeEx(None, COINIT_MULTITHREADED).ok()?;
         }
-        Ok(Self)
+        Ok(Self { _scheduling: None })
+    }
+    /// Keep scheduling through capture replacement and encoder teardown.
+    pub(crate) fn with_gpu_compatibility(compatible: bool) -> Result<Self> {
+        let mut runtime = Self::new()?;
+        runtime.begin_gpu_work(compatible);
+        Ok(runtime)
+    }
+    pub(crate) fn begin_gpu_work(&mut self, compatible: bool) {
+        self._scheduling
+            .get_or_insert_with(|| super::gpu_scheduling::Lease::with_compatibility(compatible));
+    }
+    /// Call only after the worker has released its capture/encoder resources.
+    pub(crate) fn end_gpu_work(&mut self) {
+        self._scheduling = None;
     }
 }
 impl Drop for Runtime {
     fn drop(&mut self) {
+        self.end_gpu_work();
         unsafe {
             CoUninitialize();
         }
@@ -235,6 +255,19 @@ pub(crate) enum Encoder {
     Software(Box<super::software_encoder::Encoder>),
 }
 impl Encoder {
+    pub(crate) fn reconfigure_stream(
+        &mut self,
+        device: &ID3D11Device,
+        size: (u32, u32),
+        format: super::format::Format,
+        rate: super::format::Rate,
+        color: super::format::Color,
+    ) -> Result<bool> {
+        match self {
+            Self::Intel(encoder) => encoder.reconfigure_stream(device, size, format, rate, color),
+            _ => Ok(false),
+        }
+    }
     pub(crate) fn hardware_format(
         device: &ID3D11Device,
         size: (u32, u32),
@@ -323,8 +356,8 @@ impl Encoder {
         match self {
             Self::Software(e) => e.encode(texture, timestamp, keyframe, cancel),
             Self::Nvidia(e) => e.encode(texture, timestamp, keyframe),
-            Self::Amd(e) => e.encode(texture, timestamp, keyframe),
-            Self::Intel(e) => e.encode(texture, timestamp, keyframe),
+            Self::Amd(e) => e.encode(texture, timestamp, keyframe, cancel),
+            Self::Intel(e) => e.encode(texture, timestamp, keyframe, cancel),
         }
     }
 }

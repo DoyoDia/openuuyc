@@ -1,4 +1,5 @@
 //! Ordinary-user clipboard execution for the SYSTEM resident. Only bounded protocol frames cross IPC.
+use super::wake::Wake;
 use super::{Clipboard, Settings, Status};
 use crate::features::drag_drop::{Endpoint, HostPolicy, Role};
 #[cfg(windows)]
@@ -47,6 +48,8 @@ pub(super) struct Request {
 pub(super) struct Reply {
     status: Status,
     pub(super) packet: Option<Outbound>,
+    #[serde(default)]
+    wake: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -78,6 +81,7 @@ fn current(policy: &Policy, packet: &Outbound) -> bool {
             })
 }
 pub(super) struct Backend {
+    wake: Arc<Wake>,
     policy: Arc<Mutex<Policy>>,
     status: Arc<Mutex<Status>>,
     input: mpsc::SyncSender<Outbound>,
@@ -91,6 +95,8 @@ impl Backend {
         let (input, incoming) = mpsc::sync_channel(32);
         let (outgoing, output) = tokio::sync::mpsc::channel(32);
         let settings = policy.clone();
+        let wake = Arc::new(Wake::new()?);
+        let worker_wake = wake.clone();
         let reported = status.clone();
         let activity = crate::platform::host_service::activity::Work::new();
         let worker = tokio::task::spawn_blocking(move || {
@@ -102,6 +108,7 @@ impl Backend {
                 incoming,
                 outgoing,
                 stop,
+                worker_wake,
             );
             if let Err(error) = result {
                 // The binding only sees its queue close; the cause is here.
@@ -113,6 +120,7 @@ impl Backend {
             }
         });
         Ok(Self {
+            wake,
             policy,
             status,
             input,
@@ -122,11 +130,15 @@ impl Backend {
     }
     pub fn policy(&self, settings: Settings, drag: HostPolicy, official_drop: bool) {
         let mut p = super::super::lock(&self.policy);
+        let changed = p.drag != drag || p.settings != settings || p.official_drop != official_drop;
         p.drag = drag;
         if p.settings != settings || p.official_drop != official_drop {
             p.revision = p.revision.wrapping_add(1);
             p.settings = settings;
             p.official_drop = official_drop;
+        }
+        if changed {
+            self.wake.notify();
         }
     }
     pub fn status(&self) -> Status {
@@ -147,11 +159,14 @@ impl Backend {
                 bulk: false,
                 data,
             })
-            .map_err(|_| anyhow::anyhow!("OLE用户队列已满或关闭"))
+            .map_err(|_| anyhow::anyhow!("OLE用户队列已满或关闭"))?;
+        self.wake.notify();
+        Ok(())
     }
     pub async fn next(&self) -> Option<Outbound> {
         let mut output = self.output.lock().await;
         while let Some(packet) = output.recv().await {
+            self.wake.notify();
             if current(&super::super::lock(&self.policy), &packet) {
                 return Some(packet);
             }
@@ -168,6 +183,7 @@ struct Drag {
     output: tokio::sync::mpsc::Receiver<crate::features::drag_drop::Outgoing>,
 }
 struct Local {
+    wake: Arc<Wake>,
     clipboard: Clipboard,
     drag: std::cell::RefCell<Option<Drag>>,
     prefer_drag: std::cell::Cell<bool>,
@@ -180,26 +196,39 @@ struct Local {
     checked: std::cell::Cell<Option<std::time::Instant>>,
 }
 impl Local {
-    fn new(platform: PeerPlatform) -> Result<Self> {
+    fn new(platform: PeerPlatform, wake: Arc<Wake>) -> Result<Self> {
+        Self::with_clipboard(
+            platform,
+            wake,
+            Clipboard::guarded(Some(Arc::new(desktop_available))),
+        )
+    }
+    fn with_clipboard(
+        platform: PeerPlatform,
+        wake: Arc<Wake>,
+        clipboard: Clipboard,
+    ) -> Result<Self> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
             .thread_name("clipboard-send")
             .build()?;
-        let clipboard = Clipboard::guarded(Some(Arc::new(desktop_available)));
         clipboard.platform(platform.account_code().unwrap_or(0));
         let policy = Arc::new(Mutex::new(Policy::default()));
         let state = policy.clone();
         let (send, output) = mpsc::sync_channel(32);
+        let sent = wake.clone();
         let future = clipboard.sender(move |epoch, packet| {
             let revision = super::super::lock(&state).revision;
             let result = send
                 .try_send((revision, epoch, packet))
                 .map_err(|_| anyhow::anyhow!("剪贴板发送队列已满或关闭"));
+            sent.notify();
             async move { result }
         });
         let sender = runtime.spawn(future);
         Ok(Self {
+            wake,
             clipboard,
             drag: Default::default(),
             prefer_drag: std::cell::Cell::new(false),
@@ -237,6 +266,8 @@ impl Local {
         if policy.drag.token != 0 && self.drag.borrow().is_none() {
             let _runtime = self._runtime.enter();
             let (endpoint, output) = Endpoint::new(Role::Host);
+            let wake = self.wake.clone();
+            endpoint.on_output(Arc::new(move || wake.notify()));
             *self.drag.borrow_mut() = Some(Drag { endpoint, output });
         }
         if let Some(drag) = self.drag.borrow().as_ref() {
@@ -345,6 +376,7 @@ fn worker(
     incoming: mpsc::Receiver<Outbound>,
     outgoing: tokio::sync::mpsc::Sender<Outbound>,
     stop: CancellationToken,
+    wake: Arc<Wake>,
 ) -> Result<()> {
     // Linux has no system service yet: the clipboard always belongs to the
     // desktop user's own process.
@@ -355,16 +387,17 @@ fn worker(
     let local = if system {
         None
     } else {
-        Some(Local::new(platform)?)
+        Some(Local::new(platform, wake.clone())?)
     };
     let mut remote = None;
     let result = (|| -> Result<()> {
         while !stop.is_cancelled() {
-            let pending = match incoming.recv_timeout(Duration::from_millis(10)) {
+            let pending = match incoming.try_recv() {
                 Ok(v) => Some(v),
-                Err(mpsc::RecvTimeoutError::Timeout) => None,
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::TryRecvError::Empty) => None,
+                Err(mpsc::TryRecvError::Disconnected) => break,
             };
+            let had_input = pending.is_some();
             let p = super::super::lock(&policy).clone();
             let packet = pending
                 .filter(|packet| {
@@ -382,6 +415,7 @@ fn worker(
                     local.receive(&packet)?;
                 }
                 Reply {
+                    wake: None,
                     packet: local.packet(),
                     status: local.status(),
                 }
@@ -391,6 +425,7 @@ fn worker(
                     && ((!p.settings.enabled && !p.drag.enabled) || !desktop_available())
                 {
                     Reply {
+                        wake: None,
                         status: Status::default(),
                         packet: packet
                             .as_deref()
@@ -409,7 +444,7 @@ fn worker(
                     if remote.is_none() {
                         remote = Some(Remote::new(&stop)?);
                     }
-                    remote.as_ref().unwrap().exchange(
+                    remote.as_mut().unwrap().exchange(
                         Request {
                             policy: p,
                             platform,
@@ -421,10 +456,25 @@ fn worker(
                 }
             };
             *super::super::lock(&status) = reply.status;
+            let had_output = reply.packet.is_some();
             if let Some(packet) = reply.packet {
-                outgoing
-                    .try_send(packet)
-                    .map_err(|_| anyhow::anyhow!("剪贴板网络发送拥塞"))?;
+                let mut packet = packet;
+                loop {
+                    if stop.is_cancelled() {
+                        break;
+                    }
+                    match outgoing.try_send(packet) {
+                        Ok(()) => break,
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(value)) => {
+                            packet = value;
+                            wake.wait(None)?;
+                        }
+                        Err(_) => anyhow::bail!("剪贴板网络发送已关闭"),
+                    }
+                }
+            }
+            if !had_input && !had_output {
+                wake.wait(remote.as_ref().and_then(Remote::wake))?;
             }
         }
         Ok(())
@@ -445,7 +495,7 @@ fn worker(
         }
         // An incomplete frame cannot be reused for a close request. Close the
         // data endpoint before waiting for the independent job-finished reply.
-        let Remote { pipe, agent } = remote;
+        let Remote { pipe, agent, .. } = remote;
         drop(pipe);
         // Wait for OLE cancellation/retention before closing the job.
         let _ = agent.finish();
@@ -456,6 +506,7 @@ fn worker(
 #[cfg(windows)]
 struct Remote {
     pipe: Pipe,
+    wake: Option<Wake>,
     agent: crate::platform::windows::host_service::user_backend::Lease,
 }
 /// The SYSTEM service process, which must hand the clipboard to a user child.
@@ -469,9 +520,15 @@ impl Remote {
     fn exchange(&self, _request: Request, _stop: &CancellationToken) -> Result<Reply> {
         match *self {}
     }
+    fn wake(&self) -> Option<&Wake> {
+        match *self {}
+    }
 }
 #[cfg(windows)]
 impl Remote {
+    fn wake(&self) -> Option<&Wake> {
+        self.wake.as_ref()
+    }
     fn new(stop: &CancellationToken) -> Result<Self> {
         let name = format!("{PREFIX}{}", uuid::Uuid::new_v4().simple());
         let pipe = Pipe::server(&name, true)?;
@@ -491,12 +548,27 @@ impl Remote {
             pipe.peer_session(true)? == process::active_session(),
             "剪贴板用户会话已改变"
         );
-        Ok(Self { pipe, agent })
+        Ok(Self {
+            pipe,
+            agent,
+            wake: None,
+        })
     }
-    fn exchange(&self, request: Request, _stop: &CancellationToken) -> Result<Reply> {
+    fn exchange(&mut self, request: Request, _stop: &CancellationToken) -> Result<Reply> {
         let permitted = || self.agent.alive();
         super::frame::send(&self.pipe, request, permitted)?;
-        super::frame::receive(&self.pipe, Duration::from_secs(2), permitted)
+        let reply: Reply = super::frame::receive(&self.pipe, Duration::from_secs(2), permitted)?;
+        if self.wake.is_none()
+            && let Some(name) = &reply.wake
+        {
+            match Wake::open(name) {
+                Ok(wake) => self.wake = Some(wake),
+                Err(error) => {
+                    tracing::warn!(%error, "clipboard queue event unavailable; retaining idle polling")
+                }
+            }
+        }
+        Ok(reply)
     }
 }
 
@@ -523,6 +595,13 @@ pub(crate) fn run(name: &str, parent: u32) -> Result<()> {
             && pipe.queued_bytes().is_ok()
     };
     let mut local = None;
+    let (wake, mut wake_name) = match Wake::named() {
+        Ok((wake, name)) => (Arc::new(wake), Some(name)),
+        Err(error) => {
+            tracing::warn!(%error, "clipboard queue event unavailable; retaining idle polling");
+            (Arc::new(Wake::new()?), None)
+        }
+    };
     let result = (|| -> Result<()> {
         while permitted() {
             let request: Request = super::frame::receive(&pipe, Duration::from_secs(3), permitted)?;
@@ -530,7 +609,7 @@ pub(crate) fn run(name: &str, parent: u32) -> Result<()> {
                 break;
             }
             if local.is_none() {
-                local = Some(Local::new(request.platform)?);
+                local = Some(Local::new(request.platform, wake.clone())?);
             }
             let local = local.as_ref().unwrap();
             local.update(request.policy)?;
@@ -541,6 +620,7 @@ pub(crate) fn run(name: &str, parent: u32) -> Result<()> {
             super::frame::send(
                 &pipe,
                 Reply {
+                    wake: wake_name.take(),
                     packet: local.packet(),
                     status: local.status(),
                 },

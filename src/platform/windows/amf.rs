@@ -729,9 +729,14 @@ impl Encoder {
         texture: &ID3D11Texture2D,
         timestamp: i64,
         keyframe: bool,
+        cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<Vec<Encoded>> {
+        ensure!(
+            !cancel.load(std::sync::atomic::Ordering::Acquire),
+            "编码已取消"
+        );
         if self.pending.is_some() {
-            return self.output();
+            return self.output(cancel);
         }
         self.frame_rate.input(timestamp);
         self.conversion.convert(texture)?;
@@ -794,6 +799,10 @@ impl Encoder {
             let submit = comp.vt().SubmitInput.context("AMF SubmitInput接口缺失")?;
             let mut accepted = false;
             for attempt in 0..500 {
+                ensure!(
+                    !cancel.load(std::sync::atomic::Ordering::Acquire),
+                    "编码已取消"
+                );
                 let status = submit(comp.raw(), surface.raw().cast());
                 if status == a::AMF_RESULT_AMF_OK {
                     accepted = true;
@@ -809,13 +818,18 @@ impl Encoder {
             }
             self.pending = Some((surface, keyframe));
         }
-        self.output()
+        self.output(cancel)
     }
-    fn output(&mut self) -> Result<Vec<Encoded>> {
+    fn output(&mut self, cancel: &std::sync::atomic::AtomicBool) -> Result<Vec<Encoded>> {
         unsafe {
             let comp = self.component.as_ref().unwrap();
             let mut data = ptr::null_mut();
             for attempt in 0..500 {
+                // Keep pending native input alive until Terminate in Drop.
+                ensure!(
+                    !cancel.load(std::sync::atomic::Ordering::Acquire),
+                    "编码已取消"
+                );
                 let status = comp.vt().QueryOutput.context("AMF QueryOutput接口缺失")?(
                     comp.raw(),
                     &mut data,

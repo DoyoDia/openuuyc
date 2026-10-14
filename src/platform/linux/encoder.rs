@@ -106,6 +106,11 @@ pub(crate) fn probe(
     Ok(result)
 }
 
+/// Whether the host settings offer the GPU scheduling choice. Windows raises
+/// the process GPU scheduling class (D3DKMT); Linux drivers have no
+/// per-process equivalent, and Sunshine's Linux host sets none either.
+pub(crate) const GPU_SCHEDULING: bool = false;
+
 /// Per-thread encoder runtime. Neither encoder needs setup.
 pub(crate) struct Runtime;
 #[derive(Debug, thiserror::Error)]
@@ -115,6 +120,12 @@ impl Runtime {
     pub(crate) fn new() -> Result<Self> {
         Ok(Self)
     }
+    pub(crate) fn with_gpu_compatibility(_compatible: bool) -> Result<Self> {
+        Self::new()
+    }
+    /// No GPU scheduling class to hold; see [`GPU_SCHEDULING`].
+    pub(crate) fn begin_gpu_work(&mut self, _compatible: bool) {}
+    pub(crate) fn end_gpu_work(&mut self) {}
 }
 
 pub(crate) enum Encoder {
@@ -122,6 +133,18 @@ pub(crate) enum Encoder {
     Software(Box<super::software_encoder::Encoder>),
 }
 impl Encoder {
+    /// Only Windows QSV changes size or format in place; the caller rebuilds
+    /// every other encoder, as it does for Windows NVENC.
+    pub(crate) fn reconfigure_stream(
+        &mut self,
+        _device: &Device,
+        _size: (u32, u32),
+        _format: Format,
+        _rate: Rate,
+        _color: Color,
+    ) -> Result<bool> {
+        Ok(false)
+    }
     pub(crate) fn hardware_format(
         _device: &Device,
         size: (u32, u32),
