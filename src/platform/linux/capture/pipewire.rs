@@ -553,6 +553,33 @@ fn read_dmabuf_picture(
         let (display, prime2) = cell.get().expect("initialized above");
         let modifier = format.modifier.context("DMA-BUF 缺少 modifier")?;
         ensure!(modifier != DRM_MOD_INVALID, "DMA-BUF modifier 未确定");
+        // Experimental independent shader path, never a compositor lease.
+        // Leave the proven DMA capture baseline available during validation.
+        thread_local! {
+            static GPU_FAILED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        }
+        if std::env::var("OPENUUYC_GPU_CONVERT").as_deref() == Ok("1")
+            && !GPU_FAILED.with(|failed|failed.get()) {
+
+            thread_local! {
+                static GPU: std::cell::OnceCell<Result<super::super::gpu_convert::Converter, String>> = const { std::cell::OnceCell::new() };
+            }
+            let crop = picture_crop(buffer, format.width, format.height);
+            let result = GPU.with(|cell| {
+                let converter=cell.get_or_init(||super::super::gpu_convert::Converter::new(display.clone()).map_err(|e|e.to_string()));
+                match converter {
+                    Ok(converter)=>converter.convert(&super::super::gpu_convert::RgbDma { fd:data.fd as i32,width:format.width,height:format.height,pitch:chunk.stride as u32,offset:chunk.offset,fourcc:drm_fourcc,modifier },crop),
+                    Err(e)=>Err(anyhow!("{e}")),
+                }
+            });
+            match result {
+                Ok(frame)=>return Ok(Picture { width:crop.2,height:crop.3,pixels:vec![],nv12:Some(frame) }),
+                Err(error)=> {
+                    GPU_FAILED.with(|failed|failed.set(true));
+                    tracing::warn!(%error,"独立 GPU 转换不可用，保持 DMA-BUF 的基线采集路径");
+                },
+            }
+        }
         let descriptor = CaptureImport {
             va_fourcc,
             drm_fourcc,
@@ -665,6 +692,7 @@ pub(super) struct Picture {
     pub width: u32,
     pub height: u32,
     pub pixels: Vec<u8>,
+    pub nv12: Option<Arc<super::super::gpu_convert::OwnedNv12>>,
 }
 
 #[derive(Default)]
@@ -843,6 +871,16 @@ fn copy_picture_pixels(
     width: u32,
     height: u32,
 ) -> Option<Picture> {
+    let (x, y, w, h) = picture_crop(buffer, width, height);
+    let (x, y, w, h) = (x as usize, y as usize, w as usize, h as usize);
+    let needed = base + (y + h).saturating_sub(1) * stride + (x + w) * 4;
+    if w == 0 || h == 0 || needed > source.len() {
+        return None;
+    }
+    copy_cropped_pixels(source, base, stride, format, x, y, w, h)
+}
+
+fn picture_crop(buffer: &SpaBuffer, width: u32, height: u32) -> (u32, u32, u32, u32) {
     let (mut x, mut y, mut w, mut h) = (0usize, 0usize, width as usize, height as usize);
     for index in 0..buffer.n_metas as usize {
         let meta = unsafe { &*buffer.metas.add(index) };
@@ -859,10 +897,19 @@ fn copy_picture_pixels(
             }
         }
     }
-    let needed = base + (y + h).saturating_sub(1) * stride + (x + w) * 4;
-    if w == 0 || h == 0 || needed > source.len() {
-        return None;
-    }
+    (x as u32, y as u32, w as u32, h as u32)
+}
+
+fn copy_cropped_pixels(
+    source: &[u8],
+    base: usize,
+    stride: usize,
+    format: u32,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+) -> Option<Picture> {
     // Only the encoders read these pixels, and both convert with the colour
     // channels alone: the alpha byte is never looked at. Writing it would cost
     // a pass over the frame for nothing, so the buffer is left as the
@@ -893,6 +940,7 @@ fn copy_picture_pixels(
         width: w as u32,
         height: h as u32,
         pixels,
+        nv12: None,
     })
 }
 

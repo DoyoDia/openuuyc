@@ -241,6 +241,45 @@ impl Encoder {
         let started = std::time::Instant::now();
         let encoded = self.encode_surface(index, idr, timestamp)?;
         self.encode_time += started.elapsed();
+        self.finish_encode(index, idr, encoded, timestamp)
+    }
+
+    /// Raw input and reconstructed reference pictures have distinct ownership.
+    /// The imported allocation stays alive through synchronous encode completion.
+    pub fn encode_nv12(
+        &mut self,
+        frame: &std::sync::Arc<super::gpu_convert::OwnedNv12>,
+        timestamp: i64,
+        keyframe: bool,
+    ) -> Result<Vec<Encoded>, EncodeError> {
+        if frame.size() != (self.width, self.height) {
+            return Err(EncodeError::Backend("NV12 尺寸不匹配".into()));
+        }
+        let idr = keyframe || self.reference.is_none();
+        if idr {
+            self.frame_num = 0;
+        }
+        let index = self.next;
+        self.next = (self.next + 1) % self.surfaces.len();
+        let started = std::time::Instant::now();
+        let surface = frame
+            .import(self.context.display())
+            .map_err(|e| EncodeError::Backend(e.to_string()))?;
+        self.upload_time += started.elapsed();
+        let started = std::time::Instant::now();
+        let (encoded, surface) = self.encode_picture(index, idr, timestamp, surface)?;
+        self.encode_time += started.elapsed();
+        drop(surface);
+        self.finish_encode(index, idr, encoded, timestamp)
+    }
+
+    fn finish_encode(
+        &mut self,
+        index: usize,
+        idr: bool,
+        encoded: Vec<u8>,
+        timestamp: i64,
+    ) -> Result<Vec<Encoded>, EncodeError> {
         self.reference = Some(index);
         if idr {
             self.idr_pic_id = self.idr_pic_id.wrapping_add(1);
@@ -327,19 +366,27 @@ impl Encoder {
         idr: bool,
         timestamp: i64,
     ) -> Result<Vec<u8>, EncodeError> {
+        let surface = self.surfaces[index]
+            .take()
+            .ok_or_else(|| EncodeError::Backend("编码表面已借出".into()))?;
+        let (data, surface) = self.encode_picture(index, idr, timestamp, surface)?;
+        self.surfaces[index] = Some(surface);
+        Ok(data)
+    }
+
+    fn encode_picture<D: cros_libva::SurfaceMemoryDescriptor>(
+        &mut self,
+        index: usize,
+        idr: bool,
+        timestamp: i64,
+        surface: Surface<D>,
+    ) -> Result<(Vec<u8>, Surface<D>), EncodeError> {
         let coded = self
             .context
             .create_enc_coded(coded_buffer_size(self.width, self.height))
             .map_err(|error| EncodeError::Backend(format!("create_enc_coded: {error}")))?;
         let buffers = self.parameter_buffers(index, &coded, idr)?;
-        let surface = self.surfaces[index]
-            .take()
-            .ok_or_else(|| EncodeError::Backend("编码表面已借出".into()))?;
-        let mut picture = Picture::new(
-            timestamp.max(0) as u64,
-            Rc::clone(&self.context),
-            surface,
-        );
+        let mut picture = Picture::new(timestamp.max(0) as u64, Rc::clone(&self.context), surface);
         for buffer in buffers {
             let buffer = self
                 .context
@@ -362,7 +409,6 @@ impl Encoder {
         let surface = picture
             .take_surface()
             .unwrap_or_else(|_| unreachable!("the picture owns its surface alone"));
-        self.surfaces[index] = Some(surface);
         let mapped = MappedCodedBuffer::new(&coded)?;
         let mut data = Vec::new();
         for segment in mapped.iter() {
@@ -377,7 +423,7 @@ impl Encoder {
         if data.is_empty() {
             return Err(EncodeError::Backend("编码器未输出码流".into()));
         }
-        Ok(data)
+        Ok((data, surface))
     }
 
     /// The parameter buffers for one picture, in submission order.
@@ -403,25 +449,20 @@ impl Encoder {
                     true,
                 ),
             ));
-            buffers.push(BufferType::EncPackedHeaderData(
-                self.parameter_sets.clone(),
-            ));
+            buffers.push(BufferType::EncPackedHeaderData(self.parameter_sets.clone()));
             self.sequence_dirty = false;
         }
         if self.rc_dirty {
-            buffers.push(BufferType::EncMiscParameter(
-                EncMiscParameter::FrameRate(EncMiscParameterFrameRate::new(
-                    u32::from(self.rate.fps),
-                    0,
-                )),
-            ));
+            buffers.push(BufferType::EncMiscParameter(EncMiscParameter::FrameRate(
+                EncMiscParameterFrameRate::new(u32::from(self.rate.fps), 0),
+            )));
             buffers.push(BufferType::EncMiscParameter(
                 EncMiscParameter::MaxFrameSize(EncMiscParameterBufferMaxFrameSize::new(
                     coded_buffer_size(self.width, self.height) as u32,
                 )),
             ));
-            buffers.push(BufferType::EncMiscParameter(
-                EncMiscParameter::RateControl(EncMiscParameterRateControl::new(
+            buffers.push(BufferType::EncMiscParameter(EncMiscParameter::RateControl(
+                EncMiscParameterRateControl::new(
                     self.rate.target,
                     100,
                     RC_WINDOW_MS,
@@ -433,8 +474,8 @@ impl Encoder {
                     51,
                     0,
                     0,
-                )),
-            ));
+                ),
+            )));
             self.rc_dirty = false;
         }
 
@@ -471,19 +512,7 @@ impl Encoder {
             0,
             0,
             0,
-            &H264EncPicFields::new(
-                u32::from(idr),
-                1,
-                0,
-                0,
-                0,
-                0,
-                0,
-                1,
-                0,
-                0,
-                0,
-            ),
+            &H264EncPicFields::new(u32::from(idr), 1, 0, 0, 0, 0, 0, 1, 0, 0, 0),
         );
         buffers.push(BufferType::EncPictureParameter(
             cros_libva::EncPictureParameter::H264(picture_parameter),
@@ -667,8 +696,7 @@ fn packed_headers(display: &Rc<Display>) -> Result<u32, EncodeError> {
     }
     // Sequence headers carry SPS, picture headers carry PPS.
     Ok(supported
-        & (cros_libva::VA_ENC_PACKED_HEADER_SEQUENCE
-            | cros_libva::VA_ENC_PACKED_HEADER_PICTURE))
+        & (cros_libva::VA_ENC_PACKED_HEADER_SEQUENCE | cros_libva::VA_ENC_PACKED_HEADER_PICTURE))
 }
 
 #[cfg(test)]
@@ -795,7 +823,12 @@ mod tests {
         let mut bytes = 0usize;
         for index in 0..frames {
             let out = encoder
-                .encode(&pixels, width as usize * 4, i64::from(index) * 33_333, false)
+                .encode(
+                    &pixels,
+                    width as usize * 4,
+                    i64::from(index) * 33_333,
+                    false,
+                )
                 .unwrap();
             bytes += out.iter().map(|packet| packet.data.len()).sum::<usize>();
         }

@@ -89,6 +89,10 @@ pub enum OpenDrmDisplayError {
 }
 
 impl Display {
+    /// Borrow the DRM descriptor while this display remains alive.
+    pub fn drm_fd(&self) -> std::os::fd::RawFd {
+        self.drm_file.as_raw_fd()
+    }
     /// Opens and initializes a specific DRM `Display`.
     ///
     /// `path` is the path to a DRM device that supports VAAPI, e.g. `/dev/dri/renderD128`.

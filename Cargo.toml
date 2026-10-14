@@ -176,6 +176,7 @@ windows = { version = "0.62.2", default-features = false, features = [
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+glow = "0.17.0"
 # Local display geometry for the viewer, on X11 and Wayland alike.
 display-info = "0.5.9"
 cros-libva = { path = "vendor/cros-libva" }

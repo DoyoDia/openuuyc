@@ -76,12 +76,14 @@ pub(crate) enum Image {
     },
     /// A pitched CUDA allocation on the GPU driving the display.
     Cuda(Arc<super::cuda::Buffer>),
+    Nv12(Arc<super::gpu_convert::OwnedNv12>),
 }
 impl Image {
     pub fn size(&self) -> (u32, u32) {
         match self {
             Self::Cpu { width, height, .. } => (*width, *height),
             Self::Cuda(buffer) => (buffer.width, buffer.height),
+            Self::Nv12(frame) => frame.size(),
         }
     }
     /// The pixels in system memory, read back from the GPU if need be.
@@ -89,6 +91,7 @@ impl Image {
         Ok(match self {
             Self::Cpu { pixels, .. } => std::borrow::Cow::Borrowed(pixels.as_slice()),
             Self::Cuda(buffer) => std::borrow::Cow::Owned(buffer.download()?),
+            Self::Nv12(frame) => std::borrow::Cow::Owned(frame.pixels()?),
         })
     }
 }
@@ -377,22 +380,41 @@ impl Desktop {
                 std::thread::sleep((deadline - now).min(Duration::from_millis(8)));
             },
             // PipeWire only delivers a picture when the monitor changed.
-            Backend::Portal(grab) => grab
-                .next(deadline.saturating_duration_since(Instant::now()))
-                .map(|picture| {
-                    picture.map(|picture| {
+            Backend::Portal(grab) => {
+                match grab.next(deadline.saturating_duration_since(Instant::now())) {
+                    Ok(Some(picture)) => {
                         let size = output(picture.width, picture.height, quality, maximum);
-                        // PipeWire already returned owned, tightly packed BGRA.
-                        // Reuse it at native size instead of allocating and
-                        // copying a second full frame before encoding.
-                        let image = if size == (picture.width, picture.height) {
-                            picture.pixels
+                        if let Some(frame) = picture.nv12 {
+                            if size == frame.size() {
+                                self.available = true;
+                                self.last_size = size;
+                                return Ok(Some(Frame {
+                                    width: size.0,
+                                    height: size.1,
+                                    image: Image::Nv12(frame),
+                                    captured: Instant::now(),
+                                    is_new: true,
+                                    hdr_metadata: None,
+                                }));
+                            }
+                            let pixels = frame.pixels()?;
+                            Ok(Some((
+                                size,
+                                scale(&pixels, (picture.width, picture.height), size),
+                            )))
                         } else {
-                            scale(&picture.pixels, (picture.width, picture.height), size)
-                        };
-                        (size, image)
-                    })
-                }),
+                            let image = if size == (picture.width, picture.height) {
+                                picture.pixels
+                            } else {
+                                scale(&picture.pixels, (picture.width, picture.height), size)
+                            };
+                            Ok(Some((size, image)))
+                        }
+                    }
+                    Ok(None) => Ok(None),
+                    Err(e) => Err(e),
+                }
+            }
         };
         match result {
             Ok(Some((size, image))) => {

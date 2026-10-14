@@ -255,6 +255,9 @@ impl Encoder {
         match self {
             Self::Nvidia(encoder) => encoder.encode(image, timestamp, keyframe),
             Self::Vaapi(encoder) => {
+                if let Image::Nv12(frame) = image {
+                    return Ok(encoder.encode_nv12(frame, timestamp, keyframe)?);
+                }
                 let pixels = image.pixels()?;
                 let pitch = image.size().0 as usize * 4;
                 Ok(encoder.encode(&pixels, pitch, timestamp, keyframe)?)
