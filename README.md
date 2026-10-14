@@ -120,17 +120,6 @@ sudo pacman -S --needed base-devel rust nasm clang pkgconf libva alsa-lib dbus \
     libxcursor libglvnd vulkan-icd-loader openssl fuse3 noto-fonts-cjk
 ```
 
-安装与显卡匹配的 Vulkan / VA-API 驱动后，也可用本分支的脚本构建和启动：
-
-```bash
-./build-linux.sh              # 完整输出写入 logs/build-linux.log
-./run-linux.sh                # 控制台输出写入 logs/gui-console.log
-```
-
-构建脚本默认单任务，支持 `--offline`（需已缓存依赖）及 `--release`，启动副本放在 `bin/OpenUUYC`。需要系统 NASM；也可自行将 NASM 放入 `tools/nasm/bin/`。Linux 登录不提前申请共享本机屏幕，被控采集能力在实际获授权的被控连接时检查。远程窗口默认仅观看，点击顶部“键鼠控制”启用输入；长按按键按本机桌面的重复延迟和速率发送。
-
-本分支在 EndeavourOS / KDE Wayland、libva 1.24.0 上完成构建：25 项默认单元测试通过、17 项外部设备/交互测试忽略；新增的真实 1920×1080 H.264 VA-API 裁剪测试单独通过。已验证保存账号恢复后进入设备列表，用户确认开启控制后普通键鼠可用。长按修复已验证发送队列和 UU 消息，实际远端连发、声音、中转和分辨率切换仍需完整设备回归。
-
 打包为 deb（GitHub Actions 的 “Linux deb” 工作流在 Ubuntu 22.04 上构建同样的包，产物见运行页面的 Artifacts，打 `v*` 标签时附到 Release）：
 
 ```bash
