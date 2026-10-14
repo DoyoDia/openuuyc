@@ -91,11 +91,23 @@ impl Drop for Writing {
         WRITING.with(|w| w.set(self.0));
     }
 }
+/// 这张表里那份清单是哪条路发出去的，决定本地剪贴板变了之后它还能不能用。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Origin {
+    Clipboard,
+    Drag,
+}
 struct State {
     receiver: Receiver<Command>,
     sessions: HashMap<u64, Weak<Inner>>,
     published: HashMap<u64, (Arc<LocalSource>, Vec<Format>)>,
-    tasks: HashMap<(u64, u32), Arc<LocalFiles>>,
+    /// 每个会话、每个任务号发出去的那份文件清单。
+    ///
+    /// 剪贴板和拖放共用这张表，但换的是两种东西：剪贴板那条是**缓存**，本地剪贴板
+    /// 一换就必须作废——剪贴板这条路上对方用的任务号是固定一个（官方客户端写死的
+    /// 0），缓存不清的话，第二次复制再来问还是第一份清单，粘出来就是上一次复制的
+    /// 东西。拖放那条是某一次拖放的凭据，只能等那次拖放自己结束，所以两种要分开记。
+    tasks: HashMap<(u64, u32), (Origin, Arc<LocalFiles>)>,
     drag_sources: HashMap<u64, (Arc<LocalFiles>, Arc<super::drag::Submission>)>,
     owner: Option<(IDataObject, Arc<RemoteOffer>)>,
     sequence: u32,
@@ -742,6 +754,24 @@ fn local_change() -> Result<()> {
         }
     });
     for session in sessions {
+        // 本地剪贴板换了，之前按剪贴板发出去的那份文件清单就此作废（见 `tasks` 上的
+        // 说明：不清的话对方第二次来问还是第一份，粘出来就是上一次复制的东西）。
+        // 作废了几条要记下来：下一次「粘出来还是旧的」时才分得清是这里没作废，
+        // 还是作废了但对方仍拿着旧的那份。
+        let dropped = STATE.with(|v| {
+            let mut v = v.borrow_mut();
+            let Some(v) = v.as_mut() else {
+                return 0;
+            };
+            let before = v.tasks.len();
+            v.tasks.retain(|(owner, _), (origin, _)| {
+                *owner != session.id || *origin != Origin::Clipboard
+            });
+            before - v.tasks.len()
+        });
+        if dropped != 0 {
+            tracing::info!(session = session.id, dropped, "本地剪贴板已换，作废发出去的文件清单");
+        }
         let links = formats::outgoing(
             &ids,
             session.platform.load(Ordering::Acquire),
@@ -1247,12 +1277,12 @@ fn serve(s: &Arc<Inner>, epoch: u64, id: i64, kind: ClipboardRequestKind) -> Res
                     .as_ref()
                     .and_then(|v| v.published.get(&s.id).map(|p| p.0.clone()))
             });
-            let result = (|| -> Result<Arc<LocalFiles>> {
+            let result = (|| -> Result<(Origin, Arc<LocalFiles>)> {
                 ensure!(s.file_allowed(), "文件剪贴板已关闭");
                 let explicit = STATE.with(|v| {
                     let mut v = v.borrow_mut();
                     let v = v.as_mut().unwrap();
-                    if let Some(files) = v.tasks.get(&(s.id, r.task_id)) {
+                    if let Some((_, files)) = v.tasks.get(&(s.id, r.task_id)) {
                         return Some(Ok(files.clone()));
                     }
                     v.drag_sources.remove(&s.id).map(|(files, ticket)| {
@@ -1260,10 +1290,13 @@ fn serve(s: &Arc<Inner>, epoch: u64, id: i64, kind: ClipboardRequestKind) -> Res
                             if v.tasks.len() < 32 {
                                 v.tasks.insert(
                                     (s.id, r.task_id),
-                                    Arc::new(LocalFiles {
-                                        items: Vec::new(),
-                                        object: None,
-                                    }),
+                                    (
+                                        Origin::Drag,
+                                        Arc::new(LocalFiles {
+                                            items: Vec::new(),
+                                            object: None,
+                                        }),
+                                    ),
                                 );
                             } else {
                                 v.drag_sources.insert(s.id, (files, ticket));
@@ -1274,24 +1307,27 @@ fn serve(s: &Arc<Inner>, epoch: u64, id: i64, kind: ClipboardRequestKind) -> Res
                         Ok(files)
                     })
                 });
-                let files = match explicit {
-                    Some(files) => files?,
-                    None => source
-                        .ok_or_else(|| anyhow!("原文件剪贴板已失效"))?
-                        .files()?,
+                let (origin, files) = match explicit {
+                    Some(files) => (Origin::Drag, files?),
+                    None => (
+                        Origin::Clipboard,
+                        source
+                            .ok_or_else(|| anyhow!("原文件剪贴板已失效"))?
+                            .files()?,
+                    ),
                 };
                 ensure!(!files.items.is_empty(), "文件列表为空");
-                Ok(files)
+                Ok((origin, files))
             })();
             match result {
-                Ok(files) => {
+                Ok((origin, files)) => {
                     let inserted = STATE.with(|v| {
                         let mut v = v.borrow_mut();
                         let v = v.as_mut().unwrap();
                         if v.tasks.len() >= 32 {
                             return false;
                         }
-                        v.tasks.insert((s.id, r.task_id), files.clone());
+                        v.tasks.insert((s.id, r.task_id), (origin, files.clone()));
                         true
                     });
                     if !inserted {
@@ -1368,7 +1404,7 @@ fn serve(s: &Arc<Inner>, epoch: u64, id: i64, kind: ClipboardRequestKind) -> Res
             let files = STATE.with(|v| {
                 v.borrow()
                     .as_ref()
-                    .and_then(|v| v.tasks.get(&(s.id, r.task_id)).cloned())
+                    .and_then(|v| v.tasks.get(&(s.id, r.task_id)).map(|(_, f)| f.clone()))
             });
             let result = if s.file_allowed() {
                 files
