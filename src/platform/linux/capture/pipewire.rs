@@ -138,12 +138,6 @@ const VIDEO_BGRX: u32 = 8;
 const VIDEO_RGBA: u32 = 11;
 const VIDEO_BGRA: u32 = 12;
 
-/// DRM fourcc values, distinct from the negotiated SPA video format.
-const DRM_FORMAT_ARGB8888: u32 = u32::from_le_bytes(*b"AR24");
-const DRM_FORMAT_XRGB8888: u32 = u32::from_le_bytes(*b"XR24");
-const DRM_FORMAT_ABGR8888: u32 = u32::from_le_bytes(*b"AB24");
-const DRM_FORMAT_XBGR8888: u32 = u32::from_le_bytes(*b"XB24");
-
 /// `I915_FORMAT_MOD_Y_TILED`: what i965 exports and its encoder imports.
 const DRM_MOD_Y_TILED: u64 = 0x0100_0000_0000_0002;
 /// `I915_FORMAT_MOD_X_TILED`.
@@ -262,12 +256,6 @@ impl Pod {
             self.u32(*word);
         }
         self.pad();
-    }
-    /// A `Long`, which SPA stores as eight bytes.
-    fn value_long(&mut self, value: u64) {
-        self.u32(8);
-        self.u32(TYPE_LONG);
-        self.u64(value);
     }
     /// A choice of `Long` values, the form SPA uses for DRM modifiers.
     fn choice_long(&mut self, choice: u32, values: &[u64]) {
