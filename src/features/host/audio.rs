@@ -401,7 +401,7 @@ impl Audio {
                 let message = format!("桌面声音暂不可用：{error:#}");
                 let mut status = lock(&self.0.status);
                 if status.error.as_ref() != Some(&message) {
-                    tracing::warn!(%error,"host desktop audio rebuilding; video retained");
+                    tracing::warn!(device = %status.device, error = %format!("{error:#}"),"host desktop audio rebuilding; video retained");
                 }
                 status.error = Some(message);
                 status.capturing = false;

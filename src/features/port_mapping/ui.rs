@@ -173,7 +173,7 @@ impl Editor {
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let mut enabled = snapshot.enabled;
-                if controls::service_switch(ui, &mut enabled)
+                if controls::switch(ui, &mut enabled)
                     .on_hover_text("启停此设备的全部端口转发")
                     .changed()
                 {

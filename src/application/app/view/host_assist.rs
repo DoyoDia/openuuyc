@@ -58,7 +58,7 @@ fn local_card(
         ui.spacing_mut().item_spacing.y = 0.0;
         header(ui, "本设备", None, |ui| {
             ui.add_enabled_ui((allowed || action.enabled) && !saving, |ui| {
-                crate::ui::controls::service_switch(ui, &mut action.enabled);
+                crate::ui::controls::switch(ui, &mut action.enabled);
             });
             ui.label("允许他人远程协助");
         });
@@ -462,12 +462,12 @@ impl DeviceCenterApp {
                     ui.add_space(12.0);
                     ui.horizontal(|ui| {
                         ui.label("允许剪贴板同步");
-                        crate::ui::controls::service_switch(ui, &mut clipboard.enabled);
+                        crate::ui::controls::switch(ui, &mut clipboard.enabled);
                     });
                     ui.add_enabled_ui(clipboard.enabled, |ui| {
                         ui.horizontal(|ui| {
                             ui.label("允许文件复制");
-                            crate::ui::controls::service_switch(ui, &mut clipboard.files);
+                            crate::ui::controls::switch(ui, &mut clipboard.files);
                         });
                     });
                 }
