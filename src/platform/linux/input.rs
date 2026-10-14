@@ -356,7 +356,7 @@ mod virtual_keyboard {
     use anyhow::{Context, Result};
     use std::os::fd::AsFd;
     use std::time::Duration;
-    use wayland_client::globals::{registry_queue_init, GlobalList};
+    use wayland_client::globals::{GlobalList, registry_queue_init};
     use wayland_client::protocol::{wl_registry, wl_seat};
     use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle};
     use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::{
@@ -389,8 +389,9 @@ mod virtual_keyboard {
     const KEYCODE_OFFSET: u8 = 8;
 
     pub(crate) struct Keyboard {
+        /// Held so the queue and the globals registry stay connected.
         connection: Connection,
-        keyboard: keyboard::ZwpVirtualKeyboardV1,
+        globals: GlobalList,
         queue: EventQueue<State>,
     }
 
@@ -419,7 +420,11 @@ mod virtual_keyboard {
         out.push_str("  xkb_symbols \"vk\" {\n");
         for (index, c) in chars.iter().enumerate() {
             let point = *c as u32;
-            let sym = if point < 0x100 { point } else { 0x0100_0000 | point };
+            let sym = if point < 0x100 {
+                point
+            } else {
+                0x0100_0000 | point
+            };
             out.push_str(&format!("    key <VK{index:02}> {{ [ 0x{sym:08x} ] }};\n"));
         }
         out.push_str("  };\n};\n");
@@ -442,49 +447,59 @@ mod virtual_keyboard {
             let connection = Connection::connect_to_env().context("连接 Wayland 失败")?;
             let (globals, mut queue): (GlobalList, EventQueue<State>) =
                 registry_queue_init(&connection).context("枚举 Wayland 全局对象失败")?;
-            let keyboard = {
+            // Bind once up front so a desktop without the protocol is reported
+            // at startup rather than on the first keystroke.
+            {
                 let qh = queue.handle();
-                let manager: manager::ZwpVirtualKeyboardManagerV1 = globals
-                    .bind(&qh, 1..=1, ())
-                    .context("桌面没有提供 zwp_virtual_keyboard_manager_v1")?;
-                let seat: wl_seat::WlSeat =
+                let _manager: manager::ZwpVirtualKeyboardManagerV1 =
+                    globals
+                        .bind(&qh, 1..=1, ())
+                        .context("桌面没有提供 zwp_virtual_keyboard_manager_v1")?;
+                let _seat: wl_seat::WlSeat =
                     globals.bind(&qh, 1..=8, ()).context("没有 Wayland seat")?;
-                let keyboard = manager.create_virtual_keyboard(&seat, &qh, ());
-                // keymap 必须在上报按键之前上传（否则合成器会报
-                // NO_KEYMAP）。这里同样要补 NUL 结尾。
-                let (keymap, _) = keymap_for(" ");
-                let mut bytes = keymap.into_bytes();
-                bytes.push(0);
-                let fd = keymap_fd(&bytes)?;
-                keyboard.keymap(1, fd.as_fd(), bytes.len() as u32);
-                keyboard
-            };
+            }
             queue.flush().context("提交虚拟键盘请求失败")?;
             Ok(Self {
                 connection,
-                keyboard,
+                globals,
                 queue,
             })
         }
 
-        /// 输入一段文本：先上传含这些字符的 keymap，再逐个按键。
+        /// 输入一段文本：新建一个虚拟键盘对象，上传含这些字符的 keymap，
+        /// 逐个按键，最后销毁该对象。
+        ///
+        /// **每次调用都必须新建对象。** Hyprland 只在对象第一次收到 keymap
+        /// 时建立键位映射，之后在同一对象上重新上传 keymap 不会生效；手机输入
+        /// 法逐字符发送（每次 `chars=1`），复用对象会让每个字符都按第一个字符
+        /// 的键位输入（输入 `XYZ` 得到 `XXX`）。wtype 同样每次新建对象。
         pub(crate) fn text(&mut self, text: &str, permitted: &dyn Fn() -> bool) -> Result<()> {
             let (keymap, bound) = keymap_for(text);
             if bound == 0 {
                 return Ok(());
             }
-            // xkbcommon 的 xkb_keymap_new_from_string 要求 NUL 结尾的字符串，
-            // 长度也要把它算进去。
+            let qh = self.queue.handle();
+            let manager: manager::ZwpVirtualKeyboardManagerV1 =
+                self.globals
+                    .bind(&qh, 1..=1, ())
+                    .context("桌面没有提供 zwp_virtual_keyboard_manager_v1")?;
+            let seat: wl_seat::WlSeat = self
+                .globals
+                .bind(&qh, 1..=8, ())
+                .context("没有 Wayland seat")?;
+            let keyboard = manager.create_virtual_keyboard(&seat, &qh, ());
+            // keymap 必须在上报按键之前上传，且要等合成器处理完
+            // （否则合成器会报 NO_KEYMAP）。xkbcommon 的
+            // xkb_keymap_new_from_string 要求 NUL 结尾，长度也要算上。
             let mut bytes = keymap.into_bytes();
             bytes.push(0);
             let fd = keymap_fd(&bytes)?;
-            self.keyboard.keymap(1, fd.as_fd(), bytes.len() as u32);
-            // 必须等合成器处理完 keymap，之后的按键才有意义。
+            keyboard.keymap(1, fd.as_fd(), bytes.len() as u32);
             self.queue
                 .roundtrip(&mut State)
                 .context("等待虚拟键盘 keymap 生效失败")?;
             // 清掉可能残留的修饰键状态。
-            self.keyboard.modifiers(0, 0, 0, 0);
+            keyboard.modifiers(0, 0, 0, 0);
             let _ = self.queue.roundtrip(&mut State);
 
             let mut index = 0u8;
@@ -507,14 +522,16 @@ mod virtual_keyboard {
                 };
                 // 发送 evdev 风格键码；合成器与客户端会各自 +8 查 keymap。
                 let code = u32::from(FIRST_CODE + position);
-                self.keyboard.key(0, code, 1);
+                keyboard.key(0, code, 1);
                 let _ = self.queue.roundtrip(&mut State);
-                self.keyboard.key(0, code, 0);
+                keyboard.key(0, code, 0);
                 let _ = self.queue.roundtrip(&mut State);
                 // 输入法（IBus）会丢过快的按键。
                 std::thread::sleep(Duration::from_millis(4));
             }
-            let _ = self.connection;
+            keyboard.destroy();
+            let _ = self.queue.roundtrip(&mut State);
+            let _ = &self.connection;
             Ok(())
         }
     }
