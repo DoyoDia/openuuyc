@@ -18,7 +18,8 @@ use std::time::{Duration, Instant};
 /// 128 条目 NACK ~600B 仍在单个 RTCP 包内。
 const PRE_WINDOW_NACK: u16 = 128;
 /// 会话起点（首包锚定）后允许「扣住前缀未到齐的帧」等待补传的宽限期。
-/// 过期后按原行为直接发出，避免 host 不重传时永久卡住。
+/// 过期后不再组装缺了开头的帧，按常规缺口请求关键帧，避免 host 不重传
+/// 时永久等待。
 const PRE_WINDOW_GRACE: Duration = Duration::from_millis(2000);
 
 pub(super) struct BufferedPacket {
@@ -143,10 +144,13 @@ impl PacketBuffer {
             // 登记预窗口缺失：加入会话时早于首包的包（macOS host 的初始
             // STAP-A(SPS/PPS) + IDR 首片）由 feedback 侧 pre-window NACK
             // 补回；登记后 find_frames 才能识别「帧前缀未到齐」，避免把
-            // 残缺帧当作完整关键帧发出（那会永久卡住首次解码）。
-            for offset in 1u16..=PRE_WINDOW_NACK {
-                self.missing_packets
-                    .insert(sequence_number.wrapping_sub(offset));
+            // 残缺帧当作完整关键帧发出（那会永久卡住首次解码）。首包本身
+            // 就是关键帧开头时没有缺口，feedback 侧也不会去要。
+            if !packet.starts_keyframe() {
+                for offset in 1u16..=PRE_WINDOW_NACK {
+                    self.missing_packets
+                        .insert(sequence_number.wrapping_sub(offset));
+                }
             }
         } else if ahead_of(self.first_sequence_number, sequence_number) {
             if self.cleared_to_first_sequence {
@@ -308,12 +312,27 @@ impl PacketBuffer {
     }
 
     /// 重扫被扣住的帧（前缀等待 pre-window NACK 补传）。接收 worker 在每次
-    /// poll 时调用：补全后释放，宽限期过后按原行为发出残缺帧。
+    /// poll 时调用：补全后释放，宽限期过后放弃（按常规缺口处理）。
     pub(super) fn rescan_pending(&mut self) -> Vec<EncodedFrame> {
         let Some(sequence_number) = self.pending_rescan else {
             return Vec::new();
         };
+        if !self.in_startup_window() {
+            // 宽限期已过：不再从帧尾回溯，残缺帧不会被组装，按常规缺口
+            // 处理（请求关键帧）。
+            self.pending_rescan = None;
+            return Vec::new();
+        }
         self.find_frames(sequence_number)
+    }
+
+    /// 会话起点的宽限期内、尚未组装出任何关键帧时，才允许为补传扣住帧
+    /// 或从帧尾 marker 回溯。之后缺了首片的帧按常规缺口处理。
+    fn in_startup_window(&self) -> bool {
+        self.last_keyframe_first_sequence.is_none()
+            && self
+                .anchored_at
+                .is_some_and(|anchored| anchored.elapsed() < PRE_WINDOW_GRACE)
     }
 
     pub(super) fn potential_new_frame(&self, sequence_number: u16) -> bool {
@@ -334,8 +353,9 @@ impl PacketBuffer {
         }
         // 加入会话时可能错过关键帧的 S=1 首片（macOS host 的初始 IDR 常早于
         // 接收窗口），此时从帧尾 marker 包回溯也能拼出该帧，避免永久卡在
-        // 「等关键帧」。
-        if entry.packet.marker {
+        // 「等关键帧」。只限会话起点：之后缺了开头的帧是普通丢包，组装
+        // 出来只会把花屏带到下一个关键帧。
+        if entry.packet.marker && self.in_startup_window() {
             return true;
         }
         let Some(previous) = self.buffer[previous_index].as_ref() else {
@@ -391,10 +411,8 @@ impl PacketBuffer {
                 // （macOS host）：若帧前缀未到齐（首包是 FU-A 续片，或关键帧
                 // 缺参数集）且其前序包仍在缺失集合中（pre-window NACK 补传
                 // 中），扣住本帧等待补全，由接收 worker 的 poll 重扫；宽限期
-                // 过后按原行为直接发出，避免 host 不重传时永久卡住。
-                let grace_live = self
-                    .anchored_at
-                    .is_some_and(|anchored| anchored.elapsed() < PRE_WINDOW_GRACE);
+                // 过后放弃，按常规缺口请求关键帧，避免 host 不重传时永久卡住。
+                let grace_live = self.in_startup_window();
                 // 槽位缺席 = 该 seq 从未到达（已登记 missing，或落在 pre-window
                 // 之外而从未被 NACK）。比 missing 集合判定更健壮：超出 NACK
                 // 窗口的缺口同样能扣住帧；只有真正“帧头”（前槽是别的包的
@@ -575,8 +593,6 @@ impl PacketBuffer {
                     complete.extend_from_slice(&pair);
                     complete.append(&mut data);
                     data = complete;
-                    sps = true;
-                    pps = true;
                 }
                 if keyframe {
                     self.last_keyframe_first_sequence = Some(start);
@@ -666,5 +682,75 @@ impl SequenceUnwrapper {
             .expect("sequence candidates");
         self.last = Some(unwrapped);
         unwrapped
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use webrtc::rtp::{header::Header, packet::Packet};
+
+    fn packet(
+        sequence_number: u16,
+        timestamp: u32,
+        marker: bool,
+        payload: &[u8],
+    ) -> ParsedVideoPacket {
+        let rtp = Packet {
+            header: Header {
+                sequence_number,
+                timestamp,
+                marker,
+                ..Default::default()
+            },
+            payload: bytes::Bytes::copy_from_slice(payload),
+        };
+        super::super::depacketize::depacketize_h264(&rtp, Instant::now()).unwrap()
+    }
+
+    /// A P frame sent as three FU-A fragments (type 1), without its first.
+    fn p_frame_tail(buffer: &mut PacketBuffer, start: u16, timestamp: u32) -> Vec<EncodedFrame> {
+        let mut frames = buffer
+            .insert(packet(
+                start + 1,
+                timestamp,
+                false,
+                &[0x7c, 0x01, 0xaa, 0xbb],
+            ))
+            .frames;
+        frames.extend(
+            buffer
+                .insert(packet(
+                    start + 2,
+                    timestamp,
+                    true,
+                    &[0x7c, 0x41, 0xcc, 0xdd],
+                ))
+                .frames,
+        );
+        frames
+    }
+
+    #[test]
+    fn mid_session_frame_missing_its_start_is_not_assembled() {
+        let mut buffer = PacketBuffer::new();
+        // A whole IDR slice in one packet starts the session.
+        buffer.insert(packet(100, 1_000, true, &[0x65, 0x88, 0x84, 0x00, 0x10]));
+        buffer.anchored_at = Some(Instant::now() - PRE_WINDOW_GRACE * 2);
+        buffer.rescan_pending();
+        assert!(p_frame_tail(&mut buffer, 101, 4_000).is_empty());
+    }
+
+    #[test]
+    fn startup_frame_missing_its_start_waits_then_gives_up() {
+        let mut buffer = PacketBuffer::new();
+        assert!(p_frame_tail(&mut buffer, 101, 4_000).is_empty());
+        assert!(
+            buffer.pending_rescan.is_some(),
+            "held for the pre-window NACK"
+        );
+        buffer.anchored_at = Some(Instant::now() - PRE_WINDOW_GRACE * 2);
+        assert!(buffer.rescan_pending().is_empty());
+        assert!(buffer.pending_rescan.is_none());
     }
 }

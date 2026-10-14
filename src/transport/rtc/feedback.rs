@@ -63,8 +63,6 @@ pub(super) struct NackBatch {
 pub(super) struct RtcpFeedbackBuffer {
     pub(super) request_keyframe: bool,
     pub(super) nack_sequences: Vec<u16>,
-    // FIR 需要单调递增的序号，官方 host 用它去重。
-    fir_sequence: u8,
 }
 
 impl RtcpFeedbackBuffer {
@@ -82,8 +80,7 @@ impl RtcpFeedbackBuffer {
             if let Err(error) = pli {
                 tracing::warn!(%error, "buffered keyframe request failed");
             }
-            let fir = send_full_intra_request(connection, media_ssrc, self.fir_sequence).await;
-            self.fir_sequence = self.fir_sequence.wrapping_add(1);
+            let fir = send_full_intra_request(connection, media_ssrc).await;
             if let Err(error) = fir {
                 tracing::warn!(%error, "buffered FIR request failed");
             }
@@ -143,11 +140,14 @@ impl NackRequester {
             }
             // 订阅建立时流的开头（SPS/PPS、关键帧首片）可能已经发出：
             // 日志里首包常是关键帧的中段 FU-A（S=0）。对首包之前的窗口
-            // 立即补发 NACK，host 的 RTX 重传可补齐这部分包。
-            self.add_missing(
-                sequence_number.wrapping_sub(RTP_STARTUP_NACK_WINDOW),
-                sequence_number,
-            );
+            // 立即补发 NACK，host 的 RTX 重传可补齐这部分包。首包本身就是
+            // 关键帧开头时没有缺口，不去要旧帧的包。
+            if !starts_keyframe {
+                self.add_missing(
+                    sequence_number.wrapping_sub(RTP_STARTUP_NACK_WINDOW),
+                    sequence_number,
+                );
+            }
             let batch = self.get_batch(NackFilter::Sequence, now);
             return NackReceiveResult {
                 batch,
@@ -396,12 +396,23 @@ pub(super) async fn send_picture_loss_indication(
 }
 
 /// FIR（RFC 5104 §3.5.1）。部分 host 只对 FIR 生成关键帧，
-/// 因此与 PLI 一起发送。序号需单调递增，host 用它去重。
+/// 因此与 PLI 一起发送。序号按媒体 SSRC 单调递增，host 用它去重；
+/// 所有发送路径共用一个计数，重复的序号会被当作同一请求丢弃。
 pub(super) async fn send_full_intra_request(
     connection: &RTCPeerConnection,
     media_ssrc: u32,
-    sequence: u8,
 ) -> Result<()> {
+    static SEQUENCES: std::sync::LazyLock<std::sync::Mutex<HashMap<u32, u8>>> =
+        std::sync::LazyLock::new(Default::default);
+    let sequence = {
+        let mut sequences = SEQUENCES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let next = sequences.entry(media_ssrc).or_default();
+        let sequence = *next;
+        *next = next.wrapping_add(1);
+        sequence
+    };
     tracing::debug!(media_ssrc, sequence, "sending RTCP FIR");
     let fir: Box<dyn RtcpPacket + Send + Sync> = Box::new(FullIntraRequest {
         sender_ssrc: DEFAULT_RECEIVER_SSRC,

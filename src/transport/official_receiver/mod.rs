@@ -390,7 +390,7 @@ impl OfficialVideoReceiver {
         let mut frames = self.take_ready_frames(true);
         let mut request_keyframe = false;
         // 会话起点被扣住的帧（帧前缀等待 pre-window NACK 补传）每次 poll
-        // 重扫：补全后先于后续帧释放；宽限期过后按原行为发出。
+        // 重扫：补全后先于后续帧释放；宽限期过后放弃。
         if self.packet_buffer.pending_rescan.is_some() {
             let insert = PacketInsertResult {
                 frames: self.packet_buffer.rescan_pending(),
