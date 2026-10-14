@@ -1,9 +1,42 @@
 //! Installing user's ordinary-permission tray startup; no Windows password.
 use anyhow::{Result, ensure};
 use windows::{
-    Win32::System::Registry::*,
+    Win32::{Foundation::ERROR_FILE_NOT_FOUND, System::Registry::*},
     core::{PCWSTR, w},
 };
+/// Whether this user's login starts OpenUUYC.
+pub(crate) fn enabled() -> Result<bool> {
+    let mut size = 0u32;
+    let result = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!(r"Software\Microsoft\Windows\CurrentVersion\Run"),
+            w!("OpenUUYC"),
+            RRF_RT_REG_SZ,
+            None,
+            None,
+            Some(&mut size),
+        )
+    };
+    if result == ERROR_FILE_NOT_FOUND {
+        return Ok(false);
+    }
+    result.ok()?;
+    Ok(true)
+}
+/// The settings switch. Points at the installed program while the components
+/// are installed, otherwise at this copy, as enabling remote wake does.
+pub(crate) fn configure(enabled: bool) -> Result<()> {
+    if !enabled {
+        return set_image(false, std::path::Path::new(""));
+    }
+    let image = if super::resident::managed() {
+        crate::platform::windows::components::application::image()?
+    } else {
+        std::env::current_exe()?
+    };
+    set_image(true, &image)
+}
 pub(crate) fn set(enabled: bool) -> Result<()> {
     set_image(
         enabled,

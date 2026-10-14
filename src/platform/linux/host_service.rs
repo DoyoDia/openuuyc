@@ -106,6 +106,30 @@ pub(crate) mod startup {
         Ok(config.join("autostart/openuuyc.desktop"))
     }
 
+    /// Whether login starts OpenUUYC: the entry exists and the desktop has
+    /// not been told to skip it (`Hidden=true`, or GNOME's own switch).
+    pub(crate) fn enabled() -> Result<bool> {
+        let entry = entry()?;
+        let text = match std::fs::read_to_string(&entry) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            result => result.with_context(|| format!("无法读取自启动设置 {}", entry.display()))?,
+        };
+        Ok(!text.lines().map(str::trim).any(|line| {
+            line.eq_ignore_ascii_case("Hidden=true")
+                || line.eq_ignore_ascii_case("X-GNOME-Autostart-enabled=false")
+        }))
+    }
+
+    /// The settings switch. There is no installed copy apart from the
+    /// running one (the deb puts it at /usr/bin/OpenUUYC), so the entry
+    /// starts this program, as enabling remote wake does.
+    pub(crate) fn configure(enabled: bool) -> Result<()> {
+        if !enabled {
+            return set_image(false, std::path::Path::new(""));
+        }
+        set_image(true, &std::env::current_exe()?)
+    }
+
     pub(crate) fn set_image(enabled: bool, path: &std::path::Path) -> Result<()> {
         let entry = entry()?;
         if !enabled {
