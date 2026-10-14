@@ -123,10 +123,10 @@ pub(crate) fn paint_port_mapping_icon(p: &egui::Painter, rect: egui::Rect, color
 }
 
 pub(crate) fn switch(ui: &mut egui::Ui, value: &mut bool) -> egui::Response {
-    sized_switch(ui, value, vec2(34.0, 20.0))
+    sized_switch(ui, value, theme::SWITCH_SIZE)
 }
-pub(crate) fn service_switch(ui: &mut egui::Ui, value: &mut bool) -> egui::Response {
-    sized_switch(ui, value, theme::SERVICE_SWITCH_SIZE)
+pub(crate) fn compact_switch(ui: &mut egui::Ui, value: &mut bool) -> egui::Response {
+    sized_switch(ui, value, theme::COMPACT_SWITCH_SIZE)
 }
 fn sized_switch(ui: &mut egui::Ui, value: &mut bool, size: egui::Vec2) -> egui::Response {
     let (rect, mut response) = ui.allocate_exact_size(size, egui::Sense::click());
@@ -134,24 +134,37 @@ fn sized_switch(ui: &mut egui::Ui, value: &mut bool, size: egui::Vec2) -> egui::
         *value = !*value;
         response.mark_changed();
     }
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Checkbox, ui.is_enabled(), *value, "")
+    });
+    paint_switch(ui, rect, *value);
+    response
+}
+
+/// Shared appearance for standalone switches and whole-row menu switches.
+pub(crate) fn paint_switch(ui: &egui::Ui, rect: egui::Rect, value: bool) {
+    let radius = rect.height() / 2.0;
     ui.painter().rect_filled(
         rect,
-        size.y / 2.0,
-        if *value { theme::ACCENT } else { theme::LINE },
+        radius,
+        if value && ui.is_enabled() {
+            theme::ACCENT
+        } else {
+            theme::LINE
+        },
     );
     ui.painter().circle_filled(
         egui::pos2(
-            if *value {
-                rect.right() - size.y / 2.0
+            if value {
+                rect.right() - radius
             } else {
-                rect.left() + size.y / 2.0
+                rect.left() + radius
             },
             rect.center().y,
         ),
-        size.y / 2.0 - 3.0,
+        radius - 3.0,
         theme::TEXT,
     );
-    response
 }
 
 pub(crate) fn connection_wallpaper(ui: &egui::Ui, texture: &egui::TextureHandle, details: bool) {

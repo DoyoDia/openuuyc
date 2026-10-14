@@ -73,30 +73,42 @@ fn open_native(endpoint: &Endpoint, samples: Samples) -> Result<NativeCapture> {
     let apartment = Apartment::new()?;
     unsafe {
         let endpoint = &endpoint.device;
-        let input: IAudioClient = endpoint.Activate(CLSCTX_ALL, None)?;
-        let mix = Mix(input.GetMixFormat()?);
+        let input: IAudioClient = endpoint
+            .Activate(CLSCTX_ALL, None)
+            .context("激活桌面声音采集设备失败")?;
+        let mix = Mix(input.GetMixFormat().context("读取桌面声音采集格式失败")?);
         ensure!(!mix.0.is_null(), "播放设备未提供音频格式");
         let format = *mix.0;
         let channels = usize::from(format.nChannels);
         let rate = format.nSamplesPerSec;
+        let bits = format.wBitsPerSample;
+        let tag = format.wFormatTag;
+        let extension_bytes = format.cbSize;
+        let block_align = format.nBlockAlign;
         ensure!(
             (1..=8).contains(&channels) && (8000..=192000).contains(&rate),
-            "播放设备音频格式不受支持"
+            "播放设备音频格式不受支持：{rate} Hz / {channels} 声道 / {bits} 位 / 格式标记 {tag:#06x}"
         );
         let mut mask = 0;
         let float = if format.wFormatTag == 0xfffe {
-            ensure!(format.cbSize >= 22, "播放设备扩展格式不完整");
+            ensure!(
+                format.cbSize >= 22,
+                "播放设备扩展格式不完整：{extension_bytes} 字节，至少需要 22 字节"
+            );
             let ext = *(mix.0.cast::<WAVEFORMATEXTENSIBLE>());
             mask = ext.dwChannelMask;
             let subformat = ext.SubFormat;
             ensure!(
                 subformat == GUID::from_u128(0x00000001_0000_0010_8000_00aa00389b71)
                     || subformat == GUID::from_u128(0x00000003_0000_0010_8000_00aa00389b71),
-                "播放设备子格式不受支持"
+                "播放设备子格式不受支持：{subformat:?}"
             );
             subformat.data1 == 3
         } else {
-            ensure!(matches!(format.wFormatTag, 1 | 3), "播放设备格式不受支持");
+            ensure!(
+                matches!(format.wFormatTag, 1 | 3),
+                "播放设备格式不受支持：格式标记 {tag:#06x}"
+            );
             format.wFormatTag == 3
         };
         let bytes = usize::from(format.wBitsPerSample) / 8;
@@ -106,11 +118,11 @@ fn open_native(endpoint: &Endpoint, samples: Samples) -> Result<NativeCapture> {
             } else {
                 matches!(bytes, 2 | 3 | 4)
             },
-            "播放设备位深不受支持"
+            "播放设备位深不受支持：{bits} 位，浮点={float}"
         );
         ensure!(
             usize::from(format.nBlockAlign) == channels * bytes,
-            "播放设备帧大小无效"
+            "播放设备帧大小无效：{block_align} 字节 / {channels} 声道 / {bits} 位"
         );
         input
             .Initialize(
@@ -125,7 +137,9 @@ fn open_native(endpoint: &Endpoint, samples: Samples) -> Result<NativeCapture> {
         let capture: IAudioCaptureClient = input.GetService()?;
         // Keep the engine running through silence, without changing volume or defaults.
         let silence: IAudioClient = endpoint.Activate(CLSCTX_ALL, None)?;
-        silence.Initialize(AUDCLNT_SHAREMODE_SHARED, 0, 100_000, 0, mix.0, None)?;
+        silence
+            .Initialize(AUDCLNT_SHAREMODE_SHARED, 0, 100_000, 0, mix.0, None)
+            .context("初始化桌面声音静音保活流失败")?;
         let render: IAudioRenderClient = silence.GetService()?;
         let render_frames = silence.GetBufferSize()?;
         render.GetBuffer(render_frames)?;

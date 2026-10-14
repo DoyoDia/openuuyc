@@ -156,26 +156,10 @@ fn switch_row(ui: &mut egui::Ui, label: &str, value: &mut bool) -> egui::Respons
             crate::ui::theme::DISABLED
         },
     );
-    let rect = egui::Rect::from_center_size(row.right_center() - vec2(25.0, 0.0), vec2(34.0, 20.0));
-    ui.painter().rect_filled(
-        rect,
-        10.0,
-        if *value && enabled {
-            ACCENT
-        } else {
-            crate::ui::theme::LINE
-        },
-    );
-    let center = egui::pos2(
-        if *value {
-            rect.right() - 10.0
-        } else {
-            rect.left() + 10.0
-        },
-        rect.center().y,
-    );
-    ui.painter()
-        .circle_filled(center, 7.0, crate::ui::theme::TEXT);
+    let size = crate::ui::theme::COMPACT_SWITCH_SIZE;
+    let rect =
+        egui::Rect::from_center_size(row.right_center() - vec2(8.0 + size.x / 2.0, 0.0), size);
+    crate::ui::controls::paint_switch(ui, rect, *value);
     response
 }
 
@@ -525,7 +509,12 @@ pub(super) fn show_stream_control_window(
         (state.open && state.page == Page::Audio && !audio.output_devices().loaded)
             .then_some("正在读取输出设备…"),
     );
-    let audio_error = audio.snapshot().error;
+    let audio_error = audio.snapshot().notice_error;
+    if audio_error.is_none() {
+        // A recovered device must not leave a stale modal queued behind another
+        // notice. This is specific to the live audio failure, not operation results.
+        crate::ui::controls::clear_notice(ctx, "audio-output-error");
+    }
     if crate::ui::controls::observe_notice_action(
         ctx,
         "audio-output-error",

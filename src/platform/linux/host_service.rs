@@ -106,18 +106,36 @@ pub(crate) mod startup {
         Ok(config.join("autostart/openuuyc.desktop"))
     }
 
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub(crate) enum State {
+        Disabled,
+        Enabled,
+        /// Windows keeps a separate Startup Apps approval the program cannot
+        /// override. A desktop's disable switch lives in our own entry, which
+        /// the settings switch rewrites, so it reads as plain `Disabled`.
+        #[allow(dead_code)]
+        DisabledByWindows,
+    }
+
     /// Whether login starts OpenUUYC: the entry exists and the desktop has
     /// not been told to skip it (`Hidden=true`, or GNOME's own switch).
-    pub(crate) fn enabled() -> Result<bool> {
+    pub(crate) fn state() -> Result<State> {
         let entry = entry()?;
         let text = match std::fs::read_to_string(&entry) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(State::Disabled);
+            }
             result => result.with_context(|| format!("无法读取自启动设置 {}", entry.display()))?,
         };
-        Ok(!text.lines().map(str::trim).any(|line| {
+        let skipped = text.lines().map(str::trim).any(|line| {
             line.eq_ignore_ascii_case("Hidden=true")
                 || line.eq_ignore_ascii_case("X-GNOME-Autostart-enabled=false")
-        }))
+        });
+        Ok(if skipped {
+            State::Disabled
+        } else {
+            State::Enabled
+        })
     }
 
     /// The settings switch. There is no installed copy apart from the

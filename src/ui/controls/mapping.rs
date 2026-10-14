@@ -1,4 +1,4 @@
-use super::{switch, theme};
+use super::{compact_switch, theme};
 use egui::{
     Align, Align2, FontId, Layout, Rect, RichText, Sense, Stroke, Ui, UiBuilder, pos2, vec2,
 };
@@ -232,7 +232,7 @@ pub(crate) fn mapping_row(ui: &mut Ui, row: MappingRow<'_>, last: bool) -> Mappi
     );
     actions.spacing_mut().item_spacing.x = 8.0;
     let mut enabled = row.enabled;
-    if switch(&mut actions, &mut enabled)
+    if compact_switch(&mut actions, &mut enabled)
         .on_hover_text(if row.enabled {
             "停用规则"
         } else {
