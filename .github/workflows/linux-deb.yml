@@ -59,6 +59,11 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    # linux-release.yml also publishes to this tag; the shared group serializes
+    # them so the second run updates the existing release instead of racing it.
+    concurrency:
+      group: release-${{ github.ref }}
+      cancel-in-progress: false
     steps:
       - uses: actions/download-artifact@v8
         with:

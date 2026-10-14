@@ -348,6 +348,16 @@ impl<D: SurfaceMemoryDescriptor> Surface<D> {
 
     /// Returns a PRIME descriptor for this surface.
     pub fn export_prime(&self) -> Result<DrmPrimeSurfaceDescriptor, VaError> {
+        self.export_prime_flags(bindings::VA_EXPORT_SURFACE_READ_ONLY)
+    }
+
+    /// Export a surface for a GPU producer that will write its pixel planes.
+    /// The caller must complete those writes before using the surface in VA.
+    pub fn export_prime_writable(&self) -> Result<DrmPrimeSurfaceDescriptor, VaError> {
+        self.export_prime_flags(bindings::VA_EXPORT_SURFACE_READ_WRITE)
+    }
+
+    fn export_prime_flags(&self, access: u32) -> Result<DrmPrimeSurfaceDescriptor, VaError> {
         let mut desc: bindings::VADRMPRIMESurfaceDescriptor = Default::default();
 
         va_check(unsafe {
@@ -355,7 +365,7 @@ impl<D: SurfaceMemoryDescriptor> Surface<D> {
                 self.display.handle(),
                 self.id(),
                 bindings::VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
-                bindings::VA_EXPORT_SURFACE_READ_ONLY | bindings::VA_EXPORT_SURFACE_COMPOSED_LAYERS,
+                access | bindings::VA_EXPORT_SURFACE_COMPOSED_LAYERS,
                 &mut desc as *mut _ as *mut c_void,
             )
         })?;

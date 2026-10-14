@@ -96,13 +96,20 @@ struct SpaMetaRegion {
 const STREAM_EVENTS_VERSION: u32 = 2;
 const DIRECTION_INPUT: u32 = 0;
 const FLAG_AUTOCONNECT: u32 = 1 << 0;
-const FLAG_MAP_BUFFERS: u32 = 1 << 2;
+// Shared-memory buffers are mapped explicitly; DMA-BUF is imported through VA.
 const STATE_ERROR: c_int = -1;
 const STATE_UNCONNECTED: c_int = 0;
 const STATE_STREAMING: c_int = 3;
 
+// Keep the modifier mandatory so DMA-BUF cannot silently become SHM.
+// Let PipeWire fixate our supported choices normally. DONT_FIXATE here causes
+// xdg-desktop-portal-hyprland 1.4.1 to repeat its allocation negotiation until
+// its retry limit is exhausted, after which no new DMA-BUF frames arrive.
+const SPA_POD_PROP_FLAG_MANDATORY: u32 = 1 << 3;
+
 const TYPE_ID: u32 = 3;
 const TYPE_INT: u32 = 4;
+const TYPE_LONG: u32 = 5;
 const TYPE_RECTANGLE: u32 = 10;
 const TYPE_FRACTION: u32 = 11;
 const TYPE_OBJECT: u32 = 15;
@@ -117,6 +124,11 @@ const PARAM_META: u32 = 6;
 const FORMAT_MEDIA_TYPE: u32 = 1;
 const FORMAT_MEDIA_SUBTYPE: u32 = 2;
 const FORMAT_VIDEO_FORMAT: u32 = 0x20001;
+/// The DRM format modifier. SPA documents it as "use only with DMA-BUF and
+/// omit for other buffer types", and that is the whole signal: the portal
+/// negotiates shared memory unless this key is present, however the
+/// buffer-type mask reads.
+const FORMAT_VIDEO_MODIFIER: u32 = 0x20002;
 const FORMAT_VIDEO_SIZE: u32 = 0x20003;
 const FORMAT_VIDEO_FRAMERATE: u32 = 0x20004;
 const MEDIA_TYPE_VIDEO: u32 = 2;
@@ -125,12 +137,22 @@ const VIDEO_RGBX: u32 = 7;
 const VIDEO_BGRX: u32 = 8;
 const VIDEO_RGBA: u32 = 11;
 const VIDEO_BGRA: u32 = 12;
+
+/// `I915_FORMAT_MOD_Y_TILED`: what i965 exports and its encoder imports.
+const DRM_MOD_Y_TILED: u64 = 0x0100_0000_0000_0002;
+/// `I915_FORMAT_MOD_X_TILED`.
+const DRM_MOD_X_TILED: u64 = 0x0100_0000_0000_0001;
+/// `DRM_FORMAT_MOD_LINEAR`.
+const DRM_MOD_LINEAR: u64 = 0;
+/// `DRM_FORMAT_MOD_INVALID`, which SPA reads as "let the compositor choose".
+const DRM_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
 const BUFFERS_DATA_TYPE: u32 = 6;
 const META_TYPE: u32 = 1;
 const META_SIZE: u32 = 2;
 const META_VIDEO_CROP: u32 = 2;
 const DATA_MEM_PTR: u32 = 1;
 const DATA_MEM_FD: u32 = 2;
+const DATA_MEM_DMABUF: u32 = 3;
 const CHOICE_RANGE: u32 = 1;
 const CHOICE_ENUM: u32 = 3;
 const CHOICE_FLAGS: u32 = 4;
@@ -219,6 +241,9 @@ impl Pod {
     fn u32(&mut self, value: u32) {
         self.0.extend_from_slice(&value.to_ne_bytes());
     }
+    fn u64(&mut self, value: u64) {
+        self.0.extend_from_slice(&value.to_ne_bytes());
+    }
     fn pad(&mut self) {
         while self.0.len() % 8 != 0 {
             self.0.push(0);
@@ -229,6 +254,19 @@ impl Pod {
         self.u32(kind);
         for word in body {
             self.u32(*word);
+        }
+        self.pad();
+    }
+    /// A choice of `Long` values, the form SPA uses for DRM modifiers.
+    fn choice_long(&mut self, choice: u32, values: &[u64]) {
+        self.u32((16 + values.len() * 8) as u32);
+        self.u32(TYPE_CHOICE);
+        self.u32(choice);
+        self.u32(0);
+        self.u32(8);
+        self.u32(TYPE_LONG);
+        for value in values {
+            self.u64(*value);
         }
         self.pad();
     }
@@ -258,8 +296,12 @@ impl Pod {
         pod
     }
     fn key(&mut self, key: u32) {
+        self.key_flags(key, 0);
+    }
+    /// A property key with `spa_pod_prop` flags.
+    fn key_flags(&mut self, key: u32, flags: u32) {
         self.u32(key);
-        self.u32(0);
+        self.u32(flags);
     }
     /// The bytes, copied into 8-byte aligned storage as SPA requires.
     fn aligned(&self) -> Vec<u64> {
@@ -277,6 +319,50 @@ impl Pod {
 }
 
 fn enum_format() -> Pod {
+    Pod::object(OBJECT_FORMAT, PARAM_ENUM_FORMAT, |p| {
+        p.key(FORMAT_MEDIA_TYPE);
+        p.value(TYPE_ID, &[MEDIA_TYPE_VIDEO]);
+        p.key(FORMAT_MEDIA_SUBTYPE);
+        p.value(TYPE_ID, &[MEDIA_SUBTYPE_RAW]);
+        // The modifier comes first: SPA treats its presence as the request for
+        // DMA-BUF, and omits it for the shared-memory formats below. The portal
+        // reads the pair together, so a format with no modifier means
+        // shared memory.
+        p.key_flags(FORMAT_VIDEO_MODIFIER, SPA_POD_PROP_FLAG_MANDATORY);
+        p.choice_long(
+            CHOICE_ENUM,
+            &[
+                DRM_MOD_LINEAR,
+                DRM_MOD_LINEAR,
+                DRM_MOD_X_TILED,
+                DRM_MOD_Y_TILED,
+            ],
+        );
+        // The format stays a `spa_video_format`: the compositor offers AR24 and
+        // AB24 from wlr, and the portal reports those as `BGRx`/`RGBA`-family
+        // enums with the modifier carrying the tiling. A DRM fourcc here is a
+        // different, unused encoding and never matches.
+        p.key(FORMAT_VIDEO_FORMAT);
+        p.choice(
+            CHOICE_ENUM,
+            TYPE_ID,
+            1,
+            &[VIDEO_BGRA, VIDEO_RGBA, VIDEO_BGRX, VIDEO_RGBX],
+        );
+        p.key(FORMAT_VIDEO_SIZE);
+        p.choice(
+            CHOICE_RANGE,
+            TYPE_RECTANGLE,
+            2,
+            &[1920, 1080, 1, 1, 16384, 16384],
+        );
+        p.key(FORMAT_VIDEO_FRAMERATE);
+        p.choice(CHOICE_RANGE, TYPE_FRACTION, 2, &[60, 1, 0, 1, 1000, 1]);
+    })
+}
+
+/// The shared-memory format offer, used when the compositor will not do DMA-BUF.
+fn enum_format_shm() -> Pod {
     Pod::object(OBJECT_FORMAT, PARAM_ENUM_FORMAT, |p| {
         p.key(FORMAT_MEDIA_TYPE);
         p.value(TYPE_ID, &[MEDIA_TYPE_VIDEO]);
@@ -304,11 +390,18 @@ fn enum_format() -> Pod {
 fn buffers() -> Pod {
     Pod::object(OBJECT_PARAM_BUFFERS, PARAM_BUFFERS, |p| {
         p.key(BUFFERS_DATA_TYPE);
+        // A flags choice holds one value: the mask. The count `SPA_CHOICE_FLAGS`
+        // writes is not part of the pod -- `SPA_POD_CHOICE_N_VALUES` derives it
+        // from the body size, which `choice` sets from the value count here.
         p.choice(
             CHOICE_FLAGS,
             TYPE_INT,
             1,
-            &[(1 << DATA_MEM_PTR) | (1 << DATA_MEM_FD)],
+            &[if dmabuf_requested() {
+                1 << DATA_MEM_DMABUF
+            } else {
+                (1 << DATA_MEM_PTR) | (1 << DATA_MEM_FD)
+            }],
         );
     })
 }
@@ -322,13 +415,29 @@ fn crop_meta() -> Pod {
     })
 }
 
-/// The negotiated `(video format, width, height)` from a Format object.
+/// The negotiated format from a Format object.
+///
+/// `modifier` is present only when the compositor agreed to DMA-BUF; a shared
+/// memory stream leaves it `None`. It is what decides which path the frame
+/// takes, not the format code, because a DRM fourcc can also arrive over
+/// shared memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct NegotiatedFormat {
+    pub format: u32,
+    pub width: u32,
+    pub height: u32,
+    pub modifier: Option<u64>,
+}
+
+/// The negotiated format from a Format object.
 ///
 /// # Safety
 /// `pod` must point at a valid SPA pod.
-unsafe fn parse_format(pod: *const c_void) -> Option<(u32, u32, u32)> {
+unsafe fn parse_format(pod: *const c_void) -> Option<NegotiatedFormat> {
     let read =
         |offset: usize| unsafe { pod.cast::<u8>().add(offset).cast::<u32>().read_unaligned() };
+    let read64 =
+        |offset: usize| unsafe { pod.cast::<u8>().add(offset).cast::<u64>().read_unaligned() };
     let size = read(0) as usize;
     if read(4) != TYPE_OBJECT || size < 8 {
         return None;
@@ -336,6 +445,7 @@ unsafe fn parse_format(pod: *const c_void) -> Option<(u32, u32, u32)> {
     let end = 8 + size;
     let mut offset = 16;
     let (mut format, mut width, mut height) = (None, None, None);
+    let mut modifier = None;
     while offset + 16 <= end {
         let key = read(offset);
         let value_size = read(offset + 8) as usize;
@@ -349,6 +459,7 @@ unsafe fn parse_format(pod: *const c_void) -> Option<(u32, u32, u32)> {
         }
         match (key, value_type) {
             (FORMAT_VIDEO_FORMAT, TYPE_ID) => format = Some(read(value)),
+            (FORMAT_VIDEO_MODIFIER, TYPE_LONG) => modifier = Some(read64(value)),
             (FORMAT_VIDEO_SIZE, TYPE_RECTANGLE) => {
                 width = Some(read(value));
                 height = Some(read(value + 4));
@@ -357,7 +468,209 @@ unsafe fn parse_format(pod: *const c_void) -> Option<(u32, u32, u32)> {
         }
         offset += 16 + value_size.next_multiple_of(8);
     }
-    Some((format?, width?, height?))
+    Some(NegotiatedFormat {
+        format: format?,
+        width: width?,
+        height: height?,
+        modifier,
+    })
+}
+
+fn dmabuf_requested() -> bool {
+    std::env::var("OPENUUYC_CAPTURE_DMABUF").is_ok_and(|value| value != "0")
+}
+
+/// Import into the baseline's owned BGRA picture while the PipeWire buffer is
+/// dequeued. No compositor buffer or fd is retained by the encoder/cache.
+fn read_dmabuf_picture(
+    buffer: &SpaBuffer,
+    data: &SpaData,
+    format: NegotiatedFormat,
+) -> Result<Picture> {
+    ensure!(
+        buffer.n_datas == 1 && data.fd >= 0 && !data.chunk.is_null(),
+        "DMA-BUF 要求一个有效 RGB 平面"
+    );
+    let chunk = unsafe { &*data.chunk };
+    ensure!(
+        chunk.stride > 0 && format.width > 0 && format.height > 0,
+        "DMA-BUF 尺寸或 stride 无效"
+    );
+    let size = unsafe { libc::lseek(data.fd as i32, 0, libc::SEEK_END) };
+    let size = u32::try_from(size).context("读取 DMA-BUF 真实大小失败")?;
+    ensure!(size > 0, "空 DMA-BUF");
+    let (va_fourcc, drm_fourcc) = match format.format {
+        VIDEO_BGRA => (cros_libva::VA_FOURCC_BGRA, u32::from_le_bytes(*b"AR24")),
+        VIDEO_BGRX => (cros_libva::VA_FOURCC_BGRX, u32::from_le_bytes(*b"XR24")),
+        VIDEO_RGBA => (cros_libva::VA_FOURCC_RGBA, u32::from_le_bytes(*b"AB24")),
+        VIDEO_RGBX => (cros_libva::VA_FOURCC_RGBX, u32::from_le_bytes(*b"XB24")),
+        _ => bail!("不支持的 DMA-BUF RGB 格式"),
+    };
+    thread_local! {
+        static IMPORT: std::cell::OnceCell<(std::rc::Rc<cros_libva::Display>, bool)> = const { std::cell::OnceCell::new() };
+    }
+    IMPORT.with(|cell| {
+        if cell.get().is_none() {
+            let display = cros_libva::Display::open().context("找不到 VA-API render node")?;
+            let mut config = display
+                .create_config(
+                    Vec::new(),
+                    cros_libva::VAProfile::VAProfileNone,
+                    cros_libva::VAEntrypoint::VAEntrypointVideoProc,
+                )
+                .map_err(|e| anyhow!(e.to_string()))?;
+            let types = config
+                .query_surface_attributes_by_type(
+                    cros_libva::VASurfaceAttribType::VASurfaceAttribMemoryType,
+                )
+                .map_err(|e| anyhow!(e.to_string()))?
+                .iter()
+                .fold(0u32, |mask, value| match value {
+                    cros_libva::GenericValue::Integer(value) => mask | *value as u32,
+                    _ => mask,
+                });
+            let prime2 = types & cros_libva::VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2 != 0;
+            ensure!(
+                prime2 || types & cros_libva::VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME != 0,
+                "驱动不支持 PRIME 导入"
+            );
+            tracing::info!(prime2, types, "DMA-BUF 基线采集导入类型已选择");
+            drop(config);
+            let _ = cell.set((display, prime2));
+        }
+        let (display, prime2) = cell.get().expect("initialized above");
+        let modifier = format.modifier.context("DMA-BUF 缺少 modifier")?;
+        ensure!(modifier != DRM_MOD_INVALID, "DMA-BUF modifier 未确定");
+        // Experimental independent shader path, never a compositor lease.
+        // Leave the proven DMA capture baseline available during validation.
+        thread_local! {
+            static GPU_FAILED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        }
+        if std::env::var("OPENUUYC_GPU_CONVERT").as_deref() == Ok("1")
+            && !GPU_FAILED.with(|failed|failed.get()) {
+
+            thread_local! {
+                static GPU: std::cell::OnceCell<Result<super::super::gpu_convert::Converter, String>> = const { std::cell::OnceCell::new() };
+            }
+            let crop = picture_crop(buffer, format.width, format.height);
+            let result = GPU.with(|cell| {
+                let converter=cell.get_or_init(||super::super::gpu_convert::Converter::new(display.clone()).map_err(|e|e.to_string()));
+                match converter {
+                    Ok(converter)=>converter.convert(&super::super::gpu_convert::RgbDma { fd:data.fd as i32,width:format.width,height:format.height,pitch:chunk.stride as u32,offset:chunk.offset,fourcc:drm_fourcc,modifier },crop),
+                    Err(e)=>Err(anyhow!("{e}")),
+                }
+            });
+            match result {
+                Ok(frame)=>return Ok(Picture { width:crop.2,height:crop.3,pixels:vec![],nv12:Some(frame) }),
+                Err(error)=> {
+                    GPU_FAILED.with(|failed|failed.set(true));
+                    tracing::warn!(%error,"独立 GPU 转换不可用，保持 DMA-BUF 的基线采集路径");
+                },
+            }
+        }
+        let descriptor = CaptureImport {
+            va_fourcc,
+            drm_fourcc,
+            width: format.width,
+            height: format.height,
+            size,
+            fd: data.fd as i32,
+            offset: chunk.offset,
+            pitch: chunk.stride as u32,
+            modifier,
+            prime2: *prime2,
+        };
+        let surfaces = display
+            .create_surfaces(
+                cros_libva::VA_RT_FORMAT_RGB32,
+                Some(va_fourcc),
+                format.width,
+                format.height,
+                None,
+                vec![descriptor],
+            )
+            .map_err(|e| anyhow!(e.to_string()))?;
+        let image = cros_libva::Image::derive_from(&surfaces[0], (format.width, format.height))
+            .map_err(|e| anyhow!(e.to_string()))?;
+        let info = image.image();
+        let pixel_format = match info.format.fourcc {
+            cros_libva::VA_FOURCC_BGRA | cros_libva::VA_FOURCC_BGRX => VIDEO_BGRA,
+            cros_libva::VA_FOURCC_RGBA | cros_libva::VA_FOURCC_RGBX => VIDEO_RGBA,
+            _ => bail!("导入后未提供 packed RGB 图像"),
+        };
+        copy_picture_pixels(
+            buffer,
+            image.as_ref(),
+            info.offsets[0] as usize,
+            info.pitches[0] as usize,
+            pixel_format,
+            format.width,
+            format.height,
+        )
+        .context("导入图像的尺寸或裁剪越界")
+    })
+}
+
+/// The effective uncommitted PRIME fix: choose the supported import API,
+/// map DRM/VA byte orders correctly, and keep descriptor storage alive.
+struct CaptureImport {
+    va_fourcc: u32,
+    drm_fourcc: u32,
+    width: u32,
+    height: u32,
+    size: u32,
+    fd: i32,
+    offset: u32,
+    pitch: u32,
+    modifier: u64,
+    prime2: bool,
+}
+impl cros_libva::SurfaceMemoryDescriptor for CaptureImport {
+    fn add_attrs(
+        &mut self,
+        attrs: &mut Vec<cros_libva::VASurfaceAttrib>,
+    ) -> Option<Box<dyn std::any::Any>> {
+        let mut memory =
+            cros_libva::VASurfaceAttrib::new_memory_type(cros_libva::MemoryType::DrmPrime2);
+        if self.prime2 {
+            let mut descriptor: Box<cros_libva::VADRMPRIMESurfaceDescriptor> = Box::default();
+            descriptor.fourcc = self.va_fourcc;
+            descriptor.width = self.width;
+            descriptor.height = self.height;
+            descriptor.num_objects = 1;
+            descriptor.objects[0].fd = self.fd;
+            descriptor.objects[0].size = self.size;
+            descriptor.objects[0].drm_format_modifier = self.modifier;
+            descriptor.num_layers = 1;
+            descriptor.layers[0].drm_format = self.drm_fourcc;
+            descriptor.layers[0].num_planes = 1;
+            descriptor.layers[0].offset[0] = self.offset;
+            descriptor.layers[0].pitch[0] = self.pitch;
+            attrs.push(memory);
+            attrs.push(cros_libva::VASurfaceAttrib::new_buffer_descriptor(
+                &mut *descriptor,
+            ));
+            Some(descriptor)
+        } else {
+            let fds = Box::new([self.fd as usize]);
+            let mut descriptor: Box<cros_libva::VASurfaceAttribExternalBuffers> = Box::default();
+            descriptor.pixel_format = self.va_fourcc;
+            descriptor.width = self.width;
+            descriptor.height = self.height;
+            descriptor.data_size = self.size;
+            descriptor.num_planes = 1;
+            descriptor.pitches[0] = self.pitch;
+            descriptor.offsets[0] = self.offset;
+            descriptor.buffers = fds.as_ptr() as *mut usize;
+            descriptor.num_buffers = 1;
+            memory.value.value.i = cros_libva::VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME as i32;
+            attrs.push(memory);
+            attrs.push(cros_libva::VASurfaceAttrib::new_buffer_descriptor(
+                &mut *descriptor,
+            ));
+            Some(Box::new((descriptor, fds)))
+        }
+    }
 }
 
 // --- Stream ----------------------------------------------------------------------
@@ -367,15 +680,17 @@ pub(super) struct Picture {
     pub width: u32,
     pub height: u32,
     pub pixels: Vec<u8>,
+    pub nv12: Option<Arc<super::super::gpu_convert::OwnedNv12>>,
 }
 
 #[derive(Default)]
 struct State {
     picture: Option<Picture>,
     sequence: u64,
-    format: Option<(u32, u32, u32)>,
+    format: Option<NegotiatedFormat>,
     streaming: bool,
     error: Option<String>,
+    buffers_sent: bool,
 }
 
 struct Shared {
@@ -429,15 +744,29 @@ unsafe extern "C" fn on_param_changed(data: *mut c_void, id: u32, param: *const 
     }
     let callbacks = unsafe { &*data.cast::<Callbacks>() };
     let format = unsafe { parse_format(param) };
-    lock(&callbacks.shared.state).format = format;
-    tracing::debug!(?format, "PipeWire screencast format negotiated");
-    // Ask for buffers in memory the CPU can read, and for the crop region.
+    let mut state = lock(&callbacks.shared.state);
+    state.format = format;
+    if state.buffers_sent {
+        return;
+    }
+    state.buffers_sent = true;
+    drop(state);
+    // The portal must fixate the format before it receives a buffer request.
+    // Submit allocation and metadata parameters once after Format is received.
     let buffers = buffers().aligned();
     let meta = crop_meta().aligned();
-    let mut params = [buffers.as_ptr().cast::<c_void>(), meta.as_ptr().cast()];
+    let mut params = [
+        buffers.as_ptr().cast::<c_void>(),
+        meta.as_ptr().cast::<c_void>(),
+    ];
     unsafe {
-        (callbacks.api.stream_update_params)(callbacks.stream, params.as_mut_ptr(), 2);
-    }
+        (callbacks.api.stream_update_params)(
+            callbacks.stream,
+            params.as_mut_ptr(),
+            params.len() as u32,
+        )
+    };
+    tracing::debug!(?format, "PipeWire screencast format negotiated");
 }
 
 unsafe extern "C" fn on_process(data: *mut c_void) {
@@ -474,25 +803,72 @@ unsafe extern "C" fn on_process(data: *mut c_void) {
 ///
 /// # Safety
 /// `buffer` must be a buffer the stream just dequeued.
-unsafe fn read_picture(
-    buffer: *mut SpaBuffer,
-    (format, width, height): (u32, u32, u32),
-) -> Option<Picture> {
+unsafe fn read_picture(buffer: *mut SpaBuffer, negotiated: NegotiatedFormat) -> Option<Picture> {
+    let NegotiatedFormat {
+        format,
+        width,
+        height,
+        modifier: _,
+    } = negotiated;
     let buffer = unsafe { &*buffer };
     if buffer.n_datas == 0 || buffer.datas.is_null() {
         return None;
     }
     let data = unsafe { &*buffer.datas };
+    if data.kind == DATA_MEM_DMABUF {
+        return match read_dmabuf_picture(buffer, data, negotiated) {
+            Ok(picture) => Some(picture),
+            Err(error) => {
+                tracing::warn!(%error, "DMA-BUF 导入失败");
+                None
+            }
+        };
+    }
     if data.data.is_null() || data.chunk.is_null() {
-        // DMA-BUF, which was not offered, or an empty buffer.
+        // A DMA-BUF was not mapped for the CPU. Asking the portal for one does
+        // not help: Hyprland's ScreenCast offers only MemFd, so this stays the
+        // path a GPU encoder would need to import through PipeWire directly.
+        tracing::debug!(data_type = data.kind, "PipeWire buffer is not CPU-mappable");
         return None;
     }
     let chunk = unsafe { &*data.chunk };
+    // The type the portal actually chose, which is the only way to tell whether
+    // a DMA-BUF request was honoured or quietly answered with shared memory.
+    tracing::debug!(
+        data_type = data.kind,
+        maxsize = data.maxsize,
+        "PipeWire buffer delivered"
+    );
     let stride = if chunk.stride > 0 {
         chunk.stride as usize
     } else {
         width as usize * 4
     };
+    let base = (chunk.offset % data.maxsize.max(1)) as usize;
+    let source =
+        unsafe { std::slice::from_raw_parts(data.data.cast::<u8>(), data.maxsize as usize) };
+    copy_picture_pixels(buffer, source, base, stride, format, width, height)
+}
+
+fn copy_picture_pixels(
+    buffer: &SpaBuffer,
+    source: &[u8],
+    base: usize,
+    stride: usize,
+    format: u32,
+    width: u32,
+    height: u32,
+) -> Option<Picture> {
+    let (x, y, w, h) = picture_crop(buffer, width, height);
+    let (x, y, w, h) = (x as usize, y as usize, w as usize, h as usize);
+    let needed = base + (y + h).saturating_sub(1) * stride + (x + w) * 4;
+    if w == 0 || h == 0 || needed > source.len() {
+        return None;
+    }
+    copy_cropped_pixels(source, base, stride, format, x, y, w, h)
+}
+
+fn picture_crop(buffer: &SpaBuffer, width: u32, height: u32) -> (u32, u32, u32, u32) {
     let (mut x, mut y, mut w, mut h) = (0usize, 0usize, width as usize, height as usize);
     for index in 0..buffer.n_metas as usize {
         let meta = unsafe { &*buffer.metas.add(index) };
@@ -509,29 +885,50 @@ unsafe fn read_picture(
             }
         }
     }
-    let base = (chunk.offset % data.maxsize.max(1)) as usize;
-    let needed = base + (y + h).saturating_sub(1) * stride + (x + w) * 4;
-    if w == 0 || h == 0 || needed > data.maxsize as usize {
-        return None;
-    }
-    let source =
-        unsafe { std::slice::from_raw_parts(data.data.cast::<u8>(), data.maxsize as usize) };
+    (x as u32, y as u32, w as u32, h as u32)
+}
+
+fn copy_cropped_pixels(
+    source: &[u8],
+    base: usize,
+    stride: usize,
+    format: u32,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+) -> Option<Picture> {
+    // Only the encoders read these pixels, and both convert with the colour
+    // channels alone: the alpha byte is never looked at. Writing it would cost
+    // a pass over the frame for nothing, so the buffer is left as the
+    // compositor sent it.
     let swap = matches!(format, VIDEO_RGBX | VIDEO_RGBA);
-    let mut pixels = Vec::with_capacity(w * h * 4);
-    for row in 0..h {
-        let start = base + (y + row) * stride + x * 4;
-        pixels.extend_from_slice(&source[start..start + w * 4]);
-    }
-    for pixel in pixels.chunks_exact_mut(4) {
-        if swap {
-            pixel.swap(0, 2);
+    let mut pixels = vec![0u8; w * h * 4];
+    if !swap {
+        // The common case is already BGRX, so each row is a straight copy.
+        for row in 0..h {
+            let start = base + (y + row) * stride + x * 4;
+            pixels[row * w * 4..(row + 1) * w * 4].copy_from_slice(&source[start..start + w * 4]);
         }
-        pixel[3] = 0xff;
+    } else {
+        // Swap red and blue while copying, so the result is BGRA either way.
+        for row in 0..h {
+            let start = base + (y + row) * stride + x * 4;
+            let source_row = &source[start..start + w * 4];
+            let target = &mut pixels[row * w * 4..(row + 1) * w * 4];
+            for (texel, out) in source_row.chunks_exact(4).zip(target.chunks_exact_mut(4)) {
+                out[0] = texel[2];
+                out[1] = texel[1];
+                out[2] = texel[0];
+                out[3] = texel[3];
+            }
+        }
     }
     Some(Picture {
         width: w as u32,
         height: h as u32,
         pixels,
+        nv12: None,
     })
 }
 
@@ -642,15 +1039,20 @@ impl Stream {
                     &*this._events,
                     this.callbacks.cast(),
                 );
-                let format = enum_format().aligned();
+                let format = if dmabuf_requested() {
+                    enum_format()
+                } else {
+                    enum_format_shm()
+                }
+                .aligned();
                 let mut params = [format.as_ptr().cast::<c_void>()];
                 let connected = (api.stream_connect)(
                     this.stream,
                     DIRECTION_INPUT,
                     node,
-                    FLAG_AUTOCONNECT | FLAG_MAP_BUFFERS,
+                    FLAG_AUTOCONNECT,
                     params.as_mut_ptr(),
-                    1,
+                    params.len() as u32,
                 );
                 ensure!(connected >= 0, "连接 PipeWire 画面流失败：{connected}");
                 Ok(())
@@ -733,10 +1135,70 @@ mod tests {
         .aligned();
         assert_eq!(
             unsafe { parse_format(pod.as_ptr().cast()) },
-            Some((VIDEO_BGRX, 2560, 1440))
+            Some(NegotiatedFormat {
+                format: VIDEO_BGRX,
+                width: 2560,
+                height: 1440,
+                modifier: None
+            })
         );
         let choices = enum_format().aligned();
         let size = unsafe { choices.as_ptr().cast::<u32>().read() } as usize;
         assert_eq!((size + 8) % 8, 0);
+    }
+
+    #[test]
+    fn imported_rgb_preserves_baseline_crop_channel_order_and_bounds() {
+        let mut region = SpaMetaRegion {
+            x: 1,
+            y: 1,
+            width: 1,
+            height: 1,
+        };
+        let mut meta = SpaMeta {
+            kind: META_VIDEO_CROP,
+            size: size_of::<SpaMetaRegion>() as u32,
+            data: (&mut region as *mut SpaMetaRegion).cast(),
+        };
+        let buffer = SpaBuffer {
+            n_metas: 1,
+            n_datas: 0,
+            metas: &mut meta,
+            datas: std::ptr::null_mut(),
+        };
+        let source = [
+            0, 0, 0, 0, 0, 0, 0, 0, 9, 9, 9, 9, 0, 0, 0, 0, 10, 20, 30, 255,
+        ];
+        let picture = copy_picture_pixels(&buffer, &source, 0, 12, VIDEO_RGBA, 2, 2).unwrap();
+        assert_eq!((picture.width, picture.height), (1, 1));
+        assert_eq!(picture.pixels, vec![30, 20, 10, 255]);
+        assert!(copy_picture_pixels(&buffer, &source[..19], 0, 12, VIDEO_RGBA, 2, 2).is_none());
+    }
+
+    #[test]
+    fn buffers_offers_dmabuf_in_one_flags_choice() {
+        // The portal only offers DMA-BUF when the mask reaches it intact, and
+        // the value count is derived from the body size rather than stored, so
+        // a wrong word count silently produces a different number of values.
+        let pod = buffers().aligned();
+        let words: Vec<u32> = (0..14)
+            .map(|index| unsafe { pod.as_ptr().cast::<u32>().add(index).read() })
+            .collect();
+        // [size, TYPE_OBJECT, ParamBuffers, PARAM_BUFFERS, key, pad,
+        //  choice size, TYPE_CHOICE, CHOICE_FLAGS, 0, child size, TYPE_INT, mask]
+        assert_eq!(words[1], TYPE_OBJECT);
+        assert_eq!(words[2], OBJECT_PARAM_BUFFERS);
+        assert_eq!(words[3], PARAM_BUFFERS);
+        assert_eq!(words[4], BUFFERS_DATA_TYPE);
+        assert_eq!(words[7], TYPE_CHOICE);
+        assert_eq!(words[8], CHOICE_FLAGS);
+        assert_eq!(words[11], TYPE_INT);
+        let mask = words[12];
+        let expected = if dmabuf_requested() {
+            1 << DATA_MEM_DMABUF
+        } else {
+            (1 << DATA_MEM_PTR) | (1 << DATA_MEM_FD)
+        };
+        assert_eq!(mask, expected);
     }
 }

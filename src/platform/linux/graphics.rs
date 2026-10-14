@@ -85,20 +85,43 @@ pub(crate) fn create_device() -> Result<Graphics> {
 
 fn create_graphics() -> Result<Graphics> {
     // Vulkan first, GL as the fallback for drivers or VMs without it.
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::VULKAN | wgpu::Backends::GL,
-        ..wgpu::InstanceDescriptor::new_without_display_handle_from_env()
-    });
+    // OPENUUYC_BACKEND=gl 可强制 OpenGL：作为 Vulkan 不可用时的备用后端。
+    // 注意 new_without_display_handle_from_env() 内部会调 with_env()，
+    // 必须在其后覆盖 backends，否则 WGPU_BACKEND 会失效。
+    let mut desc = wgpu::InstanceDescriptor::new_without_display_handle_from_env();
+    desc.backends = match std::env::var("OPENUUYC_BACKEND").as_deref() {
+        Ok("gl") | Ok("gles") | Ok("opengl") => wgpu::Backends::GL,
+        Ok("vulkan") | Ok("vk") => wgpu::Backends::VULKAN,
+        _ => wgpu::Backends::VULKAN | wgpu::Backends::GL,
+    };
+    // Haswell/Broadwell 的 HasVK 驱动上报 conformance_version.major == 0（未通过
+    // Vulkan 认证），wgpu 会据此隐藏整个适配器，UI 便静默回落到 llvmpipe 软渲
+    // （Haswell 上空闲即烧掉一整个核心）。除非显式要求恢复 wgpu 默认行为，
+    // 否则允许使用非认证适配器，优先走硬件渲染。
+    if !matches!(
+        std::env::var("WGPU_ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER").as_deref(),
+        Ok("0") | Ok("false")
+    ) {
+        desc.flags |= wgpu::InstanceFlags::ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER;
+    }
+    let instance = wgpu::Instance::new(desc);
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::HighPerformance,
         ..Default::default()
     }))
     .context("没有可用的 GPU 适配器（需要 Vulkan 或 OpenGL）")?;
     let info = adapter.get_info();
+    // The zero-copy path imports VA-API dmabufs as Vulkan images; without the
+    // feature the renderer falls back to the CPU upload.
+    let mut required_features = wgpu::Features::empty();
+    let dmabuf_feature = wgpu::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF;
+    if crate::platform::linux::dmabuf::enabled() && adapter.features().contains(dmabuf_feature) {
+        required_features |= dmabuf_feature;
+    }
     let (device, queue) = pollster::block_on(
         adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("openuuyc-ui"),
-            required_features: wgpu::Features::empty(),
+            required_features,
             // The UI stays within the baseline limits; video upload does too.
             required_limits: wgpu::Limits::downlevel_defaults()
                 .using_resolution(adapter.limits())
@@ -200,6 +223,27 @@ impl UiPresenter {
         self.transform = Some(transform);
         self.video
             .upload_nv12(&self.device, &self.queue, width, height, data)
+    }
+
+    /// Binds an exported dmabuf as the video picture.
+    ///
+    /// The decoder's surface stays reserved through the frame's lease until the
+    /// picture is replaced. A backend that cannot import the buffer is recorded
+    /// as unsupported so the decoder stops exporting; this picture is dropped
+    /// and the previous one stays on screen for one frame.
+    pub(crate) fn upload_video_dmabuf(
+        &mut self,
+        width: u32,
+        height: u32,
+        frame: &crate::platform::linux::dmabuf::DmabufFrame,
+        transform: [[f32; 4]; 3],
+    ) -> Result<()> {
+        if !self.video.upload_dmabuf(&self.device, frame, width, height) {
+            crate::platform::linux::dmabuf::mark_unsupported();
+            return Ok(());
+        }
+        self.transform = Some(transform);
+        Ok(())
     }
 
     pub(crate) fn set_video_placement(
@@ -327,7 +371,8 @@ impl UiPresenter {
             }
             self.renderer.render(&mut pass, &jobs, &descriptor);
         }
-        self.queue
+        let submission = self
+            .queue
             .submit(user_buffers.into_iter().chain(Some(encoder.finish())));
         // Freeing after submit keeps a texture alive while the frame still uses it.
         for id in &output.textures_delta.free {
@@ -342,7 +387,22 @@ impl UiPresenter {
         // submitting nor presenting hands it back -- only maintaining the device
         // does. Without this the buffers pile up at the video bitrate, a few
         // hundred megabytes a second, until an upload fails with out of memory.
-        if let Err(error) = self.device.poll(wgpu::PollType::Poll) {
+        //
+        // When the picture aliases a decoder surface the wait must be real:
+        // the next upload drops the lease and frees that surface for decoding,
+        // which would overwrite it while the GPU is still sampling. Blocking
+        // here costs the tail of one frame and removes that race. The wait is
+        // bounded: a hung or lost device must not freeze the UI thread, and
+        // the worst a late frame can cost is one torn picture.
+        let poll = if self.video.holds_dmabuf() {
+            wgpu::PollType::Wait {
+                submission_index: Some(submission),
+                timeout: Some(std::time::Duration::from_millis(250)),
+            }
+        } else {
+            wgpu::PollType::Poll
+        };
+        if let Err(error) = self.device.poll(poll) {
             tracing::debug!(?error, "维护 GPU 设备失败");
         }
         Ok(UiFrame::Presented)

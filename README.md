@@ -69,13 +69,13 @@ OpenUUYC 是用 Rust 编写的 UU 远程第三方客户端，支持 Windows 和 
 
 ## Linux 版差异
 
-Linux 版可以登录、管理设备、观看和控制远端桌面，界面走 wgpu（Vulkan，缺失时回退 OpenGL），X11 与 Wayland 均可运行。本机被控在 Xorg 会话中可用。与 Windows 版相比：
+Linux 版可以登录、管理设备、观看和控制远端桌面，界面走 wgpu（Vulkan，缺失时回退 OpenGL），X11 与 Wayland 均可运行。本机被控在 Xorg 与 Wayland 会话中均可用（Wayland 下键鼠需要 `/dev/uinput` 权限，见下）。与 Windows 版相比：
 
-- **解码**：H.264 通过 VA-API 硬件解码（Constrained Baseline、Main、High，8 位 4:2:0），其余 H.264 格式与 AV1 使用 Rust 软件解码；AV1 软解只声明 8 位 4:2:0（播放窗口按 NV12 绘制），10 位与 4:4:4 不向对端声明。H.265 暂不支持。双方都有硬件编解码时协商优先选硬件。硬件解码需要对应的 VA-API 驱动。编解码首选中的解码方式与编码方式（硬件优先、仅硬件、仅软件）可用，但不能指定显卡：VA-API 与 NVENC 都使用桌面所在的显卡，显卡一栏显示为“自动”。
+- **解码**：H.264 通过 VA-API 硬件解码（Constrained Baseline、Main、High，8 位 4:2:0），其余 H.264 格式与 AV1 使用 Rust 软件解码；AV1 软解只声明 8 位 4:2:0（播放窗口按 NV12 绘制），10 位与 4:4:4 不向对端声明。H.265 暂不支持。双方都有硬件编解码时协商优先选硬件。硬件解码需要对应的 VA-API 驱动。编解码首选中的解码方式与编码方式（硬件优先、仅硬件、仅软件）可用，但不能指定显卡：VA-API 与 NVENC 都使用桌面所在的显卡，显卡一栏显示为“自动”。设 `OPENUUYC_ZEROCOPY=1` 时，VA-API 解出的画面以 dmabuf 直接交给渲染器、不经内存拷贝（零拷贝；只在 Intel 显卡上验证过，默认关闭）。
 - **声音**：主控端的播放与麦克风经 PulseAudio 协议直接连接声音服务（PulseAudio 或 PipeWire 的 pulse 服务），输出设备列表即声音服务中的输出设备；没有声音服务时改用 ALSA。
 - **剪贴板**：主控与被控两端都支持文字、图片与文件双向同步。粘贴远端复制的文件时，文件通过挂载在 `$XDG_RUNTIME_DIR` 下的只读 FUSE 文件系统按需读取，需要安装 `fuse3`。文件拖放在 Xorg 会话中可用，经 XDND 协议完成：作为主控，本地文件可拖进播放窗口（OpenUUYC 对端为实时拖放，官方被控为松手后投放），也可从 OpenUUYC 被控的桌面拖出到本地桌面，官方被控用队列浮窗发来的文件保存到下载目录；作为被控，主控拖入的文件在落点处投放给本机程序，向官方 Windows 主控发送文件时，在桌面上拖动文件会于屏幕顶部弹出待发送队列浮窗。远端文件以 FUSE 挂载的路径交给目标程序，读取时才按需传输；目标读完全部文件即视为完成，五分钟未读取则停止。Wayland 会话不支持文件拖放（提示“Wayland 桌面暂不支持拖放文件”）。拖出到本地或远端后不能再拖回原窗口接续原拖动（Windows 版经 OLE 支持），Linux 端不向对端声明这项能力，两端都把拖出视为结束；X11 拖放也没有拖动预览图。
 - **被控文件传输与电源**：独立文件传输在本机桌面用户身份下运行，路径为 Unix 路径，根目录列出 `/` 与 xdg 用户目录（文档、桌面、下载等），不允许经过符号链接。远程关机与重启经 systemd-logind 执行，受 polkit 策略约束（有其他用户登录时可能需要管理员授权）。远程开机的网络登记、局域网唤醒协助与网卡检查可用（检查只读：唤醒权限取自 sysfs，魔术包状态需安装 `ethtool`）；配置网卡需要 root，程序内不提供，请用 `sudo ethtool -s <网卡> wol g` 设置；开启远程开机时写入 `~/.config/autostart/openuuyc.desktop` 登录自启动。
-- **本机被控**：在已登录的桌面内运行。画面采集按 Sunshine 的优先级选择：Xorg 下先用 NVIDIA NvFBC（画面直接抓进显存交给 NVENC，仅在 NVENC 可用时选用），再到 X11 MIT-SHM，最后是 XDG 屏幕共享门户（PipeWire）；Wayland 下只用门户。门户第一次使用时需要在本机屏幕上点“共享”，授权会被记住（`~/.local/share/OpenUUYC/screencast-restore-token`，在系统隐私设置中可撤销）；授权之前登录时不检测本机编码能力（以免登录卡在授权窗口），被控设置的编码列表在第一次被控连接后才按实际能力显示；可用环境变量 `OPENUUYC_CAPTURE`（如 `nvfbc`、`x11,portal`）指定顺序。编码优先用 NVENC（H.264/H.265，4:2:0 与 4:4:4，8 位；AV1 为 4:2:0 8 位，需要带 AV1 编码单元的显卡，尚未在这类显卡上实测），不可用时回退 Rust H.264 软件编码（没有 HDR 采集，因此没有 10 位）；桌面声音参照 Sunshine 经 PulseAudio 客户端接口录制所选播放设备的监听源（PulseAudio 与 PipeWire 均可）；该设备静音或音量为 0 时可能录不到声音；键鼠经 XTest 注入（按物理键位映射，文字输入不依赖键盘布局，移动端触摸按单指指针模拟），因此键鼠目前只在 Xorg 会话可用；支持物理多屏与通过 RandR 切换分辨率，退出时恢复。暂无 AMD/Intel 硬件编码、10 位与 HDR、KMS 采集、虚拟屏、超级屏、无显示器兜底屏、按显示器 DPI、被控设置中的「GPU 调度」（Windows 的进程 GPU 调度优先级，Linux 驱动没有对应接口，选项不显示）、远端麦克风与调整默认音频设备（OpenUUYC Audio 虚拟声卡是 Windows 驱动；Linux 上开启时会提示暂不支持），也没有后台服务，因此无法在登录界面或锁屏时被控。
+- **本机被控**：在已登录的桌面内运行。画面采集按 Sunshine 的优先级选择：Xorg 下先用 NVIDIA NvFBC（画面直接抓进显存交给 NVENC，仅在 NVENC 可用时选用），再到 X11 MIT-SHM，最后是 XDG 屏幕共享门户（PipeWire）；Wayland 下只用门户。门户第一次使用时需要在本机屏幕上点“共享”，授权会被记住（`~/.local/share/OpenUUYC/screencast-restore-token`，在系统隐私设置中可撤销）；授权之前登录时不检测本机编码能力（以免登录卡在授权窗口），被控设置的编码列表在第一次被控连接后才按实际能力显示；可用环境变量 `OPENUUYC_CAPTURE`（如 `nvfbc`、`x11,portal`）指定顺序。编码优先用 NVENC（H.264/H.265，4:2:0 与 4:4:4，8 位；AV1 为 4:2:0 8 位，需要带 AV1 编码单元的显卡，尚未在这类显卡上实测），其次是 VA-API H.264 编码（AMD 与 Intel，8 位 4:2:0；只在 Intel Haswell 的 i965 驱动上实测；探测时会实际编码并解码一帧来确认驱动可用），都不可用时回退 Rust H.264 软件编码（没有 HDR 采集，因此没有 10 位）。门户采集另有两个默认关闭的试验开关：`OPENUUYC_CAPTURE_DMABUF=1` 向门户协商 DMA-BUF 缓冲，`OPENUUYC_GPU_CONVERT=1` 在 GPU 上把采集画面转成 NV12；桌面声音参照 Sunshine 经 PulseAudio 客户端接口录制所选播放设备的监听源（PulseAudio 与 PipeWire 均可）；该设备静音或音量为 0 时可能录不到声音；键鼠按物理键位映射注入：Xorg 会话经 XTest（指针绝对定位，无需设置）；Wayland 会话经 `/dev/uinput`（内核层，能到达原生 Wayland 客户端；需要写权限，deb 与 AUR 包带 udev 规则，见[安装](#linux)），没有权限时回退 XTest，只能控制 XWayland 程序。uinput 设备只有相对位移，绝对定位按当前指针位置换算：Hyprland 下经其 IPC 读取指针与显示器布局，其他合成器只能从 XWayland 读取，指针停在原生窗口上时可能偏移；系统的指针加速也会影响精度，建议在被控端关闭加速。文字输入（移动端输入法等）在 Wayland 下经 `zwp_virtual_keyboard_v1`（Hyprland 等 wlroots 系合成器支持，GNOME 不支持时回退 XTest），Xorg 下经 XTest，都不依赖键盘布局；移动端触摸按单指指针模拟；支持物理多屏与通过 RandR 切换分辨率，退出时恢复。暂无 10 位与 HDR、KMS 采集、虚拟屏、超级屏、无显示器兜底屏、按显示器 DPI、被控设置中的「GPU 调度」（Windows 的进程 GPU 调度优先级，Linux 驱动没有对应接口，选项不显示）、远端麦克风与调整默认音频设备（OpenUUYC Audio 虚拟声卡是 Windows 驱动；Linux 上开启时会提示暂不支持），也没有后台服务，因此无法在登录界面或锁屏时被控。
 - **访问通知**：「系统通知」走桌面的 freedesktop 通知服务（GNOME、KDE 等），允许、拒绝、查看按钮直接回到正在运行的程序；「程序浮窗」在 X11 下放在主显示器右下角，Wayland 下由合成器决定位置。
 - **设备资料**：上报本机真实硬件，取自主机名、`/etc/os-release` 与内核版本、`/proc`、DMI 主板信息、PCI 显卡（按 `pci.ids` 命名）和默认路由所在网卡。SMBIOS 系统 UUID 只有 root 能读，因此系统标识由 `/etc/machine-id` 派生，重装系统后视为新设备。壁纸从 GNOME、Cinnamon、MATE 的 GSettings 或 KDE Plasma 配置读取，其他桌面会在诊断页提示暂不支持。
 - **安装与托盘**：没有“安装服务”，直接运行构建出的程序。“开机自启”写入 `~/.config/autostart/openuuyc.desktop`，指向当前运行的程序（deb 安装为 `/usr/bin/OpenUUYC`），登录桌面后在托盘启动；在桌面的“启动应用程序”里停用它，开关也显示为关闭。关闭窗口隐藏到托盘（StatusNotifierItem；GNOME 需 AppIndicator 扩展，Ubuntu 默认启用），桌面没有托盘时关闭即退出。
@@ -102,7 +102,31 @@ cargo dist
 
 ### Linux
 
-需要 Rust stable（edition 2024）与 C/C++ 工具链。Ubuntu 22.04 及以上：
+需要 Rust stable（edition 2024）与 C/C++ 工具链。
+
+#### Arch / Omarchy
+
+AUR 上有安装发布包的 `openuuyc-bin` 和跟踪 `linux-port` 分支源码构建的 `openuuyc-git`，说明见 [`packaging/aur/README.md`](packaging/aur/README.md)：
+
+```bash
+yay -S openuuyc-bin
+```
+
+Omarchy 用户可以把 [`packaging/omarchy/omarchy-menu.jsonc`](packaging/omarchy/omarchy-menu.jsonc) 里的条目加进 `~/.config/omarchy/extensions/omarchy-menu.jsonc`，从 `Super + Space → Install → Service` 安装。不用 AUR 时，在源码目录构建后（或解压 Release 里的 `OpenUUYC-<版本>-x86_64-linux.tar.zst` 后）运行 `./install-omarchy.sh`，它会安装程序、桌面入口、uinput 规则和 Omarchy 菜单项（`--uninstall` 卸载）。
+
+自建：
+
+```bash
+sudo pacman -S --needed base-devel cmake clang nasm pkg-config rust \
+    libva libx11 libxcb libxrandr libxi libxcursor libxfixes \
+    libxkbcommon libxkbcommon-x11 wayland libglvnd vulkan-icd-loader \
+    dbus alsa-lib openssl fuse3 noto-fonts-cjk
+cargo build --release --bin OpenUUYC
+```
+
+#### Debian / Ubuntu
+
+Ubuntu 22.04 及以上：
 
 ```bash
 sudo apt install build-essential cmake clang nasm pkg-config libva-dev \
@@ -114,6 +138,35 @@ cd openuuyc
 cargo build --release
 ./target/release/OpenUUYC gui
 ```
+
+#### 被控端输入权限（Wayland 必需）
+
+Wayland 会话下键鼠经 `/dev/uinput` 注入。安装包会带上 udev 规则，重载后当前登录用户即可使用：
+
+```bash
+sudo udevadm control --reload-rules && sudo modprobe uinput
+echo uinput | sudo tee /etc/modules-load.d/uinput.conf
+```
+
+规则使用 `TAG+="uaccess"`，由 systemd-logind 给本机活动会话授权，**不需要把用户加进 `input` 组，也不需要重新登录**。从源码构建或手动安装时，把
+[`packaging/linux/60-openuuyc-uinput.rules`](packaging/linux/60-openuuyc-uinput.rules)
+放到 `/etc/udev/rules.d/` 即可。没有权限时程序会记录一条警告并回退到 XTest（只影响 XWayland 客户端）。Xorg 会话不使用 uinput，无需这一步。
+
+Wayland 下被控需要 XDG 屏幕共享门户：
+
+```bash
+# Hyprland
+sudo pacman -S --needed xdg-desktop-portal-hyprland
+# GNOME / KDE 使用对应的 xdg-desktop-portal-gnome / -kde
+```
+
+首次被控时会弹出一次共享授权，之后记在 `~/.local/share/OpenUUYC/screencast-restore-token`。
+
+#### 硬件解码 / 编码
+
+- **解码**：H.264 走 VA-API。AMD 用 `mesa`，Intel 用 `intel-media-driver`，NVIDIA 用 `libva-nvidia-driver`（并设 `NVD_BACKEND=direct`）。
+- **编码**（被控）：NVIDIA 用 NVENC；AMD 与 Intel 经 VA-API 编码 H.264（Intel 需 `intel-media-driver` 或 `libva-intel-driver`，AMD 用 `mesa`），都不可用时回退软件编码。
+- **老 Intel GPU / 虚拟机**：Haswell/Broadwell 的 Vulkan 驱动未通过一致性认证，程序仍会使用它（设 `WGPU_ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER=0` 恢复 wgpu 默认的隐藏行为）；驱动无法向 Wayland surface 呈现时，可安装 `vulkan-swrast`（lavapipe）并用 `OPENUUYC_BACKEND=gl` 或 `OPENUUYC_BACKEND=vulkan` 指定界面后端。
 
 `cargo dist` 只用于 Windows 打包，Linux 直接用 `cargo build`。
 

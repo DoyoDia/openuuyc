@@ -99,6 +99,7 @@ impl Encoder {
         let copied = match image {
             Image::Cpu { pixels, .. } => self.input.upload(pixels),
             Image::Cuda(buffer) => self.input.copy_from_device(buffer.ptr, buffer.pitch),
+            Image::Nv12(_) => self.input.upload(&image.pixels()?),
         };
         timing.stage(1);
         copied?;

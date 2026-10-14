@@ -45,6 +45,10 @@ pub(super) enum Command {
         PreparedFiles,
         tokio::sync::oneshot::Sender<Result<(), String>>,
     ),
+    /// The local selection changed. Posted by the watcher thread.
+    LocalChanged,
+    /// The watcher stopped; the worker polls on a timer again.
+    WatchEnded,
 }
 
 /// Local files picked for a drag or a drop, walked before they are offered.
@@ -594,15 +598,19 @@ struct State {
     drag_tasks: HashMap<(u64, u32), Arc<LocalFiles>>,
     /// Set while this adapter writes, so the poll does not report its own write.
     writing: bool,
+    /// Set once a Wayland watcher is posting `LocalChanged`, which makes the
+    /// loop block instead of polling on a timer.
+    watching: bool,
 }
 
 pub(super) fn start() -> Result<()> {
     WORKER
         .get_or_init(|| {
             let (sender, receiver) = sync_channel(64);
+            let watcher_sender = sender.clone();
             let thread = std::thread::Builder::new()
                 .name("UU clipboard".into())
-                .spawn(move || run(receiver))
+                .spawn(move || run(receiver, watcher_sender))
                 .map_err(|error| format!("启动剪贴板线程失败：{error}"))?;
             Ok(Worker {
                 sender,
@@ -642,7 +650,7 @@ pub(super) fn shutdown() {
     }
 }
 
-fn run(receiver: Receiver<Command>) {
+fn run(receiver: Receiver<Command>, watcher_sender: SyncSender<Command>) {
     let clipboard = match arboard::Clipboard::new() {
         Ok(clipboard) => Some(clipboard),
         Err(error) => {
@@ -662,23 +670,102 @@ fn run(receiver: Receiver<Command>) {
         drag_files: HashMap::new(),
         drag_tasks: HashMap::new(),
         writing: false,
+        watching: false,
     };
+    // A Wayland watcher turns the poll into an event. X11 has no equivalent, so
+    // it keeps the timer; either way `poll_local` does the reading.
+    state.watching = start_watcher(watcher_sender);
     loop {
-        match state.receiver.recv_timeout(POLL) {
-            Ok(command) => {
-                if matches!(command, Command::Remove(u64::MAX)) {
-                    break;
+        // With a watcher running, a `LocalChanged` arrives when the selection
+        // actually changes, so the loop blocks instead of waking every `POLL`.
+        // Without one it falls back to the timer.
+        let command = if state.watching {
+            state.receiver.recv().ok()
+        } else {
+            match state.receiver.recv_timeout(POLL) {
+                Ok(command) => Some(command),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if let Err(error) = poll_local(&mut state) {
+                        tracing::debug!(%error, "读取本地剪贴板失败");
+                    }
+                    continue;
                 }
-                process(&mut state, command);
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => None,
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                if let Err(error) = poll_local(&mut state) {
-                    tracing::debug!(%error, "读取本地剪贴板失败");
-                }
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+        let Some(command) = command else { break };
+        if matches!(command, Command::Remove(u64::MAX)) {
+            break;
         }
+        if matches!(command, Command::WatchEnded) {
+            state.watching = false;
+        }
+        if matches!(command, Command::LocalChanged | Command::WatchEnded) {
+            if let Err(error) = poll_local(&mut state) {
+                tracing::debug!(%error, "读取本地剪贴板失败");
+            }
+            continue;
+        }
+        process(&mut state, command);
     }
+}
+
+/// Starts the Wayland selection watcher, returning whether it is running.
+///
+/// The watcher posts one `LocalChanged` per selection change and blocks in
+/// between, which is what lets the worker stop polling. `arboard` opens a fresh
+/// connection for every read, so a timer meant reconnecting several times a
+/// second whether or not anything had changed; a screenshot on the clipboard
+/// was PNG-decoded on each of those wakes.
+///
+/// Returns false when there is no Wayland session to watch, or the compositor
+/// offers no data-control protocol (GNOME), leaving the timer in charge. The
+/// watcher thread ends with the worker, since the send fails once the
+/// receiver is dropped, and posts `WatchEnded` if it stops before that.
+fn start_watcher(sender: SyncSender<Command>) -> bool {
+    use wl_clipboard_rs::paste::Seat;
+    use wl_clipboard_rs::watch::{ClipboardType, Watcher};
+    if std::env::var_os("WAYLAND_DISPLAY").is_none() {
+        return false;
+    }
+    let (ready, started) = std::sync::mpsc::sync_channel(1);
+    let spawned = std::thread::Builder::new()
+        .name("UU clipboard watch".into())
+        .spawn(move || {
+            let mut watcher = match Watcher::new(ClipboardType::Regular, Seat::Unspecified) {
+                Ok(watcher) => watcher,
+                Err(error) => {
+                    tracing::debug!(%error, "剪贴板监视不可用，回退到定时轮询");
+                    let _ = ready.send(false);
+                    return;
+                }
+            };
+            let _ = ready.send(true);
+            // The first event reports the current selection, which the poll
+            // picks up as it would any other change. A blocking send: this
+            // thread has nothing else to do, and a dropped event would be a
+            // missed change.
+            loop {
+                match watcher.next_event() {
+                    Ok(Some(_)) => {
+                        if sender.send(Command::LocalChanged).is_err() {
+                            return;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(error) => {
+                        tracing::debug!(%error, "剪贴板监视中断，回退到定时轮询");
+                        break;
+                    }
+                }
+            }
+            let _ = sender.send(Command::WatchEnded);
+        });
+    if let Err(error) = spawned {
+        tracing::debug!(%error, "剪贴板监视线程无法启动，回退到定时轮询");
+        return false;
+    }
+    started.recv().unwrap_or(false)
 }
 
 fn sessions(state: &State) -> Vec<Arc<Inner>> {
@@ -704,6 +791,8 @@ fn process(state: &mut State, command: Command) {
         }
     }
     match command {
+        // Handled by the worker loop, which turns them into a local read.
+        Command::LocalChanged | Command::WatchEnded => {}
         Command::Activate(weak) => {
             if let Some(session) = weak.upgrade() {
                 state.sessions.insert(session.id, Arc::downgrade(&session));

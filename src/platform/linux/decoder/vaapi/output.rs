@@ -1,4 +1,8 @@
 //! Read a cropped, pitched VA surface back into packed NV12.
+//!
+//! This is the fallback for drivers that cannot export the surface as a dmabuf
+//! or for renderers that cannot import one. When both sides support it, the
+//! picture stays on the GPU and never takes this path.
 use cros_libva::{Image, VAImage};
 
 use crate::media::decode_api::DecodeError;

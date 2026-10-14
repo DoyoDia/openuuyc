@@ -484,6 +484,15 @@ impl ConnectingWindowsRunner {
                         data,
                         color.transform(8),
                     )?,
+                    RenderSurface::Dmabuf {
+                        frame: dmabuf,
+                        color,
+                    } => shell.presenter.upload_video_dmabuf(
+                        frame.width,
+                        frame.height,
+                        dmabuf,
+                        color.transform(8),
+                    )?,
                     RenderSurface::CpuRgba8(pixels) => shell.presenter.upload_video(
                         frame.width,
                         frame.height,

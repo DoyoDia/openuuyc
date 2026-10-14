@@ -1,8 +1,10 @@
 //! The video layer drawn underneath the egui chrome on Linux.
 //!
-//! Decoded frames arrive either as NV12, which is converted to RGB by the
-//! fragment shader, or as RGBA when the decoder produced 4:4:4 and the CPU
-//! already converted it. Keeping NV12 on the GPU saves both the conversion and
+//! Decoded frames arrive as NV12, converted to RGB by the fragment shader, or
+//! as RGBA when the decoder produced 4:4:4 and the CPU already converted it.
+//! NV12 normally arrives as a dmabuf the layer imports as two single-plane
+//! textures, so no frame data crosses the CPU; drivers that cannot export one
+//! are uploaded instead. Keeping NV12 on the GPU saves both the conversion and
 //! two thirds of the upload: a 2560x1600 frame is 6 MiB instead of 16 MiB.
 //!
 //! The quad is letterboxed into the content area and can be rotated by the
@@ -47,11 +49,115 @@ enum Planes {
     },
 }
 
+/// An NV12 picture whose planes are dmabuf-backed textures.
+///
+/// The textures alias the decoder's surface, so the exported frame must stay
+/// alive for as long as they are drawn. `lease` carries that reservation.
+pub(crate) struct DmabufPlanes {
+    pub(crate) luma: wgpu::Texture,
+    pub(crate) chroma: wgpu::Texture,
+    pub(crate) lease: crate::platform::linux::dmabuf::SurfaceLease,
+}
+
+impl DmabufPlanes {
+    /// Wraps the decoder's exported dmabuf as two sampled textures.
+    ///
+    /// Returns `None` when the backend is not Vulkan or the driver cannot
+    /// import the buffer, so the caller can fall back to the CPU upload.
+    pub(crate) fn new(
+        device: &wgpu::Device,
+        frame: &crate::platform::linux::dmabuf::DmabufFrame,
+        width: u32,
+        height: u32,
+    ) -> Option<Self> {
+        use wgpu::hal::api::Vulkan as Vk;
+
+        // The dmabuf import path is Vulkan-only; the GL backend keeps the
+        // CPU upload even when the decoder exported a buffer.
+        let hal_device = unsafe { device.as_hal::<Vk>() }?;
+        let luma = import_plane(
+            device,
+            &hal_device,
+            &frame.planes[0],
+            frame.modifier,
+            wgpu::TextureFormat::R8Unorm,
+            width,
+            height,
+        )?;
+        let chroma = import_plane(
+            device,
+            &hal_device,
+            &frame.planes[1],
+            frame.modifier,
+            wgpu::TextureFormat::Rg8Unorm,
+            width.div_ceil(2),
+            height.div_ceil(2),
+        )?;
+        Some(Self {
+            luma,
+            chroma,
+            lease: frame.lease(),
+        })
+    }
+}
+
+/// Imports one dmabuf plane as a single-plane sampled texture.
+fn import_plane(
+    device: &wgpu::Device,
+    hal_device: &wgpu::hal::vulkan::Device,
+    plane: &crate::platform::linux::dmabuf::Plane,
+    modifier: u64,
+    format: wgpu::TextureFormat,
+    width: u32,
+    height: u32,
+) -> Option<wgpu::Texture> {
+    use wgpu::hal::api::Vulkan as Vk;
+    let fd = plane.dup().ok()?;
+    // wgpu-hal wants its own descriptor type, with the usage already reduced to
+    // the `TextureUses` bits the resource tracker understands.
+    let hal_desc = wgpu::hal::TextureDescriptor {
+        label: Some("openuuyc-video-dmabuf"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUses::RESOURCE,
+        memory_flags: wgpu::hal::MemoryFlags::empty(),
+        view_formats: Vec::new(),
+    };
+    let desc = wgpu::TextureDescriptor {
+        label: Some("openuuyc-video-dmabuf"),
+        size: hal_desc.size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    };
+    let hal_texture = unsafe {
+        hal_device
+            .texture_from_dmabuf_fd(fd, &hal_desc, modifier, plane.stride, plane.offset)
+            .ok()?
+    };
+    // Safe: the hal texture was created from this device and matches `desc`.
+    Some(unsafe {
+        device.create_texture_from_hal::<Vk>(hal_texture, &desc, wgpu::TextureUses::RESOURCE)
+    })
+}
+
 struct Frame {
     planes: Planes,
     bind_group: wgpu::BindGroup,
     width: u32,
     height: u32,
+    /// Held so the decoder's surface stays reserved while the texture is live.
+    lease: Option<crate::platform::linux::dmabuf::SurfaceLease>,
 }
 
 impl Frame {
@@ -105,8 +211,75 @@ impl VideoLayer {
         self.frame.is_some()
     }
 
+    /// Whether the current picture aliases a decoder surface.
+    ///
+    /// The caller must not let that surface return to the decoder pool until
+    /// the GPU is done sampling it, so it waits for the submission to complete.
+    pub(crate) fn holds_dmabuf(&self) -> bool {
+        self.frame
+            .as_ref()
+            .is_some_and(|frame| frame.lease.is_some())
+    }
+
     pub(crate) fn clear(&mut self) {
         self.frame = None;
+    }
+
+    /// Binds an exported dmabuf as the current picture.
+    ///
+    /// The luma and chroma textures alias the decoder's surface, so their
+    /// lease rides along in the frame and is only released when the picture is
+    /// replaced or cleared. Returns `false` when the buffer could not be
+    /// imported, letting the caller fall back to the CPU upload.
+    pub(crate) fn upload_dmabuf(
+        &mut self,
+        device: &wgpu::Device,
+        frame: &crate::platform::linux::dmabuf::DmabufFrame,
+        width: u32,
+        height: u32,
+    ) -> bool {
+        let Some(planes) = DmabufPlanes::new(device, frame, width, height) else {
+            return false;
+        };
+        let luma_view = planes
+            .luma
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let chroma_view = planes
+            .chroma
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("openuuyc-video-nv12"),
+            layout: &self.nv12.layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.uniform.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&luma_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&chroma_view),
+                },
+            ],
+        });
+        self.frame = Some(Frame {
+            planes: Planes::Nv12 {
+                luma: planes.luma,
+                chroma: planes.chroma,
+            },
+            bind_group,
+            width,
+            height,
+            lease: Some(planes.lease),
+        });
+        true
     }
 
     /// `pixels` is tightly packed RGBA8, `width * height` entries.
@@ -152,6 +325,7 @@ impl VideoLayer {
                 bind_group,
                 width,
                 height,
+                lease: None,
             });
         }
         let Some(Frame {
@@ -225,6 +399,7 @@ impl VideoLayer {
                 bind_group,
                 width,
                 height,
+                lease: None,
             });
         }
         let Some(Frame {

@@ -7,10 +7,12 @@
 //! drivers), so the local layout decides the character, as it would for a
 //! keyboard plugged into this machine.
 //!
-//! Sunshine injects through uinput instead, which also reaches Wayland
-//! sessions and the login screen but needs write access to `/dev/uinput`
-//! (a udev rule). That backend is the planned second injector behind the same
-//! calls; this one covers Xorg sessions without any setup.
+//! In a Wayland session XTest only reaches XWayland clients, so there keys,
+//! buttons and motion go through a uinput device, as Sunshine does (it needs
+//! write access to `/dev/uinput`, granted by the udev rule the packages
+//! ship), and text through `zwp_virtual_keyboard_v1`. X11 still reads the key
+//! map, the pointer and the lock keys. Xorg sessions keep XTest alone, which
+//! needs no setup and positions the pointer absolutely.
 use anyhow::{Context, Result, bail, ensure};
 use std::time::Duration;
 use x11rb::connection::{Connection, RequestConnection as _};
@@ -45,11 +47,499 @@ impl Lock {
     }
 }
 
+/// uinput 注入后端。
+///
+/// Wayland 会话下 XTest 只能影响 XWayland 客户端，Hyprland 等合成器里的
+/// 原生客户端收不到；Wayland 会话有 `/dev/uinput` 时改用它注入。X11 仍保留
+/// 用于读取键位表、指针位置与锁定键状态。
+mod uinput {
+    use anyhow::{Context, Result, ensure};
+    use std::fs::{File, OpenOptions};
+    use std::io::Write;
+    use std::os::unix::io::AsRawFd;
+
+    const EV_SYN: u16 = 0x00;
+    const EV_KEY: u16 = 0x01;
+    const EV_REL: u16 = 0x02;
+
+    const REL_X: u16 = 0x00;
+    const REL_Y: u16 = 0x01;
+    const REL_HWHEEL: u16 = 0x06;
+    const REL_WHEEL: u16 = 0x08;
+    const SYN_REPORT: u16 = 0x00;
+
+    const BTN_LEFT: u16 = 0x110;
+    const BTN_RIGHT: u16 = 0x111;
+    const BTN_MIDDLE: u16 = 0x112;
+    const BTN_SIDE: u16 = 0x113;
+    const BTN_EXTRA: u16 = 0x114;
+
+    // linux/uinput.h 的 _IOW('U', n, size)；x86、ARM 与 RISC-V 上相同。
+    const UI_DEV_CREATE: libc::c_ulong = 0x5501;
+    const UI_DEV_DESTROY: libc::c_ulong = 0x5502;
+    const UI_DEV_SETUP: libc::c_ulong = 0x405c_5503;
+    const UI_SET_EVBIT: libc::c_ulong = 0x4004_5564;
+    const UI_SET_KEYBIT: libc::c_ulong = 0x4004_5565;
+    const UI_SET_RELBIT: libc::c_ulong = 0x4004_5566;
+
+    #[repr(C)]
+    struct InputId {
+        bustype: u16,
+        vendor: u16,
+        product: u16,
+        version: u16,
+    }
+    #[repr(C)]
+    struct UinputSetup {
+        id: InputId,
+        name: [libc::c_char; 80],
+        ff_effects_max: u32,
+    }
+    #[repr(C)]
+    struct InputEvent {
+        sec: libc::c_long,
+        usec: libc::c_long,
+        kind: u16,
+        code: u16,
+        value: i32,
+    }
+
+    pub(crate) struct Device {
+        file: File,
+    }
+
+    fn set(fd: i32, request: libc::c_ulong, value: libc::c_ulong) -> Result<()> {
+        let rc = unsafe { libc::ioctl(fd, request, value) };
+        ensure!(
+            rc >= 0,
+            "uinput ioctl 0x{request:x} 失败：{}",
+            std::io::Error::last_os_error()
+        );
+        Ok(())
+    }
+
+    /// X 按键编号到 evdev 按键码（1 左、2 中、3 右、8 侧、9 扩展）。
+    pub(crate) fn button_code(x_button: u8) -> Option<u16> {
+        Some(match x_button {
+            1 => BTN_LEFT,
+            2 => BTN_MIDDLE,
+            3 => BTN_RIGHT,
+            8 => BTN_SIDE,
+            9 => BTN_EXTRA,
+            _ => return None,
+        })
+    }
+
+    impl Device {
+        pub(crate) fn open() -> Result<Self> {
+            let file = OpenOptions::new()
+                .write(true)
+                .open("/dev/uinput")
+                .context("打开 /dev/uinput 失败（需要 input 组与 udev 规则）")?;
+            let fd = file.as_raw_fd();
+            set(fd, UI_SET_EVBIT, EV_KEY.into())?;
+            set(fd, UI_SET_EVBIT, EV_REL.into())?;
+            // Keyboard keys (every code `evdev` maps to is below 256) and the
+            // mouse buttons only. Declaring BTN_TOUCH, BTN_TOOL_* or the
+            // joystick range makes udev and libinput classify the device as
+            // something else.
+            for code in (1..0x100u16).chain(BTN_LEFT..=BTN_EXTRA) {
+                set(fd, UI_SET_KEYBIT, code.into())?;
+            }
+            for bit in [REL_X, REL_Y, REL_WHEEL, REL_HWHEEL] {
+                set(fd, UI_SET_RELBIT, bit.into())?;
+            }
+            let mut name = [0 as libc::c_char; 80];
+            for (slot, byte) in name.iter_mut().zip(b"OpenUUYC virtual input".iter()) {
+                *slot = *byte as libc::c_char;
+            }
+            let setup = UinputSetup {
+                id: InputId {
+                    bustype: 0x06, // BUS_VIRTUAL，与 ydotool 一致
+                    vendor: 0x2333,
+                    product: 0x6666,
+                    version: 1,
+                },
+                name,
+                ff_effects_max: 0,
+            };
+            let rc = unsafe { libc::ioctl(fd, UI_DEV_SETUP, &setup as *const _) };
+            ensure!(
+                rc >= 0,
+                "注册 uinput 设备失败：{}",
+                std::io::Error::last_os_error()
+            );
+            set(fd, UI_DEV_CREATE, 0)?;
+            Ok(Self { file })
+        }
+
+        fn emit(&self, kind: u16, code: u16, value: i32) -> Result<()> {
+            let event = InputEvent {
+                sec: 0,
+                usec: 0,
+                kind,
+                code,
+                value,
+            };
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    &event as *const _ as *const u8,
+                    std::mem::size_of::<InputEvent>(),
+                )
+            };
+            let mut sink = &self.file;
+            sink.write_all(bytes).context("写入 uinput 事件失败")?;
+            Ok(())
+        }
+
+        fn sync(&self) -> Result<()> {
+            self.emit(EV_SYN, SYN_REPORT, 0)
+        }
+
+        pub(crate) fn key(&self, code: u16, down: bool) -> Result<()> {
+            self.emit(EV_KEY, code, i32::from(down))?;
+            self.sync()
+        }
+
+        pub(crate) fn button(&self, x_button: u8, down: bool) -> Result<()> {
+            let code = button_code(x_button).context("不支持的鼠标按键")?;
+            self.key(code, down)
+        }
+
+        pub(crate) fn move_by(&self, dx: i32, dy: i32) -> Result<()> {
+            self.emit(EV_REL, REL_X, dx)?;
+            self.emit(EV_REL, REL_Y, dy)?;
+            self.sync()
+        }
+
+        pub(crate) fn wheel(&self, horizontal: bool, positive: bool) -> Result<()> {
+            let (code, value) = match (horizontal, positive) {
+                (false, true) => (REL_WHEEL, 1),
+                (false, false) => (REL_WHEEL, -1),
+                (true, true) => (REL_HWHEEL, 1),
+                (true, false) => (REL_HWHEEL, -1),
+            };
+            self.emit(EV_REL, code, value)?;
+            self.sync()
+        }
+    }
+
+    impl Drop for Device {
+        fn drop(&mut self) {
+            let _ = unsafe { libc::ioctl(self.file.as_raw_fd(), UI_DEV_DESTROY, 0) };
+        }
+    }
+}
+
+/// Whether Hyprland's IPC is there to ask; other compositors have no
+/// equivalent, and positions then come from XWayland.
+fn hyprland() -> bool {
+    std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some()
+}
+
+/// 向 Hyprland 的 IPC socket 发一条请求并读回响应。
+///
+/// XWayland 的 `query_pointer` 只在 XWayland 表面上跟随指针；光标停在原生
+/// Wayland 客户端上时它返回的是陈旧值（实测移动到极限后仍然不动），所以
+/// 绝对定位必须用合成器的权威数据。
+fn hyprland_request(command: &str) -> Option<String> {
+    use std::io::{Read as _, Write as _};
+    let signature = std::env::var("HYPRLAND_INSTANCE_SIGNATURE").ok()?;
+    let runtime = std::env::var("XDG_RUNTIME_DIR").ok()?;
+    let mut socket =
+        std::os::unix::net::UnixStream::connect(format!("{runtime}/hypr/{signature}/.socket.sock"))
+            .ok()?;
+    socket
+        .set_read_timeout(Some(Duration::from_millis(300)))
+        .ok()?;
+    socket.write_all(command.as_bytes()).ok()?;
+    let mut buffer = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        match socket.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => {
+                buffer.extend_from_slice(&chunk[..read]);
+                if buffer.len() > (1 << 20) {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    String::from_utf8(buffer).ok()
+}
+
+/// Hyprland 合成器里的光标位置（逻辑全局布局坐标）。
+fn hyprland_cursor() -> Option<(i32, i32)> {
+    let reply = hyprland_request("cursorpos")?;
+    let (x, y) = reply.trim().split_once(',')?;
+    Some((x.trim().parse().ok()?, y.trim().parse().ok()?))
+}
+
+/// Hyprland 每个显示器的逻辑矩形：`(名称, left, top, 逻辑宽, 逻辑高)`。
+///
+/// `hyprctl monitors` 报的是物理分辨率与缩放，光标坐标用的是逻辑尺寸，
+/// 所以要按 `scale` 折算。
+fn hyprland_monitors() -> Option<Vec<(String, i32, i32, i32, i32)>> {
+    let reply = hyprland_request("j/monitors")?;
+    let value: serde_json::Value = serde_json::from_str(&reply).ok()?;
+    let mut monitors = Vec::new();
+    for monitor in value.as_array()? {
+        let name = monitor.get("name")?.as_str()?.to_owned();
+        let left = monitor.get("x")?.as_i64()? as i32;
+        let top = monitor.get("y")?.as_i64()? as i32;
+        let width = monitor.get("width")?.as_i64()? as i32;
+        let height = monitor.get("height")?.as_i64()? as i32;
+        let scale = monitor.get("scale").and_then(|v| v.as_f64()).unwrap_or(1.0);
+        let scale = if scale > 0.0 { scale } else { 1.0 };
+        monitors.push((
+            name,
+            left,
+            top,
+            (f64::from(width) / scale).round() as i32,
+            (f64::from(height) / scale).round() as i32,
+        ));
+    }
+    (!monitors.is_empty()).then_some(monitors)
+}
+
+/// X11 侧每个显示器的矩形，按键名对齐到 Hyprland 的逻辑矩形。
+///
+/// 两套坐标空间完全不同：XWayland 把显示器按物理像素横排（本机是
+/// 4800x1800，eDP-1 在左、HDMI-A-3 在右），Hyprland 按逻辑像素竖排
+/// （2304x2520，HDMI-A-3 在上、eDP-1 在下）。绝对定位要把程序算出的
+/// X11 全局坐标换算到 Hyprland 空间。
+fn screen_rect_maps() -> Vec<(String, (i32, i32, i32, i32), (i32, i32, i32, i32))> {
+    let Ok(topology) = super::display::topology::Topology::query(true) else {
+        return Vec::new();
+    };
+    let x11 = topology.monitors();
+    let Some(hypr) = hyprland_monitors() else {
+        return Vec::new();
+    };
+    let mut maps = Vec::new();
+    for monitor in &x11 {
+        let Some((_, hx, hy, hw, hh)) = hypr.iter().find(|(name, ..)| *name == monitor.name) else {
+            continue;
+        };
+        maps.push((
+            monitor.name.clone(),
+            (
+                monitor.left,
+                monitor.top,
+                monitor.width as i32,
+                monitor.height as i32,
+            ),
+            (*hx, *hy, *hw, *hh),
+        ));
+    }
+    maps
+}
+
+/// 通过 `zwp_virtual_keyboard_v1` 输入文本。
+///
+/// 与 uinput 不同，这条协议允许客户端**自带 xkb keymap**，因此可以输入键位表
+/// 里不存在的字符（中文等）。Hyprland 暴露 `zwp_virtual_keyboard_manager_v1`。
+///
+/// 注意：XWayland 客户端使用的是 X 自己的键位表，虚拟键盘的自定义 keymap 对它
+/// 无效，那类窗口仍走 XTest。
+mod virtual_keyboard {
+    use anyhow::{Context, Result};
+    use std::os::fd::AsFd;
+    use std::time::Duration;
+    use wayland_client::globals::{GlobalList, registry_queue_init};
+    use wayland_client::protocol::{wl_registry, wl_seat};
+    use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle};
+    use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::{
+        zwp_virtual_keyboard_manager_v1 as manager, zwp_virtual_keyboard_v1 as keyboard,
+    };
+
+    struct State;
+
+    impl Dispatch<wl_registry::WlRegistry, wayland_client::globals::GlobalListContents> for State {
+        fn event(
+            _: &mut Self,
+            _: &wl_registry::WlRegistry,
+            _: wl_registry::Event,
+            _: &wayland_client::globals::GlobalListContents,
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+        }
+    }
+    wayland_client::delegate_noop!(State: ignore manager::ZwpVirtualKeyboardManagerV1);
+    wayland_client::delegate_noop!(State: ignore keyboard::ZwpVirtualKeyboardV1);
+    wayland_client::delegate_noop!(State: ignore wl_seat::WlSeat);
+
+    /// 发送给合成器的第一个键码。协议里传的是 **evdev 风格**键码，合成器
+    /// 与客户端都会 `+8` 得到 xkb keycode（Hyprland `Keyboard.cpp`：
+    /// `updateXkbStateWithKey(event.key + 8, ...)`），所以 keymap 里声明的
+    /// 键码必须是 `FIRST_CODE + KEYCODE_OFFSET`。与 wtype 一致取 1。
+    const FIRST_CODE: u8 = 1;
+    /// evdev 键码到 xkb keycode 的固定偏移。
+    const KEYCODE_OFFSET: u8 = 8;
+
+    pub(crate) struct Keyboard {
+        /// Held so the queue and the globals registry stay connected.
+        connection: Connection,
+        globals: GlobalList,
+        queue: EventQueue<State>,
+    }
+
+    /// 生成只包含所需字符的 keymap，返回 (字节, 覆盖的字符数)。
+    fn keymap_for(text: &str) -> (String, usize) {
+        let mut chars: Vec<char> = Vec::new();
+        for c in text.chars() {
+            if !chars.contains(&c) && chars.len() < 56 {
+                chars.push(c);
+            }
+        }
+        let mut out = String::from("xkb_keymap {\n  xkb_keycodes \"vk\" {\n");
+        out.push_str(&format!("    minimum = {};\n", FIRST_CODE + KEYCODE_OFFSET));
+        out.push_str(&format!(
+            "    maximum = {};\n",
+            FIRST_CODE as usize + KEYCODE_OFFSET as usize + chars.len().saturating_sub(1)
+        ));
+        for index in 0..chars.len() {
+            out.push_str(&format!(
+                "    <VK{index:02}> = {};\n",
+                FIRST_CODE as usize + KEYCODE_OFFSET as usize + index
+            ));
+        }
+        out.push_str("  };\n  xkb_types \"vk\" { include \"complete\" };\n");
+        out.push_str("  xkb_compat \"vk\" { include \"complete\" };\n");
+        out.push_str("  xkb_symbols \"vk\" {\n");
+        for (index, c) in chars.iter().enumerate() {
+            let point = *c as u32;
+            let sym = if point < 0x100 {
+                point
+            } else {
+                0x0100_0000 | point
+            };
+            out.push_str(&format!("    key <VK{index:02}> {{ [ 0x{sym:08x} ] }};\n"));
+        }
+        out.push_str("  };\n};\n");
+        (out, chars.len())
+    }
+
+    fn keymap_fd(bytes: &[u8]) -> Result<std::os::fd::OwnedFd> {
+        use std::os::fd::FromRawFd;
+        let name = c"openuuyc-vk";
+        let raw = unsafe { libc::memfd_create(name.as_ptr(), 0) };
+        anyhow::ensure!(raw >= 0, "创建 keymap 内存文件失败");
+        let mut file = unsafe { std::fs::File::from_raw_fd(raw) };
+        use std::io::Write as _;
+        file.write_all(bytes).context("写入 keymap 失败")?;
+        Ok(std::os::fd::OwnedFd::from(file))
+    }
+
+    impl Keyboard {
+        pub(crate) fn connect() -> Result<Self> {
+            let connection = Connection::connect_to_env().context("连接 Wayland 失败")?;
+            let (globals, queue): (GlobalList, EventQueue<State>) =
+                registry_queue_init(&connection).context("枚举 Wayland 全局对象失败")?;
+            // Bind once up front so a desktop without the protocol is reported
+            // at startup rather than on the first keystroke.
+            {
+                let qh = queue.handle();
+                let _manager: manager::ZwpVirtualKeyboardManagerV1 =
+                    globals
+                        .bind(&qh, 1..=1, ())
+                        .context("桌面没有提供 zwp_virtual_keyboard_manager_v1")?;
+                let _seat: wl_seat::WlSeat =
+                    globals.bind(&qh, 1..=8, ()).context("没有 Wayland seat")?;
+            }
+            queue.flush().context("提交虚拟键盘请求失败")?;
+            Ok(Self {
+                connection,
+                globals,
+                queue,
+            })
+        }
+
+        /// 输入一段文本：新建一个虚拟键盘对象，上传含这些字符的 keymap，
+        /// 逐个按键，最后销毁该对象。
+        ///
+        /// **每次调用都必须新建对象。** Hyprland 只在对象第一次收到 keymap
+        /// 时建立键位映射，之后在同一对象上重新上传 keymap 不会生效；手机输入
+        /// 法逐字符发送（每次 `chars=1`），复用对象会让每个字符都按第一个字符
+        /// 的键位输入（输入 `XYZ` 得到 `XXX`）。wtype 同样每次新建对象。
+        pub(crate) fn text(&mut self, text: &str, permitted: &dyn Fn() -> bool) -> Result<()> {
+            let (keymap, bound) = keymap_for(text);
+            if bound == 0 {
+                return Ok(());
+            }
+            let qh = self.queue.handle();
+            let manager: manager::ZwpVirtualKeyboardManagerV1 =
+                self.globals
+                    .bind(&qh, 1..=1, ())
+                    .context("桌面没有提供 zwp_virtual_keyboard_manager_v1")?;
+            let seat: wl_seat::WlSeat = self
+                .globals
+                .bind(&qh, 1..=8, ())
+                .context("没有 Wayland seat")?;
+            let keyboard = manager.create_virtual_keyboard(&seat, &qh, ());
+            // keymap 必须在上报按键之前上传，且要等合成器处理完
+            // （否则合成器会报 NO_KEYMAP）。xkbcommon 的
+            // xkb_keymap_new_from_string 要求 NUL 结尾，长度也要算上。
+            let mut bytes = keymap.into_bytes();
+            bytes.push(0);
+            let fd = keymap_fd(&bytes)?;
+            keyboard.keymap(1, fd.as_fd(), bytes.len() as u32);
+            self.queue
+                .roundtrip(&mut State)
+                .context("等待虚拟键盘 keymap 生效失败")?;
+            // 清掉可能残留的修饰键状态。
+            keyboard.modifiers(0, 0, 0, 0);
+            let _ = self.queue.roundtrip(&mut State);
+
+            let mut index = 0u8;
+            let mut seen: Vec<char> = Vec::new();
+            for c in text.chars() {
+                if !permitted() {
+                    break;
+                }
+                let position = match seen.iter().position(|seen| *seen == c) {
+                    Some(found) => found as u8,
+                    None => {
+                        if seen.len() >= 56 {
+                            continue;
+                        }
+                        seen.push(c);
+                        let assigned = index;
+                        index += 1;
+                        assigned
+                    }
+                };
+                // 发送 evdev 风格键码；合成器与客户端会各自 +8 查 keymap。
+                let code = u32::from(FIRST_CODE + position);
+                keyboard.key(0, code, 1);
+                let _ = self.queue.roundtrip(&mut State);
+                keyboard.key(0, code, 0);
+                let _ = self.queue.roundtrip(&mut State);
+                // 输入法（IBus）会丢过快的按键。
+                std::thread::sleep(Duration::from_millis(4));
+            }
+            keyboard.destroy();
+            let _ = self.queue.roundtrip(&mut State);
+            let _ = &self.connection;
+            Ok(())
+        }
+    }
+}
+
 pub(crate) struct Injector {
     connection: RustConnection,
     root: Window,
     min_keycode: Keycode,
     max_keycode: Keycode,
+    /// 可用时优先进到这里，X11 只负责读键位表与指针位置。
+    uinput: Option<uinput::Device>,
+    /// X11 矩形 → Hyprland 逻辑矩形的映射（按显示器名对齐）。
+    screen_maps: Vec<(String, (i32, i32, i32, i32), (i32, i32, i32, i32))>,
+    /// 原生 Wayland 客户端的文字输入（可携带自定义 keymap）。
+    virtual_keyboard: Option<virtual_keyboard::Keyboard>,
 }
 
 impl Injector {
@@ -65,12 +555,87 @@ impl Injector {
         let setup = connection.setup();
         let root = setup.roots[screen].root;
         let (min_keycode, max_keycode) = (setup.min_keycode, setup.max_keycode);
+        // Xorg delivers XTest to every client and positions absolutely;
+        // uinput there would only add pointer acceleration.
+        let wayland = super::capture::wayland_session();
+        let uinput = if !wayland {
+            None
+        } else {
+            match uinput::Device::open() {
+                Ok(device) => {
+                    tracing::info!("启用 uinput 输入注入（EV_KEY + EV_REL，无 ABS 轴）");
+                    Some(device)
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "无法使用 uinput，回退到 XTest（只影响 XWayland 客户端）");
+                    None
+                }
+            }
+        };
+        let screen_maps = if uinput.is_some() && hyprland() {
+            let maps = screen_rect_maps();
+            if maps.is_empty() {
+                tracing::warn!("未能对齐 X11 与 Hyprland 的显示器布局，绝对定位可能偏移");
+            } else {
+                tracing::info!(monitors = maps.len(), "已对齐 X11 与 Hyprland 显示器布局");
+            }
+            maps
+        } else {
+            Vec::new()
+        };
+        let virtual_keyboard = if wayland {
+            match virtual_keyboard::Keyboard::connect() {
+                Ok(keyboard) => {
+                    tracing::info!("启用 zwp_virtual_keyboard 文字输入（支持任意 Unicode）");
+                    Some(keyboard)
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "虚拟键盘不可用，文字输入将回退 XTest");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         Ok(Self {
             connection,
             root,
             min_keycode,
             max_keycode,
+            uinput,
+            screen_maps,
+            virtual_keyboard,
         })
+    }
+
+    /// 当前焦点窗口是否跑在 XWayland 里。
+    fn foreground_is_xwayland(&self) -> bool {
+        let Some(reply) = hyprland_request("j/activewindow") else {
+            return false;
+        };
+        serde_json::from_str::<serde_json::Value>(&reply)
+            .ok()
+            .and_then(|value| value.get("xwayland").and_then(|v| v.as_bool()))
+            .unwrap_or(false)
+    }
+
+    /// 把程序给出的 X11 全局坐标换算到 Hyprland 的逻辑布局坐标。
+    fn to_hyprland(&self, x: i32, y: i32) -> Option<(i32, i32)> {
+        for (_, x11, hypr) in &self.screen_maps {
+            let (left, top, width, height) = *x11;
+            let (hx, hy, hw, hh) = *hypr;
+            let (right, bottom) = (left + width, top + height);
+            if width <= 0 || height <= 0 || x < left || x >= right || y < top || y >= bottom {
+                continue;
+            }
+            let u = f64::from(x - left) / f64::from(width);
+            let v = f64::from(y - top) / f64::from(height);
+            return Some((
+                hx + (f64::from(hw) * u).round() as i32,
+                hy + (f64::from(hh) * v).round() as i32,
+            ));
+        }
+        None
     }
 
     fn fake(&self, kind: u8, detail: u8, x: i16, y: i16) -> Result<()> {
@@ -84,6 +649,9 @@ impl Injector {
     /// A key by Windows virtual-key code.
     pub fn key(&self, key: u16, down: bool) -> Result<()> {
         let code = evdev(key).with_context(|| format!("不支持的按键 {key:#04x}"))?;
+        if let Some(device) = &self.uinput {
+            return device.key(code, down);
+        }
         let keycode = u8::try_from(code + 8).context("按键超出 X11 键码范围")?;
         ensure!(
             (self.min_keycode..=self.max_keycode).contains(&keycode),
@@ -94,6 +662,9 @@ impl Injector {
 
     /// A button by X button number (1 left, 2 middle, 3 right, 8/9 side).
     pub fn button(&self, button: u8, down: bool) -> Result<()> {
+        if let Some(device) = &self.uinput {
+            return device.button(button, down);
+        }
         self.fake(
             if down { BUTTON_PRESS } else { BUTTON_RELEASE },
             button,
@@ -104,6 +675,20 @@ impl Injector {
 
     /// Move to a root-window position.
     pub fn move_to(&self, x: i32, y: i32) -> Result<()> {
+        if let Some(device) = &self.uinput {
+            // 设备不声明 ABS 轴（否则会被 libinput 误分类），所以按当前
+            // 指针位置换算成相对位移。位置以合成器为准：每次重新读取，
+            // 所以加速造成的单步偏差不会累积。
+            let (cx, cy) = hyprland_cursor()
+                .or_else(|| self.pointer().ok())
+                .context("无法获取当前指针位置")?;
+            let (tx, ty) = self.to_hyprland(x, y).unwrap_or((x, y));
+            let (dx, dy) = (tx - cx, ty - cy);
+            if dx == 0 && dy == 0 {
+                return Ok(());
+            }
+            return device.move_by(dx, dy);
+        }
         self.fake(
             MOTION_NOTIFY,
             0,
@@ -114,6 +699,9 @@ impl Injector {
 
     /// Move by a pixel delta from wherever the pointer is.
     pub fn move_by(&self, mut dx: i32, mut dy: i32) -> Result<()> {
+        if let Some(device) = &self.uinput {
+            return device.move_by(dx, dy);
+        }
         while dx != 0 || dy != 0 {
             let x = dx.clamp(i16::MIN.into(), i16::MAX.into());
             let y = dy.clamp(i16::MIN.into(), i16::MAX.into());
@@ -126,6 +714,9 @@ impl Injector {
 
     /// One wheel notch: X delivers wheels as buttons 4-7.
     pub fn wheel_notch(&self, horizontal: bool, positive: bool) -> Result<()> {
+        if let Some(device) = &self.uinput {
+            return device.wheel(horizontal, positive);
+        }
         // Windows: positive vertical is away from the user (up), positive
         // horizontal is to the right.
         let button = match (horizontal, positive) {
@@ -164,7 +755,32 @@ impl Injector {
     /// are released while typing and pressed again afterwards, and Caps Lock
     /// does not change the case of a letter. A Windows line break (CR LF)
     /// is one Enter.
-    pub fn text(&self, text: &str, permitted: impl Fn() -> bool) -> Result<()> {
+    pub fn text(&mut self, text: &str, permitted: impl Fn() -> bool) -> Result<()> {
+        // 原生 Wayland 客户端走虚拟键盘（XTest 到不了它们）；
+        // XWayland 客户端用 X 自己的键位表，自带 keymap 的虚拟键盘对它无效，
+        // 因此仍然走 XTest。焦点不在 Hyprland 的窗口上时按原生处理。
+        let xwayland = self.foreground_is_xwayland();
+        tracing::info!(
+            chars = text.chars().count(),
+            xwayland,
+            virtual_keyboard = self.virtual_keyboard.is_some(),
+            "文字输入"
+        );
+        if let Some(keyboard) = &mut self.virtual_keyboard
+            && !xwayland
+        {
+            match keyboard.text(text, &permitted) {
+                Ok(()) => {
+                    tracing::info!("文字输入：虚拟键盘路径完成");
+                    return Ok(());
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "虚拟键盘输入失败，回退 XTest");
+                }
+            }
+        } else {
+            tracing::info!("文字输入：使用 XTest 路径");
+        }
         let count = self.max_keycode - self.min_keycode + 1;
         let map = self
             .connection

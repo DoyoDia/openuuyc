@@ -460,6 +460,7 @@ pub(super) fn capture_loop(
             let created = if hardware {
                 encoder::Encoder::hardware_format(
                     &device,
+                    candidate.capability.backend,
                     size,
                     wanted.format,
                     crate::features::host::format::Rate {
