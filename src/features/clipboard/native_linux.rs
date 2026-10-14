@@ -1145,31 +1145,13 @@ fn write_text(state: &mut State, text: &str) -> Result<()> {
     Ok(())
 }
 
-/// Publish paths as a file copy on the local clipboard.
+/// Publish paths as a file copy on the local clipboard, and record them as the
+/// copy this adapter put there so the poll does not announce them back.
 ///
-/// A file copy has to be offered under several names at once, and only the
-/// owner of the selection can answer for more than one, so this takes the
-/// clipboard itself rather than going through the library used for text and
-/// images. On a desktop where that fails there is still `text/uri-list`, which
-/// is enough for anything that does not insist on the GTK file-manager name.
+/// Which clipboard that is takes some care: see `publish_files`.
 fn write_files(state: &mut State, paths: &[PathBuf]) -> Result<()> {
     state.writing = true;
-    let offer = super::x11_offer::FileOffer::publish(paths.to_vec());
-    let result = match offer {
-        Ok(offer) => {
-            state.offer = Some(offer);
-            Ok(())
-        }
-        Err(error) => {
-            tracing::debug!(error = format!("{error:#}"), "接管剪贴板失败，改用单一格式");
-            state.offer = None;
-            let clipboard = state.clipboard.as_mut().context("系统剪贴板不可用")?;
-            clipboard
-                .set()
-                .file_list(paths)
-                .map_err(anyhow::Error::from)
-        }
-    };
+    let result = publish_files(state, paths);
     state.writing = false;
     result.context("写入系统剪贴板失败")?;
     state.local = LocalSnapshot {
@@ -1178,6 +1160,50 @@ fn write_files(state: &mut State, paths: &[PathBuf]) -> Result<()> {
     };
     state.retire();
     Ok(())
+}
+
+/// 把这一批路径挂到本地剪贴板上。
+///
+/// X11 与 Wayland 的选择区是两个互不相通的剪贴板：这条路在 niri 上实测双向都
+/// 不过桥——xclip 写进去的东西 `wl-paste` 看不见，反过来也一样。X11 的 offer
+/// 只有 XWayland 里的程序看得见，而 Wayland 原生的程序（GNOME 那套文件管理器
+/// 就是）只读 Wayland 那一侧。只写一边，本地总有一半程序粘不出来。
+///
+/// 所以两边都写。arboard 的后端跟着 `WAYLAND_DISPLAY` 走（有这个变量就走
+/// Wayland data-control），Wayland 会话里由它写 Wayland 那侧；X11 会话里它自己
+/// 就落在 X11 上，这时不能让它抢先——它只会挂 `text/uri-list` 一个名字，而
+/// GNOME 的文件管理器只认 `x-special/gnome-copied-files`，多个名字只有 X11
+/// 的 offer 给得出。
+fn publish_files(state: &mut State, paths: &[PathBuf]) -> Result<()> {
+    let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
+    if wayland {
+        let clipboard = state.clipboard.as_mut().context("系统剪贴板不可用")?;
+        clipboard
+            .set()
+            .file_list(paths)
+            .map_err(anyhow::Error::from)
+            .context("写入 Wayland 剪贴板失败")?;
+    }
+    match super::x11_offer::FileOffer::publish(paths.to_vec()) {
+        Ok(offer) => {
+            state.offer = Some(offer);
+            Ok(())
+        }
+        Err(error) => {
+            state.offer = None;
+            tracing::debug!(error = format!("{error:#}"), "接管 X11 剪贴板失败");
+            // Wayland 那一侧上一步已经写好了，这里失败只是少了 XWayland 那半个
+            // 桌面；X11 会话里没有别处可写，只能退回 arboard 的单格式。
+            if wayland {
+                return Ok(());
+            }
+            let clipboard = state.clipboard.as_mut().context("系统剪贴板不可用")?;
+            clipboard
+                .set()
+                .file_list(paths)
+                .map_err(anyhow::Error::from)
+        }
+    }
 }
 
 fn write_image(state: &mut State, dib: &[u8]) -> Result<()> {
@@ -1674,6 +1700,27 @@ fn rgba_to_dib(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 本机这台 Wayland 桌面上，X11 与 Wayland 的剪贴板互不相通（实测 `xclip`
+    /// 写的 `wl-paste` 看不见，反过来也一样），所以文件复制只写 X11 那条 offer
+    /// 时，Wayland 原生的文件管理器根本读不到 `text/uri-list`——伸手粘贴什么也
+    /// 没有。这条验证 arboard 的 Wayland 后端确实能把文件挂上去，也就是
+    /// `publish_files` 那一步的前提。
+    #[test]
+    #[ignore = "会占用真实剪贴板，需要 Wayland 会话"]
+    fn file_copies_reach_the_wayland_selection() {
+        let path = std::env::temp_dir().join("openuuyc-clipboard-probe.txt");
+        std::fs::write(&path, b"probe").unwrap();
+        let mut clipboard = arboard::Clipboard::new().unwrap();
+        clipboard
+            .set()
+            .file_list(std::slice::from_ref(&path))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        let read = clipboard.get().file_list().unwrap_or_default();
+        println!("从剪贴板读回 {read:?}");
+        assert_eq!(read, vec![path]);
+    }
 
     fn read_tree(path: &Path, out: &mut Vec<(String, Vec<u8>)>, base: &Path) {
         if path.is_dir() {
