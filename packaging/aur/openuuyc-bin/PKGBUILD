@@ -8,7 +8,7 @@
 # then commit. See packaging/aur/README.md.
 
 pkgname=openuuyc-bin
-pkgver=1.0.0.omarchy.1
+pkgver=1.0.0.omarchy.2
 pkgrel=1
 # The git tag keeps the hyphen and dot that pkgver may not contain:
 # 1.0.0.omarchy.1 -> v1.0.0-omarchy.1
