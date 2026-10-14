@@ -1167,11 +1167,12 @@ impl Actor {
                     self.entries.remove(&id);
                 }
             }
+            // 这张图只是「拖起来时跟着指针的那个图标」，别让它把整次拖放判死。
+            // NATIVE_RETURN 说的是「能不能把拖出去的东西再拖回来」，不是「认不认识这个
+            // 扩展」：被控端是 Linux 时它老老实实报 false（XDND 还没法把拖放还给原手势），
+            // 可它照样会把这图发过来——发不发只看**对端**的能力位。以前这里要求对方也
+            // 能拖回，于是 Linux 被控一拖出就卡在这条提示上，整次拖放跟着结束。
             Payload::Image(image) => {
-                ensure!(
-                    self.shared.return_capable.load(Ordering::Acquire),
-                    "未协商拖放图像"
-                );
                 if let Some(entry) = self
                     .entries
                     .get_mut(&id)
