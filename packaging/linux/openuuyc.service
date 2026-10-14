@@ -1,0 +1,22 @@
+# 登录自启的被控服务，跟着图形会话走。
+#
+# 被控的画面、剪贴板与声音都来自合成器会话，所以这个单元不挂在 default.target
+# 上：没人登录时它没有被控可言，会话结束它也该停。这与 Sunshine 的 Linux 服务是
+# 同一个形态；「登录前被控」需要 KMS 抓屏或虚拟显示器，那是另一件事。
+#
+# 便携运行（没装包）时这份单元不存在，程序会按当前可执行文件在
+# ~/.config/systemd/user/ 里自己写一份同名单元，内容与这里一致。
+[Unit]
+Description=OpenUUYC 远程被控
+PartOf=graphical-session.target
+After=graphical-session.target xdg-desktop-portal.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/OpenUUYC gui --background
+# 崩了自动回来；从托盘退出是正常退出，不会又被拉起来。
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target
