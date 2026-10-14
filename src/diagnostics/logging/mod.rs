@@ -314,6 +314,14 @@ pub fn init(level: Option<&str>, path: Option<&Path>) -> Result<LoggingGuard> {
         .thread_name("log-writer")
         .finish(sink);
     let dropped = writer.error_counter();
+    // 被 systemd 起来时输出接在 journal 上，systemd 会设这个变量。日志平时只落
+    // 文件，这里再挂一层 stderr，`journalctl --user -u openuuyc` 才有内容。
+    let journal = std::env::var_os("JOURNAL_STREAM").map(|_| {
+        tracing_subscriber::fmt::layer()
+            .with_writer(std::io::stderr)
+            .with_ansi(false)
+            .with_filter(filter.clone())
+    });
     let (filter_layer, filter) = tracing_subscriber::reload::Layer::new(filter);
     tracing_subscriber::registry()
         .with(
@@ -328,6 +336,7 @@ pub fn init(level: Option<&str>, path: Option<&Path>) -> Result<LoggingGuard> {
                 ))
                 .with_filter(filter_layer),
         )
+        .with(journal)
         .try_init()
         .context("初始化日志系统")?;
     let runtime = Arc::new(Runtime {
