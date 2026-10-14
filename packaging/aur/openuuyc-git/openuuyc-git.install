@@ -2,9 +2,10 @@ post_install() {
     cat <<'EOF'
 OpenUUYC 已安装。
 
-被控（让别人控制本机）需要两件事：
+Wayland 会话下被控（让别人控制本机）需要两件事；Xorg 会话经 XTest 注入键鼠，
+无需额外设置：
 
-1. uinput 输入权限。udev 规则已安装，当前会话立即生效：
+1. uinput 输入权限。udev 规则已安装，执行下面三行后当前会话即可使用：
        sudo udevadm control --reload-rules
        sudo modprobe uinput
        echo uinput | sudo tee /etc/modules-load.d/uinput.conf
@@ -17,7 +18,8 @@ OpenUUYC 已安装。
        KDE:      xdg-desktop-portal-kde
    首次被控时在本机屏幕上点一次「共享」，之后不再询问。
 
-启动：应用菜单里的「UU 远程（OpenUUYC）」，或运行 openuuyc-launch gui。
+启动：应用菜单里的「OpenUUYC」，或运行 OpenUUYC。登录后自动启动请在
+「连接设置 → 启动 → 开机自启」中打开。
 
 登录态保存在系统密钥环（Secret Service），需要 gnome-keyring 或 KWallet。
 EOF
@@ -32,7 +34,7 @@ pre_remove() {
 OpenUUYC 已移除。以下用户数据被保留：
 
     ~/.local/share/OpenUUYC/          日志与屏幕共享授权令牌
-    ~/.config/autostart/openuuyc.desktop  （若开启过远程开机自启）
+    ~/.config/autostart/openuuyc.desktop  （若开启过开机自启或远程开机）
 
 需要时手动删除。
 EOF

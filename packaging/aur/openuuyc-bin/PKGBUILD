@@ -1,6 +1,7 @@
 # Maintainer: risent <shengqi542@gmail.com>
 #
-# Binary package built from the GitHub release of the Omarchy/Wayland fork.
+# Binary package built from a GitHub release of the Linux port
+# (DoyoDia/openuuyc), which linux-release.yml publishes for every v* tag.
 # Prefer this over openuuyc-git unless you want to track the branch.
 #
 # AUR submission: copy this directory to an AUR git checkout and run
@@ -8,14 +9,14 @@
 # then commit. See packaging/aur/README.md.
 
 pkgname=openuuyc-bin
-pkgver=1.0.0.omarchy.2
+pkgver=1.0.1.linux.1
 pkgrel=1
-# The git tag keeps the hyphen and dot that pkgver may not contain:
-# 1.0.0.omarchy.1 -> v1.0.0-omarchy.1
-_tag=v${pkgver/.omarchy./-omarchy.}
-pkgdesc="Third-party UU Remote client (Wayland/Hyprland host support)"
+# Releases are tagged v<Cargo version>-linux.<n>; pkgver may not contain the
+# hyphen: 1.0.1.linux.1 -> v1.0.1-linux.1
+_tag=v${pkgver/.linux./-linux.}
+pkgdesc="Third-party UU Remote client (Linux port, X11 and Wayland)"
 arch=('x86_64')
-url="https://github.com/risent/openuuyc"
+url="https://github.com/DoyoDia/openuuyc"
 license=('custom')
 depends=('gcc-libs' 'fuse3' 'libx11' 'libxcb' 'libxrandr' 'libxi' 'libxcursor'
          'libxfixes' 'libxkbcommon' 'libxkbcommon-x11' 'wayland'
@@ -37,37 +38,24 @@ conflicts=('openuuyc' 'openuuyc-git')
 # The binary is built with debuginfo stripped and there is nothing to split.
 options=('!debug')
 install=openuuyc-bin.install
-source=(
-    "OpenUUYC-$pkgver::${url}/releases/download/${_tag}/OpenUUYC"
-    "openuuyc.desktop::${url}/raw/${_tag}/packaging/linux/openuuyc.desktop"
-    "openuuyc-launch::${url}/raw/${_tag}/packaging/linux/openuuyc-launch"
-    "openuuyc-gui.service::${url}/raw/${_tag}/packaging/linux/openuuyc-gui.service"
-    "60-openuuyc-uinput.rules::${url}/raw/${_tag}/packaging/linux/60-openuuyc-uinput.rules"
-    "icon-256.png::${url}/raw/${_tag}/assets/icon-256.png"
-    "LICENSE::${url}/raw/${_tag}/LICENSE"
-    "THIRD_PARTY_NOTICES::${url}/raw/${_tag}/THIRD_PARTY_NOTICES"
-)
-sha256sums=('SKIP'
-            'SKIP'
-            'SKIP'
-            'SKIP'
-            'SKIP'
-            'SKIP'
-            'SKIP'
-            'SKIP')
+# The release archive mirrors the repository layout (see linux-release.yml),
+# so one versioned download carries the binary, its desktop files and every
+# license text, and makepkg's source cache never mixes versions.
+_dir=OpenUUYC-${_tag#v}-x86_64-linux
+source=("${url}/releases/download/${_tag}/${_dir}.tar.zst")
+sha256sums=('SKIP')
 
 package() {
-    install -Dm755 "$srcdir/OpenUUYC-$pkgver" "$pkgdir/usr/bin/OpenUUYC"
-    install -Dm755 "$srcdir/openuuyc-launch" "$pkgdir/usr/bin/openuuyc-launch"
-    install -Dm644 "$srcdir/openuuyc.desktop" \
+    cd "$srcdir/$_dir"
+    install -Dm755 OpenUUYC "$pkgdir/usr/bin/OpenUUYC"
+    install -Dm644 packaging/linux/openuuyc.desktop \
         "$pkgdir/usr/share/applications/openuuyc.desktop"
-    install -Dm644 "$srcdir/icon-256.png" \
+    install -Dm644 assets/icon-256.png \
         "$pkgdir/usr/share/icons/hicolor/256x256/apps/openuuyc.png"
-    install -Dm644 "$srcdir/openuuyc-gui.service" \
-        "$pkgdir/usr/lib/systemd/user/openuuyc-gui.service"
-    install -Dm644 "$srcdir/60-openuuyc-uinput.rules" \
+    install -Dm644 packaging/linux/60-openuuyc-uinput.rules \
         "$pkgdir/usr/lib/udev/rules.d/60-openuuyc-uinput.rules"
-    install -Dm644 "$srcdir/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
-    install -Dm644 "$srcdir/THIRD_PARTY_NOTICES" \
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    install -Dm644 THIRD_PARTY_NOTICES \
         "$pkgdir/usr/share/licenses/$pkgname/THIRD_PARTY_NOTICES"
+    cp -r assets/licenses "$pkgdir/usr/share/licenses/$pkgname/licenses"
 }

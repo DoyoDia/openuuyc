@@ -2,7 +2,7 @@ name: Linux deb
 
 on:
   push:
-    branches: [main, linux-port, omarchy]
+    branches: [main, linux-port]
     tags: ["v*"]
   pull_request:
   workflow_dispatch:

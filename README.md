@@ -104,22 +104,13 @@ cargo dist
 
 #### Arch / Omarchy
 
-AUR 上有预编译包（`openuuyc-bin`）和跟踪分支的源码包（`openuuyc-git`），推荐前者：
+AUR 上有安装发布包的 `openuuyc-bin` 和跟踪 `linux-port` 分支源码构建的 `openuuyc-git`，说明见 [`packaging/aur/README.md`](packaging/aur/README.md)：
 
 ```bash
-# Omarchy 自带 yay，也可以直接用 AUR helper
 yay -S openuuyc-bin
 ```
 
-Omarchy 用户还可以把下面一行加进 `~/.config/omarchy/extensions/omarchy-menu.jsonc`，从
-`Super + Space → Install → Service` 里一键安装：
-
-```jsonc
-"install.service.openuuyc": {"icon":"󰒺","label":"UU Remote (OpenUUYC)","disabled":"omarchy-pkg-present openuuyc-bin","action":"omarchy-launch-floating-terminal-with-presentation omarchy-pkg-aur-add openuuyc-bin"},
-```
-
-完整文件见 [`packaging/omarchy/omarchy-menu.jsonc`](packaging/omarchy/omarchy-menu.jsonc)；
-`install-omarchy.sh` 会在检测到 Omarchy 时自动安装。
+Omarchy 用户可以把 [`packaging/omarchy/omarchy-menu.jsonc`](packaging/omarchy/omarchy-menu.jsonc) 里的条目加进 `~/.config/omarchy/extensions/omarchy-menu.jsonc`，从 `Super + Space → Install → Service` 安装。不用 AUR 时，在源码目录构建后（或解压 Release 里的 `OpenUUYC-<版本>-x86_64-linux.tar.zst` 后）运行 `./install-omarchy.sh`，它会安装程序、桌面入口、uinput 规则和 Omarchy 菜单项（`--uninstall` 卸载）。
 
 自建：
 

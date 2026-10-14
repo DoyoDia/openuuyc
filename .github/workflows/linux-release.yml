@@ -1,11 +1,13 @@
 name: Linux release
 
 # Builds the x86_64 binary on Arch (the distribution the AUR packages target)
-# and attaches it to the GitHub Release for the pushed tag.
+# and attaches it to the GitHub Release for the pushed tag, next to the .deb
+# that linux-deb.yml attaches to the same release. Tags are
+# v<Cargo version>-linux.<n>.
 #
-# The package in `openuuyc-bin` downloads the `OpenUUYC` asset directly, so the
-# asset name and the tag naming scheme (v<version>) are part of the interface:
-# keep them in sync with packaging/aur/openuuyc-bin/PKGBUILD.
+# `openuuyc-bin` downloads OpenUUYC-<version>-x86_64-linux.tar.zst, so the
+# archive name, its layout and the tag scheme (v<version>) are part of the
+# interface: keep them in sync with packaging/aur/openuuyc-bin/PKGBUILD.
 
 on:
   push:
@@ -58,21 +60,19 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           stage="OpenUUYC-${version}-x86_64-linux"
           mkdir -p "$stage"
+          # Same layout as the repository: install-omarchy.sh and the AUR
+          # binary package both read these paths from the unpacked archive.
           install -Dm755 target/release/OpenUUYC "$stage/OpenUUYC"
-          install -Dm755 packaging/linux/openuuyc-launch "$stage/openuuyc-launch"
-          install -Dm644 packaging/linux/openuuyc.desktop "$stage/openuuyc.desktop"
-          install -Dm644 packaging/linux/openuuyc-gui.service "$stage/openuuyc-gui.service"
-          install -Dm644 packaging/linux/60-openuuyc-uinput.rules \
-            "$stage/60-openuuyc-uinput.rules"
-          install -Dm644 packaging/omarchy/omarchy-menu.jsonc \
-            "$stage/omarchy-menu.jsonc"
-          install -Dm644 assets/icon-256.png "$stage/icon-256.png"
-          install -Dm644 LICENSE "$stage/LICENSE"
-          install -Dm644 THIRD_PARTY_NOTICES "$stage/THIRD_PARTY_NOTICES"
-          cp -r assets/licenses "$stage/licenses"
+          install -Dm755 install-omarchy.sh "$stage/install-omarchy.sh"
+          for file in packaging/linux/openuuyc.desktop \
+            packaging/linux/60-openuuyc-uinput.rules \
+            packaging/omarchy/omarchy-menu.jsonc assets/icon-256.png \
+            LICENSE THIRD_PARTY_NOTICES; do
+            install -Dm644 "$file" "$stage/$file"
+          done
+          cp -r assets/licenses "$stage/assets/licenses"
           tar --zstd -cf "$stage.tar.zst" "$stage"
           sha256sum "$stage.tar.zst" > "$stage.tar.zst.sha256"
-          # The AUR binary package downloads this exact name.
           install -Dm755 target/release/OpenUUYC OpenUUYC
           ls -lh "$stage.tar.zst" OpenUUYC
 
@@ -91,7 +91,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    # The deb workflow also publishes to this tag; the shared group serializes
+    # linux-deb.yml also publishes to this tag; the shared group serializes
     # them so the second run updates the existing release instead of racing it.
     concurrency:
       group: release-${{ github.ref }}
@@ -109,12 +109,14 @@ jobs:
           # The LICENSE reserves all rights on original material and requires
           # attribution and third-party notices; say so before anyone downloads.
           body: |
-            Linux (x86_64) build of the Omarchy/Wayland fork.
+            Linux (x86_64) builds of the Linux port.
 
-            - `OpenUUYC` — the binary. Arch/Omarchy users should prefer the AUR
-              package `openuuyc-bin`, which installs this plus the desktop entry,
-              icon, systemd unit and uinput udev rule.
-            - `OpenUUYC-<version>-x86_64-linux.tar.zst` — binary with those files.
+            - `openuuyc_<version>_amd64.deb` — Debian/Ubuntu package.
+            - `OpenUUYC` — the binary, built on Arch.
+            - `OpenUUYC-<version>-x86_64-linux.tar.zst` — the binary with the
+              desktop entry, icon, uinput udev rule, licenses and
+              `install-omarchy.sh`. Arch/Omarchy users should prefer the AUR
+              package `openuuyc-bin`, which installs this archive.
 
             Host (被控) input on Wayland needs `/dev/uinput` access and an XDG
             ScreenCast portal; see the README's Linux section.

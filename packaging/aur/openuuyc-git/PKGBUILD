@@ -1,6 +1,6 @@
 # Maintainer: risent <shengqi542@gmail.com>
 #
-# Source package tracking the Omarchy/Wayland fork's default branch.
+# Source package tracking the Linux port's branch (DoyoDia/openuuyc linux-port).
 # Builds from source; expect 20-40 minutes and ~4 GB of RAM on first build.
 # Use openuuyc-bin if you just want the program.
 
@@ -8,9 +8,9 @@ pkgname=openuuyc-git
 _pkgname=openuuyc
 pkgver=1.0.0.rc.2.r12.g574a090
 pkgrel=1
-pkgdesc="Third-party UU Remote client (Wayland/Hyprland host support)"
+pkgdesc="Third-party UU Remote client (Linux port, X11 and Wayland)"
 arch=('x86_64')
-url="https://github.com/risent/openuuyc"
+url="https://github.com/DoyoDia/openuuyc"
 license=('custom')
 depends=('gcc-libs' 'fuse3' 'libx11' 'libxcb' 'libxrandr' 'libxi' 'libxcursor'
          'libxfixes' 'libxkbcommon' 'libxkbcommon-x11' 'wayland'
@@ -33,7 +33,7 @@ conflicts=('openuuyc' 'openuuyc-bin')
 # The release profile keeps only debuginfo; nothing is left to split out.
 options=('!debug')
 install=openuuyc-git.install
-source=("$pkgname::git+${url}.git#branch=omarchy")
+source=("$pkgname::git+${url}.git#branch=linux-port")
 sha256sums=('SKIP')
 
 pkgver() {
@@ -62,13 +62,10 @@ build() {
 package() {
     cd "$pkgname"
     install -Dm755 target/release/OpenUUYC "$pkgdir/usr/bin/OpenUUYC"
-    install -Dm755 packaging/linux/openuuyc-launch "$pkgdir/usr/bin/openuuyc-launch"
     install -Dm644 packaging/linux/openuuyc.desktop \
         "$pkgdir/usr/share/applications/openuuyc.desktop"
     install -Dm644 assets/icon-256.png \
         "$pkgdir/usr/share/icons/hicolor/256x256/apps/openuuyc.png"
-    install -Dm644 packaging/linux/openuuyc-gui.service \
-        "$pkgdir/usr/lib/systemd/user/openuuyc-gui.service"
     install -Dm644 packaging/linux/60-openuuyc-uinput.rules \
         "$pkgdir/usr/lib/udev/rules.d/60-openuuyc-uinput.rules"
     install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"

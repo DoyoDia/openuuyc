@@ -1,17 +1,25 @@
 #!/bin/bash
 # Install OpenUUYC on Omarchy (Arch + Hyprland), including host (被控) support.
 #
-# This is the manual path for people who build from source or download the
-# release tarball. AUR users do not need it: `yay -S openuuyc-bin` already
-# installs every file below.
+# This is the manual path for people who build from source or unpack the
+# release archive (it has the same layout as this repository). AUR users do
+# not need it: `yay -S openuuyc-bin` already installs every file below.
 #
 # Usage:
 #   ./install-omarchy.sh              # install the binary in this tree
 #   ./install-omarchy.sh --uninstall  # remove it (keeps user data)
 set -euo pipefail
+cd "$(dirname "$0")"
 
-BINARY="${OPENUUYC_BINARY:-target/release/OpenUUYC}"
+if [[ -n ${OPENUUYC_BINARY:-} ]]; then
+    BINARY=$OPENUUYC_BINARY
+elif [[ -x target/release/OpenUUYC ]]; then
+    BINARY=target/release/OpenUUYC
+else
+    BINARY=OpenUUYC # the release archive
+fi
 PREFIX="${PREFIX:-/usr/local}"
+MENU="$HOME/.config/omarchy/extensions/omarchy-menu.jsonc"
 
 say() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m警告:\033[0m %s\n' "$*" >&2; }
@@ -22,22 +30,33 @@ else
     SUDO=(sudo)
 fi
 
+# Earlier versions of this script installed and enabled a systemd user unit.
+# Login startup is now the settings page's switch (an XDG autostart entry);
+# leaving both would start two copies.
+remove_legacy_service() {
+    if [[ -e /usr/lib/systemd/user/openuuyc-gui.service ]]; then
+        systemctl --user disable --now openuuyc-gui.service 2>/dev/null || true
+        "${SUDO[@]}" rm -f /usr/lib/systemd/user/openuuyc-gui.service
+        systemctl --user daemon-reload 2>/dev/null || true
+    fi
+}
+
 uninstall() {
     say "移除 OpenUUYC"
     "${SUDO[@]}" rm -f \
         "$PREFIX/bin/OpenUUYC" \
-        "$PREFIX/bin/openuuyc-launch" \
         "$PREFIX/share/applications/openuuyc.desktop" \
         "$PREFIX/share/icons/hicolor/256x256/apps/openuuyc.png" \
         /usr/lib/udev/rules.d/60-openuuyc-uinput.rules
-    # Only remove the menu extension if it is the one we wrote.
-    menu="$HOME/.config/omarchy/extensions/omarchy-menu.jsonc"
-    if [[ -e $menu ]] && grep -q 'install.service.openuuyc' "$menu"; then
-        rm -f "$menu"
+    # Only remove the menu extension if it is exactly the one we wrote; an
+    # extension the user merged our entry into stays.
+    if [[ -e $MENU ]] && cmp -s packaging/omarchy/omarchy-menu.jsonc "$MENU"; then
+        rm -f "$MENU"
+    elif [[ -e $MENU ]] && grep -q 'install.service.openuuyc' "$MENU"; then
+        warn "$MENU 含有 OpenUUYC 菜单项，请手动删除该条目"
     fi
-    rm -f "$HOME/.config/systemd/user/openuuyc-gui.service"
-    systemctl --user daemon-reload 2>/dev/null || true
-    say "已移除。用户数据保留在 ~/.local/share/OpenUUYC/"
+    remove_legacy_service
+    say "已移除。用户数据保留在 ~/.local/share/OpenUUYC/，开机自启项在 ~/.config/autostart/openuuyc.desktop"
     exit 0
 }
 
@@ -50,8 +69,8 @@ if [[ ! -x $BINARY ]]; then
 先构建：
     cargo build --release --bin OpenUUYC
 
-或从 Release 下载 tarball 后，在本目录运行：
-    OPENUUYC_BINARY=./OpenUUYC ./install-omarchy.sh
+或从 Release 下载 OpenUUYC-<版本>-x86_64-linux.tar.zst，解压后运行其中的
+    ./install-omarchy.sh
 EOF
     exit 1
 fi
@@ -81,36 +100,22 @@ fi
 
 say "安装程序文件"
 "${SUDO[@]}" install -Dm755 "$BINARY" "$PREFIX/bin/OpenUUYC"
-"${SUDO[@]}" install -Dm755 packaging/linux/openuuyc-launch "$PREFIX/bin/openuuyc-launch"
 "${SUDO[@]}" install -Dm644 packaging/linux/openuuyc.desktop \
     "$PREFIX/share/applications/openuuyc.desktop"
 "${SUDO[@]}" install -Dm644 assets/icon-256.png \
     "$PREFIX/share/icons/hicolor/256x256/apps/openuuyc.png"
-"${SUDO[@]}" install -Dm644 packaging/linux/openuuyc-gui.service \
-    /usr/lib/systemd/user/openuuyc-gui.service
-
-# The wrapper execs /usr/bin/OpenUUYC; when installing under /usr/local, point
-# it at the binary we just placed so both layouts work.
-if [[ $PREFIX != /usr ]]; then
-    "${SUDO[@]}" sed -i "s|^exec /usr/bin/OpenUUYC|exec $PREFIX/bin/OpenUUYC|" \
-        "$PREFIX/bin/openuuyc-launch"
-fi
-
-say "启用图形会话服务"
-systemctl --user daemon-reload
-systemctl --user enable --now openuuyc-gui.service
+remove_legacy_service
 
 # Omarchy only: add an Install → Service row so the app is discoverable there.
 if [[ -d $HOME/.config/omarchy ]]; then
     say "添加 Omarchy 菜单项"
     mkdir -p "$HOME/.config/omarchy/extensions"
-    target="$HOME/.config/omarchy/extensions/omarchy-menu.jsonc"
-    if [[ -e $target ]] && ! grep -q 'install.service.openuuyc' "$target"; then
-        warn "$target 已存在，未自动修改"
+    if [[ -e $MENU ]] && ! cmp -s packaging/omarchy/omarchy-menu.jsonc "$MENU"; then
+        warn "$MENU 已存在，未自动修改"
         warn "请手动加入 packaging/omarchy/omarchy-menu.jsonc 里的条目"
     else
-        cp packaging/omarchy/omarchy-menu.jsonc "$target"
-        say "菜单项已写入 $target（Quickshell 会自动重新加载）"
+        cp packaging/omarchy/omarchy-menu.jsonc "$MENU"
+        say "菜单项已写入 $MENU（Quickshell 会自动重新加载）"
     fi
 fi
 
@@ -118,12 +123,12 @@ cat <<EOF
 
 完成。
 
-  启动      应用菜单「UU 远程（OpenUUYC）」，或 openuuyc-launch gui
-  服务      systemctl --user status openuuyc-gui.service
-  日志      tail -f ~/.local/state/openuuyc/gui.log
+  启动      应用菜单「OpenUUYC」，或运行 OpenUUYC
+  日志      ~/.local/share/OpenUUYC/logs/
   菜单      Super + Space → Install → Service → UU Remote (OpenUUYC)
 
-下一步：扫码登录 → 连接设置 → 打开「允许被控」。
+下一步：扫码登录 → 连接设置 → 打开「允许被控」；需要登录后自动启动时，
+打开「连接设置 → 启动 → 开机自启」。
 
 首次被控时会在本机屏幕弹出一次屏幕共享授权，点「共享」即可，之后不再询问。
 若弹窗被 Hyprland 插件遮挡（例如 overview 常驻表面），可临时提层：
