@@ -147,11 +147,7 @@ fn import_plane(
     };
     // Safe: the hal texture was created from this device and matches `desc`.
     Some(unsafe {
-        device.create_texture_from_hal::<Vk>(
-            hal_texture,
-            &desc,
-            wgpu::TextureUses::RESOURCE,
-        )
+        device.create_texture_from_hal::<Vk>(hal_texture, &desc, wgpu::TextureUses::RESOURCE)
     })
 }
 
@@ -245,8 +241,12 @@ impl VideoLayer {
         let Some(planes) = DmabufPlanes::new(device, frame, width, height) else {
             return false;
         };
-        let luma_view = planes.luma.create_view(&wgpu::TextureViewDescriptor::default());
-        let chroma_view = planes.chroma.create_view(&wgpu::TextureViewDescriptor::default());
+        let luma_view = planes
+            .luma
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let chroma_view = planes
+            .chroma
+            .create_view(&wgpu::TextureViewDescriptor::default());
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("openuuyc-video-nv12"),
             layout: &self.nv12.layout,

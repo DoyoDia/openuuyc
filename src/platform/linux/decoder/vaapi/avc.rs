@@ -947,9 +947,7 @@ fn submit(
 /// single-buffer NV12 this renderer imports; the caller then reads back on the
 /// CPU. The handles are duplicated because the renderer's import consumes one
 /// per plane while the descriptor keeps the originals alive.
-fn export_nv12(
-    surface: &Surface,
-) -> Option<(u64, [crate::platform::linux::dmabuf::Plane; 2])> {
+fn export_nv12(surface: &Surface) -> Option<(u64, [crate::platform::linux::dmabuf::Plane; 2])> {
     use crate::platform::linux::dmabuf::Plane;
     let descriptor = match surface.export_prime() {
         Ok(descriptor) => descriptor,

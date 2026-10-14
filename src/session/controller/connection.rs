@@ -400,9 +400,16 @@ pub(super) async fn resolve_saved_connection(
     reporter: Option<&ConnectionProgressReporter>,
 ) -> Result<ResolvedConnection> {
     let client = Arc::new(AuthenticatedClient::from_saved_session()?);
-    let result =
-        resolve_connection_with_client(Arc::clone(&client), alias, options, reporter, None, None, false)
-            .await;
+    let result = resolve_connection_with_client(
+        Arc::clone(&client),
+        alias,
+        options,
+        reporter,
+        None,
+        None,
+        false,
+    )
+    .await;
     if result.is_err() {
         client.close().await;
     }
@@ -469,8 +476,8 @@ pub(super) async fn resolve_connection_with_client(
         .await;
     // CLI --force-takeover：与 GUI 的“强制接管”确认同一条路径（Approval
     // 会在 connect 时重新验证设备状态），只是不交互。
-    let takeover = takeover
-        .or_else(|| force_takeover.then(|| takeover::Approval::confirmed(device)));
+    let takeover =
+        takeover.or_else(|| force_takeover.then(|| takeover::Approval::confirmed(device)));
     if device.participant_count() != 0
         && shared::get(&shared::key(&client.device_id(), &device.device_id)).is_none()
         && !takeover

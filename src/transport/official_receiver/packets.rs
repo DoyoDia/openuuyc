@@ -128,10 +128,7 @@ impl PacketBuffer {
         // 包级 prepend 可能给首片补上了 SPS/PPS NAL：重算标志位，
         // 帧组装时才不会重复前拼接。
         if packet.codec == VideoCodecKind::H264 {
-            packet.sps = packet
-                .nalus
-                .iter()
-                .any(|n| n.kind == 7 && n.sps >= 0);
+            packet.sps = packet.nalus.iter().any(|n| n.kind == 7 && n.sps >= 0);
             packet.pps = packet.nalus.iter().any(|n| n.kind == 8);
         }
         true
@@ -148,7 +145,8 @@ impl PacketBuffer {
             // 补回；登记后 find_frames 才能识别「帧前缀未到齐」，避免把
             // 残缺帧当作完整关键帧发出（那会永久卡住首次解码）。
             for offset in 1u16..=PRE_WINDOW_NACK {
-                self.missing_packets.insert(sequence_number.wrapping_sub(offset));
+                self.missing_packets
+                    .insert(sequence_number.wrapping_sub(offset));
             }
         } else if ahead_of(self.first_sequence_number, sequence_number) {
             if self.cleared_to_first_sequence {
@@ -405,9 +403,10 @@ impl PacketBuffer {
                 let boundary_absent = self
                     .buffer
                     .get(boundary_seq as usize % self.buffer.len())
-                    .map(|slot| slot
-                        .as_ref()
-                        .is_none_or(|entry| entry.packet.sequence_number != boundary_seq))
+                    .map(|slot| {
+                        slot.as_ref()
+                            .is_none_or(|entry| entry.packet.sequence_number != boundary_seq)
+                    })
                     .unwrap_or(true);
                 if grace_live && boundary_absent {
                     let truncated = !self.buffer[start as usize % self.buffer.len()]
@@ -432,8 +431,7 @@ impl PacketBuffer {
                         }
                         probe = probe.wrapping_add(1);
                     }
-                    let parameter_gap = match self
-                        .buffer[index]
+                    let parameter_gap = match self.buffer[index]
                         .as_ref()
                         .expect("last frame packet")
                         .packet

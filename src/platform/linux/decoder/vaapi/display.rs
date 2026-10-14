@@ -133,9 +133,7 @@ pub(super) fn supports_encode() -> bool {
     .any(|profile| {
         display
             .query_config_entrypoints(*profile)
-            .is_ok_and(|entrypoints| {
-                entrypoints.contains(&VAEntrypoint::VAEntrypointEncSlice)
-            })
+            .is_ok_and(|entrypoints| entrypoints.contains(&VAEntrypoint::VAEntrypointEncSlice))
     })
 }
 

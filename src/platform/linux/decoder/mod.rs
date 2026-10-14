@@ -11,9 +11,9 @@ use bytes::Bytes;
 
 mod vaapi;
 
+use std::collections::VecDeque;
 /// The shared VA display and encode capability, for the host encoder.
 pub(crate) use vaapi::{encoder_available, shared_display};
-use std::collections::VecDeque;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CpuFormat {
@@ -158,15 +158,13 @@ impl LinuxVideoDecoder {
             Backend::Hardware(session) => {
                 let frame = session.decode(payload, self.notification.cancellation())?;
                 let pending = match frame.data {
-                    vaapi::FrameData::Cpu(data) => {
-                        PlatformDecodedFrame::Cpu(CpuVideoFrame {
-                            pts: token,
-                            width: frame.width,
-                            height: frame.height,
-                            format: CpuFormat::Nv12,
-                            data: Bytes::from(data),
-                        })
-                    }
+                    vaapi::FrameData::Cpu(data) => PlatformDecodedFrame::Cpu(CpuVideoFrame {
+                        pts: token,
+                        width: frame.width,
+                        height: frame.height,
+                        format: CpuFormat::Nv12,
+                        data: Bytes::from(data),
+                    }),
                     vaapi::FrameData::Dmabuf(frame_data) => {
                         PlatformDecodedFrame::Dmabuf(DmabufVideoFrame {
                             pts: token,

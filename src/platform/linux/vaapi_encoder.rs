@@ -168,15 +168,14 @@ impl Encoder {
         let context = display
             .create_context(&config, size.0, size.1, Some(&surfaces), true)
             .map_err(|error| EncodeError::Backend(error.to_string()))?;
-        let parameter_sets = openuuyc_h264::encoder::parameter_sets(
-            openuuyc_h264::encoder::Config {
+        let parameter_sets =
+            openuuyc_h264::encoder::parameter_sets(openuuyc_h264::encoder::Config {
                 width: size.0,
                 height: size.1,
                 fps: rate.fps,
                 bitrate: rate.target,
-            },
-        )
-        .map_err(|error| EncodeError::Unsupported(error.to_string()))?;
+            })
+            .map_err(|error| EncodeError::Unsupported(error.to_string()))?;
         Ok(Self {
             ids: surfaces.iter().map(Surface::id).collect(),
             context,

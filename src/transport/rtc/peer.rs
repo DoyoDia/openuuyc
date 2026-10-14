@@ -517,7 +517,9 @@ impl NativePeer {
         let fmtp_lines: Vec<&str> = sdp
             .lines()
             .filter(|line| {
-                line.starts_with("a=fmtp") || line.starts_with("a=rtpmap") || line.starts_with("m=video")
+                line.starts_with("a=fmtp")
+                    || line.starts_with("a=rtpmap")
+                    || line.starts_with("m=video")
             })
             .collect();
         tracing::debug!(restart_ice, sdp_fmtp = ?fmtp_lines, "installing remote SDP answer");
@@ -584,7 +586,9 @@ impl NativePeer {
     pub async fn request_keyframe(&self, media_ssrc: u32) -> Result<()> {
         // 同时发 PLI 与 FIR：部分 host（macOS）只对 FIR 生成关键帧。
         let pli = send_picture_loss_indication(&self.core.connection, media_ssrc).await;
-        let fir = send_full_intra_request(&self.core.connection, media_ssrc, self.next_fir_sequence()).await;
+        let fir =
+            send_full_intra_request(&self.core.connection, media_ssrc, self.next_fir_sequence())
+                .await;
         pli.and(fir)
     }
 

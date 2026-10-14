@@ -187,8 +187,8 @@ impl ParameterTracker {
                         .get(&pps.sps)
                         .ok_or("H.264 PPS references missing SPS")?;
                     format = sps.format;
-                    let packet_carries_parameters = nalus.iter().any(|n| n.kind == 7)
-                        && nalus.iter().any(|n| n.kind == 8);
+                    let packet_carries_parameters =
+                        nalus.iter().any(|n| n.kind == 7) && nalus.iter().any(|n| n.kind == 8);
                     if !packet_carries_parameters
                         && (sps.in_band.is_some() || sps.out_of_band.is_some())
                         && (pps.in_band.is_some() || pps.out_of_band.is_some())
