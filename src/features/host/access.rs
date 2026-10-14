@@ -361,6 +361,13 @@ impl Handle {
             return Ok(());
         }
         tokio::task::spawn_blocking(super::displays::recovery::recover_abandoned).await??;
+        if capture::needs_consent() {
+            // Opening capture would ask the local user to share the screen
+            // (the ScreenCast portal before its first grant); login must not
+            // wait on that. An authorized incoming session prepares media.
+            tracing::info!("host media probe deferred until an authorized incoming session");
+            return Ok(());
+        }
         let screens = capture::screens()?;
         let Some(screen) = screens
             .iter()

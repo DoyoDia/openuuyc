@@ -192,6 +192,16 @@ fn candidates() -> Result<Vec<Kind>> {
     })
 }
 
+/// Whether opening capture now would ask the local user to share the
+/// screen: the portal comes first and has no remembered grant yet.
+pub(crate) fn needs_consent() -> bool {
+    candidates().is_ok_and(|kinds| consent_needed(&kinds, portal::remembered()))
+}
+
+fn consent_needed(kinds: &[Kind], remembered: bool) -> bool {
+    kinds.first() == Some(&Kind::Portal) && !remembered
+}
+
 enum Backend {
     NvFbc(nvfbc::Grab),
     X11(x11::Grab),
@@ -477,7 +487,18 @@ fn scale(source: &[u8], from: (u32, u32), to: (u32, u32)) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::scale;
+    use super::{Kind, consent_needed, scale};
+
+    #[test]
+    fn only_an_unremembered_portal_asks_the_user() {
+        assert!(consent_needed(&[Kind::Portal], false));
+        assert!(!consent_needed(&[Kind::Portal], true));
+        // X11 sessions reach the portal only after NvFBC and MIT-SHM fail.
+        assert!(!consent_needed(
+            &[Kind::NvFbc, Kind::X11, Kind::Portal],
+            false
+        ));
+    }
 
     #[test]
     fn crop_to_even_keeps_pixels() {

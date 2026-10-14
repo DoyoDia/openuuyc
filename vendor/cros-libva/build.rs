@@ -60,6 +60,9 @@ fn get_va_version(va_h_path: &str) -> (u32, u32) {
 }
 
 fn main() {
+    for version in [16, 19, 20, 21] {
+        println!("cargo::rustc-check-cfg=cfg(libva_1_{version}_or_higher)");
+    }
     // Do not require dependencies when generating docs.
     if std::env::var("CARGO_DOC").is_ok() || std::env::var("DOCS_RS").is_ok() {
         return;

@@ -56,6 +56,13 @@ fn token_path() -> Result<std::path::PathBuf> {
     Ok(crate::platform::paths::require_local_app_data()?.join("OpenUUYC/screencast-restore-token"))
 }
 
+/// Whether the user has granted a session that the portal can restore.
+pub(super) fn remembered() -> bool {
+    token_path()
+        .and_then(|path| Ok(std::fs::read_to_string(path)?))
+        .is_ok_and(|token| !token.trim().is_empty())
+}
+
 impl Session {
     fn start(cursor: bool) -> Result<Self> {
         let runtime = tokio::runtime::Builder::new_multi_thread()

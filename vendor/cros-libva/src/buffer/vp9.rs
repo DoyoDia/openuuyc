@@ -435,6 +435,9 @@ impl EncPictureParameterBufferVP9 {
             number_skip_frames,
             skip_frames_size,
             va_reserved: Default::default(),
+            // New libva headers add segmentation fields in reserved space.
+            // Keep their zero defaults without requiring them in older headers.
+            ..Default::default()
         }))
     }
 

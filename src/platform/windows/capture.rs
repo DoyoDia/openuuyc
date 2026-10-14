@@ -22,6 +22,11 @@ mod power;
 mod recovery;
 mod session;
 
+/// Capture never asks the local user on Windows.
+pub(crate) fn needs_consent() -> bool {
+    false
+}
+
 /// Read the state of this process's interactive session. Unknown/failure is
 /// not an unlocked session; callers retain their last confirmed report.
 pub(crate) fn session_locked() -> Option<bool> {

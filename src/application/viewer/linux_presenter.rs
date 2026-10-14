@@ -143,6 +143,12 @@ struct Shell {
 }
 
 impl ConnectingWindowsRunner {
+    pub(crate) fn has_focus(&self) -> bool {
+        self.window
+            .as_ref()
+            .is_some_and(|window| window.has_focus())
+    }
+
     pub(crate) fn new(
         config: ConnectingWindowsRunConfig,
         needs_display: bool,
@@ -558,10 +564,19 @@ impl ApplicationHandler<UiEvent> for ConnectingWindowsRunner {
         let (Some(window), Some(shell)) = (self.window.clone(), self.shell.as_mut()) else {
             return;
         };
+        let previous_events = shell.input.egui_input_mut().events.len();
         let response = shell.input.on_window_event(&window, &event);
         let consumed = response.consumed;
         if let Stage::Playing(player) = &mut self.stage {
-            player.on_window_event(&window, &shell.context, &event, consumed);
+            let forwarded = player.on_window_event(&window, &shell.context, &event, consumed);
+            if forwarded && matches!(event, WindowEvent::KeyboardInput { .. }) {
+                // A remote Tab must not also focus a local toolbar button.
+                shell
+                    .input
+                    .egui_input_mut()
+                    .events
+                    .truncate(previous_events);
+            }
         }
         match event {
             WindowEvent::CloseRequested | WindowEvent::Destroyed => {
@@ -713,6 +728,8 @@ struct Player {
     pointer_locked: bool,
     /// The compositor only lets a focused window hold the pointer.
     focused: bool,
+    /// A local menu, text field or modal temporarily owns input.
+    local_input_blocked: bool,
     /// Sub-pixel motion carried between raw events.
     motion_remainder: [f64; 2],
     /// Report rate per physical mouse, for the high polling-rate notice.
@@ -763,7 +780,8 @@ impl Player {
             control_error: None,
             cursor: None,
             pointer_locked: false,
-            focused: true,
+            focused: window.has_focus(),
+            local_input_blocked: false,
             motion_remainder: [0.0, 0.0],
             polling: Default::default(),
             polling_origin: Instant::now(),
@@ -984,6 +1002,7 @@ impl Player {
         self.drag
             .tick(window, ui.ctx(), available, |position| map(position, false));
         self.drag.show(ui.ctx());
+        self.update_input_gate(ui.ctx(), window);
         self.restore_control(ui.ctx(), window);
         self.update_pointer_lock(window);
         self.draw_remote_cursor(ui, window);
@@ -1219,6 +1238,9 @@ impl Player {
         let DeviceEvent::MouseMotion { delta } = event else {
             return false;
         };
+        if !self.focused || self.local_input_blocked {
+            return false;
+        }
         let input = self.input();
         if input.mode() == MouseMode::View || input.waiting_for_neutral() {
             return false;
@@ -1257,7 +1279,10 @@ impl Player {
     /// local cursor cannot wander onto another window mid-game.
     fn update_pointer_lock(&mut self, window: &Arc<Window>) {
         let input = self.input();
-        let wanted = self.focused && input.relative_mode() && input.mode() != MouseMode::View;
+        let wanted = self.focused
+            && !self.local_input_blocked
+            && input.relative_mode()
+            && input.mode() != MouseMode::View;
         if wanted == self.pointer_locked {
             return;
         }
@@ -1305,6 +1330,24 @@ impl Player {
         }
     }
 
+    fn local_ui_owns_input(&self, context: &egui::Context) -> bool {
+        self.stream_control_ui.open
+            || context.any_popup_open()
+            || context.text_edit_focused()
+            || context.memory(|memory| memory.top_modal_layer().is_some())
+    }
+
+    fn update_input_gate(&mut self, context: &egui::Context, window: &Arc<Window>) {
+        let blocked = self.local_ui_owns_input(context);
+        if blocked && !self.local_input_blocked {
+            self.release_keys();
+            self.input().pause_owner(self.owner);
+            self.release_pointer(window);
+            self.motion_remainder = [0.0, 0.0];
+        }
+        self.local_input_blocked = blocked;
+    }
+
     fn on_focus_changed(&mut self, window: &Arc<Window>, focused: bool) {
         self.focused = focused;
         if !focused && self.control().drag_drop().handoff_pending() {
@@ -1328,6 +1371,7 @@ impl Player {
         self.physical_keys.clear();
         self.physical_buttons = 0;
         self.modifiers = winit::keyboard::ModifiersState::empty();
+        self.motion_remainder = [0.0, 0.0];
         self.input().pause_owner(self.owner);
         self.control().drag_drop().cancel_gesture(true);
     }
@@ -1340,6 +1384,7 @@ impl Player {
         event: &WindowEvent,
         consumed_by_ui: bool,
     ) -> bool {
+        self.update_input_gate(context, window);
         if self.drag.event(event) {
             return false;
         }
@@ -1360,10 +1405,13 @@ impl Player {
                 self.modifiers = modifiers.state();
                 false
             }
-            WindowEvent::KeyboardInput { event, .. } => {
-                if event.repeat {
-                    return false;
-                }
+            WindowEvent::KeyboardInput {
+                event,
+                is_synthetic,
+                ..
+            } => {
+                // Focus changes can synthesize presses for keys already held
+                // outside this window. Track them for neutral detection only.
                 let down = event.state == ElementState::Pressed;
                 if let Some(key) =
                     crate::application::viewer_shortcuts::physical_key(event.physical_key)
@@ -1377,26 +1425,42 @@ impl Player {
                     }
                     self.confirm_neutral();
                 }
-                if down && let Some(action) = viewer_shortcut(self.modifiers, event.physical_key) {
-                    self.run_shortcut(action, window);
-                    return true;
-                }
-                if consumed_by_ui || self.input().mode() == MouseMode::View {
-                    return false;
-                }
                 let Some(key) =
                     crate::application::viewer_shortcuts::physical_key(event.physical_key)
                 else {
                     return false;
                 };
-                if down {
+                if !down {
+                    self.held_keys.retain(|held| *held != key);
+                    return forward_key(self.input(), self.owner, key, false, true, consumed_by_ui);
+                }
+                if *is_synthetic || !self.focused || self.local_input_blocked || dragging {
+                    return false;
+                }
+                if event.repeat {
+                    // Keep the compositor's delay/rate. A repeat can only extend
+                    // an accepted remote press, never execute a local shortcut
+                    // again or acquire a key held before control was enabled.
+                    return forward_repeat_key(
+                        self.input(),
+                        self.owner,
+                        key,
+                        false,
+                        consumed_by_ui,
+                    );
+                }
+                if let Some(action) = viewer_shortcut(self.modifiers, event.physical_key) {
+                    self.run_shortcut(action, window);
+                    return true;
+                }
+                let accepted =
+                    forward_key(self.input(), self.owner, key, true, false, consumed_by_ui);
+                if accepted {
                     if !self.held_keys.contains(&key) {
                         self.held_keys.push(key);
                     }
-                } else {
-                    self.held_keys.retain(|held| *held != key);
                 }
-                self.input().key(self.owner, key, down, None)
+                accepted
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.last_position = Some(*position);
@@ -1422,6 +1486,15 @@ impl Player {
                     self.confirm_neutral();
                 }
                 let pressed = *state == ElementState::Pressed;
+                let Some(code) = mouse_button(*button) else {
+                    return false;
+                };
+                if !pressed {
+                    // The input queue checks owner/held state. Never let an
+                    // overlay swallow a release belonging to the remote.
+                    self.input().button(self.owner, code, false);
+                    return true;
+                }
                 // egui answers `consumed_by_ui` from the pointer position of
                 // its last pass, so a click right after the pointer left the
                 // caption, a menu or a notice was kept for the UI and never
@@ -1437,24 +1510,27 @@ impl Player {
                     relative = self.input().relative_mode(),
                     neutral_wait = self.input().waiting_for_neutral(),
                     "mouse button");
-                if dragging || self.input().mode() == MouseMode::View {
+                if dragging
+                    || self.local_input_blocked
+                    || !self.focused
+                    || self.input().mode() == MouseMode::View
+                {
                     return false;
                 }
-                // A release always goes through: the remote only acts on it
-                // for a button it holds.
-                if pressed && (!self.pointer_in_video || ui_dragging) {
+                if !self.pointer_in_video || ui_dragging {
                     return false;
                 }
-                let Some(code) = mouse_button(*button) else {
-                    return false;
-                };
-                self.input()
-                    .button(self.owner, code, *state == ElementState::Pressed);
+                self.input().button(self.owner, code, true);
                 true
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 self.pointer_in_video = self.pointer_on_video(context);
-                if dragging || !self.pointer_in_video || context.dragged_id().is_some() {
+                if dragging
+                    || self.local_input_blocked
+                    || !self.focused
+                    || !self.pointer_in_video
+                    || context.dragged_id().is_some()
+                {
                     return false;
                 }
                 let (horizontal, amount) = match delta {
@@ -1641,6 +1717,9 @@ impl Player {
     }
 
     fn send_position(&mut self, position: PhysicalPosition<f64>) {
+        if !self.focused || self.local_input_blocked {
+            return;
+        }
         let input = self.input();
         if input.mode() == MouseMode::View || input.waiting_for_neutral() {
             return;
@@ -1675,6 +1754,200 @@ impl Player {
 
     fn scale_factor(&self) -> f32 {
         self.scale.max(0.1)
+    }
+}
+
+/// egui-winit always consumes Tab for local focus navigation, even when no
+/// local editor owns input. Releases always reach the owner-aware queue.
+fn forward_key(
+    input: &crate::features::remote_input::RemoteInput,
+    owner: u64,
+    key: u16,
+    down: bool,
+    local_ui: bool,
+    consumed_by_ui: bool,
+) -> bool {
+    if down && (local_ui || (consumed_by_ui && key != 9)) {
+        return false;
+    }
+    input.key(owner, key, down, None)
+}
+
+fn forward_repeat_key(
+    input: &crate::features::remote_input::RemoteInput,
+    owner: u64,
+    key: u16,
+    local_ui: bool,
+    consumed_by_ui: bool,
+) -> bool {
+    // A repeat only extends a press this window already sent: it never
+    // acquires a key held before control began or revives a retired one.
+    input.owner_holds_key(owner, key)
+        && forward_key(input, owner, key, true, local_ui, consumed_by_ui)
+}
+
+#[cfg(test)]
+mod input_tests {
+    use super::*;
+    use crate::features::remote_input::{InputEvent, InputWork, RemoteInput};
+    use crate::protocol::keyboard::KeyboardKey;
+
+    const OWNER: u64 = 42;
+
+    fn ready_input() -> RemoteInput {
+        let input = RemoteInput::default();
+        input.set_keyboard_platform(1);
+        input.set_ready(true);
+        input.enable(MouseMode::Local, false).unwrap();
+        input.confirm_neutral(input.activation_generation());
+        input
+    }
+
+    async fn submitted(input: &RemoteInput) -> InputEvent {
+        let InputWork::Event(queued) = tokio::time::timeout(Duration::from_secs(1), input.next())
+            .await
+            .expect("expected an input event")
+        else {
+            panic!("unexpected recovery");
+        };
+        let event = queued.event.clone();
+        input.complete(&queued, Ok(()));
+        event
+    }
+
+    #[tokio::test]
+    async fn remote_shift_tab_survives_egui_focus_navigation() {
+        let input = ready_input();
+        for (key, consumed) in [(16, false), (9, true)] {
+            assert!(forward_key(&input, OWNER, key, true, false, consumed));
+            assert!(
+                matches!(submitted(&input).await, InputEvent::Key { key: k, down: true, .. } if k == KeyboardKey::Windows(key))
+            );
+        }
+        for key in [9, 16] {
+            assert!(forward_key(&input, OWNER, key, false, true, true));
+            assert!(
+                matches!(submitted(&input).await, InputEvent::Key { key: k, down: false, .. } if k == KeyboardKey::Windows(key))
+            );
+            assert!(!input.owner_holds_key(OWNER, key));
+        }
+    }
+
+    #[tokio::test]
+    async fn editor_blocks_new_keys_without_swallowing_remote_release() {
+        let input = ready_input();
+        assert!(forward_key(&input, OWNER, 65, true, false, false));
+        submitted(&input).await;
+        assert!(!forward_key(&input, OWNER, 9, true, true, true));
+        assert!(!forward_key(&input, OWNER, 66, true, true, false));
+        assert!(!forward_key(&input, OWNER + 1, 65, false, true, true));
+        assert!(input.owner_holds_key(OWNER, 65));
+        assert!(forward_key(&input, OWNER, 65, false, true, true));
+        assert!(matches!(
+            submitted(&input).await,
+            InputEvent::Key {
+                key: KeyboardKey::Windows(65),
+                down: false,
+                ..
+            }
+        ));
+        assert!(!input.owner_holds_key(OWNER, 65));
+    }
+
+    #[tokio::test]
+    async fn local_ui_takeover_releases_submitted_key_and_button() {
+        let input = ready_input();
+        assert!(forward_key(&input, OWNER, 65, true, false, false));
+        submitted(&input).await;
+        input.button(OWNER, 1, true);
+        submitted(&input).await;
+        input.pause_owner(OWNER);
+        assert!(matches!(
+            submitted(&input).await,
+            InputEvent::Key {
+                key: KeyboardKey::Windows(65),
+                down: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            submitted(&input).await,
+            InputEvent::Button {
+                button: 1,
+                down: false
+            }
+        ));
+        assert!(!input.owner_holds_key(OWNER, 65));
+        assert!(!input.owner_holds_buttons(OWNER));
+    }
+
+    #[tokio::test]
+    async fn held_letters_backspace_and_arrows_send_repeated_presses_then_release() {
+        let input = ready_input();
+        for key in [65, 8, 37, 9] {
+            let consumed = key == 9;
+            assert!(forward_key(&input, OWNER, key, true, false, consumed));
+            for _ in 0..3 {
+                assert!(forward_repeat_key(&input, OWNER, key, false, consumed));
+            }
+            assert!(forward_key(&input, OWNER, key, false, false, consumed));
+            for down in [true, true, true, true, false] {
+                let event = submitted(&input).await;
+                let wire: serde_json::Value = serde_json::from_slice(&event.encode()).unwrap();
+                assert_eq!(wire["key"], key);
+                assert_eq!(
+                    wire["action"],
+                    if down { "kbd_press" } else { "kbd_release" }
+                );
+            }
+            assert!(!input.owner_holds_key(OWNER, key));
+            assert!(!forward_repeat_key(&input, OWNER, key, false, consumed));
+        }
+    }
+
+    #[tokio::test]
+    async fn repeat_cannot_acquire_or_revive_a_retired_key() {
+        let input = ready_input();
+        assert!(!forward_repeat_key(&input, OWNER, 65, false, false));
+        assert!(forward_key(&input, OWNER, 65, true, false, false));
+        submitted(&input).await;
+        assert!(!forward_repeat_key(&input, OWNER + 1, 65, false, false));
+        assert!(!forward_repeat_key(&input, OWNER, 65, true, false));
+        assert!(!forward_repeat_key(&input, OWNER, 65, false, true));
+        assert!(input.owner_holds_key(OWNER, 65));
+        input.pause_owner(OWNER);
+        assert!(matches!(
+            submitted(&input).await,
+            InputEvent::Key {
+                key: KeyboardKey::Windows(65),
+                down: false,
+                ..
+            }
+        ));
+        assert!(!forward_repeat_key(&input, OWNER, 65, false, false));
+        assert!(forward_key(&input, OWNER, 65, true, false, false));
+        submitted(&input).await;
+        input.disable();
+        assert!(matches!(
+            submitted(&input).await,
+            InputEvent::Key {
+                key: KeyboardKey::Windows(65),
+                down: false,
+                ..
+            }
+        ));
+        input.enable(MouseMode::Local, false).unwrap();
+        input.confirm_neutral(input.activation_generation());
+        assert!(!forward_repeat_key(&input, OWNER, 65, false, false));
+        // A fresh physical press is required after control is restored.
+        assert!(forward_key(&input, OWNER, 65, true, false, false));
+        assert!(forward_repeat_key(&input, OWNER, 65, false, false));
+        assert!(forward_key(&input, OWNER, 65, false, false, false));
+        for down in [true, true, false] {
+            assert!(
+                matches!(submitted(&input).await, InputEvent::Key { key: KeyboardKey::Windows(65), down: d, .. } if d == down)
+            );
+        }
     }
 }
 
