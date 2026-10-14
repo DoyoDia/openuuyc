@@ -293,7 +293,7 @@ impl Controller {
         ctx: &egui::Context,
         open: &mut bool,
         style: fn(&mut egui::Ui),
-        _control: &crate::features::stream_control::StreamControlHandle,
+        anchor_offset: egui::Vec2,
     ) {
         self.update();
         if !*open {
@@ -310,7 +310,7 @@ impl Controller {
             .title_bar(false)
             .resizable(false)
             .auto_sized()
-            .anchor(egui::Align2::RIGHT_TOP, [-148.0, 52.0])
+            .anchor(egui::Align2::RIGHT_TOP, anchor_offset)
             .frame(
                 egui::Frame::new()
                     .fill(crate::ui::theme::BG)

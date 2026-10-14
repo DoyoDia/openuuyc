@@ -137,6 +137,8 @@ struct Shell {
     presenter: UiPresenter,
     move_state: WindowMoveState,
     resize_state: WindowResizeState,
+    /// The caption floats over the video in fullscreen, as on Windows.
+    fullscreen_chrome: super::fullscreen_chrome::FullscreenChrome,
     timing_audit: Option<UiTimingAudit>,
 }
 
@@ -263,6 +265,7 @@ impl ConnectingWindowsRunner {
             presenter,
             move_state: WindowMoveState::default(),
             resize_state: WindowResizeState::default(),
+            fullscreen_chrome: Default::default(),
             timing_audit: None,
         });
         // Only the D3D11 path can hand a decoder its own surfaces; a Linux
@@ -410,7 +413,9 @@ impl ConnectingWindowsRunner {
                     None,
                 );
             });
-            if window.fullscreen().is_none() {
+            let fullscreen = window.fullscreen().is_some();
+            shell.fullscreen_chrome.sync(fullscreen);
+            if !fullscreen {
                 title_bar_panel(ui, "player-window-chrome", title_bar_height(), |ui| {
                     let bar = ui.available_rect_before_wrap();
                     close_requested |= window_title_bar(
@@ -424,13 +429,26 @@ impl ConnectingWindowsRunner {
                         player.title_bar_controls(ui, bar, &window);
                     }
                 });
+            } else if let Stage::Playing(player) = stage {
+                let relative = player.input().relative_mode();
+                let menu_open = player.stream_control_ui.open;
+                close_requested |=
+                    shell
+                        .fullscreen_chrome
+                        .show(&ctx, relative, menu_open, false, |ui| {
+                            let bar = ui.available_rect_before_wrap();
+                            let close = window_title_bar(ui, &window, &title, None, true);
+                            player.title_bar_controls(ui, bar, &window);
+                            close
+                        });
             }
+            let menu_inset = shell.fullscreen_chrome.menu_inset(&ctx);
             match stage {
                 Stage::Connecting(app) => match audio.as_mut() {
                     Some(audio) => close_requested |= audio.show(ui),
                     None => app.draw(ui),
                 },
-                Stage::Playing(player) => placement = player.draw(ui, &window),
+                Stage::Playing(player) => placement = player.draw(ui, &window, menu_inset),
                 Stage::Finished => {}
             }
             crate::ui::controls::show_notices(ui.ctx());
@@ -673,6 +691,8 @@ struct Player {
     /// The device's local display aspect, which stretches the video and the
     /// pointer mapping with it; `None` keeps the picture's own aspect.
     display_aspect: Option<(u32, u32)>,
+    /// Whether the window was fullscreen at the last frame.
+    fullscreen: bool,
     /// Content area of the last frame, used to map pointer positions.
     video_rect: Option<egui::Rect>,
     pointer_in_video: bool,
@@ -731,6 +751,7 @@ impl Player {
             current: None,
             video_size: None,
             display_aspect: None,
+            fullscreen: false,
             video_rect: None,
             pointer_in_video: false,
             last_position: None,
@@ -838,11 +859,27 @@ impl Player {
         Some(self.display_aspect.unwrap_or(size))
     }
 
-    fn draw(&mut self, ui: &mut egui::Ui, window: &Arc<Window>) -> Option<VideoPlacement> {
+    /// `menu_inset` moves the stream menu under the floating fullscreen bar.
+    fn draw(
+        &mut self,
+        ui: &mut egui::Ui,
+        window: &Arc<Window>,
+        menu_inset: f32,
+    ) -> Option<VideoPlacement> {
         // The title bar is a panel above this ui; max_rect would include it and
         // push the first rows of the picture underneath it.
         let content = ui.available_rect_before_wrap();
         self.video_rect = None;
+        let fullscreen = window.fullscreen().is_some();
+        if self.fullscreen != fullscreen {
+            // Entering or leaving fullscreen hands input back and closes the
+            // stream menu, as the Windows fullscreen shortcut does.
+            self.fullscreen = fullscreen;
+            self.stream_control_ui.open = false;
+            if !self.control().drag_drop().handoff_pending() {
+                self.release_input(window);
+            }
+        }
         let display_aspect = self
             .session
             .stream_control
@@ -906,6 +943,7 @@ impl Player {
             &mut view,
             screen_id,
             local_size,
+            egui::vec2(-114.0 - menu_inset, 52.0),
         );
         self.set_performance_mode(view.performance_mode);
         self.session

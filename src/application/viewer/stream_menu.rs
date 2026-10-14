@@ -505,6 +505,7 @@ pub(super) fn show_stream_control_window(
     view: &mut LocalViewSettings,
     screen_id: i32,
     local_size: Option<(u32, u32)>,
+    anchor_offset: egui::Vec2,
 ) {
     topology_menu::show(ctx, handle, local_size);
     topology_menu::show_error(ctx, handle);
@@ -619,7 +620,7 @@ pub(super) fn show_stream_control_window(
         .collapsible(false)
         .auto_sized()
         .title_bar(false)
-        .anchor(egui::Align2::RIGHT_TOP, [-114.0, 52.0])
+        .anchor(egui::Align2::RIGHT_TOP, anchor_offset)
         .default_width(menu_width + 24.0)
         .frame(
             egui::Frame::new()

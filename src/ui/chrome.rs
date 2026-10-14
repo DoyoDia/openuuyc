@@ -279,6 +279,8 @@ fn window_buttons_impl(ui: &mut egui::Ui, window: &Window, tooltips: bool) -> bo
             false,
             if !tooltips {
                 ""
+            } else if window.fullscreen().is_some() {
+                "退出全屏"
             } else if expanded {
                 "还原"
             } else {
@@ -303,7 +305,14 @@ fn window_buttons_impl(ui: &mut egui::Ui, window: &Window, tooltips: bool) -> bo
         ui,
         TitleIcon::Close,
         false,
-        if tooltips { "关闭" } else { "" },
+        if !tooltips {
+            ""
+        } else if window.fullscreen().is_some() {
+            // Only a player window goes fullscreen.
+            "关闭当前串流窗口"
+        } else {
+            "关闭"
+        },
     )
     .clicked()
 }

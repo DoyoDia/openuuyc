@@ -115,7 +115,9 @@ pub(in crate::application::viewer) fn player_title_bar(
         ui.id().with("player-title-drag"),
         egui::Sense::click_and_drag(),
     );
-    if let Some(state) = bar.move_state.as_deref_mut() {
+    if bar.window.fullscreen().is_some() {
+        // Floating fullscreen chrome must not move/maximize the playback window.
+    } else if let Some(state) = bar.move_state.as_deref_mut() {
         update_nonmodal_window_move(ui.ctx(), bar.window, &drag, state);
     } else {
         action.drag_window = handle_title_drag(bar.window, &drag);
@@ -335,7 +337,17 @@ pub(in crate::application::viewer) fn player_title_bar(
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
     controls.spacing_mut().item_spacing.x = 4.0;
-    action.close = window_buttons(&mut controls, bar.window);
+    if bar.window.fullscreen().is_some() {
+        if title_icon_button(&mut controls, TitleIcon::Minimize, false, "最小化").clicked() {
+            bar.window.set_minimized(true);
+        }
+        action.exit_fullscreen =
+            title_icon_button(&mut controls, TitleIcon::Restore, false, "退出全屏").clicked();
+        action.close =
+            title_icon_button(&mut controls, TitleIcon::Close, false, "关闭当前串流窗口").clicked();
+    } else {
+        action.close = window_buttons(&mut controls, bar.window);
+    }
     ui.painter().line_segment(
         [
             egui::pos2(controls_rect.min.x, rect.min.y + 8.0),
@@ -349,6 +361,7 @@ pub(in crate::application::viewer) fn player_title_bar(
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(in crate::application::viewer) struct PlayerChromeAction {
+    pub(in crate::application::viewer) exit_fullscreen: bool,
     pub(in crate::application::viewer) close: bool,
     pub(in crate::application::viewer) one_to_one: bool,
     pub(in crate::application::viewer) toggle_mouse: bool,

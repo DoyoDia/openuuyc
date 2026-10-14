@@ -37,7 +37,9 @@ pub(crate) use performance::{
     performance_trace,
 };
 pub(crate) use updates::{update_actions, update_device_row, update_prepared_notice};
-pub(crate) use viewer_caption::{ViewerCaptionIcon, viewer_caption_button};
+pub(crate) use viewer_caption::{
+    ViewerCaptionIcon, viewer_caption_button, viewer_fullscreen_handle,
+};
 
 pub const HEIGHT: f32 = theme::CONTROL_HEIGHT;
 pub const COMPACT_HEIGHT: f32 = theme::COMPACT_HEIGHT;

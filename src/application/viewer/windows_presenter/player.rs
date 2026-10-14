@@ -43,6 +43,7 @@ pub(in crate::application::viewer) fn viewer_shortcut(
 }
 
 pub(in crate::application::viewer) struct ThreadedWindowsApp {
+    fullscreen_chrome: crate::application::viewer::fullscreen_chrome::FullscreenChrome,
     drag: Option<crate::application::viewer::windows_drag::WindowDrag>,
     _shortcuts: crate::application::viewer_shortcuts::Watcher,
     pub(in crate::application::viewer) annotation:
@@ -151,6 +152,8 @@ impl ThreadedWindowsApp {
             Arc::clone(&cpu_device),
         )?;
         Ok(Self {
+            fullscreen_chrome:
+                crate::application::viewer::fullscreen_chrome::FullscreenChrome::default(),
             drag: Some(crate::application::viewer::windows_drag::WindowDrag::new(
                 window,
                 &stream_control,
@@ -296,15 +299,18 @@ impl ThreadedWindowsApp {
                 }
             }
             ViewerShortcut::Fullscreen => {
+                self.mouse.release(window);
                 self.pending_aspect_size = None;
                 self.window_move = WindowMoveState::default();
                 self.window_resize = WindowResizeState::default();
                 self.stream_control_ui.open = false;
+                self.plugin_menu_open = false;
                 let fullscreen = window
                     .fullscreen()
                     .is_none()
                     .then(|| winit::window::Fullscreen::Borderless(window.current_monitor()));
                 set_fullscreen(window, fullscreen);
+                self.fullscreen_chrome.sync(window.fullscreen().is_some());
                 // A maximized window may keep the same outer size. Update
                 // the video origin even if no size-change event follows.
                 self.resize_targets(window, window.inner_size())?;
@@ -378,6 +384,10 @@ impl ThreadedWindowsApp {
         // The visible transition owns the obscured desktop, like a local menu.
         // Release held input while it is shown; the title bar remains interactive.
         let display_transition = self.stream_control.annotation_snapshot().enabled
+            || self.fullscreen_chrome.owns_pointer(
+                &self.egui_context,
+                self.stream_control.mouse().relative_mode(),
+            )
             || self
                 .stream_control
                 .remote_upgrade()
@@ -476,16 +486,34 @@ impl ThreadedWindowsApp {
         };
         let mut chrome_action = PlayerChromeAction::default();
         let fullscreen = window.fullscreen().is_some();
-        if fullscreen {
-            self.plugin_menu_open = false;
-            self.stream_control_ui.open = false;
-        }
+        self.fullscreen_chrome.sync(fullscreen);
         let mut resize = None;
         let resize_aspect = self.current_presentation_size();
         let plugin_video_size = self.current_presentation_size();
         let output = self.egui_context.run_ui(input, |ui| {
             let ctx = ui.ctx().clone();
-            if !fullscreen {
+            if fullscreen {
+                let relative = self.stream_control.mouse().relative_mode();
+                let menu_open = self.stream_control_ui.open || self.plugin_menu_open;
+                let pending = self.screen_tabs.is_pending();
+                chrome_action =
+                    self.fullscreen_chrome
+                        .show(&ctx, relative, menu_open, pending, |ui| {
+                            player_title_bar(
+                                ui,
+                                PlayerTitleBar {
+                                    screens: &mut self.screen_tabs,
+                                    window,
+                                    title: &self.title,
+                                    performance: &self.performance,
+                                    stream_control: &self.stream_control,
+                                    stream_control_ui: &mut self.stream_control_ui,
+                                    plugin_menu_open: &mut self.plugin_menu_open,
+                                    move_state: None,
+                                },
+                            )
+                        });
+            } else {
                 resize =
                     borderless_resize(ui, window, Some((&mut self.window_resize, resize_aspect)));
                 title_bar_panel(
@@ -519,6 +547,7 @@ impl ThreadedWindowsApp {
                 self._session.screen_id(),
                 ui.available_rect_before_wrap(),
             );
+            let menu_inset = self.fullscreen_chrome.menu_inset(&ctx);
             show_stream_control_window(
                 &ctx,
                 &self.stream_control,
@@ -528,12 +557,13 @@ impl ThreadedWindowsApp {
                 window
                     .current_monitor()
                     .map(|m| (m.size().width, m.size().height)),
+                egui::vec2(-114.0 - menu_inset, 52.0),
             );
             self.renderer.plugins.window(
                 &ctx,
                 &mut self.plugin_menu_open,
                 crate::application::viewer::stream_menu::menu_style,
-                &self.stream_control,
+                egui::vec2(-148.0 - menu_inset, 52.0),
             );
             let size = window.inner_size();
             let top = title_bar_height_pixels(window);
@@ -668,6 +698,9 @@ impl ThreadedWindowsApp {
             self.fit_window_to_current_aspect(window);
         }
         self.last_aspect_video_size = current_video_size;
+        if chrome_action.exit_fullscreen && window.fullscreen().is_some() {
+            self.apply_shortcut(window, ViewerShortcut::Fullscreen)?;
+        }
         if chrome_action.close {
             self.mouse.release(window);
             self.close_requested = true;

@@ -1,6 +1,34 @@
 //! Shared icons and interaction states for the player caption.
 use crate::ui::theme;
 
+pub(crate) fn viewer_fullscreen_handle(ui: &mut egui::Ui) -> (egui::Response, egui::Rect) {
+    let (hit_rect, response) = ui.allocate_exact_size(
+        theme::VIEWER_FULLSCREEN_HANDLE_HIT_SIZE,
+        egui::Sense::click(),
+    );
+    let line = egui::Rect::from_center_size(
+        egui::pos2(
+            hit_rect.center().x,
+            hit_rect.top() + theme::VIEWER_FULLSCREEN_HANDLE_CENTER_Y,
+        ),
+        theme::VIEWER_FULLSCREEN_HANDLE_SIZE,
+    );
+    let hovered = response.hovered()
+        && ui.input(|i| i.pointer.hover_pos().is_some_and(|p| hit_rect.contains(p)));
+    // A dark outline keeps the small handle legible over bright desktop content.
+    ui.painter().rect(
+        line,
+        theme::CONTROL_RADIUS,
+        if hovered { theme::TEXT } else { theme::MUTED },
+        egui::Stroke::new(1.0, theme::VIEWER_SCRIM),
+        egui::StrokeKind::Outside,
+    );
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), "展开全屏操作栏")
+    });
+    (response, hit_rect)
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum ViewerCaptionIcon {
     Plugins,
