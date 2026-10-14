@@ -7,10 +7,12 @@
 //! drivers), so the local layout decides the character, as it would for a
 //! keyboard plugged into this machine.
 //!
-//! Sunshine injects through uinput instead, which also reaches Wayland
-//! sessions and the login screen but needs write access to `/dev/uinput`
-//! (a udev rule). That backend is the planned second injector behind the same
-//! calls; this one covers Xorg sessions without any setup.
+//! In a Wayland session XTest only reaches XWayland clients, so there keys,
+//! buttons and motion go through a uinput device, as Sunshine does (it needs
+//! write access to `/dev/uinput`, granted by the udev rule the packages
+//! ship), and text through `zwp_virtual_keyboard_v1`. X11 still reads the key
+//! map, the pointer and the lock keys. Xorg sessions keep XTest alone, which
+//! needs no setup and positions the pointer absolutely.
 use anyhow::{Context, Result, bail, ensure};
 use std::time::Duration;
 use x11rb::connection::{Connection, RequestConnection as _};
@@ -48,8 +50,8 @@ impl Lock {
 /// uinput 注入后端。
 ///
 /// Wayland 会话下 XTest 只能影响 XWayland 客户端，Hyprland 等合成器里的
-/// 原生客户端收不到；有 `/dev/uinput` 时改用它注入。X11 仍保留用于读取
-/// 键位表、指针位置与锁定键状态。
+/// 原生客户端收不到；Wayland 会话有 `/dev/uinput` 时改用它注入。X11 仍保留
+/// 用于读取键位表、指针位置与锁定键状态。
 mod uinput {
     use anyhow::{Context, Result, ensure};
     use std::fs::{File, OpenOptions};
@@ -59,14 +61,11 @@ mod uinput {
     const EV_SYN: u16 = 0x00;
     const EV_KEY: u16 = 0x01;
     const EV_REL: u16 = 0x02;
-    const EV_ABS: u16 = 0x03;
 
     const REL_X: u16 = 0x00;
     const REL_Y: u16 = 0x01;
     const REL_HWHEEL: u16 = 0x06;
     const REL_WHEEL: u16 = 0x08;
-    const ABS_X: u16 = 0x00;
-    const ABS_Y: u16 = 0x01;
     const SYN_REPORT: u16 = 0x00;
 
     const BTN_LEFT: u16 = 0x110;
@@ -75,15 +74,13 @@ mod uinput {
     const BTN_SIDE: u16 = 0x113;
     const BTN_EXTRA: u16 = 0x114;
 
-    // linux/uinput.h 的 _IOW('U', n, size)，x86_64 上的结果。
+    // linux/uinput.h 的 _IOW('U', n, size)；x86、ARM 与 RISC-V 上相同。
     const UI_DEV_CREATE: libc::c_ulong = 0x5501;
     const UI_DEV_DESTROY: libc::c_ulong = 0x5502;
     const UI_DEV_SETUP: libc::c_ulong = 0x405c_5503;
-    const UI_ABS_SETUP: libc::c_ulong = 0x401c_5504;
     const UI_SET_EVBIT: libc::c_ulong = 0x4004_5564;
     const UI_SET_KEYBIT: libc::c_ulong = 0x4004_5565;
     const UI_SET_RELBIT: libc::c_ulong = 0x4004_5566;
-    const UI_SET_ABSBIT: libc::c_ulong = 0x4004_5567;
 
     #[repr(C)]
     struct InputId {
@@ -97,21 +94,6 @@ mod uinput {
         id: InputId,
         name: [libc::c_char; 80],
         ff_effects_max: u32,
-    }
-    #[repr(C)]
-    struct InputAbsInfo {
-        value: i32,
-        minimum: i32,
-        maximum: i32,
-        fuzz: i32,
-        flat: i32,
-        resolution: i32,
-    }
-    #[repr(C)]
-    struct UinputAbsSetup {
-        code: u16,
-        pad: [u8; 2],
-        absinfo: InputAbsInfo,
     }
     #[repr(C)]
     struct InputEvent {
@@ -157,7 +139,11 @@ mod uinput {
             let fd = file.as_raw_fd();
             set(fd, UI_SET_EVBIT, EV_KEY.into())?;
             set(fd, UI_SET_EVBIT, EV_REL.into())?;
-            for code in 0..0x300u16 {
+            // Keyboard keys (every code `evdev` maps to is below 256) and the
+            // mouse buttons only. Declaring BTN_TOUCH, BTN_TOOL_* or the
+            // joystick range makes udev and libinput classify the device as
+            // something else.
+            for code in (1..0x100u16).chain(BTN_LEFT..=BTN_EXTRA) {
                 set(fd, UI_SET_KEYBIT, code.into())?;
             }
             for bit in [REL_X, REL_Y, REL_WHEEL, REL_HWHEEL] {
@@ -243,6 +229,12 @@ mod uinput {
             let _ = unsafe { libc::ioctl(self.file.as_raw_fd(), UI_DEV_DESTROY, 0) };
         }
     }
+}
+
+/// Whether Hyprland's IPC is there to ask; other compositors have no
+/// equivalent, and positions then come from XWayland.
+fn hyprland() -> bool {
+    std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some()
 }
 
 /// 向 Hyprland 的 IPC socket 发一条请求并读回响应。
@@ -445,7 +437,7 @@ mod virtual_keyboard {
     impl Keyboard {
         pub(crate) fn connect() -> Result<Self> {
             let connection = Connection::connect_to_env().context("连接 Wayland 失败")?;
-            let (globals, mut queue): (GlobalList, EventQueue<State>) =
+            let (globals, queue): (GlobalList, EventQueue<State>) =
                 registry_queue_init(&connection).context("枚举 Wayland 全局对象失败")?;
             // Bind once up front so a desktop without the protocol is reported
             // at startup rather than on the first keystroke.
@@ -563,17 +555,24 @@ impl Injector {
         let setup = connection.setup();
         let root = setup.roots[screen].root;
         let (min_keycode, max_keycode) = (setup.min_keycode, setup.max_keycode);
-        let uinput = match uinput::Device::open() {
-            Ok(device) => {
-                tracing::info!("启用 uinput 输入注入（EV_KEY + EV_REL，无 ABS 轴）");
-                Some(device)
-            }
-            Err(error) => {
-                tracing::warn!(%error, "无法使用 uinput，回退到 XTest（只影响 XWayland 客户端）");
-                None
+        // Xorg delivers XTest to every client and positions absolutely;
+        // uinput there would only add pointer acceleration.
+        let wayland = super::capture::wayland_session();
+        let uinput = if !wayland {
+            None
+        } else {
+            match uinput::Device::open() {
+                Ok(device) => {
+                    tracing::info!("启用 uinput 输入注入（EV_KEY + EV_REL，无 ABS 轴）");
+                    Some(device)
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "无法使用 uinput，回退到 XTest（只影响 XWayland 客户端）");
+                    None
+                }
             }
         };
-        let screen_maps = if uinput.is_some() {
+        let screen_maps = if uinput.is_some() && hyprland() {
             let maps = screen_rect_maps();
             if maps.is_empty() {
                 tracing::warn!("未能对齐 X11 与 Hyprland 的显示器布局，绝对定位可能偏移");
@@ -584,7 +583,7 @@ impl Injector {
         } else {
             Vec::new()
         };
-        let virtual_keyboard = if uinput.is_some() {
+        let virtual_keyboard = if wayland {
             match virtual_keyboard::Keyboard::connect() {
                 Ok(keyboard) => {
                     tracing::info!("启用 zwp_virtual_keyboard 文字输入（支持任意 Unicode）");
