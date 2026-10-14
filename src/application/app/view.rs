@@ -20,6 +20,7 @@ mod logs;
 mod port_mapping;
 mod power;
 mod remote_diagnostics;
+mod startup;
 mod update_dialog;
 mod wol_setup;
 
@@ -74,6 +75,7 @@ pub(super) struct CenterUi {
     logs: logs::LogUi,
     diagnostics: diagnostics_panel::ViewState,
     wol_setup: wol_setup::ViewState,
+    startup: startup::ViewState,
     host_assist_password: Option<host_assist::PasswordEditor>,
     host_assist_settings_open: bool,
     host_assist_show_code: bool,
@@ -1211,6 +1213,7 @@ impl DeviceCenterApp {
         ui.add_space(18.0);
         self.alert(ui);
         crate::ui::controls::page_scroll("center-settings-scroll").show(ui, |ui| {
+            self.startup_settings(ui);
             self.host_settings(ui);
             self.notification_settings(ui);
             section(ui, "本机作为主控");
