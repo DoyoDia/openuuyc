@@ -23,6 +23,15 @@ pub(super) struct ViewState {
     publication_error: Option<String>,
     wol_refresh: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
     wol_error: Option<String>,
+    /// 虚拟屏辅助程序的状态。探测要连一次套接字，所以放到后台线程；这个状态是人
+    /// 手动装/启服务改出来的，几秒问一次就够。
+    #[cfg(not(windows))]
+    virtual_display: Option<crate::platform::linux::virtual_display::Availability>,
+    #[cfg(not(windows))]
+    virtual_display_probe:
+        Option<std::sync::mpsc::Receiver<crate::platform::linux::virtual_display::Availability>>,
+    #[cfg(not(windows))]
+    virtual_display_checked: Option<std::time::Instant>,
 }
 
 impl DeviceCenterApp {
@@ -170,7 +179,7 @@ impl DeviceCenterApp {
         );
     }
 
-    fn diagnostic_device(&self, ui: &mut egui::Ui) {
+    fn diagnostic_device(&mut self, ui: &mut egui::Ui) {
         diagnostics_row(
             ui,
             "显示器",
@@ -184,6 +193,53 @@ impl DeviceCenterApp {
         }
         for value in &self.diagnostics.graphics {
             diagnostics_row(ui, "渲染设备", value);
+        }
+        #[cfg(not(windows))]
+        self.virtual_display_row(ui);
+    }
+
+    /// 「虚拟显示器」这一行：装没装、能不能用、最多几块。
+    ///
+    /// 探活会连一次辅助程序的套接字（必要时把它拉起来），所以不能放在绘制线程里等。
+    #[cfg(not(windows))]
+    fn virtual_display_row(&mut self, ui: &mut egui::Ui) {
+        use crate::platform::linux::virtual_display;
+        let state = &mut self.center_ui.diagnostics;
+        if let Some(rx) = &state.virtual_display_probe {
+            match rx.try_recv() {
+                Ok(availability) => {
+                    state.virtual_display = Some(availability);
+                    state.virtual_display_probe = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    state.virtual_display_probe = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        let due = state
+            .virtual_display_checked
+            .is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(5));
+        if due && state.virtual_display_probe.is_none() {
+            state.virtual_display_checked = Some(std::time::Instant::now());
+            let (sender, receiver) = std::sync::mpsc::channel();
+            state.virtual_display_probe = Some(receiver);
+            let context = ui.ctx().clone();
+            std::thread::spawn(move || {
+                let _ = sender.send(virtual_display::availability());
+                context.request_repaint();
+            });
+        }
+        let row = match &state.virtual_display {
+            Some(availability) => diagnostics_row(ui, "虚拟显示器", availability.label()),
+            None => diagnostics_row(ui, "虚拟显示器", "正在读取…"),
+        };
+        if let Some(detail) = state
+            .virtual_display
+            .as_ref()
+            .and_then(|availability| availability.detail())
+        {
+            row.on_hover_text(detail.to_owned());
         }
     }
 

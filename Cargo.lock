@@ -3670,6 +3670,7 @@ dependencies = [
  "openuuyc-h264",
  "openuuyc-nvenc-sys",
  "openuuyc-plugin-api",
+ "openuuyc-vkms",
  "openuuyc-vpl-sys",
  "opusic-c",
  "pollster",
@@ -3782,6 +3783,17 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "openuuyc-vkms"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "serde",
+ "serde_json",
+ "zbus",
 ]
 
 [[package]]

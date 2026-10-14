@@ -178,6 +178,9 @@ windows = { version = "0.62.2", default-features = false, features = [
 glow = "0.17.0"
 # Local display geometry for the viewer, on X11 and Wayland alike.
 display-info = "0.5.9"
+# 被控端加虚拟屏要写 configfs，只有 root 能写，中间隔一个专用的辅助程序
+# （crates/vkms）。这里用的是它的客户端部分。
+openuuyc-vkms = { path = "crates/vkms" }
 cros-libva = { path = "vendor/cros-libva" }
 # The H.264 syntax and its error kinds for the VA-API slice parameters; the
 # software session itself goes through openuuyc-codec like on Windows.

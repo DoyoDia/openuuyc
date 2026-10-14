@@ -74,6 +74,12 @@ impl Drop for Heartbeat {
     }
 }
 
+/// 虚拟屏在 Linux 上不是「驱动里的一块显示器」，而是「一路 VKMS 连接器 + 合成器
+/// 认下它」，所以刷新率由我们自己定；和 Windows 那条路（写死 144）保持一致，好让
+/// 主控协商出来的码率在两边含义相同。
+#[cfg(not(windows))]
+const VIRTUAL_HZ: u32 = 144;
+
 struct State {
     journal: Journal,
     path: PathBuf,
@@ -85,6 +91,9 @@ struct State {
     render_adapter: Option<u64>,
     dirty: bool,
     restoring: bool,
+    /// Linux 上的虚拟屏：一条到 root 辅助程序的连接，连接在，租约就在。
+    #[cfg(not(windows))]
+    virtual_display: Option<crate::platform::linux::virtual_display::Session>,
 }
 pub(crate) struct Session {
     lease: Lease,
@@ -143,6 +152,8 @@ impl Session {
                 render_adapter: None,
                 dirty: false,
                 restoring: false,
+                #[cfg(not(windows))]
+                virtual_display: None,
             })),
         }))
     }
@@ -248,6 +259,20 @@ impl Session {
         }
         Ok(())
     }
+    /// Linux：虚拟屏由 root 辅助程序接一路 VKMS 连接器出来，分辨率交给合成器定。
+    /// Windows 那套 RandR/驱动模型在这里没有对应的东西，所以整条路分开写，而不是
+    /// 在中间塞条件分支。
+    #[cfg(not(windows))]
+    pub(crate) async fn create(&self, resolutions: Vec<(u32, u32)>) -> Result<capture::Screen> {
+        ensure!(
+            self.lease.display_expansion_allowed(),
+            "本次会话不允许添加虚拟屏"
+        );
+        self.run(move |state, lease| state.create_compositor(resolutions, 1, lease))
+            .await
+    }
+
+    #[cfg(windows)]
     pub(crate) async fn create(&self, resolutions: Vec<(u32, u32)>) -> Result<capture::Screen> {
         ensure!(
             self.lease.display_expansion_allowed(),
@@ -294,6 +319,28 @@ impl Session {
         })
         .await
     }
+    /// Linux：撤一块虚拟屏就是让辅助程序断开那一路连接器，合成器会把它当成拔线。
+    #[cfg(not(windows))]
+    pub(crate) async fn remove(&self, identity: String) -> Result<()> {
+        self.run(move |state, lease| {
+            let index = state.owned_index(&identity)?;
+            ensure!(
+                matches!(state.journal.owned[index].kind, 1 | 3),
+                "不能用删除扩展屏操作退出超级屏"
+            );
+            ensure!(lease.requested(), "显示操作已取消");
+            state
+                .virtual_display
+                .as_mut()
+                .context("虚拟显示器辅助程序不可用")?
+                .remove(&identity)?;
+            state.journal.owned.remove(index);
+            state.update_preferences()
+        })
+        .await
+    }
+
+    #[cfg(windows)]
     pub(crate) async fn remove(&self, identity: String) -> Result<()> {
         self.run(move |state, lease| {
             let index = state.owned_index(&identity)?;
@@ -396,6 +443,27 @@ impl Session {
         })
         .await
     }
+    /// Linux 还没有超级屏：它要先把本机的物理显示器让出来、再把一块虚拟屏铺满整个
+    /// 桌面，而 Wayland 下「让出来」和「铺满」都要靠合成器，这两步都还没做。主控那
+    /// 边因为 `capture_setting` 是一个整档、没法只开虚拟屏，所以会把这个按钮画出来，
+    /// 点了就在这里带着原因失败。
+    #[cfg(not(windows))]
+    pub(crate) async fn enter_super(
+        &self,
+        _width: u32,
+        _height: u32,
+        _dpi: u32,
+        _use_saved: bool,
+    ) -> Result<capture::Screen> {
+        anyhow::bail!("Linux 被控端暂不支持超级屏，请用扩展模式添加虚拟屏")
+    }
+
+    #[cfg(not(windows))]
+    pub(crate) async fn quit_super(&self) -> Result<()> {
+        anyhow::bail!("Linux 被控端暂不支持超级屏，请用扩展模式添加虚拟屏")
+    }
+
+    #[cfg(windows)]
     pub(crate) async fn enter_super(
         &self,
         width: u32,
@@ -406,6 +474,8 @@ impl Session {
         self.run(move |state, lease| state.enter_super(width, height, dpi, use_saved, lease))
             .await
     }
+
+    #[cfg(windows)]
     pub(crate) async fn quit_super(&self) -> Result<()> {
         self.run(|state, _| state.quit_super(true)).await
     }
@@ -427,6 +497,59 @@ impl Session {
         })
         .await
     }
+    /// Linux：改分辨率就是让合成器换模式。物理显示器从它自己的模式表里挑，虚拟屏
+    /// 用 `custom-mode` 现造——那块屏的分辨率本来就是我们让合成器定出来的。
+    #[cfg(not(windows))]
+    pub(crate) async fn set_resolution(
+        &self,
+        target: Target,
+        width: u32,
+        height: u32,
+    ) -> Result<capture::Screen> {
+        self.run(move |state, lease| {
+            ensure!(lease.requested(), "显示操作已取消");
+            validate_modes(&[(width, height)])?;
+            let owned = state
+                .journal
+                .owned
+                .iter()
+                .position(|o| o.identity.as_deref() == Some(target.identity.as_str()));
+            let hz = owned.map(|index| state.journal.owned[index].hz);
+            crate::platform::linux::display::compositor::set_mode(
+                &target.identity,
+                width,
+                height,
+                hz,
+            )?;
+            // 合成器说成功不等于显示器真的换了模式，所以只认观察到的尺寸。等不到就是
+            // 失败——这比让主控以为切成功了要好。
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                ensure!(lease.requested(), "显示操作已取消");
+                if let Ok(screen) = find_screen(&target.identity)
+                    && (screen.width, screen.height) == (width, height)
+                {
+                    if let Some(index) = owned {
+                        let record = &mut state.journal.owned[index];
+                        record.width = width;
+                        record.height = height;
+                        if !record.modes.contains(&(width, height)) {
+                            record.modes.push((width, height));
+                        }
+                    }
+                    return Ok(screen);
+                }
+                ensure!(
+                    std::time::Instant::now() < deadline,
+                    "显示器没有切到请求的分辨率"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        })
+        .await
+    }
+
+    #[cfg(windows)]
     pub(crate) async fn set_resolution(
         &self,
         target: Target,
@@ -467,6 +590,13 @@ impl Session {
         })
         .await
     }
+    /// Linux 上不报 DPI，主控也就不会给出这个选项；真收到了就直说做不到。
+    #[cfg(not(windows))]
+    pub(crate) async fn set_dpi(&self, _target: Target, _dpi: u32) -> Result<()> {
+        anyhow::bail!("Linux 被控端不能改显示器的 DPI")
+    }
+
+    #[cfg(windows)]
     pub(crate) async fn set_dpi(&self, target: Target, dpi: u32) -> Result<()> {
         self.run(move |state, lease| {
             state.begin()?;
@@ -531,6 +661,31 @@ impl Drop for Session {
                 state.fallback_pin.take();
                 Ok(())
             });
+    }
+}
+
+/// 等采集那边看见这块新屏。
+///
+/// 采集枚举的是合成器报出来的输出，而合成器要处理完热插拔才有它；中间这一小段
+/// 空档里创建还不算成功，所以宁可在这里等，也不要先把一块还看不见的屏报给主控。
+#[cfg(not(windows))]
+fn wait_for_screen(connector: &str, lease: &Lease) -> Result<capture::Screen> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        ensure!(lease.requested(), "显示操作已取消");
+        // 合成器刚接上新输出时枚举本身也可能短暂失败，所以失败不算数，只看期限。
+        if let Ok(screens) = capture::screens()
+            && let Some(screen) = screens
+                .into_iter()
+                .find(|s| s.identity.as_deref() == Some(connector))
+        {
+            return Ok(screen);
+        }
+        ensure!(
+            std::time::Instant::now() < deadline,
+            "虚拟显示器创建后没有出现在桌面里"
+        );
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -865,12 +1020,111 @@ impl State {
             .position(|o| o.identity.as_deref() == Some(identity))
             .context("不是本次会话创建的虚拟显示器")
     }
+    /// 到辅助程序的连接按需建立：没人加虚拟屏就不该去惊动一个 root 服务。
+    #[cfg(not(windows))]
+    fn virtual_display(&mut self) -> Result<&mut crate::platform::linux::virtual_display::Session> {
+        if self.virtual_display.is_none() {
+            self.virtual_display = Some(crate::platform::linux::virtual_display::Session::open()?);
+        }
+        Ok(self
+            .virtual_display
+            .as_mut()
+            .context("虚拟显示器辅助程序不可用")?)
+    }
+
+    /// 走合成器的那条虚拟屏创建路径。
+    ///
+    /// 和 [`Self::create`] 的区别不只是实现：这里没有基线拓扑要记、没有布局要算，
+    /// 因为合成器会自己把新输出摆在空位上，而 Wayland 下那些 RandR 写入本来就是
+    /// 空动作。真正要做的只有三件——租一路连接器、等采集那边看见它、把它记进
+    /// `journal.owned`（`annotate` 靠它把这块屏报成虚拟屏并挂上 `openuuyc-virtual`
+    /// 这个身份）。
+    #[cfg(not(windows))]
+    fn create_compositor(
+        &mut self,
+        resolutions: Vec<(u32, u32)>,
+        kind: i32,
+        lease: &Lease,
+    ) -> Result<capture::Screen> {
+        ensure!(
+            self.journal.super_baseline.is_none(),
+            "超级屏内不能添加扩展屏"
+        );
+        let screens = capture::screens()?;
+        ensure!(
+            screens.len() < 5
+                && self
+                    .journal
+                    .owned
+                    .iter()
+                    .filter(|o| matches!(o.kind, 1 | 3))
+                    .count()
+                    < 3,
+            "显示器数量已达上限"
+        );
+        // 主控报的是它自己那块屏的尺寸；它没报就退回本机第一块屏的尺寸。
+        let (width, height) = resolutions
+            .first()
+            .copied()
+            .or_else(|| screens.first().map(|s| (s.width, s.height)))
+            .context("没有可用的显示器")?;
+        validate_modes(&[(width, height)])?;
+        ensure!(lease.requested(), "显示操作已取消");
+
+        // 先接连接器、再记账、最后等采集看见它：记账放中间，是因为连接器一接上合成器
+        // 那边就多了一块屏，采集随时可能把它报上去，那时候它得已经是「我们造的」。
+        let connector = self.virtual_display()?.create(width, height, VIRTUAL_HZ)?;
+        let guid = uuid::Uuid::new_v4().to_string();
+        self.journal.owned.push(Virtual {
+            guid: guid.clone(),
+            identity: Some(connector.clone()),
+            width,
+            height,
+            hz: VIRTUAL_HZ,
+            dpi: 0,
+            kind,
+            resolution_type: 1,
+            modes: vec![(width, height)],
+            layout: None,
+        });
+        let mut screen = match wait_for_screen(&connector, lease) {
+            Ok(screen) => screen,
+            Err(error) => {
+                self.journal
+                    .owned
+                    .retain(|o| o.identity.as_deref() != Some(connector.as_str()));
+                if let Err(rollback) = self.virtual_display().and_then(|s| s.remove(&connector)) {
+                    tracing::error!(%rollback, connector, "虚拟屏回滚失败");
+                }
+                return Err(error);
+            }
+        };
+        self.update_preferences()?;
+        tracing::info!(connector, width, height, "虚拟屏已加入");
+        screen.id = display::source_id(&format!("openuuyc-virtual/{guid}"))?;
+        screen.render_adapter = self.render_adapter;
+        Ok(screen)
+    }
+
     fn create(
         &mut self,
         spec: Virtual,
         lease: &Lease,
         super_screen: bool,
     ) -> Result<capture::Screen> {
+        // 虚拟屏在 Linux 上走的不是驱动模型（见 create_compositor）。这里也要管住，
+        // 因为「连接时就带一块虚拟屏」是从 initial.rs 直接调到这里来的，那一路的
+        // kind 是 3（1 是会话里手动加的，3 是连接时自动加的）。
+        #[cfg(not(windows))]
+        if matches!(spec.kind, 1 | 3) {
+            // Windows 上「只用虚拟屏启动」还要用 CCD 把一份只有它的完整布局写下去，
+            // 物理显示器因此下线。那一步也要合成器配合，这边还没做，所以只把屏建出来，
+            // 原来的显示器照旧——至少如实说一声，别让人以为桌面被换掉了。
+            if super_screen {
+                tracing::warn!("Linux 被控端不支持「只用虚拟屏启动」，物理显示器会保留");
+            }
+            return self.create_compositor(vec![(spec.width, spec.height)], spec.kind, lease);
+        }
         let before = Topology::query(true)?.snapshot()?;
         let dpi = current_dpi()?;
         let preferences = self.preferences.clone();
@@ -1113,6 +1367,8 @@ impl State {
         layout.apply()?;
         Ok(())
     }
+    /// 只有 Windows 走得到：Linux 的 `Session::quit_super` 在更外层就带着原因拒绝了。
+    #[cfg(windows)]
     fn quit_super(&mut self, explicit: bool) -> Result<()> {
         if let Some(layout) = self.journal.super_baseline.clone() {
             if !layout.targets.is_empty() {
@@ -1154,6 +1410,12 @@ impl State {
         Ok(())
     }
     fn cleanup(&mut self) -> Result<()> {
+        // 虚拟屏和 X11 的布局恢复没关系，所以放在最前面：`dirty` 为假时下面会直接
+        // 返回，而那些连接器还是得还回去。
+        #[cfg(not(windows))]
+        if let Some(mut session) = self.virtual_display.take() {
+            session.release_all();
+        }
         if !self.dirty {
             self.driver.take();
             return Ok(());

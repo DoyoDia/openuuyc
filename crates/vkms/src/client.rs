@@ -1,0 +1,141 @@
+//! 主程序这一侧的客户端：连上辅助程序，要一块虚拟屏，走的时候把连接关掉。
+//!
+//! 连接本身就是租约：辅助程序把这条连接要到的连接器记在自己名下，读到 EOF 就全部
+//! 断开。所以主程序不需要（也没法）做额外的清理工作，进程死掉也不会留下悬空的虚拟屏。
+use crate::protocol::{Reply, Request, Status};
+use anyhow::{Context, Result, ensure};
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
+use std::time::Duration;
+
+/// 系统级套接字。systemd 的 `openuuyc-vkms.socket` 直接监听这个路径。
+pub const SOCKET: &str = "/run/openuuyc-vkms/control.sock";
+/// 发行版把辅助程序装在这里。
+pub const HELPER: &str = "/usr/bin/openuuyc-vkms";
+/// 套接字单元：有它就说明这套东西装上了，能不能用还要真的连一次（见 [`probe`]）。
+/// 两个路径都认：Debian 系的单元在 /lib/systemd/system，Arch 与新版 Debian 在
+/// /usr/lib/systemd/system。
+pub const HELPER_SOCKET_UNITS: [&str; 2] = [
+    "/usr/lib/systemd/system/openuuyc-vkms.socket",
+    "/lib/systemd/system/openuuyc-vkms.socket",
+];
+
+/// 单次往返的等待上限。辅助程序建屏时要等内核把连接器报出来，但也就几百毫秒。
+const TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 辅助程序装没装。装没装看文件，能不能用要真的连一次（见 [`probe`]）。
+pub fn installed() -> bool {
+    std::path::Path::new(HELPER).exists()
+        || HELPER_SOCKET_UNITS
+            .iter()
+            .any(|unit| std::path::Path::new(unit).exists())
+}
+
+/// 问一次现在的状态。诊断页用这个判断「可用」。
+pub fn probe() -> Result<Status> {
+    let mut client = Client::connect()?;
+    let status = client.status()?;
+    Ok(status)
+}
+
+pub struct Client {
+    writer: UnixStream,
+    reader: BufReader<UnixStream>,
+}
+
+impl Client {
+    pub fn connect() -> Result<Self> {
+        Self::connect_to(SOCKET)
+    }
+
+    pub fn connect_to(path: &str) -> Result<Self> {
+        let stream = UnixStream::connect(path).with_context(|| {
+            format!("无法连接虚拟显示器辅助程序（{path}），它可能没有安装或没有运行")
+        })?;
+        stream.set_read_timeout(Some(TIMEOUT))?;
+        stream.set_write_timeout(Some(TIMEOUT))?;
+        Ok(Self {
+            reader: BufReader::new(stream.try_clone()?),
+            writer: stream,
+        })
+    }
+
+    pub fn create(&mut self, width: u32, height: u32, hz: u32) -> Result<String> {
+        let reply = self.call(&Request::Create {
+            width,
+            height,
+            hz,
+        })?;
+        reply
+            .connector
+            .context("辅助程序没有报出连接器名")
+    }
+
+    pub fn destroy(&mut self, connector: &str) -> Result<()> {
+        self.call(&Request::Destroy {
+            connector: connector.to_owned(),
+        })?;
+        Ok(())
+    }
+
+    pub fn status(&mut self) -> Result<Status> {
+        let reply = self.call(&Request::Status)?;
+        reply.status.context("辅助程序没有报出状态")
+    }
+
+    fn call(&mut self, request: &Request) -> Result<Reply> {
+        let mut line = serde_json::to_vec(request)?;
+        line.push(b'\n');
+        self.writer
+            .write_all(&line)
+            .context("向辅助程序发送请求失败")?;
+        self.writer.flush()?;
+        let mut answer = String::new();
+        let read = self
+            .reader
+            .read_line(&mut answer)
+            .context("读取辅助程序的应答失败")?;
+        ensure!(read > 0, "辅助程序没有应答就断开了连接");
+        let reply: Reply = serde_json::from_str(&answer)
+            .with_context(|| format!("辅助程序的应答无法解析：{}", answer.trim()))?;
+        reply.into_result()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_refusal_becomes_an_error_with_the_helpers_own_words() {
+        let reply = Reply::failed("没有空闲的虚拟显示器");
+        let error = reply.into_result().unwrap_err().to_string();
+        assert!(error.contains("没有空闲的虚拟显示器"));
+    }
+
+    #[test]
+    fn a_successful_reply_carries_through() {
+        let reply = Reply::connector("Virtual-5".into());
+        let reply = reply.into_result().unwrap();
+        assert_eq!(reply.connector.as_deref(), Some("Virtual-5"));
+    }
+
+    #[test]
+    fn requests_round_trip_through_the_wire_format() {
+        for request in [
+            Request::Create {
+                width: 2560,
+                height: 1440,
+                hz: 144,
+            },
+            Request::Destroy {
+                connector: "Virtual-5".into(),
+            },
+            Request::Status,
+        ] {
+            let text = serde_json::to_string(&request).unwrap();
+            assert!(!text.contains('\n'), "一行一条：{text}");
+            assert_eq!(serde_json::from_str::<Request>(&text).unwrap(), request);
+        }
+    }
+}
