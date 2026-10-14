@@ -400,6 +400,8 @@ struct Entry {
     offer: Option<FileOffer>,
     native: Option<native::Session>,
     portal: Option<native::portal::Portal>,
+    /// Wayland 那边的接取者，和 `portal` 并行摆着，谁先接住算谁的。
+    catch: Option<native::Catcher>,
     release_source: Option<ReleaseSource>,
     source_released: bool,
     image: Option<wire::DragImage>,
@@ -448,6 +450,9 @@ impl Drop for Entry {
         }
         if let Some(native) = &self.native {
             native.cancel();
+        }
+        if let Some(catch) = &self.catch {
+            catch.cancel();
         }
     }
 }
@@ -603,6 +608,7 @@ impl Actor {
             offer: None,
             native: None,
             portal: None,
+            catch: None,
             release_source: None,
             source_released: false,
             image: None,
@@ -1331,6 +1337,7 @@ impl Actor {
                 let alive = entry.ticket.alive.clone();
                 let binding = self.shared.clone();
                 let token = self.token;
+                let screen = target.clone();
                 let guard = Arc::new(move || {
                     alive.load(Ordering::Acquire)
                         && binding.enabled.load(Ordering::Acquire)
@@ -1344,13 +1351,36 @@ impl Actor {
                 entry.portal = Some(native::portal::Portal::start(
                     position,
                     self.shared.return_capable.load(Ordering::Acquire),
+                    guard.clone(),
+                    Arc::new({
+                        let commands = commands.clone();
+                        let alive = alive.clone();
+                        move |event| {
+                            if commands.try_send(Command::Portal(id, event)).is_err() {
+                                alive.store(false, Ordering::Release);
+                            }
+                        }
+                    }),
+                )?);
+                // Wayland 那边再摆一个我们自己的 surface。两个世界的拖放互相看不见
+                // （XWayland 不桥接 XDND，反过来也一样），所以两边一起等，谁接住算
+                // 谁的——就像剪贴板那边得往两个选择区都写一样。起不来只是少一条
+                // 路，不该让整个拖放失败。
+                match native::Catcher::start(
+                    &screen.device_name,
+                    (point.x, point.y),
                     guard,
                     Arc::new(move |event| {
                         if commands.try_send(Command::Portal(id, event)).is_err() {
                             alive.store(false, Ordering::Release);
                         }
                     }),
-                )?);
+                ) {
+                    Ok(catcher) => entry.catch = Some(catcher),
+                    Err(error) => {
+                        tracing::debug!(error = format!("{error:#}"), "Wayland 拖放接取不可用")
+                    }
+                }
                 self.entries.insert(id, entry);
             }
             Payload::SourceReleased(true) => {
