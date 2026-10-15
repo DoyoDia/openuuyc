@@ -1206,8 +1206,9 @@ impl Actor {
             //
             // 上图这件事现在由 `wire::DRAG_IMAGE` 单独声明（`Command::Image` 那条），
             // 「收不收得下」不再借用 `NATIVE_RETURN`。这条语义值得去上游提：上游的
-            // 接收端至今仍在用 `NATIVE_RETURN` 判断收不收图，只有等它放宽，Linux
-            // 被控端的预览图才真的送得到官方 Windows 主控。
+            // 接收端至今仍在用 `NATIVE_RETURN` 判断收不收图，而我们的发送端只看对端
+            // 有没有声明 `DRAG_IMAGE`。所以上游光放宽接收端还不够，还得登记并声明
+            // 这一位，Linux 被控端的预览图才送得到上游 OpenUUYC 的 Windows 主控。
             Payload::Image(image) => {
                 if let Some(entry) = self
                     .entries
