@@ -13,8 +13,9 @@ const REFRESH: Duration = Duration::from_secs(5);
 pub(super) struct ViewState {
     checked: Option<Instant>,
     startup: Option<Result<State, String>>,
-    /// Why login startup cannot work here, if it cannot: a systemd user unit
-    /// only runs where the desktop joins `graphical-session.target`.
+    /// Why login startup cannot work here at all, if it cannot. Windows never
+    /// says so; Linux only when it has neither a systemd user unit nor an XDG
+    /// autostart entry to write.
     unavailable: Option<String>,
     /// The resident service keeps the device online before login on its own.
     managed: bool,
@@ -39,8 +40,7 @@ impl DeviceCenterApp {
         let system_disabled = matches!(state.startup, Some(Ok(State::DisabledByWindows)));
         let mut enabled = matches!(state.startup, Some(Ok(State::Enabled)));
         let unavailable = state.unavailable.clone();
-        // 不支持这套自启的桌面上，打开只会失败；但已经开着（多半是升级前留下的
-        // XDG 条目）的还要能关掉，关掉用不到 systemd。
+        // 自启用不了时打开只会失败；但已经开着的还要能关掉。
         let toggleable = unavailable.is_none() || enabled;
         let managed = state.managed;
         // Installing or removing components rewrites this entry.

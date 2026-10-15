@@ -10,8 +10,10 @@ Two packages for Arch and Omarchy users:
 Both install the same files: `/usr/bin/OpenUUYC`, the desktop entry, the
 icon, the uinput udev rule, `openuuyc.service` (a systemd user unit) and the
 license texts. Login startup is the settings page's 「开机自启」 switch, which
-enables that unit — the same as `systemctl --user enable openuuyc.service`.
-The packages never enable it themselves.
+enables that unit — the same as `systemctl --user enable openuuyc.service` —
+on desktops that reach `graphical-session.target`, and writes the XDG
+autostart entry `~/.config/autostart/openuuyc.desktop` on those that do not
+(XFCE, MATE, Cinnamon). The packages never enable either themselves.
 
 ## Releases
 

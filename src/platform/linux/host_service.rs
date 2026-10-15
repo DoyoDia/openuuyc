@@ -7,7 +7,8 @@
 //! clipboard and audio all come from the compositor session, so a host with
 //! nobody signed in has no picture to send. What Linux does have is
 //! [`startup`]: a systemd user unit, `WantedBy=graphical-session.target`, that
-//! runs the control center with `--background` the way Sunshine runs, so the
+//! runs the control center with `--background` the way Sunshine runs (or, on
+//! desktops that never reach that target, an XDG autostart entry), so the
 //! desktop client still owns its own account and presence, and every answer
 //! below is still the portable mode's. A machine-wide service would only be
 //! worth it together with a capture path that does not need the session (KMS),
@@ -98,12 +99,18 @@ pub(crate) mod activity {
     }
 }
 
-/// 登录自启：一个 systemd 用户单元，等价于 Windows 的每用户 Run 键。
+/// 登录自启，等价于 Windows 的每用户 Run 键。按桌面选两种机制之一：
 ///
-/// 单元跟着 `graphical-session.target` 走，理由是被控要有画面可采——会话结束服务
-/// 就该停，也因此在没人登录时不会硬撑（Linux 上那本来也没有画面可采）。代价是
-/// 桌面得自己接进这个 target（GNOME、KDE、uwsm 会，XFCE、MATE、Cinnamon 与直接
-/// 启动的 sway、Hyprland 不会），见 [`startup::unavailable`]。
+/// - 桌面接进了 `graphical-session.target`（GNOME、KDE、uwsm、niri 等）时，是一个
+///   systemd 用户单元。被控要有画面可采，所以它跟着图形会话走：会话结束服务就停，
+///   崩了自动回来，日志进 journal。
+/// - XFCE、MATE、Cinnamon 与普通 X 会话到不了这个 target，单元 enable 了也没人拉它，
+///   这些桌面上写 XDG 自启动条目 `~/.config/autostart/openuuyc.desktop`，与改用单元
+///   之前写的是同一份，由桌面的会话管理器启动。
+///
+/// 开启时只留其中一种：两份同时在会让登录时起两次（第二份被实例锁挡掉，白跑一趟）。
+/// 关闭时两种都删。直接启动、既不接 target 也不处理 XDG 自启动的合成器（没有 uwsm
+/// 或 dex 的 sway、Hyprland）两种都不会拉起程序，这在程序里分辨不出来，见 README。
 pub(crate) mod startup {
     use super::*;
     use std::path::Path;
@@ -117,10 +124,8 @@ pub(crate) mod startup {
         "/usr/local/lib/systemd/user/openuuyc.service",
         "/etc/systemd/user/openuuyc.service",
     ];
-    /// 这条自启要求桌面自己接进 `graphical-session.target`：GNOME、KDE、uwsm 会接，
-    /// XFCE、MATE、Cinnamon 与直接启动的 sway、Hyprland 不会，那些桌面上单元 enable
-    /// 了也没人拉它；没有 systemd 的发行版连 systemctl 都没有。
-    const NO_SESSION_TARGET: &str = "当前桌面没有接入 systemd 的 graphical-session.target（XFCE、MATE、Cinnamon，以及直接启动的 sway、Hyprland 等），systemd 用户单元不会被拉起；请改用桌面的自启动设置";
+    /// 两种机制都要用户配置目录：XDG 条目写在那里，便携运行时的单元也写在那里。
+    const NO_CONFIG_DIR: &str = "无法确定用户配置目录（HOME 与 XDG_CONFIG_HOME 都没有设置），写不了 systemd 用户单元，也写不了 XDG 自启动条目";
     /// 本进程就在这个图形会话里跑，答案在运行期间不会变，所以只查一次。
     static REACHABLE: OnceLock<bool> = OnceLock::new();
 
@@ -132,36 +137,16 @@ pub(crate) mod startup {
             .context("无法确定用户配置目录")
     }
 
-    /// 我们自己写的那份单元，与包装的同名单元不同路径。
-    fn generated_unit() -> Result<PathBuf> {
-        Ok(config_dir()?.join("systemd/user").join(UNIT))
-    }
-
-    /// systemd 现在能不能看到这个单元，包装的或我们自己写的都算。
-    fn unit_installed() -> Result<bool> {
-        Ok(
-            generated_unit()?.exists()
-                || PACKAGED_UNITS.iter().any(|unit| Path::new(unit).exists()),
-        )
-    }
-
-    /// 早先版本写的是 XDG 自启动条目，两份同时在会让登录时起两次（第二份被实例锁
-    /// 挡掉，只是白跑一趟）。所以启用单元时把它清掉，关掉时也一样。
-    fn legacy_autostart() -> Result<PathBuf> {
-        Ok(config_dir()?.join("autostart/openuuyc.desktop"))
-    }
-
-    /// 旧条目会不会真的在登录时启动程序：桌面被明确告知跳过它就不算。
-    fn legacy_autostart_runs() -> Result<bool> {
-        let entry = legacy_autostart()?;
-        let text = match std::fs::read_to_string(&entry) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            result => result.with_context(|| format!("无法读取自启动设置 {}", entry.display()))?,
-        };
-        Ok(!text.lines().map(str::trim).any(|line| {
-            line.eq_ignore_ascii_case("Hidden=true")
-                || line.eq_ignore_ascii_case("X-GNOME-Autostart-enabled=false")
-        }))
+    /// 桌面有没有把自己接进 `graphical-session.target`：接了用 systemd 单元，没接
+    /// 用 XDG 条目。
+    fn session_reachable() -> bool {
+        *REACHABLE.get_or_init(|| {
+            std::process::Command::new("systemctl")
+                .arg("--user")
+                .args(["is-active", "graphical-session.target"])
+                .output()
+                .is_ok_and(|output| output.status.success())
+        })
     }
 
     fn systemctl(args: &[&str]) -> Result<String> {
@@ -185,20 +170,10 @@ pub(crate) mod startup {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
-    /// 桌面有没有把自己接进 `graphical-session.target`。
-    fn session_reachable() -> bool {
-        *REACHABLE.get_or_init(|| {
-            std::process::Command::new("systemctl")
-                .arg("--user")
-                .args(["is-active", "graphical-session.target"])
-                .output()
-                .is_ok_and(|output| output.status.success())
-        })
-    }
-
-    /// 这条自启在当前桌面上不可用时的原因，界面据此把开关置灰并说明。
+    /// 两种机制都用不了时的原因，界面据此把开关置灰并说明。桌面没接
+    /// `graphical-session.target` 不算：那里改用 XDG 条目。
     pub(crate) fn unavailable() -> Option<String> {
-        (!session_reachable()).then(|| NO_SESSION_TARGET.to_owned())
+        config_dir().err().map(|_| NO_CONFIG_DIR.to_owned())
     }
 
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -206,15 +181,16 @@ pub(crate) mod startup {
         Disabled,
         Enabled,
         /// Windows keeps a separate Startup Apps approval the program cannot
-        /// override. A desktop's disable switch is the unit itself, which the
-        /// settings switch rewrites, so it reads as plain `Disabled`.
+        /// override. A desktop's disable switch is the unit or entry itself,
+        /// which the settings switch rewrites, so it reads as plain `Disabled`.
         #[allow(dead_code)]
         DisabledByWindows,
     }
 
-    /// Whether login starts OpenUUYC. The answer is the unit's own enablement,
-    /// so the settings switch and `systemctl --user enable/disable` are the
-    /// same thing.
+    /// Whether login starts OpenUUYC on this desktop: the unit is enabled and
+    /// the desktop reaches its target, or the XDG entry is present and not
+    /// skipped. The settings switch and `systemctl --user enable/disable` are
+    /// the same thing where the unit is the mechanism.
     pub(crate) fn state() -> Result<State> {
         Ok(if enabled()? {
             State::Enabled
@@ -224,7 +200,7 @@ pub(crate) mod startup {
     }
 
     /// The settings switch. There is no installed copy apart from the running
-    /// one, so the unit starts this program, as enabling remote wake does.
+    /// one, so login starts this program, as enabling remote wake does.
     pub(crate) fn configure(enabled: bool) -> Result<()> {
         if !enabled {
             return set_image(false, Path::new(""));
@@ -233,88 +209,197 @@ pub(crate) mod startup {
     }
 
     pub(crate) fn set_image(enabled: bool, path: &Path) -> Result<()> {
-        let generated = generated_unit()?;
-        let legacy = legacy_autostart()?;
+        let places = Places::current()?;
         if !enabled {
-            // 单元本来就不在时不必让 systemctl 报一次「单元不存在」，那就是我们要的结果。
-            if unit_installed()? {
-                systemctl(&["disable", UNIT])?;
+            return places.disable();
+        }
+        anyhow::ensure!(path.is_file(), "尚未部署自启动程序");
+        let image = path.to_str().context("程序路径不是 UTF-8")?;
+        anyhow::ensure!(!image.contains(['\n', '\r']), "程序路径含换行");
+        places.enable(image, session_reachable())
+    }
+
+    pub(crate) fn enabled() -> Result<bool> {
+        Places::current()?.enabled(session_reachable())
+    }
+
+    /// 自启读写的位置。测试换成临时目录，碰不到真实的用户配置与系统里的单元。
+    struct Places<'a> {
+        config: PathBuf,
+        packaged: &'a [&'a str],
+    }
+
+    impl Places<'static> {
+        fn current() -> Result<Self> {
+            Ok(Self {
+                config: config_dir()?,
+                packaged: &PACKAGED_UNITS,
+            })
+        }
+    }
+
+    impl Places<'_> {
+        /// 我们自己写的那份单元，与包装的同名单元不同路径。
+        fn generated_unit(&self) -> PathBuf {
+            self.config.join("systemd/user").join(UNIT)
+        }
+
+        /// systemd 现在能不能看到这个单元，包装的或我们自己写的都算。
+        fn unit_installed(&self) -> bool {
+            self.generated_unit().exists()
+                || self.packaged.iter().any(|unit| Path::new(unit).exists())
+        }
+
+        fn entry(&self) -> PathBuf {
+            self.config.join("autostart/openuuyc.desktop")
+        }
+
+        /// 自启在这个桌面上是否开着。`systemd` 是桌面接没接 `graphical-session.target`：
+        /// 没接的桌面上 enable 了的单元登录时不会被拉起，不算。XDG 条目在接了的桌面
+        /// （GNOME、KDE 的会话管理器或 systemd 的 xdg-autostart 生成器）上照样会启动
+        /// 程序，所以哪里都算——升级前写入的条目也因此显示为开。
+        fn enabled(&self, systemd: bool) -> Result<bool> {
+            Ok(self.entry_runs()? || (systemd && self.unit_enabled()?))
+        }
+
+        fn enable(&self, image: &str, systemd: bool) -> Result<()> {
+            if systemd {
+                self.enable_unit(image)?;
+                if let Err(error) = self.remove_entry() {
+                    tracing::warn!(error = %format!("{error:#}"), "XDG 自启动条目没能删除");
+                }
+            } else {
+                self.write_entry(image)?;
+                // 先前在接了 target 的桌面上开过单元：留着它，回到那个桌面时会起两次。
+                if let Err(error) = self.disable_unit() {
+                    tracing::warn!(error = %format!("{error:#}"), "自启动单元没能停用");
+                }
             }
-            // 只删我们自己写的那份；包装的单元归包管。
-            if generated.exists() {
-                std::fs::remove_file(&generated).context("删除自启动单元失败")?;
-                systemctl(&["daemon-reload"])?;
+            Ok(())
+        }
+
+        fn disable(&self) -> Result<()> {
+            self.disable_unit()?;
+            self.remove_entry()
+        }
+
+        /// XDG 条目会不会在登录时启动程序：桌面被明确告知跳过它就不算。
+        fn entry_runs(&self) -> Result<bool> {
+            let entry = self.entry();
+            let text = match std::fs::read_to_string(&entry) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                result => {
+                    result.with_context(|| format!("无法读取自启动设置 {}", entry.display()))?
+                }
+            };
+            Ok(!text.lines().map(str::trim).any(|line| {
+                line.eq_ignore_ascii_case("Hidden=true")
+                    || line.eq_ignore_ascii_case("X-GNOME-Autostart-enabled=false")
+            }))
+        }
+
+        fn write_entry(&self, image: &str) -> Result<()> {
+            let entry = self.entry();
+            if let Some(directory) = entry.parent() {
+                std::fs::create_dir_all(directory)?;
             }
-            return match std::fs::remove_file(&legacy) {
+            std::fs::write(&entry, entry_body(image))
+                .with_context(|| format!("无法写入自启动设置 {}", entry.display()))
+        }
+
+        fn remove_entry(&self) -> Result<()> {
+            match std::fs::remove_file(self.entry()) {
                 Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
                     Err(error).context("无法删除本程序自启动设置")
                 }
                 _ => Ok(()),
-            };
-        }
-        // 桌面不参与 `graphical-session.target` 时，enable 会成功但登录时没人拉起
-        // 这个单元，界面却显示已开启——在这里就说清楚，别让它静默失效。
-        anyhow::ensure!(session_reachable(), NO_SESSION_TARGET);
-        anyhow::ensure!(path.is_file(), "尚未部署自启动程序");
-        let image = path.to_str().context("程序路径不是 UTF-8")?;
-        check_image(image)?;
-        // 包装的单元已经把可执行文件位置写死成安装路径；只有在没有包装单元、或者
-        // 之前那份本来就是我们自己写的时候，才按当前可执行文件重写一份，免得便携
-        // 运行时换了个位置后单元指向一个已经不存在的文件。
-        if generated.exists() || !unit_installed()? {
-            if let Some(directory) = generated.parent() {
-                std::fs::create_dir_all(directory)?;
             }
-            std::fs::write(&generated, unit_body(image))
-                .with_context(|| format!("无法写入自启动单元 {}", generated.display()))?;
-            systemctl(&["daemon-reload"])?;
         }
-        // 这里只 enable 不 --now：正在跑的就是本进程，再起一份会被实例锁挡住。
-        systemctl(&["enable", UNIT])?;
-        match std::fs::remove_file(&legacy) {
-            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
-                tracing::warn!(error = %error, "旧的 XDG 自启动条目没能删除");
+
+        /// 单元现在是否已启用，查的是 systemd 的实际状态。
+        fn unit_enabled(&self) -> Result<bool> {
+            // 单元没装时不必问 systemctl：v253 起 `is-enabled` 才输出 `not-found`，
+            // systemd 249（Ubuntu 22.04，deb 只投这个）对不存在的单元标准输出什么都不
+            // 打、只往标准错误写一行就非零退出。
+            if !self.unit_installed() {
+                return Ok(false);
             }
-            _ => {}
+            let output = std::process::Command::new("systemctl")
+                .arg("--user")
+                .args(["is-enabled", UNIT])
+                .output()
+                .context("无法执行 systemctl")?;
+            // 未启用、被 mask 都是非零退出，状态只写在标准输出上。
+            let state = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            match state.as_str() {
+                "enabled" | "enabled-runtime" | "alias" | "static" | "indirect" | "generated" => {
+                    Ok(true)
+                }
+                "disabled" | "linked" | "linked-runtime" | "masked" | "not-found" => Ok(false),
+                // 状态查不到时标准输出是空的，退出码非零同样只是「没启用」。
+                "" if !output.status.success() => Ok(false),
+                "" => bail!(
+                    "systemctl --user is-enabled 没有给出状态：{}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
+                other => bail!("无法识别的单元状态：{other}"),
+            }
         }
-        Ok(())
+
+        fn enable_unit(&self, image: &str) -> Result<()> {
+            check_image(image)?;
+            let generated = self.generated_unit();
+            // 包装的单元已经把可执行文件位置写死成安装路径；只有在没有包装单元、或者
+            // 之前那份本来就是我们自己写的时候，才按当前可执行文件重写一份，免得便携
+            // 运行时换了个位置后单元指向一个已经不存在的文件。
+            if generated.exists() || !self.unit_installed() {
+                if let Some(directory) = generated.parent() {
+                    std::fs::create_dir_all(directory)?;
+                }
+                std::fs::write(&generated, unit_body(image))
+                    .with_context(|| format!("无法写入自启动单元 {}", generated.display()))?;
+                systemctl(&["daemon-reload"])?;
+            }
+            // 这里只 enable 不 --now：正在跑的就是本进程，再起一份会被实例锁挡住。
+            systemctl(&["enable", UNIT])?;
+            Ok(())
+        }
+
+        fn disable_unit(&self) -> Result<()> {
+            // 没启用（包括单元不在）时不必让 systemctl 再报一次错，那就是我们要的结果。
+            if self.unit_enabled()? {
+                systemctl(&["disable", UNIT])?;
+            }
+            // 只删我们自己写的那份；包装的单元归包管。
+            let generated = self.generated_unit();
+            if generated.exists() {
+                std::fs::remove_file(&generated).context("删除自启动单元失败")?;
+                systemctl(&["daemon-reload"])?;
+            }
+            Ok(())
+        }
     }
 
-    /// 单元现在是否已启用。查到的是 systemd 的实际状态，所以界面上的「开机自启」
-    /// 与 `systemctl --user enable/disable` 永远是同一件事。升级前写入的 XDG 条目
-    /// 登录时照样会启动程序，所以也算已启用：否则升级用户的开关会显示「关」，而
-    /// 实际上每次登录都在起。
-    pub(crate) fn enabled() -> Result<bool> {
-        Ok(unit_enabled()? || legacy_autostart_runs()?)
-    }
-
-    fn unit_enabled() -> Result<bool> {
-        // 单元没装时不必问 systemctl：v253 起 `is-enabled` 才输出 `not-found`，
-        // systemd 249（Ubuntu 22.04，deb 只投这个）对不存在的单元标准输出什么都不
-        // 打、只往标准错误写一行就非零退出。
-        if !unit_installed()? {
-            return Ok(false);
-        }
-        let output = std::process::Command::new("systemctl")
-            .arg("--user")
-            .args(["is-enabled", UNIT])
-            .output()
-            .context("无法执行 systemctl")?;
-        // 未启用、被 mask 都是非零退出，状态只写在标准输出上。
-        let state = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        match state.as_str() {
-            "enabled" | "enabled-runtime" | "alias" | "static" | "indirect" | "generated" => {
-                Ok(true)
+    /// XDG 自启动条目，与改用 systemd 单元之前写的一模一样。
+    fn entry_body(image: &str) -> String {
+        // Desktop Entry quoting: reserved characters get a backslash inside the
+        // quoted argument, and the file's string escaping doubles every backslash.
+        let mut quoted = String::new();
+        for c in image.chars() {
+            match c {
+                '\\' => quoted.push_str(r"\\\\"),
+                '"' | '`' | '$' => {
+                    quoted.push_str(r"\\");
+                    quoted.push(c);
+                }
+                '%' => quoted.push_str("%%"),
+                _ => quoted.push(c),
             }
-            "disabled" | "linked" | "linked-runtime" | "masked" | "not-found" => Ok(false),
-            // 状态查不到时标准输出是空的，退出码非零同样只是「没启用」。
-            "" if !output.status.success() => Ok(false),
-            "" => bail!(
-                "systemctl --user is-enabled 没有给出状态：{}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ),
-            other => bail!("无法识别的单元状态：{other}"),
         }
+        format!(
+            "[Desktop Entry]\nType=Application\nName=OpenUUYC\n\
+             Exec=\"{quoted}\" gui --background\nX-GNOME-Autostart-enabled=true\n"
+        )
     }
 
     /// 单元内容。包里的 `packaging/linux/openuuyc.service` 是同一份定义，改这里时
@@ -412,6 +497,57 @@ pub(crate) mod startup {
             assert!(body.contains("WantedBy=graphical-session.target"));
             assert!(body.contains("PartOf=graphical-session.target"));
             assert!(body.contains("Restart=on-failure"));
+        }
+
+        /// 临时配置目录、没有包装单元：碰不到真实的用户配置，也不会去问 systemctl。
+        fn scratch(name: &str) -> Places<'static> {
+            let config = std::env::temp_dir()
+                .join(format!("openuuyc-startup-{}-{name}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&config);
+            Places {
+                config,
+                packaged: &[],
+            }
+        }
+
+        /// 到不了 `graphical-session.target` 的桌面（XFCE、MATE、Cinnamon）上开启写的
+        /// 是 XDG 条目，状态读回为开，关闭时删掉。
+        #[test]
+        fn falls_back_to_the_xdg_entry_without_the_session_target() {
+            let places = scratch("xdg");
+            assert!(!places.enabled(false).unwrap());
+            places.enable("/opt/Open UUYC/a%b$c", false).unwrap();
+            let text = std::fs::read_to_string(places.entry()).unwrap();
+            assert!(text.contains(r#"Exec="/opt/Open UUYC/a%%b\\$c" gui --background"#));
+            assert!(!places.generated_unit().exists());
+            assert!(places.enabled(false).unwrap());
+            // 接了 target 的桌面上会话管理器同样会运行这个条目。
+            assert!(places.enabled(true).unwrap());
+            places.disable().unwrap();
+            assert!(!places.entry().exists());
+            assert!(!places.enabled(false).unwrap());
+            // 已经关着时再关一次不是错误。
+            places.disable().unwrap();
+            let _ = std::fs::remove_dir_all(&places.config);
+        }
+
+        /// 桌面被告知跳过的条目登录时不会运行，读作关；关闭开关时照样删掉。
+        #[test]
+        fn a_skipped_entry_reads_as_off() {
+            let places = scratch("skipped");
+            for skip in ["Hidden=true", "X-GNOME-Autostart-enabled=false"] {
+                places.enable("/usr/bin/OpenUUYC", false).unwrap();
+                let text = std::fs::read_to_string(places.entry()).unwrap();
+                std::fs::write(
+                    places.entry(),
+                    text.replace("X-GNOME-Autostart-enabled=true", skip),
+                )
+                .unwrap();
+                assert!(!places.enabled(false).unwrap(), "{skip}");
+                places.disable().unwrap();
+                assert!(!places.entry().exists());
+            }
+            let _ = std::fs::remove_dir_all(&places.config);
         }
     }
 }

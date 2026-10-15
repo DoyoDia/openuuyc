@@ -53,7 +53,9 @@ uninstall() {
         "$PREFIX/share/icons/hicolor/256x256/apps/openuuyc.png" \
         /usr/lib/udev/rules.d/60-openuuyc-uinput.rules
     # 便携运行（没走这个脚本）时程序会自己写一份到用户配置目录，一并清掉。
-    rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/openuuyc.service"
+    # 不接 graphical-session.target 的桌面上，开关写的是 XDG 自启动条目。
+    rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/openuuyc.service" \
+        "${XDG_CONFIG_HOME:-$HOME/.config}/autostart/openuuyc.desktop"
     systemctl --user daemon-reload 2>/dev/null || true
     # Only remove the menu extension if it is exactly the one we wrote; an
     # extension the user merged our entry into stays.
@@ -63,7 +65,7 @@ uninstall() {
         warn "$MENU 含有 OpenUUYC 菜单项，请手动删除该条目"
     fi
     remove_legacy_service
-    say "已移除。用户数据保留在 ~/.local/share/OpenUUYC/，登录自启（systemd 用户单元 openuuyc.service）已关闭并删除"
+    say "已移除。用户数据保留在 ~/.local/share/OpenUUYC/，登录自启（systemd 用户单元与 XDG 自启动条目）已关闭并删除"
     exit 0
 }
 

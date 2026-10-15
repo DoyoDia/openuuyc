@@ -5,7 +5,8 @@
 # 同一个形态；「登录前被控」需要 KMS 抓屏或虚拟显示器，那是另一件事。
 #
 # 代价是桌面得自己接进 graphical-session.target（GNOME、KDE、uwsm 会；XFCE、MATE、
-# Cinnamon 与直接启动的 sway、Hyprland 不会），程序里的开关在这些桌面上会置灰。
+# Cinnamon 与普通 X 会话不会），程序里的开关在那些桌面上改写 XDG 自启动条目
+# ~/.config/autostart/openuuyc.desktop，不用这个单元。
 #
 # 便携运行（没装包）时这份单元不存在，程序会按当前可执行文件在
 # ~/.config/systemd/user/ 里自己写一份同名单元，内容与这里一致。
