@@ -235,15 +235,24 @@ impl Worker {
                     if owner_cancel.is_cancelled() || !owner_handle.requested() {
                         return;
                     }
-                    missing.store(error.is::<capture::SourceGone>(), Ordering::Release);
-                    let message = format!("画面采集已停止：{error:#}");
+                    let source_gone = error.is::<capture::SourceGone>();
+                    missing.store(source_gone, Ordering::Release);
                     failed_publication.send_modify(|state| {
                         state.capturing = false;
                         state.visible = false;
                         state.encoder = None;
                     });
                     owner_handle.video(None);
-                    owner_handle.fail(message);
+                    if source_gone {
+                        // The screen pool owns physical return and headless
+                        // handoff. Losing one source is not a terminal failure
+                        // of the connection; real recovery errors are reported
+                        // by that owner instead.
+                        tracing::info!(error = %format!("{error:#}"),
+                            "host capture source disappeared; waiting for display handoff");
+                    } else {
+                        owner_handle.fail(format!("画面采集已停止：{error:#}"));
+                    }
                     owner_cancel.cancel();
                 }
             })
