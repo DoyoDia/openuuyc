@@ -403,7 +403,8 @@ struct Entry {
     offer: Option<FileOffer>,
     native: Option<native::Session>,
     portal: Option<native::portal::Portal>,
-    /// Wayland 那边的接取者，和 `portal` 并行摆着，谁先接住算谁的。
+    /// Wayland 会话里的接取者。和 `portal` 二选一：Wayland 会话只摆它，X11 只摆
+    /// `portal`（见 `Payload::Probe` 那条）。
     catch: Option<native::Catcher>,
     release_source: Option<ReleaseSource>,
     source_released: bool,
@@ -1419,8 +1420,9 @@ impl Actor {
                         notify,
                     ) {
                         Ok(catcher) => entry.catch = Some(catcher),
-                        // 起不来只是少一条路，不该让整个拖放失败：真没结果的话
-                        // `tick` 的超时会收场。
+                        // Wayland 会话里这是唯一的一条路，起不来这次拖出就接不住了。
+                        // 但不在这里报错把拖放判死，只算「没接住」：主控那边 `tick` 的
+                        // 3 秒看门狗会取消这次拖放。
                         Err(error) => {
                             tracing::debug!(error = format!("{error:#}"), "Wayland 拖放接取不可用")
                         }
