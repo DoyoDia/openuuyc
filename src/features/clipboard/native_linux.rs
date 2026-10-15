@@ -1158,11 +1158,18 @@ fn accept_files(state: &mut State, session: &Arc<Inner>, epoch: u64) -> Result<(
     };
     let mount = super::fuse::Mount::new(&parent, super::fuse::generation(), tree, reader)?;
     let paths = mount.paths();
-    // 每次远端复制都会走到这里，而且只此一次：这条是「主控复制的那份到底有没有
-    // 落到本地剪贴板上」唯一的直接证据，所以留在 info。
+    // 每次远端复制都会走到这里，而且只此一次。这条把两个关键事实分开记：「清单
+    // 里是什么」说明远端给的目录是不是新那一份，「发布到了哪里」说明本地剪贴板有
+    // 没有跟着换过去。两件事坏掉的样子完全不同（内容还是旧的 / 粘贴根本不动），
+    // 光看现象分不出来。
+    //
+    // 名字不记：文件名本身是远端用户的内容，而「是不是新那份」看大小与改动时间
+    // 就够了（改两个字长度可能一样，改动时间一定不一样）。
     tracing::info!(
         files = descriptors.len(),
-        root = %mount.root().display(),
+        size = descriptors[0].file_size,
+        modified = descriptors[0].last_write_time,
+        published = %paths.first().map(|path| path.display().to_string()).unwrap_or_default(),
         "已挂载远端剪贴板文件"
     );
     write_files(state, &paths)?;
@@ -1429,6 +1436,17 @@ fn poll_local(state: &mut State) -> Result<()> {
             session.file_allowed(),
             true,
         );
+        // 本地复制的文件有没有真的广告出去：`advertised=0` 就是没发（文件权限被
+        // 关或格式全被过滤），对面那头自然什么都不动。
+        if !state.local.sources.is_empty() {
+            tracing::info!(
+                files = state.local.sources.len(),
+                files_allowed = session.file_allowed(),
+                advertised = links.len(),
+                formats = %links.iter().map(|f| f.wire.name.clone()).collect::<Vec<_>>().join(","),
+                "本地文件剪贴板已发布给对端"
+            );
+        }
         if links.is_empty() {
             state.published.remove(&session.id);
             continue;

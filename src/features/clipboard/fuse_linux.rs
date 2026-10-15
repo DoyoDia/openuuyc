@@ -417,10 +417,6 @@ impl Mount {
     pub(super) fn paths(&self) -> Vec<PathBuf> {
         self.names.iter().map(|name| self.root.join(name)).collect()
     }
-
-    pub(super) fn root(&self) -> &Path {
-        &self.root
-    }
 }
 
 impl Drop for Mount {
