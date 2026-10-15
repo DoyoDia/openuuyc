@@ -181,18 +181,6 @@ impl Session {
         Ok(())
     }
 
-    /// Sends a signal to the shell's process group. The child called
-    /// `setsid()`, so it leads its own group and the negative pid reaches the
-    /// whole job tree rather than the shell alone.
-    pub(crate) fn signal(&self, signal: i32) -> Result<()> {
-        let pid = self.child.id() as i32;
-        // SAFETY: `pid` is a live child of this process.
-        if unsafe { libc::kill(-pid, signal) } != 0 {
-            bail!("向 shell 发送信号 {signal} 失败");
-        }
-        Ok(())
-    }
-
     /// Whether the shell has exited.
     pub(crate) fn exited(&mut self) -> bool {
         matches!(self.child.try_wait(), Ok(Some(_)))
@@ -268,20 +256,6 @@ mod tests {
         let seen = read_until(&mut session, b"40 120", Duration::from_secs(5));
         let text = String::from_utf8_lossy(&seen);
         assert!(text.contains("40 120"), "pty reported size: {text:?}");
-    }
-
-    #[test]
-    fn signal_reaches_the_shell() {
-        let mut session = Session::open("/bin/sh", 80, 24).expect("open pty");
-        session.signal(libc::SIGTERM).expect("signal shell");
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline {
-            if session.exited() {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        panic!("shell did not exit after SIGTERM");
     }
 
     #[test]

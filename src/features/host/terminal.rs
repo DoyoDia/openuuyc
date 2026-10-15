@@ -429,7 +429,8 @@ impl Sessions {
             .retain(|_, session| session.state != SessionState::Exited);
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
         self.sessions.is_empty()
     }
 }
@@ -573,7 +574,7 @@ pub(crate) fn bind(
                 return;
             };
             let frames = {
-                let mut state = pump_screens.lock().await;
+                let state = pump_screens.lock().await;
                 let sessions = state.terminal();
                 let mut sessions = sessions.lock().unwrap_or_else(|e| e.into_inner());
                 sessions.pump()
@@ -590,7 +591,7 @@ pub(crate) fn bind(
             if failed {
                 return;
             }
-            let mut state = pump_screens.lock().await;
+            let state = pump_screens.lock().await;
             let sessions = state.terminal();
             sessions.lock().unwrap_or_else(|e| e.into_inner()).reap();
         }
