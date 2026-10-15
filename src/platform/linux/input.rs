@@ -436,7 +436,7 @@ mod uinput {
     ///
     /// 这段逻辑和设备本身分开，是为了能脱开 `/dev/uinput` 单独验：触摸屏的协议要求
     /// 全在帧的顺序里（谁先抬起、槽位什么时候能复用、BTN_TOUCH 什么时候翻转）。
-    #[derive(Default)]
+    #[derive(Clone, Default)]
     struct Contacts {
         active: BTreeMap<u32, Contact>,
         used: [bool; TOUCH_SLOTS],
@@ -446,6 +446,7 @@ mod uinput {
         touching: bool,
     }
 
+    #[derive(Clone)]
     struct Contact {
         slot: u8,
         tracking: i32,
@@ -462,7 +463,23 @@ mod uinput {
         /// 刚空出来的槽位，同一帧里同一个槽位先写 -1 再写新 id，libinput
         /// （`evdev-fallback.c`）会当成内核的错误，抬起和按下一起丢掉。所以抬起
         /// 总是自己一帧，和 Windows 的 `Touch::update` 先单独注入一帧 UP 一样。
+        ///
+        /// 出错时（触点比槽位多）什么也不改：整步先在一份副本上算完，成功了才换上。
+        /// 否则消失的触点已经从这里删掉，抬起它们的那一帧却没有发出去，合成器那边
+        /// 就会一直按着。
         fn step(&mut self, kind: u8, points: &[Touch], rotation: Rotation) -> Result<Vec<Frame>> {
+            let mut next = self.clone();
+            let frames = next.advance(kind, points, rotation)?;
+            *self = next;
+            Ok(frames)
+        }
+
+        fn advance(
+            &mut self,
+            kind: u8,
+            points: &[Touch],
+            rotation: Rotation,
+        ) -> Result<Vec<Frame>> {
             let mut frames = Vec::new();
             if kind == 1 || kind >= 3 {
                 frames.extend(self.lift_all());
@@ -765,6 +782,34 @@ mod uinput {
                 .map(|id| contact(id, 0.5, 0.5))
                 .collect();
             assert!(contacts.step(2, &points, Rotation::Normal).is_err());
+        }
+
+        /// 走不下去的一步什么也不改：本来按着的触点还记着，之后照样能抬起来。
+        #[test]
+        fn a_refused_step_keeps_the_contacts_it_had() {
+            let mut contacts = Contacts::default();
+            contacts
+                .step(
+                    2,
+                    &[contact(1, 0.1, 0.1), contact(2, 0.2, 0.2)],
+                    Rotation::Normal,
+                )
+                .unwrap();
+            // 1 和 2 都没了，换上 11 个新触点：槽位不够
+            let points: Vec<Touch> = (10..10 + TOUCH_SLOTS as u32 + 1)
+                .map(|id| contact(id, 0.5, 0.5))
+                .collect();
+            assert!(contacts.step(2, &points, Rotation::Normal).is_err());
+            assert_eq!(contacts.active.keys().copied().collect::<Vec<_>>(), [1, 2]);
+            assert_eq!(contacts.used.iter().filter(|used| **used).count(), 2);
+            assert_eq!(contacts.tracking, 2);
+            assert!(contacts.touching);
+
+            let frames = contacts.step(3, &[], Rotation::Normal).unwrap();
+            assert_eq!(frames.len(), 1);
+            assert!(frames[0].contains(&(EV_ABS, ABS_MT_SLOT, 0)));
+            assert!(frames[0].contains(&(EV_ABS, ABS_MT_SLOT, 1)));
+            assert!(frames[0].contains(&(EV_KEY, BTN_TOUCH, 0)));
         }
     }
 }
