@@ -26,6 +26,7 @@ use crate::ui::chrome::{
     resize_regions, set_fullscreen, title_bar_height, title_bar_panel,
     update_nonmodal_window_resize, window_title_bar,
 };
+use crate::ui::controls::{ViewerCaptionIcon, viewer_caption_button as caption_button};
 use crate::ui::gfx::{UiPresenter, UiTimingAudit, split_output};
 use crate::ui::window_manager::{Event as UiEvent, Repaint as UiRepaintEvent};
 
@@ -422,15 +423,37 @@ impl ConnectingWindowsRunner {
             let fullscreen = window.fullscreen().is_some();
             shell.fullscreen_chrome.sync(fullscreen);
             if !fullscreen {
+                // Windows 的 caption 里，别名那一格是可以点开的设备切换菜单；没有可切换
+                // 的设备时才是普通标签。这里跟着它走，所以标题那一格由播放器自己画。
+                let switcher = match stage {
+                    Stage::Playing(player) => player.device_switch(),
+                    _ => None,
+                };
                 title_bar_panel(ui, "player-window-chrome", title_bar_height(), |ui| {
                     let bar = ui.available_rect_before_wrap();
-                    close_requested |= window_title_bar(
-                        ui,
-                        &window,
-                        &title,
-                        Some(&mut shell.move_state),
-                        audio.is_none(),
-                    );
+                    close_requested |= match switcher.as_ref() {
+                        Some(switcher) => crate::ui::chrome::window_title_bar_with_identity(
+                            ui,
+                            &window,
+                            &title,
+                            Some(&mut shell.move_state),
+                            audio.is_none(),
+                            &mut |ui: &mut egui::Ui| {
+                                let response = crate::ui::controls::viewer_device_button(
+                                    ui,
+                                    title.trim_start_matches(crate::VIEWER_TITLE_PREFIX),
+                                );
+                                switcher.menu(&response, window.id());
+                            },
+                        ),
+                        None => window_title_bar(
+                            ui,
+                            &window,
+                            &title,
+                            Some(&mut shell.move_state),
+                            audio.is_none(),
+                        ),
+                    };
                     if let Stage::Playing(player) = stage {
                         player.title_bar_controls(ui, bar, &window);
                     }
@@ -1318,7 +1341,9 @@ impl Player {
     }
 
     /// The player commands, placed in the window caption between the title and
-    /// the window buttons. The Windows player has the same row.
+    /// the window buttons. The Windows player has the same row, in the same
+    /// order, with the same icons — 鼠标、麦克风、1:1、批注、插件、画质，最右是
+    /// 窗口按钮。Linux 上还没实现的那几个画成禁用而不是不画：一眼就能看出缺什么。
     pub(super) fn title_bar_controls(
         &mut self,
         ui: &mut egui::Ui,
@@ -1344,49 +1369,121 @@ impl Player {
                 .layout(egui::Layout::right_to_left(egui::Align::Center)),
         );
         row.set_clip_rect(rect);
-        row.spacing_mut().item_spacing.x = 6.0;
-        // As in the Windows caption, control waiting for released keys or for
-        // a stalled input channel counts as on, and a click cancels it.
+        row.spacing_mut().item_spacing.x = 4.0;
+
+        // 画质与串流设置。Windows 的 Quality 也在最右。
+        if caption_button(
+            &mut row,
+            ViewerCaptionIcon::Quality,
+            self.stream_control_ui.open,
+            "画质与串流设置",
+        )
+        .clicked()
+        {
+            self.stream_control_ui.open = !self.stream_control_ui.open;
+        }
+
+        // 这三样是 Windows 播放器里才有的东西：插件面板和批注整套界面都在那边，
+        // 1:1 的「固定左上角」在 Wayland 下也没有可写的地方（合成器不给客户端摆窗口）。
+        for (icon, hint) in [
+            (ViewerCaptionIcon::Plugins, "Linux 主控还没有插件面板"),
+            (ViewerCaptionIcon::Annotation, "Linux 主控还没有批注"),
+            (ViewerCaptionIcon::OneToOne, "Linux 主控还没有 1:1 实际像素"),
+        ] {
+            row.add_enabled_ui(false, |ui| caption_button(ui, icon, false, ""))
+                .inner
+                .on_disabled_hover_text(hint);
+        }
+
+        // 麦克风：和 Windows 同一套判定，用的是同一份共享状态。
+        let mic = self.session.stream_control.microphone().snapshot();
+        let mic_hint = if mic.pending {
+            "麦克风：等待远端确认"
+        } else if let Some(error) = mic.error.as_deref() {
+            error
+        } else if mic.capturing {
+            "正在将麦克风发送到远端，点击关闭"
+        } else if mic.enabled {
+            "麦克风已开启，等待远端应用使用，点击关闭"
+        } else {
+            "将所选麦克风发送到远端（设备可在串流设置中切换）"
+        };
+        let control = self.session.stream_control.snapshot();
+        if row
+            .add_enabled_ui(
+                mic.enabled
+                    || (self.session.stream_control.microphone_available()
+                        && control.ready
+                        && control.mouse_mode != MouseMode::View),
+                |ui| caption_button(ui, ViewerCaptionIcon::Microphone, mic.enabled, mic_hint),
+            )
+            .inner
+            .on_disabled_hover_text("请先连接支持麦克风的 Windows 设备并开启键鼠控制")
+            .clicked()
+        {
+            crate::ui::controls::clear_notice(row.ctx(), "microphone-request-error");
+            match self
+                .session
+                .stream_control
+                .set_microphone_enabled(!mic.enabled)
+            {
+                Ok(()) => crate::ui::controls::clear_notice(row.ctx(), "microphone-error"),
+                Err(error) => crate::ui::controls::notice(
+                    row.ctx(),
+                    "microphone-request-error",
+                    "麦克风",
+                    crate::ui::controls::DialogIcon::Error,
+                    error.to_string(),
+                ),
+            }
+        }
+
+        // 键鼠控制。等键鼠松开、或输入通道卡住重连时都算「开着」，点一下就取消。
         let recovering = self.input().transport_recovering();
         let controlling = self.input().mode() != MouseMode::View
             || self.input().waiting_for_neutral()
             || recovering;
-        if row.button("全屏").clicked() {
-            toggle_fullscreen(window);
-        }
-        let always_visible = self
-            .session
-            .stream_control
-            .device_preferences()
-            .performance_always_visible;
+        let mouse_hint = if recovering {
+            "键鼠控制正在自动恢复；点击取消".to_owned()
+        } else if self.input().waiting_for_neutral() {
+            format!(
+                "等待松开全部键鼠；退出控制快捷键：{}",
+                crate::application::viewer_shortcuts::label(ViewerShortcut::ReleaseMouse)
+            )
+        } else if controlling {
+            format!(
+                "退出控制（{}）",
+                crate::application::viewer_shortcuts::label(ViewerShortcut::ReleaseMouse)
+            )
+        } else if self.input().keyboard_supported() {
+            "开启键鼠控制".to_owned()
+        } else {
+            "开启鼠标控制（此平台暂未适配键盘）".to_owned()
+        };
         if row
-            .selectable_label(always_visible, "性能")
-            .on_hover_text("关闭后仅在异常时临时显示")
-            .clicked()
-        {
-            // The caption button is the stream menu's「性能监控常驻」switch;
-            // the menu chooses between the compact and detailed panels.
-            self.session
-                .stream_control
-                .set_performance_always_visible(!always_visible);
-        }
-        if row.button("串流设置").clicked() {
-            self.stream_control_ui.open = !self.stream_control_ui.open;
-        }
-        if row
-            .selectable_label(controlling, "键鼠控制")
-            .on_hover_text(if recovering {
-                "键鼠控制正在自动恢复；点击取消".to_owned()
-            } else {
-                format!(
-                    "退出控制：{}",
-                    crate::application::viewer_shortcuts::label(ViewerShortcut::ReleaseMouse)
-                )
+            .add_enabled_ui(controlling || control.ready, |ui| {
+                caption_button(ui, ViewerCaptionIcon::Mouse, controlling, &mouse_hint)
             })
+            .inner
             .clicked()
         {
             self.set_control(!controlling);
         }
+
+        // Windows 的 caption 里没有全屏按钮：它全屏之后会浮出一根工具条。Linux 还没有
+        // 那根条子，而全屏时整条标题栏都会隐藏（见 `draw` 里的判断），所以离开全屏
+        // 得留一个入口在这儿。
+        if caption_button(
+            &mut row,
+            ViewerCaptionIcon::Fullscreen,
+            window.fullscreen().is_some(),
+            "切换全屏",
+        )
+        .clicked()
+        {
+            toggle_fullscreen(window);
+        }
+
         if let Some(error) = &self.control_error {
             row.add(
                 egui::Label::new(
@@ -1403,6 +1500,11 @@ impl Player {
             egui::pos2((row.min_rect().left() - 6.0).max(rect.min.x), rect.max.y),
         );
         self.title_bar_screens(ui, free, window);
+    }
+
+    /// 这台播放器能切到哪些设备。连接时由 controller 装进来，和 Windows 那份是同一个。
+    fn device_switch(&self) -> Option<super::device_switch::DeviceSwitcher> {
+        self.screens.device_switch.clone()
     }
 
     /// 顶栏中间的屏标签与码流信息：每块远端屏一个 tab（点一下切过去，右键是这块
@@ -1424,11 +1526,19 @@ impl Player {
             egui::pos2((metrics_rect.min.x - 6.0).max(rect.min.x), rect.max.y),
         );
         let stats = self.session.performance.snapshot();
-        let codec = if stats.video_codec.contains("AV1") {
+        // 和 Windows 的 caption 同一套判断：解码器的字符串里带 264/265 时以它为准
+        // （那才是实际在解的东西，比如 "H.265 (VAAPI)"），否则退回编解码器名。
+        let codec_info = if stats.video_format.contains("264") || stats.video_format.contains("265")
+        {
+            &stats.video_format
+        } else {
+            &stats.video_codec
+        };
+        let codec = if codec_info.contains("AV1") {
             "AV1"
-        } else if stats.video_codec.contains("265") || stats.video_codec.contains("HEVC") {
+        } else if codec_info.contains("265") || codec_info.contains("HEVC") {
             "H.265"
-        } else if stats.video_codec.contains("264") || stats.video_codec.contains("AVC") {
+        } else if codec_info.contains("264") || codec_info.contains("AVC") {
             "H.264"
         } else {
             "—"

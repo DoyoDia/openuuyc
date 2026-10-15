@@ -90,6 +90,29 @@ pub(crate) fn window_title_bar(
     window_title_bar_alert(ui, window, alias, move_state, tooltips, None)
 }
 
+/// 同 [`window_title_bar`]，只是标题那一格让调用方自己画。
+///
+/// 播放器窗口要在这儿放设备切换菜单（Windows 的 caption 也是这么做的），而设备列表
+/// 只有它自己知道。除了这一格，拖动、品牌图标、窗口按钮都照旧。
+pub(crate) fn window_title_bar_with_identity(
+    ui: &mut egui::Ui,
+    window: &Window,
+    alias: &str,
+    move_state: Option<&mut WindowMoveState>,
+    tooltips: bool,
+    identity: &mut dyn FnMut(&mut egui::Ui),
+) -> bool {
+    window_title_bar_impl(
+        ui,
+        window,
+        alias,
+        move_state,
+        tooltips,
+        None,
+        Some(identity),
+    )
+}
+
 pub(crate) fn window_title_bar_alert(
     ui: &mut egui::Ui,
     window: &Window,
@@ -97,6 +120,18 @@ pub(crate) fn window_title_bar_alert(
     move_state: Option<&mut WindowMoveState>,
     tooltips: bool,
     alert: Option<&TitleBarAlert>,
+) -> bool {
+    window_title_bar_impl(ui, window, alias, move_state, tooltips, alert, None)
+}
+
+fn window_title_bar_impl(
+    ui: &mut egui::Ui,
+    window: &Window,
+    alias: &str,
+    move_state: Option<&mut WindowMoveState>,
+    tooltips: bool,
+    alert: Option<&TitleBarAlert>,
+    identity: Option<&mut dyn FnMut(&mut egui::Ui)>,
 ) -> bool {
     ui.set_min_height(crate::ui::theme::WINDOW_TITLE_CONTENT_HEIGHT);
     let rect = egui::Rect::from_min_size(
@@ -142,14 +177,19 @@ pub(crate) fn window_title_bar_alert(
     );
     caption.set_clip_rect(brand_rect);
     paint_brand_logo(&mut caption);
-    caption.add(
-        egui::Label::new(
-            egui::RichText::new(alias)
-                .size(crate::ui::theme::SMALL)
-                .color(crate::ui::theme::TEXT),
-        )
-        .truncate(),
-    );
+    match identity {
+        Some(draw) => draw(&mut caption),
+        None => {
+            caption.add(
+                egui::Label::new(
+                    egui::RichText::new(alias)
+                        .size(crate::ui::theme::SMALL)
+                        .color(crate::ui::theme::TEXT),
+                )
+                .truncate(),
+            );
+        }
+    }
     if let Some(alert) = alert {
         let margin = crate::ui::theme::WINDOW_TITLE_MARGIN;
         let centered = rect.translate(egui::vec2(

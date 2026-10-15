@@ -37,6 +37,9 @@ pub(crate) enum ViewerCaptionIcon {
     Mouse,
     Microphone,
     Quality,
+    /// 只有 Linux 的播放器用它：Windows 那边全屏之后会浮出一根工具条，Linux 还没有，
+    /// 而全屏时整条标题栏都会隐藏，所以离开全屏必须留一个图标在这儿。
+    Fullscreen,
     Minimize,
     Maximize,
     Restore,
@@ -186,6 +189,14 @@ fn paint_caption_icon(
                     stroke,
                 );
                 painter.circle_filled(egui::pos2(center.x + knob, center.y + offset), 2.0, color);
+            }
+        }
+        ViewerCaptionIcon::Fullscreen => {
+            // 四个外扩的直角，就是常见的「进入全屏」样子。
+            for (x, y) in [(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
+                let corner = center + egui::vec2(6.5 * x, 6.5 * y);
+                painter.line_segment([corner, corner - egui::vec2(4.5 * x, 0.0)], stroke);
+                painter.line_segment([corner, corner - egui::vec2(0.0, 4.5 * y)], stroke);
             }
         }
         ViewerCaptionIcon::Minimize => {
