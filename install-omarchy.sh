@@ -84,6 +84,23 @@ EOF
     exit 1
 fi
 
+# 自启单元里要写 $PREFIX/bin/OpenUUYC。systemd 只认绝对路径，路径里的引号、反斜杠
+# 与换行在单元里表达不了（Executable path contains special characters），所以在动
+# 系统之前就拒绝。空格与 % 没问题：前者靠引号，后者写成 %%。
+case $PREFIX in
+/*) ;;
+*)
+    echo "PREFIX 必须是绝对路径：$PREFIX" >&2
+    exit 1
+    ;;
+esac
+case $PREFIX in
+*[\"\\]* | *$'\n'*)
+    echo "PREFIX 含引号、反斜杠或换行，无法写进 systemd 单元：$PREFIX" >&2
+    exit 1
+    ;;
+esac
+
 say "安装依赖"
 "${SUDO[@]}" pacman -S --needed --noconfirm \
     libva libx11 libxcb libxrandr libxi libxcursor libxfixes \
@@ -115,14 +132,21 @@ say "安装程序文件"
     "$PREFIX/share/icons/hicolor/256x256/apps/openuuyc.png"
 
 say "安装登录自启单元"
-"${SUDO[@]}" install -Dm644 packaging/linux/openuuyc.service \
-    "$PREFIX/lib/systemd/user/openuuyc.service"
 # 打包的那份单元把程序路径写死成 /usr/bin/OpenUUYC；这个脚本装到 $PREFIX，
-# 按实际位置改掉，否则单元启动的是另一个（或不存在）的程序。
-"${SUDO[@]}" sed -i \
-    -e "s#^ExecStart=.*#ExecStart=$PREFIX/bin/OpenUUYC gui --background#" \
-    -e "s#^ConditionFileIsExecutable=.*#ConditionFileIsExecutable=$PREFIX/bin/OpenUUYC#" \
-    "$PREFIX/lib/systemd/user/openuuyc.service"
+# 按实际位置改掉，否则单元启动的是另一个（或不存在）的程序。逐行替换而不用 sed，
+# 路径里的 # & 之类不会被当成 sed 的语法；% 是 systemd 的说明符，写成 %%。
+unit_image="$PREFIX/bin/OpenUUYC"
+unit_image=${unit_image//\%/%%}
+unit=$(mktemp)
+trap 'rm -f "$unit"' EXIT
+while IFS= read -r line; do
+    case $line in
+    ExecStart=*) printf 'ExecStart="%s" gui --background\n' "$unit_image" ;;
+    ConditionFileIsExecutable=*) printf 'ConditionFileIsExecutable=%s\n' "$unit_image" ;;
+    *) printf '%s\n' "$line" ;;
+    esac
+done <packaging/linux/openuuyc.service >"$unit"
+"${SUDO[@]}" install -Dm644 "$unit" "$PREFIX/lib/systemd/user/openuuyc.service"
 systemctl --user daemon-reload 2>/dev/null || true
 remove_legacy_service
 
