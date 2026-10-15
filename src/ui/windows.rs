@@ -37,6 +37,8 @@ pub(super) fn run(config: WindowConfig, factory: AppFactory) -> Result<()> {
             factory: Some(factory),
             state: None,
             hidden: None,
+            #[cfg(target_os = "linux")]
+            activation: None,
             error: None,
             proxy: event_loop.create_proxy(),
             root: true,
@@ -75,6 +77,10 @@ struct Runner {
     state: Option<DesktopWindow>,
     /// 主窗口收进托盘后留下的部分；这时 `state` 是 None。
     hidden: Option<Hidden>,
+    /// The startup-notification token the next window is created with: a
+    /// second start's, when it finds the control center destroyed in the tray.
+    #[cfg(target_os = "linux")]
+    activation: Option<winit::window::ActivationToken>,
     error: Option<String>,
     proxy: EventLoopProxy<Event>,
 }
@@ -331,16 +337,19 @@ impl Runner {
         }
         let min_inner_size = viewport_builder.min_inner_size;
         let viewport_builder = viewport_builder.with_visible(false).with_decorations(false);
-        // The first control center window takes the token its launcher left in
+        // A window rebuilt for a second start takes that start's token. The
+        // first control center window takes the token its launcher left in
         // the environment, so it gets focus and the launch feedback ends. The
         // variables stay set: removing them now would race the threads already
         // reading the environment, and a spent token is worthless to a child.
         #[cfg(target_os = "linux")]
         let window = {
             use winit::platform::startup_notify::EventLoopExtStartupNotify;
-            let token = (self.root && self.factory.is_some())
-                .then(|| event_loop.read_token_from_env())
-                .flatten();
+            let token = self.activation.take().or_else(|| {
+                (self.root && self.factory.is_some())
+                    .then(|| event_loop.read_token_from_env())
+                    .flatten()
+            });
             create_window(&context, event_loop, &viewport_builder, token)?
         };
         #[cfg(not(target_os = "linux"))]
@@ -956,6 +965,19 @@ impl ApplicationHandler<Event> for Windows {
             Event::Request(Request::ActivateMain(token)) => {
                 if let Some(state) = &mut self.main.state {
                     state.activate(&token);
+                } else if self.main.hidden.is_some() {
+                    // Destroyed in the tray (Wayland): the rebuilt window takes
+                    // the launcher's token at creation, as a first start does.
+                    use winit::platform::wayland::ActiveEventLoopExtWayland;
+                    let token = if event_loop.is_wayland() {
+                        token.wayland
+                    } else {
+                        token.x11
+                    };
+                    self.main.activation = token.map(winit::window::ActivationToken::from_raw);
+                    if let Err(error) = self.main.create(event_loop) {
+                        self.main.fail(event_loop, error);
+                    }
                 }
             }
             Event::Request(Request::Exit) => {
@@ -995,6 +1017,8 @@ impl ApplicationHandler<Event> for Windows {
                     state: None,
                     // 只有控制中心主窗口会收进托盘。
                     hidden: None,
+                    #[cfg(target_os = "linux")]
+                    activation: None,
                     error: None,
                     proxy: self.main.proxy.clone(),
                     root: false,
