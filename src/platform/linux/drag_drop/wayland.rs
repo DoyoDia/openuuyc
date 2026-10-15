@@ -198,7 +198,7 @@ fn pick(state: &State, device: &str, size: (u32, u32)) -> Result<usize> {
         .map(|(index, _)| index)
         .collect();
     if let [index] = matched[..] {
-        tracing::debug!(device, "输出名对不上，按物理尺寸认屏");
+        tracing::debug!(device, "输出名对不上，按尺寸认屏");
         return Ok(index);
     }
     bail!(
@@ -269,22 +269,34 @@ fn run(
         .map(|output| xdg.get_xdg_output(&output.proxy, &handle, ()))
         .collect();
     state.logical = vec![None; state.outputs.len()];
-    // 全都等到齐，不是只等目标屏：认屏的退路要在两套尺寸里比，而比之前得先知道
-    // 每块屏的逻辑尺寸（名字对不上时才用得上它）。正常一轮 roundtrip 就到，
-    // `SETUP` 只是兜底。
     let known = |state: &State| {
         state
             .logical
             .iter()
             .all(|entry| entry.is_some_and(|(_, (width, height))| width > 0 && height > 0))
     };
-    let deadline = Instant::now() + SETUP;
-    while !known(&state) && Instant::now() < deadline {
-        dispatch(&mut queue, &mut state, &connection)?;
-        wait(&mut queue, &mut state, &connection, POLL)?;
-    }
 
-    let index = pick(&state, device, size)?;
+    // 认屏。名字对得上就直接用它，不必等逻辑尺寸——合成器里只要有一块从不报逻辑
+    // 尺寸的输出（笔记本上拔掉的外接屏就是），等它到齐就要白等满 `SETUP`。
+    let by_name = state
+        .outputs
+        .iter()
+        .position(|output| !output.name.is_empty() && output.name == device);
+    let index = match by_name {
+        Some(index) => index,
+        None => {
+            // 名字对不上是常态（XWayland 给的往往不是合成器的输出名，`wl_output`
+            // 在 v4 之前也不发名字），这时只能按尺寸认；而尺寸要在物理与逻辑两套
+            // 单位里都比一遍（见 `pick`），所以先把逻辑尺寸等齐。正常一轮 roundtrip
+            // 就到，`SETUP` 只是兜底。
+            let deadline = Instant::now() + SETUP;
+            while !known(&state) && Instant::now() < deadline {
+                dispatch(&mut queue, &mut state, &connection)?;
+                wait(&mut queue, &mut state, &connection, POLL)?;
+            }
+            pick(&state, device, size)?
+        }
+    };
     let target = state.outputs[index].proxy.clone();
     let (_, (logical_width, logical_height)) = state.logical[index]
         .filter(|(_, (width, height))| *width > 0 && *height > 0)
