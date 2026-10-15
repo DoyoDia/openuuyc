@@ -424,6 +424,7 @@ pub(super) async fn publish_state(
     let mut last_audio_quality = None;
     let mut revision = None;
     let mut secure_revision = None;
+    let mut inventory_error = None::<String>;
     let sequence = &reports.sequence;
     let mut timer = tokio::time::interval(Duration::from_secs(1));
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -448,16 +449,29 @@ pub(super) async fn publish_state(
             // Driver enumeration must not hold the screen lock or occupy a
             // network runtime worker. At most one periodic read is in flight.
             let result = super::screens::Inventory::collect(&cancel).await;
-            match result {
+            let outcome = match result {
                 Ok(None) => break,
                 Ok(Some(inventory)) => {
                     if let Ok(mut state) = screens.try_lock() {
-                        if let Err(error) = state.maintain(revision, inventory).await {
-                            tracing::debug!(%error,"host screen inventory refresh failed");
-                        }
+                        Some(state.maintain(revision, inventory).await)
+                    } else {
+                        None
                     }
                 }
-                Err(error) => tracing::debug!(%error,"host screen inventory read failed"),
+                Err(error) => Some(Err(error)),
+            };
+            match outcome {
+                Some(Ok(())) if inventory_error.take().is_some() => {
+                    tracing::info!("host screen inventory refresh recovered");
+                }
+                Some(Err(error)) => {
+                    let message = format!("{error:#}");
+                    if inventory_error.as_ref() != Some(&message) {
+                        tracing::warn!(error = %message, "host screen inventory refresh failed");
+                        inventory_error = Some(message);
+                    }
+                }
+                _ => {}
             }
         }
         let routes = target.borrow_and_update().clone();
