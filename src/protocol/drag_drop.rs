@@ -6,6 +6,10 @@ const MAGIC: &[u8] = b"OUDD\x01";
 pub(crate) const MAX_PACKET: usize = 524288;
 pub(crate) const COPY: u32 = 1;
 pub(crate) const NATIVE_RETURN: u32 = 2;
+/// 收得下拖动预览图（`Payload::Image`）。它和 `NATIVE_RETURN` 是两回事：前者说
+/// 「认不认识、要不要这张图」，后者说「能不能把拖出去的东西再拖回来」。不认识的
+/// 对端会忽略这一位，所以加它不破坏线上兼容。
+pub(crate) const DRAG_IMAGE: u32 = 4;
 #[derive(Clone, PartialEq, Message)]
 pub(crate) struct Packet {
     #[prost(fixed64, tag = "1")]

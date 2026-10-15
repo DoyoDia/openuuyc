@@ -122,6 +122,8 @@ struct Shared {
     ready: AtomicBool,
     peer_enabled: AtomicBool,
     return_capable: AtomicBool,
+    /// 对端收得下拖动预览图（`wire::DRAG_IMAGE`）。
+    image_capable: AtomicBool,
     token: AtomicU64,
     screens: Mutex<Vec<Screen>>,
     stop: CancellationToken,
@@ -225,6 +227,7 @@ impl Endpoint {
             ready: AtomicBool::new(false),
             peer_enabled: AtomicBool::new(role == Role::Host),
             return_capable: AtomicBool::new(false),
+            image_capable: AtomicBool::new(false),
             token: AtomicU64::new(0),
             screens: Mutex::default(),
             stop: stop.clone(),
@@ -506,11 +509,15 @@ impl Actor {
         };
         let data = wire::encode(Packet {
             token: self.token,
-            capabilities: if native::RETURN_CAPABLE {
-                wire::NATIVE_RETURN
-            } else {
-                0
-            },
+            // `DRAG_IMAGE` 两边都置：它说的是「我收得下这张拖动预览图」，和
+            // `NATIVE_RETURN`（能不能把拖出去的东西再拖回来）本来就是两件事。
+            // 不认识这一位的对端会忽略未知位，所以线上是兼容的。
+            capabilities: wire::DRAG_IMAGE
+                | if native::RETURN_CAPABLE {
+                    wire::NATIVE_RETURN
+                } else {
+                    0
+                },
             drag: id,
             sequence,
             payload: Some(payload),
@@ -719,11 +726,14 @@ impl Actor {
             Command::Image(id, image) => {
                 if let Some(entry) = self.entries.get_mut(&id) {
                     entry.image = Some(image.clone());
-                    // The receiver accepts an image only when it negotiated the
-                    // return with us, i.e. checks *our* capability bit; a side
-                    // that cannot take a drag back must not send one.
-                    if native::RETURN_CAPABLE && self.shared.return_capable.load(Ordering::Acquire)
-                    {
+                    // 发不发只看**对端**收不收得下：`DRAG_IMAGE` 是这一版新加的位，
+                    // 上游不置它（于是这里一张图都不发，和上游现在的行为一致）；
+                    // 旧的回退是「两边都能把拖出去的东西拖回来才发」，那是拿
+                    // `NATIVE_RETURN` 兼任了两件事，Linux 被控端压根置不上它。
+                    let accepts = self.shared.image_capable.load(Ordering::Acquire)
+                        || (native::RETURN_CAPABLE
+                            && self.shared.return_capable.load(Ordering::Acquire));
+                    if accepts {
                         self.emit(id, Payload::Image(image), false).await?;
                     }
                 }
@@ -1142,6 +1152,10 @@ impl Actor {
                 packet.capabilities & wire::NATIVE_RETURN != 0,
                 Ordering::Release,
             );
+            self.shared.image_capable.store(
+                packet.capabilities & wire::DRAG_IMAGE != 0,
+                Ordering::Release,
+            );
             self.shared.ready.store(true, Ordering::Release);
             self.emit(0, Payload::HelloAck(1), false).await?;
             return Ok(());
@@ -1155,6 +1169,10 @@ impl Actor {
             Payload::HelloAck(1) if self.role == Role::Host => {
                 self.shared.return_capable.store(
                     packet.capabilities & wire::NATIVE_RETURN != 0,
+                    Ordering::Release,
+                );
+                self.shared.image_capable.store(
+                    packet.capabilities & wire::DRAG_IMAGE != 0,
                     Ordering::Release,
                 );
                 self.shared.ready.store(true, Ordering::Release)
@@ -1185,6 +1203,11 @@ impl Actor {
             // 扩展」：被控端是 Linux 时它老老实实报 false（XDND 还没法把拖放还给原手势），
             // 可它照样会把这图发过来——发不发只看**对端**的能力位。以前这里要求对方也
             // 能拖回，于是 Linux 被控一拖出就卡在这条提示上，整次拖放跟着结束。
+            //
+            // 上图这件事现在由 `wire::DRAG_IMAGE` 单独声明（`Command::Image` 那条），
+            // 「收不收得下」不再借用 `NATIVE_RETURN`。这条语义值得去上游提：上游的
+            // 接收端至今仍在用 `NATIVE_RETURN` 判断收不收图，只有等它放宽，Linux
+            // 被控端的预览图才真的送得到官方 Windows 主控。
             Payload::Image(image) => {
                 if let Some(entry) = self
                     .entries
