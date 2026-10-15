@@ -113,7 +113,8 @@ pub(crate) struct Screens {
     before_super: Option<actions::Running>,
     headless: headless::State,
     /// Shells opened by the controller, shared with the frame handler on the
-    /// BINARY channel.
+    /// BINARY channel. One table serves every connection so a reconnect keeps
+    /// the running shells.
     terminal: Arc<Mutex<crate::features::host::terminal::Sessions>>,
 }
 pub(crate) struct Deferred {
@@ -316,7 +317,7 @@ impl Screens {
             deferred,
             before_super: None,
             headless: Default::default(),
-            terminal: Default::default(),
+            terminal: crate::features::host::terminal::shared(),
         };
         state.refresh()?;
         if let Some(selected) = selected {

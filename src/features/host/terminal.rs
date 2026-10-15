@@ -456,6 +456,19 @@ fn validate_name(name: &str) -> Result<String, SessionError> {
     Ok(trimmed.to_owned())
 }
 
+/// The process-wide shell table.
+///
+/// Terminals outlive a single connection: the controller reconnects
+/// routinely (screen rotation, app switching) and expects the same sessions
+/// to still be there. Keeping the table per `Screens` would drop every shell
+/// when a connection closed, so one table serves the whole process, the way
+/// the reference server keeps its sessions in tmux.
+pub(crate) fn shared() -> Arc<std::sync::Mutex<Sessions>> {
+    static SESSIONS: std::sync::OnceLock<Arc<std::sync::Mutex<Sessions>>> =
+        std::sync::OnceLock::new();
+    Arc::clone(SESSIONS.get_or_init(|| Arc::new(std::sync::Mutex::new(Sessions::default()))))
+}
+
 /// Binds the terminal handler to `channel`.
 ///
 /// Protobuf requests (the environment check, rename) go through the shared
