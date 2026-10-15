@@ -413,6 +413,22 @@ mod platform {
     }
 
     pub fn acquire() -> Result<Option<Instance>> {
+        acquire_with(Activation::Show)
+    }
+
+    /// Starting in the background never brings the running window forward.
+    pub fn acquire_background() -> Result<Option<Instance>> {
+        acquire_with(Activation::Quiet)
+    }
+
+    /// Whether losing the lock race should ask the running process to show its
+    /// window before this one gives up.
+    enum Activation {
+        Show,
+        Quiet,
+    }
+
+    fn acquire_with(activation: Activation) -> Result<Option<Instance>> {
         let path = lock_path();
         let file = OpenOptions::new()
             .read(true)
@@ -424,6 +440,12 @@ mod platform {
         match file.try_lock() {
             Ok(()) => Ok(Some(Instance(file))),
             Err(std::fs::TryLockError::WouldBlock) => {
+                // 运行的实例可能是服务，也可能只是收在托盘里，先把它的窗口叫出来；
+                // 叫不动（旧版本、通道不可用）就保持沉默，别假装又起了一份。
+                if matches!(activation, Activation::Show) && crate::ui::control::activate().is_ok()
+                {
+                    return Ok(None);
+                }
                 eprintln!("OpenUUYC 已在运行，请勿重复启动。");
                 Ok(None)
             }
@@ -432,12 +454,6 @@ mod platform {
                 Err(anyhow::Error::new(error).context("锁定程序实例保护失败"))
             }
         }
-    }
-
-    /// Starting in the background never brings the running window forward,
-    /// and on Linux a second start never does either.
-    pub fn acquire_background() -> Result<Option<Instance>> {
-        acquire()
     }
 
     /// X11 and Wayland have no portable window-property handshake; the lock file

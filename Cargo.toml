@@ -196,8 +196,9 @@ wayland-client = { version = "0.31", default-features = false }
 wayland-protocols-misc = { version = "0.3", default-features = false, features = ["client"] }
 # 被控绝对定位读 xdg_output 的逻辑布局；主控「拦截本机快捷键」用
 # zwp_keyboard_shortcuts_inhibit_v1 让合成器在播放窗口有键盘焦点时让出自己的
-# 快捷键。两者都在 unstable feature 后面。
-wayland-protocols = { version = "0.32", default-features = false, features = ["client", "unstable"] }
+# 快捷键（两者在 unstable 后面）；再次启动时用 xdg_activation_v1 凭启动令牌把
+# 已在运行的控制中心提到前台（staging）。
+wayland-protocols = { version = "0.32", default-features = false, features = ["client", "staging", "unstable"] }
 libc = "0.2"
 fuser = { version = "0.15", default-features = false }
 x11rb = { version = "0.13", features = ["dpms", "randr", "shm", "xfixes", "xtest"] }

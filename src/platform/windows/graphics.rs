@@ -291,6 +291,36 @@ impl Drop for UiPresenter {
     }
 }
 
+/// Win32 hides a window in place (`can_hide` is always true), so the control
+/// center never destroys its window while it lives in the tray: the updater
+/// and notification activation find the process by that HWND, and the
+/// presenter's composition tree stays bound to it. No drawing resources ever
+/// outlive their window here, hence an uninhabited type.
+pub(crate) enum Retained {}
+
+impl Retained {
+    pub(crate) fn take(_presenter: UiPresenter) -> Self {
+        unreachable!("Windows hides the control center instead of destroying its window")
+    }
+
+    pub(crate) fn reuse(
+        self,
+        _window: std::sync::Arc<Window>,
+        _graphics: &Graphics,
+    ) -> Result<UiPresenter> {
+        match self {}
+    }
+
+    pub(crate) fn defer_output(&mut self, _output: egui_directx11::RendererOutput) {
+        match *self {}
+    }
+}
+
+/// `set_visible(false)` takes a Win32 window off screen.
+pub(crate) fn can_hide(_window: &Window) -> bool {
+    true
+}
+
 pub(crate) fn window_hwnd(window: &Window) -> Result<HWND> {
     let RawWindowHandle::Win32(handle) = window
         .window_handle()

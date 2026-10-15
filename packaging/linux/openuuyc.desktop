@@ -10,4 +10,5 @@ Icon=openuuyc
 Terminal=false
 Categories=Network;RemoteAccess;
 Keywords=remote;desktop;uu;远程;
+StartupNotify=true
 StartupWMClass=OpenUUYC
