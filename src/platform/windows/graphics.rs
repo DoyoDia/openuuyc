@@ -310,6 +310,10 @@ impl Retained {
     ) -> Result<UiPresenter> {
         match self {}
     }
+
+    pub(crate) fn defer_output(&mut self, _output: egui_directx11::RendererOutput) {
+        match *self {}
+    }
 }
 
 /// `set_visible(false)` takes a Win32 window off screen.

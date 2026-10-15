@@ -497,6 +497,12 @@ impl Retained {
         presenter.attach(window, graphics)?;
         Ok(presenter)
     }
+
+    /// Keep a pass run without a window: its texture uploads land on the next
+    /// window, as a minimized window's do.
+    pub(crate) fn defer_output(&mut self, output: RendererOutput) {
+        self.0.defer_output(output);
+    }
 }
 
 /// Whether `set_visible(false)` takes the window off screen. X11 unmaps it;
