@@ -1244,9 +1244,13 @@ impl Injector {
 }
 
 /// Lock the session through logind, as Win+L does on Windows.
+///
+/// A program the desktop starts runs in the user manager, outside any logind
+/// session, so `loginctl lock-session` without a name cannot find one. `auto`
+/// falls back to the user's graphical session.
 pub(crate) fn lock_session() -> Result<()> {
     let status = std::process::Command::new("loginctl")
-        .arg("lock-session")
+        .args(["lock-session", "auto"])
         .status()
         .context("无法调用 loginctl 锁定会话")?;
     ensure!(status.success(), "锁定会话失败：{status}");

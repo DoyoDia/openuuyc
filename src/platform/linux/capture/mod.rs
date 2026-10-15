@@ -4,18 +4,22 @@
 //! - NVIDIA NvFBC into CUDA (`nvfbc`): Xorg on NVIDIA, only while NVENC works,
 //!   so frames go from the display to the encoder without leaving the GPU.
 //! - X11 MIT-SHM (`x11`): Xorg sessions; no setup, no consent prompt.
+//! - wlroots screencopy (`wlr`): Wayland sessions on wlroots, niri, Sway and
+//!   their relatives; frames come through the compositor itself, and nobody is
+//!   asked for consent.
 //! - XDG ScreenCast portal + PipeWire (`portal`): Wayland sessions, and any
 //!   desktop whose portal offers it; asks the local user once.
 //!
 //! Sunshine puts KMS first; on this driver stack it finds no scanout buffer
 //! under Xorg (the NVIDIA X driver bypasses KMS), so it is not in the list
-//! yet. On Wayland only the portal can see the desktop. `OPENUUYC_CAPTURE`
-//! (for example `portal` or `nvfbc,x11`) overrides the order.
+//! yet. `OPENUUYC_CAPTURE` (for example `portal` or `nvfbc,x11`) overrides the
+//! order.
 //!
 //! Frames are BGRA, in system memory or, from NvFBC, in CUDA device memory.
 mod nvfbc;
 mod pipewire;
 mod portal;
+mod wlr_screencopy;
 mod x11;
 
 use anyhow::{Result, bail, ensure};
@@ -96,6 +100,14 @@ impl Image {
     }
 }
 
+/// A backend's picture before it is scaled: tightly packed BGRA rows.
+pub(super) struct Picture {
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<u8>,
+    pub nv12: Option<Arc<super::gpu_convert::OwnedNv12>>,
+}
+
 /// One captured picture, already scaled to the size the encoder was asked for.
 #[derive(Clone)]
 pub(crate) struct Frame {
@@ -161,6 +173,7 @@ pub(crate) fn refresh(selected: &Screen) -> Result<Screen> {
 enum Kind {
     NvFbc,
     X11,
+    Wlr,
     Portal,
 }
 impl Kind {
@@ -168,6 +181,7 @@ impl Kind {
         match self {
             Self::NvFbc => "NvFBC",
             Self::X11 => "X11",
+            Self::Wlr => "wlr-screencopy",
             Self::Portal => "XDG 门户",
         }
     }
@@ -181,6 +195,7 @@ fn candidates() -> Result<Vec<Kind>> {
             .map(|name| match name.trim() {
                 "nvfbc" => Ok(Kind::NvFbc),
                 "x11" => Ok(Kind::X11),
+                "wlr" => Ok(Kind::Wlr),
                 "portal" => Ok(Kind::Portal),
                 other => bail!("OPENUUYC_CAPTURE 中有未知的采集方式：{other}"),
             })
@@ -189,16 +204,37 @@ fn candidates() -> Result<Vec<Kind>> {
         return Ok(kinds);
     }
     Ok(if wayland_session() {
-        vec![Kind::Portal]
+        // The compositor's own protocol first: it is the only one that copies
+        // without asking, and the portal stays as the fallback for compositors
+        // that do not serve it.
+        vec![Kind::Wlr, Kind::Portal]
     } else {
         vec![Kind::NvFbc, Kind::X11, Kind::Portal]
     })
 }
 
+/// The candidates that can really open here, in order. A `Wlr` entry is
+/// dropped when the compositor does not serve the protocol, so whatever is
+/// behind it — on Mutter and KWin, the portal — is seen for what it is.
+fn usable(kinds: &[Kind], wlr_available: bool) -> Vec<Kind> {
+    kinds
+        .iter()
+        .copied()
+        .filter(|kind| *kind != Kind::Wlr || wlr_available)
+        .collect()
+}
+
 /// Whether opening capture now would ask the local user to share the
-/// screen: the portal comes first and has no remembered grant yet.
+/// screen: the portal comes first and has no remembered grant yet. A `Wlr`
+/// that cannot open leaves the portal first, so the question has to be asked
+/// of the list the session would really use.
 pub(crate) fn needs_consent() -> bool {
-    candidates().is_ok_and(|kinds| consent_needed(&kinds, portal::remembered()))
+    candidates().is_ok_and(|kinds| {
+        // Only a `Wlr` head can hide the portal behind it, and the probe costs
+        // a connection, so it is skipped for every other order.
+        let wlr = kinds.first() == Some(&Kind::Wlr) && wlr_screencopy::available();
+        consent_needed(&usable(&kinds, wlr), portal::remembered())
+    })
 }
 
 fn consent_needed(kinds: &[Kind], remembered: bool) -> bool {
@@ -208,6 +244,7 @@ fn consent_needed(kinds: &[Kind], remembered: bool) -> bool {
 enum Backend {
     NvFbc(nvfbc::Grab),
     X11(x11::Grab),
+    Wlr(wlr_screencopy::Grab),
     Portal(portal::Grab),
 }
 impl Backend {
@@ -216,6 +253,7 @@ impl Backend {
         Ok(match kind {
             Kind::NvFbc => Self::NvFbc(nvfbc::Grab::open(screen, cursor, size)?),
             Kind::X11 => Self::X11(x11::Grab::open(screen)?),
+            Kind::Wlr => Self::Wlr(wlr_screencopy::Grab::open(screen, cursor)?),
             Kind::Portal => Self::Portal(portal::Grab::open(screen, cursor)?),
         })
     }
@@ -223,6 +261,7 @@ impl Backend {
         match self {
             Self::NvFbc(_) => Kind::NvFbc,
             Self::X11(_) => Kind::X11,
+            Self::Wlr(_) => Kind::Wlr,
             Self::Portal(_) => Kind::Portal,
         }
     }
@@ -251,6 +290,7 @@ impl Backend {
         match self {
             Self::NvFbc(grab) => grab.name(),
             Self::X11(grab) => grab.name(),
+            Self::Wlr(grab) => grab.name(),
             Self::Portal(grab) => grab.name(),
         }
     }
@@ -335,12 +375,19 @@ impl Desktop {
                 self.last = None;
             }
         }
-        // The portal draws the cursor or leaves it out for the whole session;
-        // a change of request moves to a session with the other mode.
+        // The portal and wlr-screencopy draw the cursor or leave it out for the
+        // whole session; a change of request moves to a session with the other
+        // mode.
         if let Backend::Portal(grab) = &self.backend
             && grab.cursor() != cursor
         {
             self.backend = Backend::Portal(portal::Grab::open(&self.screen, cursor)?);
+            self.last = None;
+        }
+        if let Backend::Wlr(grab) = &self.backend
+            && grab.cursor() != cursor
+        {
+            self.backend = Backend::Wlr(wlr_screencopy::Grab::open(&self.screen, cursor)?);
             self.last = None;
         }
         // NvFBC scales and draws the cursor as it captures; both are fixed
@@ -401,6 +448,21 @@ impl Desktop {
                 }
                 std::thread::sleep((deadline - now).min(Duration::from_millis(8)));
             },
+            // The compositor answers a copy request only when it next draws,
+            // so a still desktop reports no picture.
+            Backend::Wlr(grab) => grab
+                .next(deadline.saturating_duration_since(Instant::now()))
+                .map(|picture| {
+                    picture.map(|picture| {
+                        let size = output(picture.width, picture.height, quality, maximum);
+                        let image = if size == (picture.width, picture.height) {
+                            picture.pixels
+                        } else {
+                            scale(&picture.pixels, (picture.width, picture.height), size)
+                        };
+                        (size, image)
+                    })
+                }),
             // PipeWire only delivers a picture when the monitor changed.
             Backend::Portal(grab) => {
                 match grab.next(deadline.saturating_duration_since(Instant::now())) {
@@ -528,7 +590,7 @@ fn scale(source: &[u8], from: (u32, u32), to: (u32, u32)) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Kind, consent_needed, scale};
+    use super::{Kind, consent_needed, scale, usable};
 
     #[test]
     fn only_an_unremembered_portal_asks_the_user() {
@@ -537,6 +599,31 @@ mod tests {
         // X11 sessions reach the portal only after NvFBC and MIT-SHM fail.
         assert!(!consent_needed(
             &[Kind::NvFbc, Kind::X11, Kind::Portal],
+            false
+        ));
+    }
+
+    #[test]
+    fn a_wlr_that_cannot_open_leaves_the_portal_in_front() {
+        // Neither Mutter nor KWin serves `zwlr_screencopy_manager_v1`: the
+        // startup probe must not fall through to the portal and pop its
+        // dialog, which is what #1's guard exists to prevent.
+        assert!(consent_needed(
+            &usable(&[Kind::Wlr, Kind::Portal], false),
+            false
+        ));
+        assert!(!consent_needed(
+            &usable(&[Kind::Wlr, Kind::Portal], true),
+            false
+        ));
+        // A grant that is already remembered stays quiet either way.
+        assert!(!consent_needed(
+            &usable(&[Kind::Wlr, Kind::Portal], false),
+            true
+        ));
+        // An X11 order has no wlr entry to drop.
+        assert!(!consent_needed(
+            &usable(&[Kind::NvFbc, Kind::X11, Kind::Portal], false),
             false
         ));
     }
