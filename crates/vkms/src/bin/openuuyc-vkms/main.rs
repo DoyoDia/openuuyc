@@ -13,17 +13,20 @@ use anyhow::{Context, Result, ensure};
 use openuuyc_vkms::protocol::{Reply, Request, MAX_DIMENSION, MAX_HZ, MIN_DIMENSION};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Write};
-use std::os::fd::FromRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// systemd 的 `openuuyc-vkms.socket` 监听这个路径。
 const DEFAULT_SOCKET: &str = "/run/openuuyc-vkms/control.sock";
 /// 任何人都连得上，因为「谁可以」不是靠文件权限判的，而是连上以后按会话判的
 /// （见 [`peer::authorize`]）。这样包里既不用建组，也不用装 polkit 策略。
 const SOCKET_MODE: u32 = 0o666;
+/// 空转检查退出标志的节拍。短到关机时察觉不到，长到空闲时不烧 CPU。
+const STOP_POLL: Duration = Duration::from_millis(200);
 
 const EXIT_ERROR: i32 = 1;
 
@@ -49,6 +52,16 @@ fn main() {
     watch_signals();
     let mut connections = 0u64;
     loop {
+        if stopping() {
+            break;
+        }
+        // 退出的节拍握在这里，而不是指望 SIGTERM 把 accept 打断：信号是发给整个进程的，
+        // 内核可能把它投递给某条连接线程（每条连接一个线程），主线程的 accept 于是照旧
+        // 阻塞，收尾逻辑永远轮不到——systemd 只能等满 TimeoutStopSec 再 SIGKILL，
+        // 关机就白卡 90 秒。
+        if !readable(&listener, STOP_POLL) {
+            continue;
+        }
         match listener.accept() {
             Ok((stream, _)) => {
                 connections += 1;
@@ -68,11 +81,8 @@ fn main() {
                     break;
                 }
                 note(&format!("接受连接失败：{error}"));
-                std::thread::sleep(std::time::Duration::from_millis(200));
+                std::thread::sleep(STOP_POLL);
             }
-        }
-        if stopping() {
-            break;
         }
     }
     // 退出前把所有路断开：我们这个进程没了以后，屏幕上不该还留着一块没人管的屏。
@@ -235,6 +245,17 @@ fn validate(width: u32, height: u32, hz: u32) -> Result<()> {
     ensure!(size.contains(&width) && size.contains(&height), "无效的虚拟显示器尺寸");
     ensure!((1..=MAX_HZ).contains(&hz), "无效的虚拟显示器刷新率");
     Ok(())
+}
+
+/// 等监听套接字上来连接，最多等 `timeout`。返回它是不是可读了。
+fn readable(listener: &UnixListener, timeout: Duration) -> bool {
+    let mut descriptor = libc::pollfd {
+        fd: listener.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: 描述符在这次调用期间一直有效，pollfd 数组只有一个元素。
+    unsafe { libc::poll(&mut descriptor, 1, timeout.as_millis() as libc::c_int) > 0 }
 }
 
 /// systemd 套接字激活时监听套接字是 fd 3，不必自己建、也不该自己删。
