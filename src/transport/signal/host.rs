@@ -346,7 +346,10 @@ impl Session {
                 )?;
                 let file_only = options.kind == 5;
                 let ports_only = options.kind == 9;
-                let data_only = file_only || ports_only;
+                // UU's `CT_TERMINAL`: a shell on this machine, with no video or
+                // audio of its own. The Android client opens it as kind 8.
+                let terminal_only = options.kind == 8;
+                let data_only = file_only || ports_only || terminal_only;
                 let default_streamer = serde_json::json!({});
                 let streamer = value
                     .get("streamer_data")
@@ -387,7 +390,7 @@ impl Session {
                     decoders=?options.decoders,formats=?remote.video_codec_capability,
                     "host incoming media capabilities");
                 anyhow::ensure!(
-                    matches!(options.kind, 1 | 5 | 9)
+                    matches!(options.kind, 1 | 5 | 8 | 9)
                         && matches!(options.connect_type, 1 | 2)
                         && (!data_only || options.connect_type == 1),
                     "不支持的被控连接类型"
@@ -429,6 +432,10 @@ impl Session {
                 anyhow::ensure!(
                     !ports_only || authorization.port_policy().0,
                     "本机未允许端口转发"
+                );
+                anyhow::ensure!(
+                    !terminal_only || authorization.terminal_allowed(),
+                    "本机未允许终端"
                 );
                 self.cancel_preparation().await;
                 if let Some(peer) = self.peer.take() {

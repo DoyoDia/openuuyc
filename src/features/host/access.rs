@@ -122,6 +122,7 @@ struct Ownership {
     clipboard: super::clipboard::Settings,
     file_transfer: bool,
     port_mapping: bool,
+    terminal: bool,
     remote_power: bool,
     wol: bool,
     power_executing: bool,
@@ -176,6 +177,7 @@ impl Default for Handle {
                 clipboard: Default::default(),
                 file_transfer: true,
                 port_mapping: false,
+                terminal: false,
                 remote_power: false,
                 wol: false,
                 power_executing: false,
@@ -333,6 +335,7 @@ impl Handle {
         state.clipboard = snapshot.clipboard;
         state.file_transfer = snapshot.file_transfer;
         state.port_mapping = snapshot.port_mapping;
+        state.terminal = snapshot.terminal;
         state.remote_power = snapshot.remote_power;
         state.wol = snapshot.wol;
         state.status = snapshot.status;
@@ -420,6 +423,7 @@ impl Handle {
                 clipboard,
                 file_transfer,
                 port_mapping,
+                terminal,
                 remote_power,
                 wol,
             )) => {
@@ -437,6 +441,7 @@ impl Handle {
                 state.clipboard = clipboard;
                 state.file_transfer = file_transfer;
                 state.port_mapping = port_mapping;
+                state.terminal = terminal;
                 state.remote_power = remote_power;
                 state.wol = wol;
                 state.dirty = false;
@@ -572,6 +577,25 @@ impl Handle {
     }
     pub(crate) fn port_mapping_allowed(&self) -> bool {
         lock(&self.ownership).port_mapping
+    }
+    /// Whether the controller may open a shell on this machine.
+    ///
+    /// Off by default: a terminal is an interactive shell, so it is a larger
+    /// grant than screen control and must be turned on deliberately.
+    pub(crate) fn terminal_allowed(&self) -> bool {
+        lock(&self.ownership).terminal
+    }
+    pub(crate) fn set_terminal_allowed(&self, allowed: bool) -> anyhow::Result<()> {
+        let mut state = lock(&self.ownership);
+        anyhow::ensure!(state.active, "账号会话已结束");
+        if state.terminal != allowed {
+            state.terminal = allowed;
+            state.settings_revision = state.settings_revision.wrapping_add(1);
+            state.dirty = true;
+            state.status.saving = true;
+            state.status.settings_error = None;
+        }
+        Ok(())
     }
     pub(crate) fn set_port_mapping_allowed(&self, allowed: bool) -> anyhow::Result<()> {
         let mut state = lock(&self.ownership);
@@ -790,6 +814,7 @@ impl Handle {
                 clipboard,
                 file_transfer,
                 port_mapping,
+                terminal,
                 remote_power,
                 wol,
             ) = {
@@ -808,6 +833,7 @@ impl Handle {
                     state.clipboard,
                     state.file_transfer,
                     state.port_mapping,
+                    state.terminal,
                     state.remote_power,
                     state.wol,
                 )
@@ -825,6 +851,7 @@ impl Handle {
                         clipboard,
                         file_transfer,
                         port_mapping,
+                        terminal,
                         remote_power,
                         wol,
                     },
@@ -843,6 +870,7 @@ impl Handle {
                         clipboard,
                         file_transfer,
                         port_mapping,
+                        terminal,
                         remote_power,
                         wol,
                     )
@@ -1203,6 +1231,15 @@ impl Lease {
                 && state.port_mapping,
             state.port_revision,
         )
+    }
+    /// Whether this lease may open a shell on the controlled machine.
+    ///
+    /// A terminal is a shell, so it is refused for guest assistance and for
+    /// a controller that is not currently the active one, exactly like the
+    /// other privileged grants.
+    pub(crate) fn terminal_allowed(&self) -> bool {
+        let state = lock(&self.handle.ownership);
+        self.current(&state) && self.assistance.is_none() && !self.handle.guest && state.terminal
     }
     pub(crate) fn port_status(&self, status: crate::features::port_mapping::host::Status) {
         self.modify(|s| s.status.ports = status);

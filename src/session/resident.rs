@@ -49,6 +49,7 @@ pub(crate) enum Request {
         clipboard: host::clipboard::Settings,
         file_transfer: bool,
         port_mapping: bool,
+        terminal: bool,
         remote_power: bool,
         wol: bool,
     },
@@ -85,6 +86,8 @@ pub(crate) struct Snapshot {
     pub file_transfer: bool,
     #[serde(default)]
     pub port_mapping: bool,
+    #[serde(default)]
+    pub terminal: bool,
     #[serde(default)]
     pub remote_power: bool,
     #[serde(default)]
