@@ -9,6 +9,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use crate::account::nrd_http::RetryPolicy;
 use anyhow::{Context, Result, bail};
 use hmac::{Hmac, Mac};
 use reqwest::{
@@ -57,9 +58,11 @@ pub struct Contract {
     identity: IdentityScope,
     timeout: Duration,
     json_content_type: bool,
+    retry: RetryPolicy,
 }
 
 pub const LOGIN_QR_GENERATE: Contract = Contract {
+    retry: RetryPolicy::Replayable,
     method: Method::Post,
     path: "/api/v1/qrcode/gen/login",
     identity: IdentityScope::AccountDevice,
@@ -68,6 +71,7 @@ pub const LOGIN_QR_GENERATE: Contract = Contract {
 };
 
 pub const LOGIN_QR_STATUS: Contract = Contract {
+    retry: RetryPolicy::Replayable,
     method: Method::Post,
     path: "/api/v1/qrcode/login/status",
     identity: IdentityScope::AccountDevice,
@@ -76,6 +80,7 @@ pub const LOGIN_QR_STATUS: Contract = Contract {
 };
 
 pub const LOGIN_BY_QR: Contract = Contract {
+    retry: RetryPolicy::Replayable,
     method: Method::Post,
     path: "/api/v1/login/by_qrcode",
     identity: IdentityScope::Device,
@@ -84,15 +89,18 @@ pub const LOGIN_BY_QR: Contract = Contract {
 };
 
 pub(crate) const LOGIN_SMS_CODE: Contract = Contract {
+    retry: RetryPolicy::ConnectOnly,
     path: "/api/v1/security/mobile/code",
     ..LOGIN_BY_QR
 };
 pub(crate) const LOGIN_BY_MOBILE: Contract = Contract {
+    retry: RetryPolicy::ConnectOnly,
     path: "/api/v1/login/by_mobile",
     ..LOGIN_BY_QR
 };
 
 pub const USER_INFO: Contract = Contract {
+    retry: RetryPolicy::Replayable,
     method: Method::Get,
     path: "/api/v1/user/info",
     identity: IdentityScope::AccountDevice,
@@ -101,6 +109,7 @@ pub const USER_INFO: Contract = Contract {
 };
 
 pub(crate) const CONFIGURES_WITH_VERSION: Contract = Contract {
+    retry: RetryPolicy::Replayable,
     method: Method::Post,
     path: "/api/v1/tool/configures_with_version",
     identity: IdentityScope::AccountDevice,
@@ -116,6 +125,7 @@ pub(crate) struct VersionedConfigure {
 }
 
 pub const USER_LOGOUT: Contract = Contract {
+    retry: RetryPolicy::Replayable,
     method: Method::Post,
     path: "/api/v1/user/logout",
     identity: IdentityScope::AccountDevice,
@@ -124,6 +134,7 @@ pub const USER_LOGOUT: Contract = Contract {
 };
 
 pub const DEVICE_WINDOWS_INIT: Contract = Contract {
+    retry: RetryPolicy::Replayable,
     method: Method::Post,
     path: "/api/v1/device/windows/init",
     identity: IdentityScope::Platform,
@@ -132,6 +143,7 @@ pub const DEVICE_WINDOWS_INIT: Contract = Contract {
 };
 
 pub const DEVICE_LIST: Contract = Contract {
+    retry: RetryPolicy::Replayable,
     method: Method::Get,
     path: "/api/v1/device/list",
     identity: IdentityScope::AccountDevice,
@@ -150,17 +162,20 @@ pub const DEVICE_DETAIL: Contract = Contract {
 };
 
 const DEVICE_RENAME: Contract = Contract {
+    retry: RetryPolicy::ConnectOnly,
     method: Method::Put,
     json_content_type: true,
     ..DEVICE_DETAIL
 };
 const DEVICE_UNBIND: Contract = Contract {
+    retry: RetryPolicy::ConnectOnly,
     method: Method::Post,
     json_content_type: true,
     ..DEVICE_DETAIL
 };
 
 pub const DEVICE_CONTROLLABLE: Contract = Contract {
+    retry: RetryPolicy::Replayable,
     method: Method::Post,
     path: "/api/v1/device/controllable",
     identity: IdentityScope::AccountDevice,
@@ -169,6 +184,7 @@ pub const DEVICE_CONTROLLABLE: Contract = Contract {
 };
 
 pub const ROOM_CREATE: Contract = Contract {
+    retry: RetryPolicy::Replayable,
     method: Method::Post,
     path: "/api/v1/room/create",
     identity: IdentityScope::AccountDevice,
@@ -177,6 +193,7 @@ pub const ROOM_CREATE: Contract = Contract {
 };
 
 pub const ROOM_JOIN_BY_DEVICE: Contract = Contract {
+    retry: RetryPolicy::Replayable,
     method: Method::Post,
     path: "/api/v1/room/join/by_device",
     identity: IdentityScope::AccountDevice,
@@ -791,6 +808,7 @@ impl NrdApi {
     ) -> Result<ApiEnvelope<serde_json::Value>> {
         validate_device_id(device_id)?;
         let contract = Contract {
+            retry: RetryPolicy::ConnectOnly,
             method: Method::Post,
             path: "/api/v1/release/trigger",
             identity: IdentityScope::AccountDevice,
@@ -969,11 +987,20 @@ impl NrdApi {
             bail!("device_id must be a lowercase alphanumeric identifier");
         }
         let path = format!("{}/{device_id}", ROOM_JOIN_BY_DEVICE.path);
-        self.send_with_policy(
-            ROOM_JOIN_BY_DEVICE,
+        self.send(
+            Contract {
+                // Forcing a join can displace an existing viewer. Preserve
+                // its stronger no-replay boundary even though normal joins
+                // use the official common recovery path.
+                retry: if force_join {
+                    RetryPolicy::ConnectOnly
+                } else {
+                    ROOM_JOIN_BY_DEVICE.retry
+                },
+                ..ROOM_JOIN_BY_DEVICE
+            },
             &path,
             serde_json::to_vec(&JoinByDeviceRequest { force_join })?,
-            force_join,
         )
         .await
     }
@@ -993,19 +1020,6 @@ impl NrdApi {
     }
 
     async fn send<T>(&self, contract: Contract, path: &str, body: Vec<u8>) -> Result<ApiEnvelope<T>>
-    where
-        T: DeserializeOwned,
-    {
-        self.send_with_policy(contract, path, body, false).await
-    }
-
-    async fn send_with_policy<T>(
-        &self,
-        contract: Contract,
-        path: &str,
-        body: Vec<u8>,
-        single_attempt: bool,
-    ) -> Result<ApiEnvelope<T>>
     where
         T: DeserializeOwned,
     {
@@ -1035,20 +1049,7 @@ impl NrdApi {
                 headers,
                 body,
                 contract.timeout,
-                if single_attempt {
-                    crate::account::nrd_http::RetryPolicy::Never
-                } else {
-                    crate::account::nrd_http::RetryPolicy::Recovery {
-                        replay_ambiguous: contract != DEVICE_RENAME
-                            && contract != DEVICE_UNBIND
-                            && contract != LOGIN_SMS_CODE
-                            && contract != LOGIN_BY_MOBILE
-                            && !assist::is_write(contract)
-                            && !host_assist::is_sensitive(contract)
-                            && !power::is_write(contract)
-                            && contract != wallpaper::BIND,
-                    }
-                },
+                contract.retry,
             )
             .await?;
         let envelope: ApiEnvelope<serde_json::Value> = serde_json::from_slice(&bytes)

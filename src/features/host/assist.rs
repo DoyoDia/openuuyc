@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
-use tokio::task::{JoinHandle, JoinSet};
+use tokio::task::{AbortHandle, JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -194,11 +194,12 @@ pub(crate) enum Action {
 
 struct State {
     snapshot: Snapshot,
-    requests: Option<mpsc::Sender<Push>>,
+    requests: Option<mpsc::Sender<Queued>>,
     revision: u64,
     operations: CancellationToken,
     admission: CancellationToken,
     pending_deadline: Option<Instant>,
+    pending_room: Option<CancellationToken>,
     attempt_deadline: Option<Instant>,
     ui_seen: Option<Instant>,
 }
@@ -211,9 +212,37 @@ impl Default for State {
             operations: CancellationToken::new(),
             admission: CancellationToken::new(),
             pending_deadline: None,
+            pending_room: None,
             attempt_deadline: None,
             ui_seen: None,
         }
+    }
+}
+struct Queued {
+    event: Push,
+    revision: u64,
+    room: Option<CancellationToken>,
+}
+impl Queued {
+    fn current(&self, revision: u64) -> bool {
+        self.revision == revision && self.room.as_ref().is_none_or(|room| !room.is_cancelled())
+    }
+}
+impl State {
+    fn enqueue(&self, event: Push, room: Option<CancellationToken>) -> Result<()> {
+        ensure!(
+            room.as_ref().is_none_or(|room| !room.is_cancelled()),
+            "协助请求已结束"
+        );
+        self.requests
+            .as_ref()
+            .context("协助后台未就绪")?
+            .try_send(Queued {
+                event,
+                revision: self.revision,
+                room,
+            })
+            .map_err(|_| anyhow::anyhow!("协助后台忙，请稍后重试"))
     }
 }
 #[derive(Clone, Default)]
@@ -244,11 +273,11 @@ impl Handle {
             state.admission = CancellationToken::new();
         }
         state.revision = state.revision.wrapping_add(1);
+        state.snapshot.ready &= settings.enabled;
         state.snapshot.settings = settings;
-        if let Some(pending) = state.snapshot.pending.take()
-            && let Some(requests) = &state.requests
-        {
-            let _ = requests.try_send(Push::Reject(pending.id));
+        let room = state.pending_room.take();
+        if let Some(pending) = state.snapshot.pending.take() {
+            let _ = state.enqueue(Push::Reject(pending.id), room);
         }
         state.pending_deadline = None;
         state.snapshot.attempt = None;
@@ -258,6 +287,7 @@ impl Handle {
     }
     pub fn unavailable(&self) {
         let mut state = self.lock();
+        state.revision = state.revision.wrapping_add(1);
         state.operations.cancel();
         state.operations = CancellationToken::new();
         state.admission.cancel();
@@ -265,6 +295,7 @@ impl Handle {
         state.snapshot.ready = false;
         state.snapshot.pending = None;
         state.pending_deadline = None;
+        state.pending_room = None;
         state.snapshot.attempt = None;
         state.attempt_deadline = None;
     }
@@ -300,22 +331,15 @@ impl Handle {
                 .is_some_and(|p| p.id == id && p.token == token && !p.responding),
             "协助请求已结束"
         );
-        state
-            .requests
-            .as_ref()
-            .context("协助后台未就绪")?
-            .try_send(Push::Answer { id, token, allow })
-            .map_err(|_| anyhow::anyhow!("协助后台忙，请稍后重试"))
+        state.enqueue(
+            Push::Answer { id, token, allow },
+            state.pending_room.clone(),
+        )
     }
     pub fn refresh(&self) -> Result<()> {
-        self.lock()
-            .requests
-            .as_ref()
-            .context("协助后台未就绪")?
-            .try_send(Push::Refresh)
-            .map_err(|_| anyhow::anyhow!("协助后台忙，请稍后重试"))
+        self.lock().enqueue(Push::Refresh, None)
     }
-    pub fn push(&self, value: &serde_json::Value) -> bool {
+    pub fn push(&self, value: &serde_json::Value, room: &CancellationToken) -> bool {
         let Some(kind) = value.get("type").and_then(|v| v.as_str()) else {
             return false;
         };
@@ -354,9 +378,7 @@ impl Handle {
             },
             _ => Push::Cancel(id),
         };
-        if let Some(requests) = &self.lock().requests {
-            let _ = requests.try_send(event);
-        }
+        let _ = self.lock().enqueue(event, Some(room.clone()));
         true
     }
 }
@@ -400,9 +422,14 @@ fn verifier(salt: &str, code: &str) -> String {
 }
 
 enum Completion {
-    Identity(Result<String>),
+    Identity {
+        revision: u64,
+        result: Option<Result<String>>,
+    },
+    Cancelled,
     Reply {
         revision: u64,
+        room: CancellationToken,
         request: Option<String>,
         result: Result<()>,
     },
@@ -419,9 +446,10 @@ fn report_failure(state: &mut State, error: &anyhow::Error) {
     });
 }
 
-async fn run(client: HostClient, mut rx: mpsc::Receiver<Push>, stop: CancellationToken) {
+async fn run(client: HostClient, mut rx: mpsc::Receiver<Queued>, stop: CancellationToken) {
     let handle = client.host.assistance.clone();
     let mut jobs = JoinSet::new();
+    let mut replies = Vec::<(String, &'static str, AbortHandle)>::new();
     let mut identity_attempted = false;
     let mut identity_pending = false;
     let mut requested_revision = 0;
@@ -430,33 +458,43 @@ async fn run(client: HostClient, mut rx: mpsc::Receiver<Push>, stop: Cancellatio
     let mut answered = std::collections::VecDeque::<(String, Instant)>::new();
     let ended = client.ended();
     loop {
+        replies.retain(|(_, _, task)| !task.is_finished());
         let event = tokio::select! {
             biased;
             _=stop.cancelled()=>break,
             _=ended.cancelled()=>break,
             Some(result)=jobs.join_next(), if !jobs.is_empty()=>{
                 match result {
-                    Ok(Completion::Identity(result)) => {
+                    Ok(Completion::Identity { revision, result }) => {
                         identity_pending = false;
                         let mut state = handle.lock();
-                        match result {
-                            Ok(id) => state.snapshot.connect_id = id,
-                            Err(error) => report_failure(&mut state, &error),
+                        if revision == state.revision {
+                            match result {
+                                Some(Ok(id)) => state.snapshot.connect_id = id,
+                                Some(Err(error)) => report_failure(&mut state, &error),
+                                None => (),
+                            }
                         }
                     }
-                    Ok(Completion::Reply { revision, request, result }) => {
+                    Ok(Completion::Cancelled) => (),
+                    Ok(Completion::Reply { revision, room, request, result }) => {
                         let mut state = handle.lock();
-                        if revision == state.revision {
+                        if revision == state.revision && !room.is_cancelled() {
                             if let Some(token) = request {
                                 if state.snapshot.pending.as_ref().is_some_and(|p|p.token == token) {
                                     state.snapshot.pending = None;
                                     state.pending_deadline = None;
+                                    state.pending_room = None;
                                     state.snapshot.error = None;
                                 }
                             }
-                            if let Err(error) = result { report_failure(&mut state, &error); }
+                            match result {
+                                Ok(()) => state.snapshot.error = None,
+                                Err(error) => report_failure(&mut state, &error),
+                            }
                         }
                     }
+                    Err(error) if error.is_cancelled() => (),
                     Err(_) => {
                         handle.unavailable();
                         handle.lock().snapshot.error = Some("协助后台已停止，请重新打开程序".into());
@@ -473,6 +511,9 @@ async fn run(client: HostClient, mut rx: mpsc::Receiver<Push>, stop: Cancellatio
             let mut state = handle.lock();
             let ready = allowed && state.snapshot.settings.enabled;
             if state.snapshot.ready && !ready {
+                state.operations.cancel();
+                state.operations = CancellationToken::new();
+                state.revision = state.revision.wrapping_add(1);
                 state.admission.cancel();
                 state.admission = CancellationToken::new();
             }
@@ -487,10 +528,19 @@ async fn run(client: HostClient, mut rx: mpsc::Receiver<Push>, stop: Cancellatio
             )
         };
         if requested_revision != revision {
+            for (_, _, task) in replies.drain(..) {
+                task.abort();
+            }
             requested_revision = revision;
             identity_attempted = false;
         }
-        if matches!(event, Some(Push::Refresh)) {
+        if event.as_ref().is_some_and(|event| !event.current(revision)) {
+            continue;
+        }
+        if matches!(
+            event.as_ref().map(|event| &event.event),
+            Some(Push::Refresh)
+        ) {
             identity_attempted = false;
             handle.lock().snapshot.error = None;
         }
@@ -504,7 +554,15 @@ async fn run(client: HostClient, mut rx: mpsc::Receiver<Push>, stop: Cancellatio
             identity_attempted = true;
             identity_pending = true;
             let current = client.clone();
-            jobs.spawn(async move { Completion::Identity(current.host_assist_identity().await) });
+            let guard = guard.clone();
+            jobs.spawn(async move {
+                let result = tokio::select! {
+                    biased;
+                    _=guard.cancelled()=>None,
+                    result=current.host_assist_identity()=>Some(result),
+                };
+                Completion::Identity { revision, result }
+            });
         }
         while answered
             .front()
@@ -514,6 +572,15 @@ async fn run(client: HostClient, mut rx: mpsc::Receiver<Push>, stop: Cancellatio
         }
         let expired = {
             let mut state = handle.lock();
+            if state
+                .pending_room
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled)
+            {
+                state.snapshot.pending = None;
+                state.pending_deadline = None;
+                state.pending_room = None;
+            }
             if !allowed
                 || client.host.status().session_active
                 || state
@@ -533,23 +600,26 @@ async fn run(client: HostClient, mut rx: mpsc::Receiver<Push>, stop: Cancellatio
                     .pending
                     .as_ref()
                     .filter(|p| !p.responding)
-                    .map(|p| (p.id.clone(), p.token.clone()))
+                    .map(|p| (p.id.clone(), p.token.clone(), state.pending_room.clone()))
             } else {
                 None
             }
         };
         let mut events = std::collections::VecDeque::new();
-        if let Some((id, token)) = expired {
-            events.push_back(Push::Answer {
-                id,
-                token,
-                allow: false,
-            });
+        if let Some((id, token, room)) = expired {
+            events.push_back((
+                room,
+                Push::Answer {
+                    id,
+                    token,
+                    allow: false,
+                },
+            ));
         }
         if let Some(event) = event {
-            events.push_back(event);
+            events.push_back((event.room, event.event));
         }
-        for event in events {
+        for (room, event) in events {
             let accept = allowed && settings.enabled;
             let mut outgoing = None;
             let mut answered_request = None;
@@ -560,10 +630,18 @@ async fn run(client: HostClient, mut rx: mpsc::Receiver<Push>, stop: Cancellatio
                     answered.push_back((id, Instant::now()));
                 }
                 Push::Cancel(id) => {
+                    // Drop in-flight HTTP futures, including any endpoint
+                    // recovery, when this control request is withdrawn.
+                    for (control_id, _, task) in &replies {
+                        if control_id == &id {
+                            task.abort();
+                        }
+                    }
                     let mut state = handle.lock();
                     if state.snapshot.pending.as_ref().is_some_and(|p| p.id == id) {
                         state.snapshot.pending = None;
                         state.pending_deadline = None;
+                        state.pending_room = None;
                     }
                     if state.snapshot.attempt.as_ref().is_some_and(|p| p.id == id) {
                         state.snapshot.attempt = None;
@@ -572,6 +650,9 @@ async fn run(client: HostClient, mut rx: mpsc::Receiver<Push>, stop: Cancellatio
                     answered.push_back((id, Instant::now()));
                 }
                 Push::Mode(id) => {
+                    if answered.iter().any(|(known, _)| known == &id) {
+                        continue;
+                    }
                     if accept && !client.host.status().session_active {
                         let mut state = handle.lock();
                         if state.snapshot.pending.is_none()
@@ -589,6 +670,9 @@ async fn run(client: HostClient, mut rx: mpsc::Receiver<Push>, stop: Cancellatio
                     outgoing = Some(Reply::Mode(id, accept, settings.mode));
                 }
                 Push::Verify { id, salt } => {
+                    if answered.iter().any(|(known, _)| known == &id) {
+                        continue;
+                    }
                     if let Some(attempt) = &mut handle.lock().snapshot.attempt {
                         if attempt.id == id {
                             attempt.verifying = true;
@@ -636,6 +720,7 @@ async fn run(client: HostClient, mut rx: mpsc::Receiver<Push>, stop: Cancellatio
                         state.snapshot.attempt = None;
                         state.attempt_deadline = None;
                         state.pending_deadline = Some(Instant::now() + Duration::from_secs(60));
+                        state.pending_room = room.clone();
                     }
                 }
                 Push::Answer { id, token, allow } => {
@@ -676,18 +761,49 @@ async fn run(client: HostClient, mut rx: mpsc::Receiver<Push>, stop: Cancellatio
                 }
                 let current = client.clone();
                 let guard = guard.clone();
-                jobs.spawn(async move {
+                let (control_id, stage, granting) = reply.request();
+                // A repeated push must not start a second copy while the
+                // original reply is already recovering in the shared HTTP layer.
+                if replies.iter().any(|(id, kind, task)| {
+                    id == control_id && *kind == stage && !task.is_finished()
+                }) {
+                    continue;
+                }
+                let deadline = {
+                    let state = handle.lock();
+                    let expires = if granting && stage == "confirmation" {
+                        state.pending_deadline
+                    } else if granting
+                        && state
+                            .snapshot
+                            .attempt
+                            .as_ref()
+                            .is_some_and(|a| a.id == control_id)
+                    {
+                        state.attempt_deadline
+                    } else {
+                        None
+                    };
+                    expires.unwrap_or_else(|| Instant::now() + Duration::from_secs(30))
+                };
+                let control_id = control_id.to_owned();
+                let room = room.unwrap_or_default();
+                let task = jobs.spawn(async move {
                     let result = tokio::select! {
                         biased;
-                        _=guard.cancelled()=>Ok(()),
+                        _=guard.cancelled()=>return Completion::Cancelled,
+                        _=room.cancelled()=>return Completion::Cancelled,
+                        _=tokio::time::sleep_until(deadline.into())=>Err(anyhow::anyhow!("协助请求已过期")),
                         result=reply.send(&current)=>result,
                     };
                     Completion::Reply {
                         revision,
+                        room,
                         request: answered_request,
                         result,
                     }
                 });
+                replies.push((control_id, stage, task));
             }
         }
     }
@@ -701,6 +817,13 @@ enum Reply {
     Confirm(String, bool, bool),
 }
 impl Reply {
+    fn request(&self) -> (&str, &'static str, bool) {
+        match self {
+            Self::Mode(id, allowed, _) => (id, "mode", *allowed),
+            Self::Sign(id, allowed, ..) => (id, "sign", *allowed),
+            Self::Confirm(id, allowed, _) => (id, "confirmation", *allowed),
+        }
+    }
     async fn send(self, client: &HostClient) -> Result<()> {
         match self {
             Self::Mode(id, allowed, mode) => {

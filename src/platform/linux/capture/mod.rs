@@ -270,10 +270,21 @@ pub(crate) struct Desktop {
     last: Option<Arc<Vec<u8>>>,
     last_size: (u32, u32),
     refreshed: Instant,
+    /// Keeps the display on and the machine awake while captured. Declared
+    /// last so it outlives the capture resources, as on Windows.
+    _power: Option<super::power_request::Request>,
 }
 
 impl Desktop {
     pub fn open_selected(selected: &Screen) -> Result<Self> {
+        // Unlike Windows, a desktop without the idle-inhibit interface does
+        // not stop the capture; the session works, the screen may blank.
+        let power = super::power_request::Request::capture()
+            .inspect_err(|error| {
+                tracing::warn!(error = %format!("{error:#}"),
+                    "capture automatic display-off/sleep prevention unavailable")
+            })
+            .ok();
         let screen = refresh(selected)?;
         let size = (screen.width & !1, screen.height & !1);
         let backend = Backend::select(&screen, false, size)?;
@@ -288,6 +299,7 @@ impl Desktop {
             last: None,
             last_size: (0, 0),
             refreshed: Instant::now(),
+            _power: power,
         })
     }
 

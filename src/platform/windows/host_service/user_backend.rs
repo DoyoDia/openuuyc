@@ -158,15 +158,20 @@ impl Server {
         let worker = std::thread::Builder::new()
             .name("user-backend".into())
             .spawn(move || {
+                let _started =
+                    crate::lifecycle::OnDrop::new(|| STARTED.store(false, Ordering::Release));
                 let runtime = tokio::runtime::Builder::new_multi_thread()
                     .worker_threads(2)
                     .enable_all()
                     .build();
                 let Ok(runtime) = runtime else {
+                    STOPPING.store(true, Ordering::Release);
                     tracing::error!("user backend runtime unavailable");
                     return;
                 };
                 let result = std::thread::scope(|scope| -> Result<()> {
+                    let _stop =
+                        crate::lifecycle::OnDrop::new(|| STOPPING.store(true, Ordering::Release));
                     let mut listener = listener;
                     let mut tasks = Vec::new();
                     while !stopped.load(Ordering::Acquire) {
@@ -264,6 +269,11 @@ impl Server {
                 if let Err(error) = result {
                     tracing::error!(%error,"user backend stopped");
                 }
+            })
+            .map_err(|error| {
+                STOPPING.store(true, Ordering::Release);
+                STARTED.store(false, Ordering::Release);
+                error
             })?;
         Ok(Self {
             stop,
