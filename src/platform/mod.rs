@@ -49,30 +49,6 @@ pub(crate) enum Rotation {
     Flipped270,
 }
 
-impl Rotation {
-    /// A position on the screen as a fraction of it, to the same position as a
-    /// fraction of the touchscreen's own, untransformed panel.
-    ///
-    /// The compositor does the opposite: it reads a touch as a fraction of the
-    /// panel and applies the output's transform to it, in the output's
-    /// rectangle (smithay's `transform_point_in`, which is what a compositor
-    /// scales a touch device's axes with). Undoing that is this inverse, in
-    /// normalized coordinates: both spaces are the unit square, so the axis
-    /// lengths, the output's scale and its physical size never enter.
-    pub(crate) fn panel(self, x: f32, y: f32) -> (f32, f32) {
-        match self {
-            Self::Normal => (x, y),
-            Self::Rotate90 => (y, 1.0 - x),
-            Self::Rotate180 => (1.0 - x, 1.0 - y),
-            Self::Rotate270 => (1.0 - y, x),
-            Self::Flipped => (1.0 - x, y),
-            Self::Flipped90 => (y, x),
-            Self::Flipped180 => (x, 1.0 - y),
-            Self::Flipped270 => (1.0 - y, 1.0 - x),
-        }
-    }
-}
-
 /// Every output the compositor lays out, named or not.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct CompositorLayout {
@@ -84,78 +60,6 @@ impl CompositorLayout {
         self.outputs
             .iter()
             .find(|output| output.name.as_deref() == Some(name))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::Rotation;
-
-    /// Where a screen position lands on an untransformed panel: on an output
-    /// the compositor has turned 90°, the screen's top-left is the panel's
-    /// bottom-left, and so on.
-    #[test]
-    fn a_rotated_output_maps_screen_corners_to_panel_corners() {
-        let corners = [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)];
-        assert_eq!(Rotation::Normal.panel(0.25, 0.75), (0.25, 0.75));
-        assert_eq!(
-            corners.map(|(x, y)| Rotation::Rotate90.panel(x, y)),
-            [(0.0, 1.0), (0.0, 0.0), (1.0, 1.0), (1.0, 0.0)]
-        );
-        assert_eq!(
-            corners.map(|(x, y)| Rotation::Rotate180.panel(x, y)),
-            [(1.0, 1.0), (0.0, 1.0), (1.0, 0.0), (0.0, 0.0)]
-        );
-        assert_eq!(
-            corners.map(|(x, y)| Rotation::Rotate270.panel(x, y)),
-            [(1.0, 0.0), (1.0, 1.0), (0.0, 0.0), (0.0, 1.0)]
-        );
-    }
-
-    /// The compositor's side of the same mapping: a point as a fraction of the
-    /// panel, to a point as a fraction of the screen, which is smithay's
-    /// `transform_point_in` with the panel's own size as the area. Written out
-    /// here so [`Rotation::panel`] is checked against it rather than against
-    /// itself.
-    fn compositor(rotation: Rotation, panel: (f32, f32)) -> (f32, f32) {
-        let (x, y) = panel;
-        match rotation {
-            Rotation::Normal => (x, y),
-            Rotation::Rotate90 => (1.0 - y, x),
-            Rotation::Rotate180 => (1.0 - x, 1.0 - y),
-            Rotation::Rotate270 => (y, 1.0 - x),
-            Rotation::Flipped => (1.0 - x, y),
-            Rotation::Flipped90 => (y, x),
-            Rotation::Flipped180 => (x, 1.0 - y),
-            Rotation::Flipped270 => (1.0 - y, 1.0 - x),
-        }
-    }
-
-    /// Every turn, including the flipped ones: where the compositor puts the
-    /// point this side names for it has to be the point the controller aimed
-    /// at in the first place.
-    #[test]
-    fn a_panel_position_is_the_inverse_of_what_the_compositor_does() {
-        let rotations = [
-            Rotation::Normal,
-            Rotation::Rotate90,
-            Rotation::Rotate180,
-            Rotation::Rotate270,
-            Rotation::Flipped,
-            Rotation::Flipped90,
-            Rotation::Flipped180,
-            Rotation::Flipped270,
-        ];
-        for rotation in rotations {
-            for (x, y) in [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0), (0.25, 0.6)] {
-                let panel = rotation.panel(x, y);
-                let (sx, sy) = compositor(rotation, panel);
-                assert!(
-                    (sx - x).abs() < 1e-6 && (sy - y).abs() < 1e-6,
-                    "{rotation:?}: 屏幕 ({x}, {y}) 报成面板 {panel:?}，合成器又算回 ({sx}, {sy})"
-                );
-            }
-        }
     }
 }
 
