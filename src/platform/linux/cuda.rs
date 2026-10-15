@@ -56,6 +56,28 @@ struct Api {
     get_error_string: unsafe extern "C" fn(CuResult, *mut *const c_char) -> CuResult,
 }
 
+/// Call before opening any VA-API display. nvidia-vaapi-driver calls `cuInit`
+/// from its library constructor, inside `dlopen` and so under the dynamic
+/// loader's lock, and a first `cuInit` dlopens libraries itself: if NvFBC or
+/// NVENC runs that first `cuInit` on another thread at the same moment, the
+/// two wait on each other forever. Finishing CUDA's initialization here,
+/// once, before the VA driver loads leaves its constructor nothing to wait
+/// for. A machine without an NVIDIA render node never loads that driver.
+pub(crate) fn initialize_before_va() {
+    let nvidia = std::fs::read_dir("/sys/class/drm")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("renderD"))
+        .any(|entry| {
+            std::fs::read_to_string(entry.path().join("device/vendor"))
+                .is_ok_and(|vendor| vendor.trim() == "0x10de")
+        });
+    if nvidia && let Err(error) = api() {
+        tracing::debug!(%error, "CUDA unavailable before VA-API initialization");
+    }
+}
+
 fn api() -> Result<&'static Api> {
     static API: OnceLock<Result<Api, String>> = OnceLock::new();
     API.get_or_init(|| load().map_err(|error| format!("{error:#}")))

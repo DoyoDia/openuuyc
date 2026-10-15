@@ -65,6 +65,7 @@ impl OwnedNv12 {
         thread_local! { static DISPLAY: std::cell::OnceCell<Rc<cros_libva::Display>> = const { std::cell::OnceCell::new() }; }
         DISPLAY.with(|cell| {
             if cell.get().is_none() {
+                super::cuda::initialize_before_va();
                 let _ = cell.set(cros_libva::Display::open().context("无 VA 显示")?);
             }
             let surface = self.import(cell.get().unwrap())?;
