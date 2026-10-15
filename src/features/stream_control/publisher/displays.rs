@@ -337,6 +337,37 @@ pub(crate) async fn receive_session(
                         ));
                     }
                     session.refresh()?;
+                    // A controller picks another monitor by pointing its settings
+                    // at that screen -- the official one does exactly this, and
+                    // never sends the older restart-capture action for it. Nothing
+                    // is capturing that screen yet, and a request naming a screen
+                    // nobody has started is refused further down, which is what
+                    // "switching does nothing" looks like from the controller's
+                    // side. Start it, and let the refusal below speak for a screen
+                    // that really is gone.
+                    //
+                    // Only a screen the request actually named, and only when it
+                    // asks for nothing else: `-1` below means "whatever single
+                    // source this session has", and a resolution or DPI change
+                    // names a target too -- starting a capture for one of those
+                    // would move the stream onto a screen the controller never
+                    // asked to look at. `configure_media` further down draws the
+                    // same line for resolution_type.
+                    let selects_screen = matches!(setting.resolution_type, 0 | 1)
+                        && setting.resolution_width <= 0
+                        && setting.resolution_pixel_width <= 0
+                        && setting.dpi_scale == 0;
+                    if selects_screen
+                        && setting.screen_id >= 0
+                        && session.active_slot(setting.screen_id).is_none()
+                        && let Err(error) = session.start(setting.screen_id).await
+                    {
+                        tracing::warn!(
+                            screen_id = setting.screen_id,
+                            %error,
+                            "host could not start the requested screen"
+                        );
+                    }
                     // S456070 -> S456550: a single desktop track accepts -1
                     // for its current source. Android uses this for ordinary
                     // media settings. Do not guess a target in a multi-track session.
