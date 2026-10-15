@@ -276,8 +276,9 @@ fn run(
             .all(|entry| entry.is_some_and(|(_, (width, height))| width > 0 && height > 0))
     };
 
-    // 认屏。名字对得上就直接用它，不必等逻辑尺寸——合成器里只要有一块从不报逻辑
-    // 尺寸的输出（笔记本上拔掉的外接屏就是），等它到齐就要白等满 `SETUP`。
+    // 认屏。名字对得上就直接用它，不必先把所有屏的逻辑尺寸等齐——合成器里只要有
+    // 一块从不报逻辑尺寸的输出（笔记本上拔掉的外接屏就是），等它到齐要白等满
+    // `SETUP`。
     let by_name = state
         .outputs
         .iter()
@@ -297,6 +298,20 @@ fn run(
             pick(&state, device, size)?
         }
     };
+    // 认出来的这块屏，它的逻辑尺寸仍要等一轮（`get_xdg_output` 之后事件才到）：
+    // layer surface 的边距按逻辑算，采集给的屏幕尺寸与拖动点按物理算，两者差着
+    // 一个缩放，见 `logical_point`。只等这一块，别的屏报不报都无所谓。
+    let ready = |state: &State| {
+        state
+            .logical
+            .get(index)
+            .is_some_and(|entry| entry.is_some_and(|(_, (width, height))| width > 0 && height > 0))
+    };
+    let deadline = Instant::now() + SETUP;
+    while !ready(&state) && Instant::now() < deadline {
+        dispatch(&mut queue, &mut state, &connection)?;
+        wait(&mut queue, &mut state, &connection, POLL)?;
+    }
     let target = state.outputs[index].proxy.clone();
     let (_, (logical_width, logical_height)) = state.logical[index]
         .filter(|(_, (width, height))| *width > 0 && *height > 0)
