@@ -7,10 +7,18 @@
 //! We deliberately do not call `forkpty()`. `fork()` in a threaded process
 //! leaves only the calling thread alive in the child, and the child must not
 //! touch a lock the parent held — the allocator lock alone makes it
-//! unsound from Rust. Instead `openpty()` creates the pair and the shell is
+//! unsound from Rust. Instead the pair is opened here and the shell is
 //! started through `Command`, whose `pre_exec` hook runs only the
 //! async-signal-safe calls the child needs (`setsid`, `ioctl(TIOCSCTTY)`,
 //! `dup2`).
+//!
+//! Both ends are opened close-on-exec, atomically. `openpty()` returns them
+//! without `FD_CLOEXEC`, so every program this process starts afterwards
+//! (the next shell, `xdg-open`, helpers) would inherit every master, could
+//! read and type into those terminals, and would keep them from ever seeing
+//! a hangup. Setting the flag after `openpty()` still races a concurrent
+//! spawn on another thread. The child gets the slave as 0–2 through `dup2`,
+//! which clears the flag on the copies, so the shell itself is unaffected.
 
 use anyhow::{Context, Result, bail};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -27,32 +35,18 @@ pub(crate) struct Session {
 impl Session {
     /// Starts `shell` on a new pty of `cols` x `rows`.
     pub(crate) fn open(shell: &str, cols: u16, rows: u16) -> Result<Self> {
-        let mut master: RawFd = -1;
-        let mut slave: RawFd = -1;
         let size = libc::winsize {
             ws_row: rows.max(1),
             ws_col: cols.max(1),
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
-        // SAFETY: openpty writes both descriptors and only reads the two
-        // pointers, both of which point at live stack values.
-        let opened = unsafe {
-            libc::openpty(
-                &mut master,
-                &mut slave,
-                std::ptr::null_mut(),
-                std::ptr::null(),
-                &size,
-            )
-        };
-        if opened != 0 {
-            return Err(std::io::Error::last_os_error()).context("创建 pty 失败");
+        let (master, slave) = open_pair()?;
+        // SAFETY: the descriptor is open and `size` is a live winsize.
+        if unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ as libc::c_ulong, &size) } != 0
+        {
+            return Err(std::io::Error::last_os_error()).context("设置 pty 尺寸失败");
         }
-        // SAFETY: a zero return means both descriptors are valid and owned by
-        // us, and neither has been wrapped before.
-        let master = unsafe { OwnedFd::from_raw_fd(master) };
-        let slave = unsafe { OwnedFd::from_raw_fd(slave) };
         let master_raw = master.as_raw_fd();
         let slave_raw = slave.as_raw_fd();
 
@@ -92,7 +86,8 @@ impl Session {
                     libc::close(slave_raw);
                 }
                 // The child must not hold the master open, or the pty would
-                // never report end-of-file once the shell exits.
+                // never report end-of-file once the shell exits. Close-on-exec
+                // already guarantees that; closing here keeps it explicit.
                 if master_raw > 2 {
                     libc::close(master_raw);
                 }
@@ -200,6 +195,42 @@ impl Drop for Session {
     }
 }
 
+/// Opens a pty master and its slave, both close-on-exec and neither becoming
+/// this process's controlling terminal.
+fn open_pair() -> Result<(OwnedFd, OwnedFd)> {
+    let flags = libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC;
+    // SAFETY: posix_openpt takes no pointers; a non-negative return is a new
+    // descriptor nothing else owns.
+    let master = unsafe { libc::posix_openpt(flags) };
+    if master < 0 {
+        return Err(std::io::Error::last_os_error()).context("创建 pty 失败");
+    }
+    // SAFETY: `master` was just opened above and is wrapped exactly once.
+    let master = unsafe { OwnedFd::from_raw_fd(master) };
+    // SAFETY: both calls only take the open master descriptor.
+    if unsafe { libc::grantpt(master.as_raw_fd()) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("授权 pty 失败");
+    }
+    if unsafe { libc::unlockpt(master.as_raw_fd()) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("解锁 pty 失败");
+    }
+    let mut name = [0 as libc::c_char; 128];
+    // SAFETY: `name` is writable for its full length, which is what we pass;
+    // ptsname_r NUL-terminates on success.
+    let failed = unsafe { libc::ptsname_r(master.as_raw_fd(), name.as_mut_ptr(), name.len()) };
+    if failed != 0 {
+        return Err(std::io::Error::from_raw_os_error(failed)).context("读取 pty 名称失败");
+    }
+    // SAFETY: `name` is a NUL-terminated path written by ptsname_r.
+    let slave = unsafe { libc::open(name.as_ptr(), flags) };
+    if slave < 0 {
+        return Err(std::io::Error::last_os_error()).context("打开 pty 从端失败");
+    }
+    // SAFETY: `slave` was just opened above and is wrapped exactly once.
+    let slave = unsafe { OwnedFd::from_raw_fd(slave) };
+    Ok((master, slave))
+}
+
 fn set_nonblocking(fd: RawFd) -> Result<()> {
     // SAFETY: `fd` is open; fcntl only reads and then rewrites its flags.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
@@ -256,6 +287,42 @@ mod tests {
         let seen = read_until(&mut session, b"40 120", Duration::from_secs(5));
         let text = String::from_utf8_lossy(&seen);
         assert!(text.contains("40 120"), "pty reported size: {text:?}");
+    }
+
+    /// Where each open descriptor of `pid` points.
+    fn descriptor_targets(pid: u32) -> Vec<String> {
+        std::fs::read_dir(format!("/proc/{pid}/fd"))
+            .expect("list child descriptors")
+            .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+            .map(|target| target.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn a_shell_does_not_inherit_another_sessions_pty() {
+        let first = Session::open("/bin/sh", 80, 24).expect("open first pty");
+        let mut second = Session::open("/bin/sh", 80, 24).expect("open second pty");
+        // A round trip proves the second shell has exec'd and settled.
+        second.write(b"echo FD_'CHECK'\n").expect("write input");
+        let seen = read_until(&mut second, b"FD_CHECK", Duration::from_secs(5));
+        assert!(String::from_utf8_lossy(&seen).contains("FD_CHECK"));
+
+        let first_slave = std::fs::read_link(format!("/proc/{}/fd/0", first.child.id()))
+            .expect("first shell's terminal")
+            .to_string_lossy()
+            .into_owned();
+        let second_slave = std::fs::read_link(format!("/proc/{}/fd/0", second.child.id()))
+            .expect("second shell's terminal")
+            .to_string_lossy()
+            .into_owned();
+        assert_ne!(first_slave, second_slave);
+        for target in descriptor_targets(second.child.id()) {
+            assert_ne!(target, "/dev/ptmx", "second shell holds a pty master");
+            assert!(
+                !target.starts_with("/dev/pts/") || target == second_slave,
+                "second shell holds another terminal: {target}"
+            );
+        }
     }
 
     #[test]
