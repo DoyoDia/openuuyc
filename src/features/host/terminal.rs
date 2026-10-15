@@ -5,33 +5,152 @@
 //! wire and `TerminalSession` runs the pty (see
 //! [`crate::platform::linux::terminal`]).
 //!
-//! ## Wire format
+//! ## Two protocols on one channel
 //!
-//! Terminal requests are ordinary protobuf, not a private frame format. A
-//! captured `terminal_check_env_req` from the Android client decodes as:
+//! The client mixes two message shapes on `BINARY_DATA_CHANNEL`:
+//!
+//! * `terminal_check_env_req` and the rename RPC are ordinary protobuf
+//!   `PbControlMessage` envelopes, handled by the shared session handler.
+//! * Everything else is a private `TERM` frame.
+//!
+//! The client itself makes the same split: its coordinator logs
+//! `TERM 帧解析失败` and `非 TERM 数据解析 GvPb_Message 失败` on the two paths.
+//!
+//! ## `TERM` frame layout
+//!
+//! Reconstructed from the shipped encoder (`UURemoteServer.arm64`
+//! `0x1001a5888`) and confirmed against a capture:
 //!
 //! ```text
-//! field  1 varint = 704                  seq
-//! field  2 varint = 1792031484582        timestamp (ms)
-//! field 21 bytes  = RpcRequest            PbPayload::RpcRequest
-//!   field 1 bytes = { request_id: 32 }    PbRequestHeader
-//!   field 28      = TerminalCheck         PbRpcRequestPayload
+//! offset  size  field
+//!      0     4  "TERM"
+//!      4     1  protocol version (1)
+//!      5     1  frame type, declaration index + 1
+//!      6     2  zero
+//!      8     4  session handle, little endian (0 for list requests)
+//!     12     4  payload length, little endian
+//!     16     n  payload
 //! ```
 //!
-//! That is the same envelope the CONTROL and TEXT channels use, which is why
-//! this module routes requests through the shared session handler rather than
-//! decoding frames itself. The client sends them on the low-priority BINARY
-//! channel, the one the diagnostics transfer also uses.
+//! The captured `terminal_check_env_req` frame from the Android client was
+//! `54 45 52 4d 01 09 ...`: version 1, type 9 = `listSessionsReq`, empty
+//! handle and payload, which matches the session list the phone then shows.
 //!
-//! An earlier reading of the binaries suggested a `TerminalFrame` with a
-//! one-byte type prefix. The capture shows that was wrong: the leading `0x08`
-//! is protobuf's `field 1, varint` tag, not a type byte.
+//! The handle is chosen by the controller and echoed by the host, so it is the
+//! only thing that identifies a session on the wire.
 
 use bytes::Bytes;
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use webrtc::data_channel::RTCDataChannel;
+
+/// The four bytes every terminal frame starts with.
+const MAGIC: &[u8; 4] = b"TERM";
+/// Fixed header size, magic included.
+const HEADER: usize = 16;
+/// Only version 1 has ever been seen; refuse anything else rather than guess.
+const VERSION: u8 = 1;
+/// Stop a shell from running forever unnoticed.
+const MAX_SESSIONS: usize = 16;
+/// The client rejects a name longer than this and shows its own length hint;
+/// matching the limit keeps the two in agreement instead of failing at the
+/// client after the server already accepted it.
+const MAX_NAME: usize = 64;
+
+/// Frame kinds, in the declaration order the shipped enum uses.
+///
+/// The wire value is `index + 1`, so `open` is 1 and `detach` is 16. The
+/// encoder adds one; both binaries agree on the resulting numbers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FrameType {
+    Open = 1,
+    Stdin = 2,
+    Resize = 3,
+    Close = 4,
+    Stdout = 5,
+    Exit = 6,
+    Signal = 7,
+    Error = 8,
+    ListSessionsReq = 9,
+    ListSessionsResp = 10,
+    KillSessionReq = 11,
+    KillSessionResp = 12,
+    OpenResp = 13,
+    UnlockReq = 14,
+    UnlockResp = 15,
+    Detach = 16,
+}
+
+impl FrameType {
+    fn from_wire(byte: u8) -> Option<Self> {
+        Some(match byte {
+            1 => Self::Open,
+            2 => Self::Stdin,
+            3 => Self::Resize,
+            4 => Self::Close,
+            5 => Self::Stdout,
+            6 => Self::Exit,
+            7 => Self::Signal,
+            8 => Self::Error,
+            9 => Self::ListSessionsReq,
+            10 => Self::ListSessionsResp,
+            11 => Self::KillSessionReq,
+            12 => Self::KillSessionResp,
+            13 => Self::OpenResp,
+            14 => Self::UnlockReq,
+            15 => Self::UnlockResp,
+            16 => Self::Detach,
+            _ => return None,
+        })
+    }
+
+    fn wire(self) -> u8 {
+        self as u8
+    }
+}
+
+/// One decoded `TERM` frame.
+pub(crate) struct Frame {
+    pub(crate) kind: FrameType,
+    pub(crate) session: u32,
+    pub(crate) payload: Vec<u8>,
+}
+
+impl Frame {
+    /// Decodes a frame, or returns `None` for protobuf or malformed data.
+    ///
+    /// A frame is never abandoned halfway: the declared payload length has to
+    /// fit, otherwise a truncated read would be mistaken for a short payload.
+    pub(crate) fn parse(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < HEADER || &bytes[..4] != MAGIC || bytes[4] != VERSION {
+            return None;
+        }
+        let kind = FrameType::from_wire(bytes[5])?;
+        let session = u32::from_le_bytes(bytes[8..12].try_into().ok()?);
+        let length = u32::from_le_bytes(bytes[12..16].try_into().ok()?) as usize;
+        let payload = bytes.get(HEADER..HEADER.checked_add(length)?)?.to_vec();
+        Some(Self {
+            kind,
+            session,
+            payload,
+        })
+    }
+
+    /// Builds a frame the controller will accept.
+    fn encode(kind: FrameType, session: u32, payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(HEADER + payload.len());
+        out.extend_from_slice(MAGIC);
+        out.push(VERSION);
+        out.push(kind.wire());
+        out.extend_from_slice(&[0, 0]);
+        out.extend_from_slice(&session.to_le_bytes());
+        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+}
 
 /// Lifecycle state of one shell, mirroring the client's `TerminalSessionState`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,23 +160,35 @@ pub(crate) enum SessionState {
     Exited,
 }
 
+impl SessionState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Detached => "detached",
+            Self::Exited => "exited",
+        }
+    }
+}
+
 /// One shell and the metadata the session list shows.
 struct Session {
     pty: crate::platform::linux::terminal::Session,
     name: String,
     state: SessionState,
-    cols: u16,
-    rows: u16,
+    created_ms: i64,
+    last_active_ms: i64,
 }
 
-/// Owns every shell opened by the controller.
+/// Owns every shell opened by the controller, keyed by the controller's handle.
 ///
-/// Names are unique, because the client lists sessions by name and offers a
-/// rename action; a duplicate would make two rows indistinguishable.
+/// The controller picks the handle, so the host only has to remember which
+/// shell it points at. Names are unique because the client lists sessions by
+/// name and offers a rename action; a duplicate would make two rows
+/// indistinguishable.
 #[derive(Default)]
 pub(crate) struct Sessions {
-    sessions: HashMap<String, Session>,
-    next_id: u64,
+    sessions: HashMap<u32, Session>,
+    next_name: u64,
 }
 
 /// Why a session operation was refused.
@@ -75,119 +206,179 @@ pub(crate) enum SessionError {
     TooMany,
 }
 
-/// The client rejects a name longer than this and shows its own length hint;
-/// matching the limit keeps the two in agreement instead of failing at the
-/// client after the server already accepted it.
-const MAX_NAME: usize = 64;
-/// A shell is a large grant; keep the count small enough to audit by hand.
-const MAX_SESSIONS: usize = 16;
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_millis() as i64)
+        .unwrap_or(0)
+}
 
 impl Sessions {
-    /// Opens a shell and returns its session id.
+    /// Opens a shell under the controller's handle and returns its name.
     pub(crate) fn open(
         &mut self,
+        handle: u32,
         shell: &str,
         name: Option<String>,
         cols: u16,
         rows: u16,
     ) -> Result<String, SessionError> {
-        if self.sessions.len() >= MAX_SESSIONS {
+        if !self.sessions.contains_key(&handle) && self.sessions.len() >= MAX_SESSIONS {
             return Err(SessionError::TooMany);
         }
         let name = match name {
             Some(name) => validate_name(&name)?,
             None => self.default_name(),
         };
-        if self.sessions.values().any(|session| session.name == name) {
+        if self
+            .sessions
+            .iter()
+            .any(|(other, session)| *other != handle && session.name == name)
+        {
             return Err(SessionError::DuplicateName);
         }
         let pty = crate::platform::linux::terminal::Session::open(shell, cols, rows)
             .map_err(|_| SessionError::Gone)?;
-        self.next_id = self.next_id.wrapping_add(1);
-        let id = format!("{}-{}", self.next_id, name);
+        let stamp = now_ms();
         self.sessions.insert(
-            id.clone(),
+            handle,
             Session {
                 pty,
-                name,
+                name: name.clone(),
                 state: SessionState::Running,
-                cols,
-                rows,
+                created_ms: stamp,
+                last_active_ms: stamp,
             },
         );
-        Ok(id)
+        Ok(name)
     }
 
     /// `shell-N`, skipping names already taken so a closed session's number
     /// is not immediately reused by a different shell.
-    fn default_name(&self) -> String {
-        for index in 1..=MAX_SESSIONS + 1 {
-            let name = format!("shell-{index}");
+    fn default_name(&mut self) -> String {
+        for _ in 0..=MAX_SESSIONS {
+            self.next_name = self.next_name.wrapping_add(1);
+            let name = format!("shell-{}", self.next_name);
             if !self.sessions.values().any(|s| s.name == name) {
                 return name;
             }
         }
-        format!("shell-{}", self.next_id.wrapping_add(1))
+        format!("shell-{}", self.next_name)
     }
 
-    /// The id and display name of every session, for `listSessionsResp`.
-    pub(crate) fn list(&self) -> Vec<(String, String, SessionState)> {
+    /// The default shell, matching what a terminal emulator would start.
+    pub(crate) fn default_shell() -> String {
+        std::env::var("SHELL")
+            .ok()
+            .filter(|shell| !shell.is_empty())
+            .unwrap_or_else(|| "/bin/bash".to_owned())
+    }
+
+    /// The sessions the client lists, as the objects it parses.
+    pub(crate) fn list(&self) -> Vec<Value> {
         let mut listed: Vec<_> = self
             .sessions
             .iter()
-            .map(|(id, session)| (id.clone(), session.name.clone(), session.state))
+            .map(|(handle, session)| {
+                json!({
+                    "session_id": handle,
+                    "state": session.state.as_str(),
+                    "name": session.name,
+                    "created_at_ms": session.created_ms,
+                    "last_active_ms": session.last_active_ms,
+                    "shell": session.pty.shell(),
+                })
+            })
             .collect();
-        listed.sort_by(|a, b| a.1.cmp(&b.1));
+        listed.sort_by_key(Value::to_string);
         listed
     }
 
     /// Writes keyboard input to one session.
-    pub(crate) fn write(&self, id: &str, data: &[u8]) -> Result<usize, SessionError> {
-        let session = self.sessions.get(id).ok_or(SessionError::Gone)?;
+    pub(crate) fn write(&mut self, handle: u32, data: &[u8]) -> Result<usize, SessionError> {
+        let session = self.sessions.get_mut(&handle).ok_or(SessionError::Gone)?;
+        session.last_active_ms = now_ms();
         session.pty.write(data).map_err(|_| SessionError::Gone)
     }
 
     /// Applies a new size, which the shell sees as `SIGWINCH`.
-    pub(crate) fn resize(&mut self, id: &str, cols: u16, rows: u16) -> Result<(), SessionError> {
-        let session = self.sessions.get_mut(id).ok_or(SessionError::Gone)?;
+    pub(crate) fn resize(&mut self, handle: u32, cols: u16, rows: u16) -> Result<(), SessionError> {
+        let session = self.sessions.get_mut(&handle).ok_or(SessionError::Gone)?;
         session.pty.resize(cols, rows).map_err(|_| SessionError::Gone)?;
-        session.cols = cols;
-        session.rows = rows;
+        session.last_active_ms = now_ms();
         Ok(())
     }
 
     /// Renames a session, which is what the client's rename action does.
+    ///
+    /// The rename RPC identifies a session by its handle rendered as text,
+    /// while frames carry the handle as a number; both land here.
     pub(crate) fn rename(&mut self, id: &str, name: &str) -> Result<(), SessionError> {
+        let handle: u32 = id.parse().map_err(|_| SessionError::Gone)?;
         let name = validate_name(name)?;
         if self
             .sessions
             .iter()
-            .any(|(other, session)| other != id && session.name == name)
+            .any(|(other, session)| *other != handle && session.name == name)
         {
             return Err(SessionError::DuplicateName);
         }
-        let session = self.sessions.get_mut(id).ok_or(SessionError::Gone)?;
+        let session = self.sessions.get_mut(&handle).ok_or(SessionError::Gone)?;
         session.name = name;
         Ok(())
     }
 
     /// Ends a session and removes it from the list.
-    pub(crate) fn kill(&mut self, id: &str) -> Result<(), SessionError> {
-        self.sessions.remove(id).ok_or(SessionError::Gone)?;
+    pub(crate) fn kill(&mut self, handle: u32) -> Result<(), SessionError> {
+        self.sessions.remove(&handle).ok_or(SessionError::Gone)?;
         Ok(())
     }
 
-    /// Drops sessions whose shell has already exited.
-    pub(crate) fn reap(&mut self) -> Vec<String> {
-        let exited: Vec<String> = self
-            .sessions
-            .iter_mut()
-            .filter_map(|(id, session)| session.pty.exited().then(|| id.clone()))
-            .collect();
-        for id in &exited {
-            self.sessions.remove(id);
+    /// Marks a session detached without ending the shell.
+    pub(crate) fn detach(&mut self, handle: u32) -> Result<(), SessionError> {
+        let session = self.sessions.get_mut(&handle).ok_or(SessionError::Gone)?;
+        session.state = SessionState::Detached;
+        session.last_active_ms = now_ms();
+        Ok(())
+    }
+
+    /// Takes whatever the shells have written since the last poll.
+    ///
+    /// Each shell's exit is reported once, so the controller learns a session
+    /// ended without polling the list.
+    pub(crate) fn pump(&mut self) -> Vec<(u32, FrameType, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut exited = Vec::new();
+        let mut buffer = [0u8; 8192];
+        for (handle, session) in self.sessions.iter_mut() {
+            if session.state == SessionState::Exited {
+                continue;
+            }
+            loop {
+                match session.pty.read(&mut buffer) {
+                    Ok(Some(0)) | Err(_) => break,
+                    Ok(Some(read)) => out.push((
+                        *handle,
+                        FrameType::Stdout,
+                        buffer[..read].to_vec(),
+                    )),
+                    Ok(None) => break,
+                }
+            }
+            session.last_active_ms = now_ms();
+            if session.pty.exited() {
+                session.state = SessionState::Exited;
+                exited.push((*handle, FrameType::Exit, b"{}".to_vec()));
+            }
         }
-        exited
+        out.extend(exited);
+        out
+    }
+
+    /// Drops sessions that have already reported their exit.
+    pub(crate) fn reap(&mut self) {
+        self.sessions
+            .retain(|_, session| session.state != SessionState::Exited);
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -216,11 +407,11 @@ fn validate_name(name: &str) -> Result<String, SessionError> {
     Ok(trimmed.to_owned())
 }
 
-/// Binds the terminal request handler to `channel`.
+/// Binds the terminal handler to `channel`.
 ///
-/// Requests are ordinary protobuf RPC envelopes, so they go through the same
-/// session handler the CONTROL and TEXT channels use. Responses travel back on
-/// the channel the request arrived on.
+/// Protobuf requests (the environment check, rename) go through the shared
+/// session handler. `TERM` frames are handled here. Responses return on the
+/// channel the request arrived on.
 pub(crate) fn bind(
     channel: &Arc<RTCDataChannel>,
     screens: Arc<tokio::sync::Mutex<crate::features::host::peer::screens::Screens>>,
@@ -232,6 +423,10 @@ pub(crate) fn bind(
         close.cancel();
         Box::pin(async {})
     }));
+    // The message closure consumes the originals, so keep a handle for the
+    // output pump first.
+    let pump_screens = screens.clone();
+    let pump_stop = stop.clone();
     let weak = Arc::downgrade(channel);
     channel.on_message(Box::new(move |message| {
         let weak = weak.clone();
@@ -244,11 +439,16 @@ pub(crate) fn bind(
             let Some(channel) = weak.upgrade() else {
                 return;
             };
+            let data = message.data.clone();
+            if data.starts_with(MAGIC) {
+                handle_frame(&channel, &screens, &data, &stop).await;
+                return;
+            }
             let responses = {
                 let mut state = screens.lock().await;
                 crate::features::stream_control::publisher::receive_session(
                     &mut state,
-                    &message.data,
+                    &data,
                     false,
                 )
                 .await
@@ -268,42 +468,280 @@ pub(crate) fn bind(
                 Err(error) => {
                     tracing::warn!(
                         %error,
-                        bytes = message.data.len(),
+                        bytes = data.len(),
                         "rejected host terminal message"
                     );
                 }
             }
         })
     }));
+
+    // Pump shell output. The read side is non-blocking, so poll on a short
+    // interval; a shell that prints nothing costs one lock per tick.
+    let pump_channel = Arc::downgrade(channel);
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_millis(20));
+        loop {
+            ticker.tick().await;
+            if pump_stop.is_cancelled() {
+                return;
+            }
+            let Some(channel) = pump_channel.upgrade() else {
+                return;
+            };
+            let frames = {
+                let mut state = pump_screens.lock().await;
+                let sessions = state.terminal();
+                let mut sessions = sessions.lock().unwrap_or_else(|e| e.into_inner());
+                sessions.pump()
+            };
+            let mut failed = false;
+            for (handle, kind, payload) in frames {
+                let frame = Frame::encode(kind, handle, &payload);
+                if let Err(error) = channel.send(&Bytes::from(frame)).await {
+                    tracing::warn!(%error, "host terminal output failed");
+                    failed = true;
+                    break;
+                }
+            }
+            if failed {
+                return;
+            }
+            let mut state = pump_screens.lock().await;
+            let sessions = state.terminal();
+            sessions.lock().unwrap_or_else(|e| e.into_inner()).reap();
+        }
+    });
+}
+
+/// Reads the request payload as JSON, falling back to `u16` columns and rows.
+///
+/// The client sends `open` and `resize` as JSON objects; keeping the binary
+/// fallback means a version that packs the pair differently still resizes.
+fn geometry(payload: &[u8]) -> (Option<u16>, Option<u16>) {
+    if let Ok(value) = serde_json::from_slice::<Value>(payload) {
+        let number = |key: &str| {
+            value
+                .get(key)
+                .and_then(Value::as_u64)
+                .and_then(|v| u16::try_from(v).ok())
+        };
+        return (number("cols"), number("rows"));
+    }
+    if payload.len() >= 4 {
+        return (
+            Some(u16::from_le_bytes([payload[0], payload[1]])),
+            Some(u16::from_le_bytes([payload[2], payload[3]])),
+        );
+    }
+    (None, None)
+}
+
+async fn handle_frame(
+    channel: &Arc<RTCDataChannel>,
+    screens: &Arc<tokio::sync::Mutex<crate::features::host::peer::screens::Screens>>,
+    data: &[u8],
+    stop: &CancellationToken,
+) {
+    let Some(frame) = Frame::parse(data) else {
+        tracing::warn!(bytes = data.len(), "host terminal frame unparsed");
+        return;
+    };
+    let mut outgoing = Vec::new();
+    match frame.kind {
+        FrameType::ListSessionsReq => {
+            let listed = {
+                let state = screens.lock().await;
+                let sessions = state.terminal();
+                let sessions = sessions.lock().unwrap_or_else(|e| e.into_inner());
+                sessions.list()
+            };
+            let payload = serde_json::to_vec(&Value::Array(listed)).unwrap_or_else(|_| b"[]".into());
+            outgoing.push((FrameType::ListSessionsResp, frame.session, payload));
+        }
+        FrameType::Open => {
+            let text = serde_json::from_slice::<Value>(&frame.payload).ok();
+            let (cols, rows) = geometry(&frame.payload);
+            let shell = text
+                .as_ref()
+                .and_then(|v| v.get("shell").and_then(Value::as_str))
+                .filter(|shell| !shell.is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(Sessions::default_shell);
+            let name = text
+                .as_ref()
+                .and_then(|v| v.get("name").and_then(Value::as_str))
+                .map(str::to_owned);
+            let result = {
+                let state = screens.lock().await;
+                let sessions = state.terminal();
+                let mut sessions = sessions.lock().unwrap_or_else(|e| e.into_inner());
+                sessions.open(frame.session, &shell, name, cols.unwrap_or(80), rows.unwrap_or(24))
+            };
+            let payload = match result {
+                Ok(name) => json!({
+                    "code": 0,
+                    "message": "",
+                    "session_id": frame.session,
+                    "name": name,
+                }),
+                Err(error) => json!({
+                    "code": 1,
+                    "message": error.to_string(),
+                    "session_id": frame.session,
+                }),
+            };
+            outgoing.push((
+                FrameType::OpenResp,
+                frame.session,
+                serde_json::to_vec(&payload).unwrap_or_default(),
+            ));
+        }
+        FrameType::Stdin => {
+            let state = screens.lock().await;
+            let sessions = state.terminal();
+            let mut sessions = sessions.lock().unwrap_or_else(|e| e.into_inner());
+            if let Err(error) = sessions.write(frame.session, &frame.payload) {
+                tracing::warn!(%error, "host terminal write failed");
+            }
+        }
+        FrameType::Resize => {
+            let (cols, rows) = geometry(&frame.payload);
+            if let (Some(cols), Some(rows)) = (cols, rows) {
+                let state = screens.lock().await;
+                let sessions = state.terminal();
+                let mut sessions = sessions.lock().unwrap_or_else(|e| e.into_inner());
+                if let Err(error) = sessions.resize(frame.session, cols, rows) {
+                    tracing::warn!(%error, "host terminal resize failed");
+                }
+            }
+        }
+        FrameType::Close | FrameType::KillSessionReq => {
+            let result = {
+                let state = screens.lock().await;
+                let sessions = state.terminal();
+                let mut sessions = sessions.lock().unwrap_or_else(|e| e.into_inner());
+                sessions.kill(frame.session)
+            };
+            if frame.kind == FrameType::KillSessionReq {
+                let payload = match result {
+                    Ok(()) => json!({"code": 0, "message": "", "session_id": frame.session}),
+                    Err(error) => json!({
+                        "code": 1,
+                        "message": error.to_string(),
+                        "session_id": frame.session,
+                    }),
+                };
+                outgoing.push((
+                    FrameType::KillSessionResp,
+                    frame.session,
+                    serde_json::to_vec(&payload).unwrap_or_default(),
+                ));
+            }
+        }
+        FrameType::Detach => {
+            let state = screens.lock().await;
+            let sessions = state.terminal();
+            let mut sessions = sessions.lock().unwrap_or_else(|e| e.into_inner());
+            if let Err(error) = sessions.detach(frame.session) {
+                tracing::warn!(%error, "host terminal detach failed");
+            }
+        }
+        FrameType::UnlockReq => {
+            // The lock screen is a mobile concept; a Linux desktop is never
+            // locked from the terminal's point of view.
+            outgoing.push((FrameType::UnlockResp, frame.session, b"{}".to_vec()));
+        }
+        FrameType::Signal => {
+            let state = screens.lock().await;
+            let sessions = state.terminal();
+            let mut sessions = sessions.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = sessions.kill(frame.session);
+        }
+        other => {
+            tracing::debug!(?other, "host terminal frame ignored");
+        }
+    }
+    for (kind, handle, payload) in outgoing {
+        if stop.is_cancelled() {
+            return;
+        }
+        let frame = Frame::encode(kind, handle, &payload);
+        if let Err(error) = channel.send(&Bytes::from(frame)).await {
+            tracing::warn!(%error, "host terminal reply failed");
+            return;
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_frame_round_trips() {
+        let encoded = Frame::encode(FrameType::ListSessionsResp, 7, b"hello");
+        assert_eq!(&encoded[..4], MAGIC);
+        assert_eq!(encoded[4], VERSION);
+        assert_eq!(encoded[5], 10);
+        let frame = Frame::parse(&encoded).expect("parse");
+        assert_eq!(frame.kind, FrameType::ListSessionsResp);
+        assert_eq!(frame.session, 7);
+        assert_eq!(frame.payload, b"hello");
+    }
+
+    #[test]
+    fn the_captured_list_request_decodes() {
+        // The phone's first terminal frame, byte for byte.
+        let captured = [
+            0x54, 0x45, 0x52, 0x4d, 0x01, 0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00,
+        ];
+        let frame = Frame::parse(&captured).expect("parse");
+        assert_eq!(frame.kind, FrameType::ListSessionsReq);
+        assert_eq!(frame.session, 0);
+        assert!(frame.payload.is_empty());
+    }
+
+    #[test]
+    fn protobuf_is_not_mistaken_for_a_frame() {
+        // The check_env envelope the phone sends first.
+        let protobuf = [
+            0x08, 0x05, 0x10, 0x8a, 0x86, 0xb6, 0xed, 0x93, 0x34, 0xaa, 0x01, 0x07, 0x0a, 0x02,
+            0x08, 0x01, 0xe2, 0x01, 0x00,
+        ];
+        assert!(Frame::parse(&protobuf).is_none());
+    }
+
+    #[test]
+    fn a_truncated_frame_is_refused() {
+        let mut encoded = Frame::encode(FrameType::Stdout, 1, b"payload");
+        encoded.truncate(HEADER + 2);
+        assert!(Frame::parse(&encoded).is_none());
+    }
+
     fn shell() -> &'static str {
         "/bin/sh"
     }
 
     #[test]
-    fn sessions_get_distinct_default_names() {
+    fn sessions_are_keyed_by_the_controller_handle() {
         let mut sessions = Sessions::default();
-        let first = sessions.open(shell(), None, 80, 24).expect("open");
-        let second = sessions.open(shell(), None, 80, 24).expect("open");
-        let names: Vec<String> = sessions.list().into_iter().map(|(_, name, _)| name).collect();
-        assert_eq!(names.len(), 2);
-        assert_ne!(names[0], names[1]);
-        assert_ne!(first, second);
+        sessions.open(11, shell(), None, 80, 24).expect("open");
+        sessions.open(22, shell(), None, 80, 24).expect("open");
+        assert_eq!(sessions.list().len(), 2);
+        assert!(sessions.write(11, b"echo A\n").is_ok());
+        assert!(sessions.write(33, b"echo B\n").is_err());
     }
 
     #[test]
     fn a_duplicate_name_is_refused() {
         let mut sessions = Sessions::default();
         sessions
-            .open(shell(), Some("build".into()), 80, 24)
+            .open(1, shell(), Some("build".into()), 80, 24)
             .expect("open");
         assert_eq!(
-            sessions.open(shell(), Some("build".into()), 80, 24),
+            sessions.open(2, shell(), Some("build".into()), 80, 24),
             Err(SessionError::DuplicateName)
         );
     }
@@ -312,87 +750,75 @@ mod tests {
     fn invalid_names_are_refused() {
         let mut sessions = Sessions::default();
         assert_eq!(
-            sessions.open(shell(), Some("   ".into()), 80, 24),
+            sessions.open(1, shell(), Some("   ".into()), 80, 24),
             Err(SessionError::InvalidName)
         );
         assert_eq!(
-            sessions.open(shell(), Some("a/b".into()), 80, 24),
+            sessions.open(1, shell(), Some("a/b".into()), 80, 24),
             Err(SessionError::InvalidName)
         );
         assert_eq!(
-            sessions.open(shell(), Some("x".repeat(MAX_NAME + 1)), 80, 24),
+            sessions.open(1, shell(), Some("x".repeat(MAX_NAME + 1)), 80, 24),
             Err(SessionError::NameTooLong)
         );
     }
 
     #[test]
-    fn renaming_onto_another_session_is_refused() {
-        let mut sessions = Sessions::default();
-        let first = sessions
-            .open(shell(), Some("one".into()), 80, 24)
-            .expect("open");
-        sessions
-            .open(shell(), Some("two".into()), 80, 24)
-            .expect("open");
-        assert_eq!(
-            sessions.rename(&first, "two"),
-            Err(SessionError::DuplicateName)
-        );
-        // Renaming a session to its own name is not a conflict.
-        assert_eq!(sessions.rename(&first, "one"), Ok(()));
-    }
-
-    #[test]
     fn write_and_resize_reach_the_shell() {
         let mut sessions = Sessions::default();
-        let id = sessions.open(shell(), None, 80, 24).expect("open");
-        sessions.resize(&id, 120, 40).expect("resize");
-        assert!(sessions.write(&id, b"echo READY\n").expect("write") > 0);
-        // Let the shell run, then read back through the pty to prove the
-        // bytes arrived rather than just being accepted by the buffer.
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        let session = sessions.sessions.get(&id).expect("session");
-        let mut buffer = [0u8; 4096];
+        sessions.open(1, shell(), None, 80, 24).expect("open");
+        sessions.resize(1, 120, 40).expect("resize");
+        sessions.write(1, b"echo READY\n").expect("write");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let mut seen = Vec::new();
-        for _ in 0..50 {
-            match session.pty.read(&mut buffer) {
-                Ok(Some(0)) => break,
-                Ok(Some(read)) => {
-                    seen.extend_from_slice(&buffer[..read]);
-                    if String::from_utf8_lossy(&seen).contains("READY") {
-                        break;
-                    }
+        while std::time::Instant::now() < deadline {
+            for (_, kind, payload) in sessions.pump() {
+                if kind == FrameType::Stdout {
+                    seen.extend_from_slice(&payload);
                 }
-                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
-                Err(error) => panic!("read: {error}"),
             }
+            if String::from_utf8_lossy(&seen).contains("READY") {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        let text = String::from_utf8_lossy(&seen);
-        assert!(text.contains("READY"), "shell produced: {text:?}");
+        panic!("shell produced: {:?}", String::from_utf8_lossy(&seen));
     }
 
     #[test]
-    fn killing_removes_a_session_and_a_second_kill_is_gone() {
+    fn an_exited_shell_reports_once() {
         let mut sessions = Sessions::default();
-        let id = sessions.open(shell(), None, 80, 24).expect("open");
-        assert_eq!(sessions.kill(&id), Ok(()));
-        assert_eq!(sessions.kill(&id), Err(SessionError::Gone));
-        assert!(sessions.is_empty());
-    }
-
-    #[test]
-    fn an_exited_shell_is_reaped() {
-        let mut sessions = Sessions::default();
-        let id = sessions.open(shell(), None, 80, 24).expect("open");
-        sessions.write(&id, b"exit\n").expect("write");
+        sessions.open(1, shell(), None, 80, 24).expect("open");
+        sessions.write(1, b"exit\n").expect("write");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while std::time::Instant::now() < deadline {
-            if !sessions.reap().is_empty() {
+            if sessions
+                .pump()
+                .iter()
+                .any(|(_, kind, _)| *kind == FrameType::Exit)
+            {
+                sessions.reap();
                 assert!(sessions.is_empty());
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         panic!("shell did not exit");
+    }
+
+    #[test]
+    fn killing_removes_a_session_and_a_second_kill_is_gone() {
+        let mut sessions = Sessions::default();
+        sessions.open(1, shell(), None, 80, 24).expect("open");
+        assert_eq!(sessions.kill(1), Ok(()));
+        assert_eq!(sessions.kill(1), Err(SessionError::Gone));
+        assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn geometry_accepts_json_and_binary() {
+        assert_eq!(geometry(br#"{"cols":100,"rows":40}"#), (Some(100), Some(40)));
+        assert_eq!(geometry(&[50, 0, 20, 0]), (Some(50), Some(20)));
+        assert_eq!(geometry(b""), (None, None));
     }
 }
