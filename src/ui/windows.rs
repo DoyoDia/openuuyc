@@ -138,11 +138,22 @@ impl Runner {
             size.y += caption_height;
         }
         let min_inner_size = viewport_builder.min_inner_size;
-        let window = Arc::new(egui_winit::create_window(
-            &context,
-            event_loop,
-            &viewport_builder.with_visible(false).with_decorations(false),
-        )?);
+        let viewport_builder = viewport_builder.with_visible(false).with_decorations(false);
+        // The first control center window takes the token its launcher left in
+        // the environment, so it gets focus and the launch feedback ends. The
+        // variables stay set: removing them now would race the threads already
+        // reading the environment, and a spent token is worthless to a child.
+        #[cfg(target_os = "linux")]
+        let window = {
+            use winit::platform::startup_notify::EventLoopExtStartupNotify;
+            let token = (self.root && self.factory.is_some())
+                .then(|| event_loop.read_token_from_env())
+                .flatten();
+            create_window(&context, event_loop, &viewport_builder, token)?
+        };
+        #[cfg(not(target_os = "linux"))]
+        let window = egui_winit::create_window(&context, event_loop, &viewport_builder)?;
+        let window = Arc::new(window);
         super::chrome::configure_dwm_window(&window);
         super::branding::set_taskbar_icon(&window);
         let notification = if self.config.notification {
@@ -257,6 +268,31 @@ impl Runner {
 }
 
 impl DesktopWindow {
+    /// Show the control center for a launch elsewhere. With the launcher's
+    /// token the window is raised past focus-stealing prevention and the
+    /// launch feedback ends; without one, or if that fails, it is shown as
+    /// the tray's "打开" shows it.
+    #[cfg(target_os = "linux")]
+    fn activate(&mut self, token: &crate::platform::linux::startup_notify::LaunchToken) {
+        let raised = token.for_window(&self.window).is_some_and(|value| {
+            let window = &self.window;
+            crate::platform::linux::startup_notify::raise(window, value, || {
+                window.set_visible(true);
+                window.set_minimized(false);
+            })
+            .inspect_err(|error| {
+                tracing::warn!(error = %format!("{error:#}"), "无法用启动通知令牌激活控制中心")
+            })
+            .is_ok()
+        });
+        if !raised {
+            self.window.set_visible(true);
+            self.window.set_minimized(false);
+            self.window.focus_window();
+        }
+        self.context.request_repaint();
+    }
+
     fn schedule(&mut self, when: Instant) {
         let when = self
             .last_frame
@@ -530,6 +566,28 @@ impl ApplicationHandler<Event> for Runner {
     }
 }
 
+/// `egui_winit::create_window`, giving the new window the launcher's
+/// startup-notification token when there is one. (egui_winit's own placement
+/// on a numbered monitor only applies to fullscreen viewports, which the shell
+/// windows are not.)
+#[cfg(target_os = "linux")]
+fn create_window(
+    context: &egui::Context,
+    event_loop: &ActiveEventLoop,
+    builder: &egui::ViewportBuilder,
+    token: Option<winit::window::ActivationToken>,
+) -> Result<Window, winit::error::OsError> {
+    use winit::platform::startup_notify::WindowAttributesExtStartupNotify;
+    let Some(token) = token else {
+        return egui_winit::create_window(context, event_loop, builder);
+    };
+    let attributes = egui_winit::create_winit_window_attributes(context, builder.clone())
+        .with_activation_token(token);
+    let window = event_loop.create_window(attributes)?;
+    egui_winit::apply_viewport_builder_to_window(context, &window, builder);
+    Ok(window)
+}
+
 struct ManagedViewer {
     runner: ConnectingWindowsRunner,
     done: Option<tokio::sync::oneshot::Sender<Result<()>>>,
@@ -639,6 +697,12 @@ impl ApplicationHandler<Event> for Windows {
                     state.window.set_minimized(false);
                     state.window.focus_window();
                     state.context.request_repaint();
+                }
+            }
+            #[cfg(target_os = "linux")]
+            Event::Request(Request::ActivateMain(token)) => {
+                if let Some(state) = &mut self.main.state {
+                    state.activate(&token);
                 }
             }
             Event::Request(Request::Exit) => {

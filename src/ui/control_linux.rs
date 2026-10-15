@@ -6,10 +6,13 @@
 //! [`crate::application::app::instance`]），Wayland 与 X11 都没有对应的窗口属性，
 //! 这里用 `$XDG_RUNTIME_DIR` 下的一个 unix socket 代替。
 //!
-//! The request is one line, `show`; words after it are reserved for later
-//! fields and ignored. The answer is `ok` or `error`.
+//! The request is one line, `show`, optionally followed by the launcher's
+//! startup-notification tokens (`wayland=<token>`, `x11=<token>`), which the
+//! running process uses to raise its window past focus-stealing prevention
+//! and to end the launcher's busy feedback. The answer is `ok` or `error`.
 //! Both ends give up after [`TIMEOUT`], and every connection is served on its
 //! own thread, so a client that never finishes cannot hold up a later start.
+use crate::platform::linux::startup_notify::{LaunchToken, valid};
 use anyhow::{Context, Result, bail};
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
@@ -46,27 +49,54 @@ fn socket_path() -> Result<PathBuf> {
 /// What a second start asks of the running process.
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
-    Show,
+    Show(LaunchToken),
 }
 
 impl Command {
     fn parse(line: &str) -> Result<Self> {
-        match line.split_ascii_whitespace().next() {
-            Some("show") => Ok(Self::Show),
+        let mut words = line.split_ascii_whitespace();
+        match words.next() {
+            Some("show") => {
+                let mut token = LaunchToken::default();
+                for word in words {
+                    // Unknown or malformed fields are dropped: an activation
+                    // without a token still shows the window.
+                    match word.split_once('=') {
+                        Some(("wayland", value)) if valid(value) => {
+                            token.wayland = Some(value.to_owned())
+                        }
+                        Some(("x11", value)) if valid(value) => token.x11 = Some(value.to_owned()),
+                        _ => tracing::debug!(field = word, "控制请求里有无法识别的字段"),
+                    }
+                }
+                Ok(Self::Show(token))
+            }
             _ => bail!("未知的控制请求 {}", line.trim()),
         }
     }
 
     fn line(&self) -> String {
-        let Self::Show = self;
-        "show\n".to_owned()
+        let Self::Show(token) = self;
+        let mut line = "show".to_owned();
+        if let Some(value) = token.wayland.as_deref().filter(|value| valid(value)) {
+            line.push_str(" wayland=");
+            line.push_str(value);
+        }
+        if let Some(value) = token.x11.as_deref().filter(|value| valid(value)) {
+            line.push_str(" x11=");
+            line.push_str(value);
+        }
+        line.push('\n');
+        line
     }
 }
 
 /// 主窗口起来时占住控制通道，之后由后台线程把收到的请求转给窗口管理器。
 pub(crate) fn listen() -> Result<Control> {
     listen_at(socket_path()?, |command| match command {
-        Command::Show => super::window_manager::send(super::window_manager::Request::ShowMain),
+        Command::Show(token) => {
+            super::window_manager::send(super::window_manager::Request::ActivateMain(token))
+        }
     })
 }
 
@@ -149,9 +179,10 @@ fn answer(stream: UnixStream, handle: impl Fn(Command) -> Result<()>) -> Result<
     result
 }
 
-/// 第二个进程：把已经在跑的那个叫到前台，然后自己就该退出了。
+/// 第二个进程：把已经在跑的那个叫到前台，然后自己就该退出了。The launcher's
+/// tokens go along so the running process can raise its window with them.
 pub(crate) fn activate() -> Result<()> {
-    activate_at(&socket_path()?, &Command::Show)
+    activate_at(&socket_path()?, &Command::Show(LaunchToken::from_env()))
 }
 
 fn activate_at(path: &Path, command: &Command) -> Result<()> {
@@ -211,13 +242,25 @@ mod tests {
     }
 
     #[test]
-    fn requests_round_trip() {
+    fn requests_round_trip_with_their_tokens() {
+        let token = LaunchToken {
+            wayland: Some("abc-123".into()),
+            x11: Some("host-1-0_TIME42".into()),
+        };
+        let command = Command::Show(token.clone());
+        assert_eq!(Command::parse(&command.line()).unwrap(), command);
         assert_eq!(
-            Command::parse(&Command::Show.line()).unwrap(),
-            Command::Show
+            Command::parse("show\n").unwrap(),
+            Command::Show(LaunchToken::default())
         );
-        // Later fields are ignored.
-        assert_eq!(Command::parse("show future=1\n").unwrap(), Command::Show);
+        // A malformed token is dropped, the request still shows the window.
+        assert_eq!(
+            Command::parse("show wayland=a\"b x11=ok future=1\n").unwrap(),
+            Command::Show(LaunchToken {
+                wayland: None,
+                x11: Some("ok".into()),
+            })
+        );
         assert!(Command::parse("hide\n").is_err());
         assert!(Command::parse("").is_err());
     }
@@ -238,12 +281,16 @@ mod tests {
         // Connects and never says anything.
         let _stuck = UnixStream::connect(&path).unwrap();
         let started = Instant::now();
-        activate_at(&path, &Command::Show).unwrap();
+        let token = LaunchToken {
+            wayland: Some("w".into()),
+            x11: None,
+        };
+        activate_at(&path, &Command::Show(token.clone())).unwrap();
         assert!(
             started.elapsed() < TIMEOUT,
             "the stuck client delayed the request"
         );
-        assert_eq!(received.recv().unwrap(), Command::Show);
+        assert_eq!(received.recv().unwrap(), Command::Show(token));
         drop(control);
         assert!(!path.exists());
         cleanup(&path);
@@ -256,7 +303,7 @@ mod tests {
         // Bound and listening, but nobody accepts or answers.
         let _silent = UnixListener::bind(&path).unwrap();
         let started = Instant::now();
-        assert!(activate_at(&path, &Command::Show).is_err());
+        assert!(activate_at(&path, &Command::Show(LaunchToken::default())).is_err());
         let waited = started.elapsed();
         assert!(
             waited >= TIMEOUT && waited < TIMEOUT * 3,
@@ -297,7 +344,7 @@ mod tests {
     fn a_refused_request_is_reported_to_the_second_start() {
         let path = scratch("refused");
         let control = listen_at(path.clone(), |_| bail!("窗口管理器已关闭")).unwrap();
-        assert!(activate_at(&path, &Command::Show).is_err());
+        assert!(activate_at(&path, &Command::Show(LaunchToken::default())).is_err());
         drop(control);
         cleanup(&path);
     }

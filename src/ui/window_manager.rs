@@ -19,6 +19,11 @@ pub(crate) enum Event {
 }
 pub(crate) enum Request {
     ShowMain,
+    /// Show the control center for a launch elsewhere (a second start), with
+    /// the launcher's startup-notification tokens when it had any. Windows
+    /// does this through its registered window message instead.
+    #[cfg(target_os = "linux")]
+    ActivateMain(crate::platform::linux::startup_notify::LaunchToken),
     Exit,
     Open {
         key: String,
