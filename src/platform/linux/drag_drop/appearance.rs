@@ -246,14 +246,11 @@ fn render(file: &Path) -> Result<DragImage> {
 /// 矢量图标转成位图。自己拖进一整棵 SVG 实现不值当：本机装着的 `rsvg-convert` 就够了，
 /// 没有它这条就当没图。
 fn rasterize(file: &Path) -> Result<image::RgbaImage> {
-    let output = std::process::Command::new("rsvg-convert")
-        .args(["-w", "64", "-h", "64"])
-        .arg(file)
-        .output()
-        .context("调用 rsvg-convert 失败")?;
-    ensure!(output.status.success(), "rsvg-convert 画不出这张图标");
+    let mut command = std::process::Command::new("rsvg-convert");
+    command.args(["-w", "64", "-h", "64"]).arg(file);
+    let stdout = capture(&mut command, "rsvg-convert")?;
     Ok(
-        image::load_from_memory_with_format(&output.stdout, image::ImageFormat::Png)
+        image::load_from_memory_with_format(&stdout, image::ImageFormat::Png)
             .context("解析画出来的图标失败")?
             .into_rgba8(),
     )
