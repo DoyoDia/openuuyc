@@ -91,9 +91,22 @@ impl Hidden {
     }
 }
 
+/// Hides its window when dropped. It is [`DesktopWindow`]'s first field, so
+/// every window disappears before the application, the presenter (which
+/// detaches the composition tree) and the window itself are released, and
+/// the system background cannot show through in between.
+struct HideOnDrop(Arc<Window>);
+
+impl Drop for HideOnDrop {
+    fn drop(&mut self) {
+        self.0.set_visible(false);
+    }
+}
+
 struct DesktopWindow {
     // Hide before field destruction, then release business and composition
     // resources before destroying the HWND.
+    hide_on_drop: HideOnDrop,
     app: AppSession,
     presenter: UiPresenter,
     context: egui::Context,
@@ -122,18 +135,10 @@ struct DesktopWindow {
 impl Runner {
     fn fail(&mut self, event_loop: &ActiveEventLoop, error: anyhow::Error) {
         self.error = Some(format!("{error:#}"));
-        self.release_window();
+        self.state.take();
         self.closed = true;
         if self.root {
             event_loop.exit();
-        }
-    }
-
-    /// 退出窗口：先隐藏再拆合成树，中间这段间隔不能露出系统底色。
-    fn release_window(&mut self) {
-        if let Some(state) = self.state.take() {
-            state.window.set_visible(false);
-            drop(state);
         }
     }
 
@@ -148,6 +153,7 @@ impl Runner {
         let position = state.window.outer_position().ok();
         state.window.set_visible(false);
         let DesktopWindow {
+            hide_on_drop,
             app,
             context,
             tray,
@@ -159,6 +165,7 @@ impl Runner {
         // 绘制资源里装着 egui 的全部纹理，跟应用一起留下；surface 则随窗口放掉。
         let retained = Retained::take(presenter);
         drop(input);
+        drop(hide_on_drop);
         drop(window);
         tracing::info!(?size, "主窗口已收进托盘");
         self.hidden = Some(Hidden {
@@ -306,6 +313,7 @@ impl Runner {
             .filter(|rate| *rate != 0)
             .unwrap_or(60_000);
         self.state = Some(DesktopWindow {
+            hide_on_drop: HideOnDrop(window.clone()),
             app,
             presenter,
             context,
@@ -652,7 +660,7 @@ impl ApplicationHandler<Event> for Runner {
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
-        self.release_window();
+        self.state.take();
         self.hidden.take();
     }
 }
@@ -870,9 +878,7 @@ impl ApplicationHandler<Event> for Windows {
             viewer.finish(event_loop);
         }
         self.viewers.clear();
-        for (_, mut window) in self.windows.drain() {
-            window.release_window();
-        }
+        self.windows.clear();
         self.main.exiting(event_loop);
     }
 }
