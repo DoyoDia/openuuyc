@@ -2,6 +2,9 @@
 Description=OpenUUYC 虚拟显示器辅助程序
 Requires=openuuyc-vkms.socket
 After=openuuyc-vkms.socket
+# configfs 的挂载点必须先在，下面那条 ReadWritePaths 才有东西可指。
+Requires=sys-kernel-config.mount
+After=sys-kernel-config.mount
 
 [Service]
 Type=simple
@@ -10,10 +13,14 @@ ExecStart=/usr/bin/openuuyc-vkms
 Restart=on-failure
 
 # 这个程序以 root 运行，但只做一件事——按主程序的请求接上/断开内核 VKMS 的一路
-# 连接器。下面把它能碰的东西收到 configfs 里的那一处。
+# 连接器。下面把它能碰的东西收到 configfs 那一处。
 # 注意不能设 ProtectKernelModules：加载 vkms 模块正是它的活。
+#
+# 拿到 /sys/kernel/config 而不是它下面的 vkms：那个目录是加载 vkms 模块时才出现的，
+# 而 systemd 是在起进程**之前**按 ReadWritePaths 建命名空间的，指一个还不存在的路径
+# 会让单元直接失败（status=226/NAMESPACE）。开机后第一次用到虚拟屏时正是这个状态。
 ProtectSystem=strict
-ReadWritePaths=/sys/kernel/config/vkms
+ReadWritePaths=/sys/kernel/config
 ProtectHome=yes
 PrivateTmp=yes
 ProtectClock=yes
