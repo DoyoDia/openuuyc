@@ -398,11 +398,29 @@ impl Grab {
 /// what arrives is the framebuffer, and a monitor standing on its side shows up
 /// in it lying down. The mapping is `wl_output`'s own, read as "the framebuffer
 /// pixel this picture pixel is", and `Normal` — the one case that needs no work
-/// — passes the rows straight through.
+/// — passes the rows straight through. `orient_reference` in the tests spells
+/// the mapping out pixel by pixel; this is the same mapping, done fast.
+///
+/// Pixels move as whole four-byte units. The three transforms that keep the
+/// shape move whole rows. A quarter turn makes each picture row out of a
+/// framebuffer column, and walking a 2560-pixel column touches a new cache
+/// line, 10 KB from the last, on every read; that cost 17 ms a frame at
+/// 2560x1600. `turn` goes through the picture in 64x64 tiles instead, so the
+/// 64 framebuffer rows a tile reads from stay in cache while it is filled.
 fn orient(source: Vec<u8>, width: u32, height: u32, transform: Transform) -> (Vec<u8>, u32, u32) {
-    if transform == Transform::Normal {
-        return (source, width, height);
-    }
+    let (w, h) = (width as usize, height as usize);
+    // Which of `turn`'s and `mirror`'s variants undoes this transform; any
+    // transform a later revision adds is passed through like `Normal`.
+    let out = match transform {
+        Transform::_90 => turn::<false, true>(pixels(&source, w, h), w, h),
+        Transform::_270 => turn::<true, false>(pixels(&source, w, h), w, h),
+        Transform::Flipped90 => turn::<false, false>(pixels(&source, w, h), w, h),
+        Transform::Flipped270 => turn::<true, true>(pixels(&source, w, h), w, h),
+        Transform::_180 => mirror(pixels(&source, w, h), w, h, true, true),
+        Transform::Flipped => mirror(pixels(&source, w, h), w, h, true, false),
+        Transform::Flipped180 => mirror(pixels(&source, w, h), w, h, false, true),
+        _ => return (source, width, height),
+    };
     let turned = matches!(
         transform,
         Transform::_90 | Transform::_270 | Transform::Flipped90 | Transform::Flipped270
@@ -412,28 +430,67 @@ fn orient(source: Vec<u8>, width: u32, height: u32, transform: Transform) -> (Ve
     } else {
         (width, height)
     };
-    let (last_x, last_y) = (width as i32 - 1, height as i32 - 1);
-    let source_at = |x: i32, y: i32| match transform {
-        Transform::_90 => (y, last_y - x),
-        Transform::_180 => (last_x - x, last_y - y),
-        Transform::_270 => (last_x - y, x),
-        Transform::Flipped => (last_x - x, y),
-        Transform::Flipped90 => (y, x),
-        Transform::Flipped180 => (x, last_y - y),
-        Transform::Flipped270 => (last_x - y, last_y - x),
-        // `Normal`, and any transform a later revision adds.
-        _ => (x, y),
-    };
-    let mut out = vec![0u8; out_width as usize * out_height as usize * 4];
-    for y in 0..out_height as i32 {
-        for x in 0..out_width as i32 {
-            let (from_x, from_y) = source_at(x, y);
-            let from = (from_y as usize * width as usize + from_x as usize) * 4;
-            let to = (y as usize * out_width as usize + x as usize) * 4;
-            out[to..to + 4].copy_from_slice(&source[from..from + 4]);
+    (out.into_flattened(), out_width, out_height)
+}
+
+/// The frame's `width * height` pixels, four bytes each.
+fn pixels(source: &[u8], width: usize, height: usize) -> &[[u8; 4]] {
+    &source.as_chunks::<4>().0[..width * height]
+}
+
+/// The side length of the square tiles `turn` works through: 64 framebuffer
+/// rows of 64 pixels are 16 KB, which fits in the L1 cache alongside the tile
+/// being written.
+const TILE: usize = 64;
+
+/// A quarter turn, with or without a mirror. The picture is `height` wide and
+/// `width` tall, and its row `y` is framebuffer column `y` — or `width - 1 -
+/// y` with `FROM_RIGHT` — read from the top down, or from the bottom up with
+/// `FROM_BOTTOM`.
+fn turn<const FROM_RIGHT: bool, const FROM_BOTTOM: bool>(
+    source: &[[u8; 4]],
+    width: usize,
+    height: usize,
+) -> Vec<[u8; 4]> {
+    let (out_width, out_height) = (height, width);
+    let mut out = vec![[0; 4]; out_width * out_height];
+    for top in (0..out_height).step_by(TILE) {
+        for left in (0..out_width).step_by(TILE) {
+            let right = (left + TILE).min(out_width);
+            for y in top..(top + TILE).min(out_height) {
+                let column = if FROM_RIGHT { width - 1 - y } else { y };
+                let row = &mut out[y * out_width + left..y * out_width + right];
+                for (x, pixel) in (left..right).zip(row) {
+                    let line = if FROM_BOTTOM { height - 1 - x } else { x };
+                    *pixel = source[line * width + column];
+                }
+            }
         }
     }
-    (out, out_width, out_height)
+    out
+}
+
+/// A half turn or a mirror: the shape stays, and every picture row is a whole
+/// framebuffer row, taken from the bottom up with `bottom_up` and read right
+/// to left with `reversed`.
+fn mirror(
+    source: &[[u8; 4]],
+    width: usize,
+    height: usize,
+    reversed: bool,
+    bottom_up: bool,
+) -> Vec<[u8; 4]> {
+    let mut out = Vec::with_capacity(width * height);
+    for y in 0..height {
+        let line = if bottom_up { height - 1 - y } else { y };
+        let row = &source[line * width..(line + 1) * width];
+        if reversed {
+            out.extend(row.iter().rev());
+        } else {
+            out.extend_from_slice(row);
+        }
+    }
+    out
 }
 
 /// `Y_INVERT` says the compositor copied the framebuffer bottom-up, and
@@ -799,6 +856,86 @@ mod tests {
     /// The value of each pixel, in order.
     fn values(pixels: &[u8]) -> Vec<u8> {
         pixels.chunks_exact(4).map(|pixel| pixel[0]).collect()
+    }
+
+    const ALL: [Transform; 8] = [
+        Transform::Normal,
+        Transform::_90,
+        Transform::_180,
+        Transform::_270,
+        Transform::Flipped,
+        Transform::Flipped90,
+        Transform::Flipped180,
+        Transform::Flipped270,
+    ];
+
+    /// `orient` written the plain way, one pixel at a time straight from
+    /// `wl_output`'s mapping: what the tiled version is held against.
+    fn orient_reference(
+        source: &[u8],
+        width: u32,
+        height: u32,
+        transform: Transform,
+    ) -> (Vec<u8>, u32, u32) {
+        let turned = matches!(
+            transform,
+            Transform::_90 | Transform::_270 | Transform::Flipped90 | Transform::Flipped270
+        );
+        let (out_width, out_height) = if turned {
+            (height, width)
+        } else {
+            (width, height)
+        };
+        let (last_x, last_y) = (width as i32 - 1, height as i32 - 1);
+        let source_at = |x: i32, y: i32| match transform {
+            Transform::_90 => (y, last_y - x),
+            Transform::_180 => (last_x - x, last_y - y),
+            Transform::_270 => (last_x - y, x),
+            Transform::Flipped => (last_x - x, y),
+            Transform::Flipped90 => (y, x),
+            Transform::Flipped180 => (x, last_y - y),
+            Transform::Flipped270 => (last_x - y, last_y - x),
+            _ => (x, y),
+        };
+        let mut out = vec![0u8; out_width as usize * out_height as usize * 4];
+        for y in 0..out_height as i32 {
+            for x in 0..out_width as i32 {
+                let (from_x, from_y) = source_at(x, y);
+                let from = (from_y as usize * width as usize + from_x as usize) * 4;
+                let to = (y as usize * out_width as usize + x as usize) * 4;
+                out[to..to + 4].copy_from_slice(&source[from..from + 4]);
+            }
+        }
+        (out, out_width, out_height)
+    }
+
+    #[test]
+    fn tiles_land_where_the_plain_mapping_puts_them() {
+        use super::{TILE, invert, invert_rows};
+        // Neither side a multiple of the tile, and more than one tile each
+        // way, so full tiles and both kinds of edge tile are all crossed.
+        let (width, height) = (2 * TILE as u32 + 3, TILE as u32 + 13);
+        // Every pixel distinct in all four bytes, so a pixel that lands in the
+        // wrong place, or arrives with its bytes reordered, shows.
+        let source: Vec<u8> = (0..width * height)
+            .flat_map(|index| (index.wrapping_mul(0x0101_0101) ^ 0x8040_2010).to_le_bytes())
+            .collect();
+        for transform in ALL {
+            assert_eq!(
+                orient(source.clone(), width, height, transform),
+                orient_reference(&source, width, height, transform),
+                "{transform:?}"
+            );
+            // A `Y_INVERT` frame through `invert`, against the frame flipped
+            // by hand and given the plain mapping.
+            let mut memory = source.clone();
+            invert_rows(&mut memory, width as usize, height as usize);
+            assert_eq!(
+                orient(source.clone(), width, height, invert(transform)),
+                orient_reference(&memory, width, height, transform),
+                "inverted {transform:?}"
+            );
+        }
     }
 
     #[test]
