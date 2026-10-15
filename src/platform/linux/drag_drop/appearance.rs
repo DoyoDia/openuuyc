@@ -31,39 +31,58 @@ const MIN_BITMAP: u32 = 48;
 const TOOL_LIMIT: Duration = Duration::from_secs(2);
 
 /// 跑一个只看输出的子进程，把它的 stdout 拿回来；超过 `TOOL_LIMIT` 就杀掉它。
+///
+/// 「工具」可能是个包装脚本（发行版的 `gio`、用户自己垫的同名脚本），真正干活的是
+/// 它起的孙进程，而孙进程继承着同一根 stdout：只杀直接子进程，管道的写端还开着，
+/// 读线程就要等到孙进程自己退出。所以让它自成一个进程组、超时整组杀掉，读线程也
+/// 只等到时限为止，等不到就不要了（线程自己会在写端全关时退出）。
 fn capture(command: &mut std::process::Command, tool: &str) -> Result<Vec<u8>> {
     use std::io::Read as _;
+    use std::os::unix::process::CommandExt as _;
     let mut child = command
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
+        .process_group(0)
         .spawn()
         .with_context(|| format!("调用 {tool} 失败"))?;
     // 边跑边读：等它退出了再读，输出填满管道时两边一起卡住。
     let mut pipe = child.stdout.take().context("子进程没有标准输出")?;
-    let reader = std::thread::spawn(move || {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
         let mut data = Vec::new();
         let _ = pipe.read_to_end(&mut data);
-        data
+        let _ = sender.send(data);
     });
     let deadline = Instant::now() + TOOL_LIMIT;
-    let mut over = false;
     let status = loop {
         if let Some(status) = child
             .try_wait()
             .with_context(|| format!("等待 {tool} 失败"))?
         {
-            break status;
+            break Some(status);
         }
         if Instant::now() >= deadline {
-            over = true;
-            let _ = child.kill();
-            break child.wait().with_context(|| format!("回收 {tool} 失败"))?;
+            // 进程组号就是它自己的 pid（`process_group(0)`）。
+            // SAFETY: 只是发信号。子进程还没被回收（`wait` 在这之后），它的 pid
+            // 连同这个组号都不会被别人复用。
+            unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
+            child.wait().with_context(|| format!("回收 {tool} 失败"))?;
+            break None;
         }
         std::thread::sleep(Duration::from_millis(10));
     };
-    let data = reader.join().unwrap_or_default();
-    ensure!(!over, "{tool} 没有在时限内给出结果");
+    let status = status.with_context(|| format!("{tool} 没有在时限内给出结果"))?;
+    // 子进程退了，可它留下的孙进程也许还攥着 stdout：同样只等到时限，等不到就
+    // 不要了。这时子进程已经回收，组号随时可能被复用，不再去杀那个组。
+    // 刚好卡着时限退出的，也给读线程留一点收尾的工夫。
+    let wait = deadline
+        .saturating_duration_since(Instant::now())
+        .max(Duration::from_millis(100));
+    let data = receiver
+        .recv_timeout(wait)
+        .ok()
+        .with_context(|| format!("{tool} 没有在时限内给出结果"))?;
     ensure!(status.success(), "{tool} 没能给出结果");
     Ok(data)
 }
@@ -315,6 +334,24 @@ fn stacked(icons: &[DragImage]) -> DragImage {
         width: STACK,
         height: STACK,
         pixels,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 包装脚本卡住时，真正卡着的是它起的孙进程，而孙进程攥着同一根 stdout：
+    /// 超时要连它一起收拾掉，按时返回，而不是陪它等满 10 秒。
+    #[test]
+    fn tool_timeout_covers_grandchildren() {
+        let started = Instant::now();
+        let mut command = std::process::Command::new("sh");
+        // 后面那个 `:` 让 sh 不能把 `sleep` exec 掉，`sleep` 只能是孙进程。
+        command.args(["-c", "sleep 10; :"]);
+        assert!(capture(&mut command, "sh").is_err());
+        let elapsed = started.elapsed();
+        assert!(elapsed < TOOL_LIMIT + Duration::from_secs(1), "{elapsed:?}");
     }
 }
 
