@@ -1,17 +1,16 @@
-//! Keeps the compositor from acting on the shortcuts a remote desktop needs.
+//! Keeps the desktop from acting on the shortcuts a remote desktop needs.
 //!
-//! "Intercept shortcuts" is the viewer's promise that a key it forwards stops
-//! here, and on X11 that is the whole story: the window manager sees the
-//! window, the client sees the key. On Wayland it is not — the compositor
-//! takes `Super+O` and the overview opens before the remote ever hears about
-//! it. `zwp_keyboard_shortcuts_inhibit_v1` is the compositor's own answer: a
-//! window that holds an inhibitor gets its keys, and the compositor's own
-//! bindings stand down while that window has the keyboard.
+//! "Intercept shortcuts" promises that a key the viewer forwards stops here,
+//! which the Windows viewer keeps with a low-level keyboard hook. A Wayland
+//! compositor takes its bindings before the focused window sees them.
+//! `zwp_keyboard_shortcuts_inhibit_v1` is the compositor's own answer: a
+//! window that holds an inhibitor gets its keys while it has the keyboard, and
+//! the compositor's bindings stand down. The compositor scopes it to focus, may
+//! ask the user first (GNOME does, once) and keeps an escape shortcut of its
+//! own.
 //!
-//! The connection here is winit's, borrowed rather than opened: the protocol
-//! is per surface and per seat, and the surface belongs to winit's connection.
-//! Nothing is taken over — the surface proxy is built from the pointer winit
-//! already owns, so its events keep going where they went before.
+//! Whether to hold the shortcuts back is decided by the shared input gate; this
+//! module is only the mechanism.
 use wayland_client::backend::ObjectId;
 use wayland_client::globals::{GlobalListContents, registry_queue_init};
 use wayland_client::protocol::{wl_registry, wl_seat, wl_surface};
@@ -24,7 +23,42 @@ use winit::raw_window_handle::{
     HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle,
 };
 
-pub(super) struct Shortcuts {
+/// The desktop's shortcuts, held back or let go for one viewer window.
+pub(super) enum Shortcuts {
+    Wayland(Inhibitor),
+}
+
+impl Shortcuts {
+    /// `None` when the desktop offers no way to hold its shortcuts back (a
+    /// compositor without the protocol); they then stay with the desktop.
+    pub(super) fn new(window: &winit::window::Window) -> Option<Self> {
+        match window.display_handle().ok()?.as_raw() {
+            RawDisplayHandle::Wayland(_) => {
+                let inhibitor = Inhibitor::new(window);
+                if inhibitor.is_none() {
+                    tracing::info!(
+                        "the compositor does not offer keyboard-shortcuts-inhibit; its shortcuts stay with the desktop"
+                    );
+                }
+                inhibitor.map(Self::Wayland)
+            }
+            _ => None,
+        }
+    }
+
+    /// `wanted` is the shared gate with focus left out. Called every frame;
+    /// repeating the current state costs nothing.
+    pub(super) fn update(&mut self, wanted: bool) {
+        match self {
+            // The compositor scopes an inhibitor to the focused surface, so
+            // it is kept across focus changes rather than renewed on each one
+            // (which would also ask GNOME's permission again).
+            Self::Wayland(inhibitor) => inhibitor.set_active(wanted),
+        }
+    }
+}
+
+pub(super) struct Inhibitor {
     connection: Connection,
     queue: EventQueue<State>,
     state: State,
@@ -36,17 +70,14 @@ pub(super) struct Shortcuts {
 
 #[derive(Default)]
 struct State {
-    /// What the compositor last said about the inhibitor. A compositor that
-    /// refuses leaves the object inert, which is the same as having none, so
-    /// this is only kept so the events do not pile up unread.
+    /// What the compositor last said about the current inhibitor: `None`
+    /// until it answers. A compositor that asks the user first answers only
+    /// after the user did; one that refuses never answers.
     active: Option<bool>,
 }
 
-impl Shortcuts {
-    /// `None` when this is not a Wayland window, or the compositor does not
-    /// serve the protocol — in which case the shortcut belongs to the desktop
-    /// and there is nothing to be done about it.
-    pub(super) fn new(window: &winit::window::Window) -> Option<Self> {
+impl Inhibitor {
+    fn new(window: &winit::window::Window) -> Option<Self> {
         let display = match window.display_handle().ok()?.as_raw() {
             RawDisplayHandle::Wayland(handle) => handle.display.as_ptr(),
             _ => return None,
@@ -56,12 +87,15 @@ impl Shortcuts {
             _ => return None,
         };
         // Safe because the display belongs to the event loop, which outlives
-        // every window, and this connection only borrows it.
+        // every window and every player (they are dropped on `exiting`), and
+        // a foreign-display backend never closes the connection it borrows.
         let backend =
             unsafe { wayland_client::backend::Backend::from_foreign_display(display.cast()) };
         let connection = Connection::from_backend(backend);
         // Safe because winit created this surface and the window is still
-        // alive; the proxy is a second reference to the object, not a new one.
+        // alive. winit's proxy is managed by the same wayland-backend, so the
+        // id carries winit's liveness flag: once winit destroys the surface,
+        // requests naming it fail instead of touching freed memory.
         let id = unsafe { ObjectId::from_ptr(wl_surface::WlSurface::interface(), surface.cast()) }
             .ok()?;
         let surface = wl_surface::WlSurface::from_id(&connection, id).ok()?;
@@ -69,7 +103,14 @@ impl Shortcuts {
         let handle = queue.handle();
         let manager: manager::ZwpKeyboardShortcutsInhibitManagerV1 =
             globals.bind(&handle, 1..=1, ()).ok()?;
-        let seat: wl_seat::WlSeat = globals.bind(&handle, 1..=1, ()).ok()?;
+        let seat: wl_seat::WlSeat = match globals.bind(&handle, 1..=1, ()) {
+            Ok(seat) => seat,
+            Err(_) => {
+                manager.destroy();
+                let _ = connection.flush();
+                return None;
+            }
+        };
         Some(Self {
             connection,
             queue,
@@ -81,10 +122,22 @@ impl Shortcuts {
         })
     }
 
-    /// Holds the compositor's shortcuts back, or lets them go again. Being
-    /// called with the state it is already in costs nothing.
-    pub(super) fn set_active(&mut self, active: bool) {
+    fn set_active(&mut self, active: bool) {
+        // Answers arrive on this queue whenever winit reads the socket; take
+        // them here, where they are only reported.
+        let previous = self.state.active;
         let _ = self.queue.dispatch_pending(&mut self.state);
+        if self.state.active != previous {
+            match self.state.active {
+                Some(true) => tracing::info!("the compositor holds its shortcuts back"),
+                // Sent when the user takes the shortcuts back with the
+                // compositor's escape shortcut. The inhibitor is left alone
+                // until the gate closes and reopens, so the user's choice
+                // stands.
+                Some(false) => tracing::info!("the compositor restored its own shortcuts"),
+                None => {}
+            }
+        }
         if active == self.inhibitor.is_some() {
             return;
         }
@@ -98,16 +151,18 @@ impl Shortcuts {
                 );
         } else if let Some(inhibitor) = self.inhibitor.take() {
             inhibitor.destroy();
+            self.state.active = None;
         }
         let _ = self.connection.flush();
     }
 }
 
-impl Drop for Shortcuts {
+impl Drop for Inhibitor {
     fn drop(&mut self) {
         if let Some(inhibitor) = self.inhibitor.take() {
             inhibitor.destroy();
         }
+        self.manager.destroy();
         let _ = self.connection.flush();
     }
 }

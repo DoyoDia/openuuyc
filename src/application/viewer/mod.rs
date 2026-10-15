@@ -27,6 +27,7 @@ mod stream_menu;
 mod annotation;
 mod display_transition;
 mod fullscreen_chrome;
+mod input_gate;
 mod polling_warning;
 
 #[cfg(windows)]
