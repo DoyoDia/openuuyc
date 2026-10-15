@@ -16,6 +16,7 @@
 //! in a Wayland session goes to a second, absolute uinput pointer that the
 //! compositor resolves in its own layout (xdg-output); without that layout it
 //! becomes a relative move from the current pointer position.
+use crate::platform::Rotation;
 use anyhow::{Context, Result, bail, ensure};
 use std::time::Duration;
 use x11rb::connection::{Connection, RequestConnection as _};
@@ -50,6 +51,18 @@ impl Lock {
     }
 }
 
+/// 控制器报来的一个触点：它的 id、屏幕上的比例位置和比例半径。
+///
+/// 平台层不认识 UU 的消息，所以输入引擎先把触点换算成比例；角度和压力在 evdev
+/// 这边没有对应的轴，虚拟触摸屏只报位置和接触面积。
+#[derive(Clone, Copy)]
+pub(crate) struct Touch {
+    pub id: u32,
+    pub x: f32,
+    pub y: f32,
+    pub radius: f32,
+}
+
 /// uinput 注入后端。
 ///
 /// Wayland 会话下 XTest 只能影响 XWayland 客户端，Hyprland 等合成器里的
@@ -59,8 +72,15 @@ impl Lock {
 /// 绝对定位另有一台带 `ABS_X`/`ABS_Y` 的设备（Sunshine 的做法），轴范围固定，
 /// 由合成器按它自己全局布局的外接矩形解算：不经过 X，也就没有 XWayland 那套
 /// 尺寸与缩放。
+///
+/// 触摸另有一台多点触摸屏设备：合成器把它当成躺在某一块面板上的直接设备，触点由
+/// 合成器自己派发给应用——双指滚动、捏合、手势和接触面积都是真的，而不是把一个
+/// 触点翻成鼠标左键。
 mod uinput {
+    use super::Touch;
+    use crate::platform::Rotation;
     use anyhow::{Context, Result, ensure};
+    use std::collections::BTreeMap;
     use std::fs::{File, OpenOptions};
     use std::io::Write;
     use std::os::unix::io::AsRawFd;
@@ -76,9 +96,16 @@ mod uinput {
     const REL_WHEEL: u16 = 0x08;
     const ABS_X: u16 = 0x00;
     const ABS_Y: u16 = 0x01;
+    const ABS_MT_SLOT: u16 = 0x2f;
+    const ABS_MT_TOUCH_MAJOR: u16 = 0x30;
+    const ABS_MT_POSITION_X: u16 = 0x35;
+    const ABS_MT_POSITION_Y: u16 = 0x36;
+    const ABS_MT_TRACKING_ID: u16 = 0x39;
     const SYN_REPORT: u16 = 0x00;
     /// 绝对轴只受一根指针控制，而不是某一块屏上的坐标。
     const INPUT_PROP_POINTER: u32 = 0;
+    /// 坐标落在某一块输出上，是按在面板上的，而不是像鼠标那样在整张桌子上。
+    const INPUT_PROP_DIRECT: u32 = 1;
     /// 绝对轴的最大值，与 Sunshine 一样固定，不随布局变：布局变了只改换算，
     /// 不用换设备（换设备又要等合成器重新接手）。
     pub(crate) const AXIS_MAX: i32 = 65535;
@@ -88,6 +115,16 @@ mod uinput {
     const BTN_MIDDLE: u16 = 0x112;
     const BTN_SIDE: u16 = 0x113;
     const BTN_EXTRA: u16 = 0x114;
+    const BTN_TOUCH: u16 = 0x14a;
+
+    /// 触摸屏两条轴能取的最大值。触摸报的是屏幕上的比例，所以量程只决定精度：
+    /// 这个量程在 5120 宽的屏上一个单位是 0.16 个像素。
+    const TOUCH_RANGE: f32 = 32767.0;
+    /// 触摸屏自称的分辨率（单位/毫米），决定合成器算出来的面板物理尺寸。和量程成对
+    /// 出现才像一块真的面板，别的地方用不到。
+    const TOUCH_RESOLUTION: i32 = 40;
+    /// 触摸屏同时能按住的触点数，和协议允许的一样多。
+    const TOUCH_SLOTS: usize = 10;
 
     // linux/uinput.h 的 _IOW('U', n, size)；x86、ARM 与 RISC-V 上相同。
     const UI_DEV_CREATE: libc::c_ulong = 0x5501;
@@ -155,12 +192,13 @@ mod uinput {
 
     /// 声明一条绝对轴以及它的范围：合成器就是按这个范围把轴上的值解算成
     /// 全局位置的，范围不对落点就整体偏。
-    fn set_abs(fd: i32, axis: u16, maximum: i32) -> Result<()> {
+    fn set_abs(fd: i32, axis: u16, maximum: i32, resolution: i32) -> Result<()> {
         set(fd, UI_SET_ABSBIT, axis.into())?;
         let setup = UinputAbsSetup {
             code: axis,
             absinfo: InputAbsInfo {
                 maximum,
+                resolution,
                 ..Default::default()
             },
             ..Default::default()
@@ -249,8 +287,8 @@ mod uinput {
                     set(fd, UI_SET_KEYBIT, code.into())?;
                 }
                 set(fd, UI_SET_EVBIT, EV_ABS.into())?;
-                set_abs(fd, ABS_X, AXIS_MAX)?;
-                set_abs(fd, ABS_Y, AXIS_MAX)?;
+                set_abs(fd, ABS_X, AXIS_MAX, 0)?;
+                set_abs(fd, ABS_Y, AXIS_MAX, 0)?;
                 // 指针而不是“直接设备”：INPUT_PROP_DIRECT 是在说坐标只落在
                 // 一块屏上，而这里描述的是整个桌面。
                 set(fd, UI_SET_PROPBIT, INPUT_PROP_POINTER.into())
@@ -279,6 +317,15 @@ mod uinput {
 
         fn sync(&self) -> Result<()> {
             self.emit(EV_SYN, SYN_REPORT, 0)
+        }
+
+        /// 写一串事件，最后补一个 report：内核只有在一个同步里收到它们，
+        /// 才会当成同一时刻的状态（触点协议的顺序要求就落在这一点上）。
+        fn send(&self, events: &[(u16, u16, i32)]) -> Result<()> {
+            for &(kind, code, value) in events {
+                self.emit(kind, code, value)?;
+            }
+            self.sync()
         }
 
         pub(crate) fn key(&self, code: u16, down: bool) -> Result<()> {
@@ -319,6 +366,320 @@ mod uinput {
     impl Drop for Device {
         fn drop(&mut self) {
             let _ = unsafe { libc::ioctl(self.file.as_raw_fd(), UI_DEV_DESTROY, 0) };
+        }
+    }
+
+    // --- the touchscreen ----------------------------------------------------
+
+    /// 一块虚拟多点触摸屏。
+    ///
+    /// 它比「用指针模拟触摸」多出来的东西，正是合成器愿意认它是一块触摸屏的理由：
+    /// `INPUT_PROP_DIRECT` 和多点轴（`ABS_MT_*`）让 libinput 把它判成触摸屏，于是
+    /// 它报的触点被合成器原样派发给应用——双指滚动、捏合、手势、触摸面积都是真的，
+    /// 而不是把一个触点翻译成鼠标左键。
+    ///
+    /// 设备坐标是「面板自己」的坐标：合成器读它的时候会套上输出当前的旋转和缩放
+    /// （`Rotation::panel` 就是这件事的逆），所以屏幕大小和缩放都不进这里。
+    pub(crate) struct Touchscreen {
+        device: Device,
+        contacts: Contacts,
+    }
+
+    impl Touchscreen {
+        pub(crate) fn create() -> Result<Self> {
+            let device = Device::create("OpenUUYC 虚拟触摸屏", |fd| {
+                set(fd, UI_SET_EVBIT, EV_KEY.into())?;
+                set(fd, UI_SET_KEYBIT, BTN_TOUCH.into())?;
+                set(fd, UI_SET_EVBIT, EV_ABS.into())?;
+                for axis in [ABS_X, ABS_Y, ABS_MT_POSITION_X, ABS_MT_POSITION_Y] {
+                    set_abs(fd, axis, TOUCH_RANGE as i32, TOUCH_RESOLUTION)?;
+                }
+                set_abs(fd, ABS_MT_SLOT, TOUCH_SLOTS as i32 - 1, 0)?;
+                set_abs(fd, ABS_MT_TRACKING_ID, 65535, 0)?;
+                set_abs(fd, ABS_MT_TOUCH_MAJOR, TOUCH_RANGE as i32, 0)?;
+                set(fd, UI_SET_PROPBIT, INPUT_PROP_DIRECT.into())
+            })
+            .context("创建虚拟触摸屏失败")?;
+            Ok(Self {
+                device,
+                contacts: Contacts::default(),
+            })
+        }
+
+        pub(crate) fn touch(
+            &mut self,
+            kind: u8,
+            points: &[Touch],
+            rotation: Rotation,
+        ) -> Result<()> {
+            let frames = self.contacts.step(kind, points, rotation)?;
+            for frame in &frames {
+                if let Err(error) = self.device.send(frame) {
+                    // 写到一半失败，设备里的状态就不知道是什么了，按全抬起来算。
+                    self.contacts = Contacts::default();
+                    return Err(error);
+                }
+            }
+            Ok(())
+        }
+
+        pub(crate) fn release(&mut self) -> Result<()> {
+            let frames = self.contacts.lift_all();
+            for frame in &frames {
+                self.device.send(frame)?;
+            }
+            Ok(())
+        }
+    }
+
+    /// 触摸屏上的触点：控制器给的 id 占着哪个槽位、按没按着。
+    ///
+    /// 这段逻辑和设备本身分开，是为了能脱开 `/dev/uinput` 单独验：触摸屏的协议要求
+    /// 全在帧的顺序里（谁先抬起、槽位什么时候能复用、BTN_TOUCH 什么时候翻转）。
+    #[derive(Default)]
+    struct Contacts {
+        active: BTreeMap<u32, Contact>,
+        used: [bool; TOUCH_SLOTS],
+        /// 上一个发出去的 tracking id，每个新触点加一。
+        tracking: i32,
+        /// 上一次发出去的按下状态，只在变化时重发 BTN_TOUCH。
+        touching: bool,
+    }
+
+    struct Contact {
+        slot: u8,
+        tracking: i32,
+    }
+
+    /// 送进设备的一帧：一组事件，内核把它们当成一次同步。
+    type Frame = Vec<(u16, u16, i32)>;
+
+    impl Contacts {
+        /// 一帧触点。`kind` 是 UU 的说法：1 是「触点集合从现在开始」，2 是移动，
+        /// 3 是抬起，4 是取消。返回要写进设备的帧。
+        ///
+        /// 一次同步里不能把「抬起旧触点」和「按下新触点」当成同一批，所以 kind 1
+        /// 的取消自己是一个完整的帧。
+        fn step(&mut self, kind: u8, points: &[Touch], rotation: Rotation) -> Result<Vec<Frame>> {
+            let mut frames = Vec::new();
+            if kind == 1 || kind >= 3 {
+                frames.extend(self.lift_all());
+                if kind >= 3 {
+                    // 抬起和取消在 evdev 里没有区别：一个触点只有抬起这一种结束。
+                    return Ok(frames);
+                }
+            }
+            let mut frame = Frame::new();
+            // 这一帧里没有了的触点先抬起，槽位空出来给新触点用。
+            let gone: Vec<u32> = self
+                .active
+                .keys()
+                .copied()
+                .filter(|id| !points.iter().any(|point| point.id == *id))
+                .collect();
+            for id in gone {
+                let Some(contact) = self.active.remove(&id) else {
+                    continue;
+                };
+                self.used[usize::from(contact.slot)] = false;
+                frame.push((EV_ABS, ABS_MT_SLOT, i32::from(contact.slot)));
+                frame.push((EV_ABS, ABS_MT_TRACKING_ID, -1));
+            }
+            for point in points {
+                let (x, y) = position(point, rotation);
+                match self.active.get(&point.id) {
+                    Some(contact) => {
+                        frame.push((EV_ABS, ABS_MT_SLOT, i32::from(contact.slot)));
+                    }
+                    None => {
+                        let slot = self
+                            .used
+                            .iter()
+                            .position(|used| !used)
+                            .context("虚拟触摸屏的触点已经用满")?;
+                        self.used[slot] = true;
+                        // 新触点要一个新的 tracking id；抬起时把那个槽位的 id 写回 -1。
+                        self.tracking = self.tracking.wrapping_add(1);
+                        let contact = Contact {
+                            slot: slot as u8,
+                            tracking: self.tracking,
+                        };
+                        frame.push((EV_ABS, ABS_MT_SLOT, i32::from(contact.slot)));
+                        frame.push((EV_ABS, ABS_MT_TRACKING_ID, contact.tracking));
+                        self.active.insert(point.id, contact);
+                    }
+                }
+                frame.push((EV_ABS, ABS_MT_POSITION_X, x));
+                frame.push((EV_ABS, ABS_MT_POSITION_Y, y));
+                frame.push((EV_ABS, ABS_MT_TOUCH_MAJOR, touch_value(point.radius)));
+            }
+            // 第一个触点的单点坐标。实体触摸屏也会报，libinput 的单点回退路径读它。
+            if let Some(point) = points.first() {
+                let (x, y) = position(point, rotation);
+                frame.push((EV_ABS, ABS_X, x));
+                frame.push((EV_ABS, ABS_Y, y));
+            }
+            let touching = !self.active.is_empty();
+            if touching != self.touching {
+                self.touching = touching;
+                frame.push((EV_KEY, BTN_TOUCH, i32::from(touching)));
+            }
+            if !frame.is_empty() {
+                frames.push(frame);
+            }
+            Ok(frames)
+        }
+
+        /// 抬起所有触点，并把槽位还回去。
+        fn lift_all(&mut self) -> Vec<Frame> {
+            if self.active.is_empty() {
+                return Vec::new();
+            }
+            let mut frame = Frame::new();
+            for contact in std::mem::take(&mut self.active).into_values() {
+                frame.push((EV_ABS, ABS_MT_SLOT, i32::from(contact.slot)));
+                frame.push((EV_ABS, ABS_MT_TRACKING_ID, -1));
+            }
+            self.used = [false; TOUCH_SLOTS];
+            self.touching = false;
+            frame.push((EV_KEY, BTN_TOUCH, 0));
+            vec![frame]
+        }
+    }
+
+    /// 触点在内核里的位置：先把屏幕比例变回面板比例，再放到量程上。
+    fn position(point: &Touch, rotation: Rotation) -> (i32, i32) {
+        let (x, y) = rotation.panel(point.x.clamp(0.0, 1.0), point.y.clamp(0.0, 1.0));
+        (touch_value(x), touch_value(y))
+    }
+
+    /// 一个比例值放到触摸屏的量程上。
+    fn touch_value(fraction: f32) -> i32 {
+        (fraction.clamp(0.0, 1.0) * TOUCH_RANGE).round() as i32
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn contact(id: u32, x: f32, y: f32) -> Touch {
+            Touch {
+                id,
+                x,
+                y,
+                radius: 0.02,
+            }
+        }
+
+        /// 触点按下的那一帧：新槽位、新的 tracking id、坐标，以及整个面板的按下状态。
+        #[test]
+        fn the_first_contact_presses_the_panel_and_lifting_it_releases_it() {
+            let mut contacts = Contacts::default();
+            let frames = contacts
+                .step(2, &[contact(7, 0.25, 0.75)], Rotation::Normal)
+                .unwrap();
+            assert_eq!(frames.len(), 1);
+            let frame = &frames[0];
+            assert!(frame.contains(&(EV_ABS, ABS_MT_SLOT, 0)));
+            assert!(frame.contains(&(EV_ABS, ABS_MT_TRACKING_ID, 1)));
+            assert!(frame.contains(&(EV_ABS, ABS_MT_POSITION_X, touch_value(0.25))));
+            assert!(frame.contains(&(EV_ABS, ABS_MT_POSITION_Y, touch_value(0.75))));
+            // 单点坐标跟着第一个触点走
+            assert!(frame.contains(&(EV_ABS, ABS_X, touch_value(0.25))));
+            assert!(frame.contains(&(EV_ABS, ABS_Y, touch_value(0.75))));
+            assert!(frame.contains(&(EV_KEY, BTN_TOUCH, 1)));
+
+            let frames = contacts.step(3, &[], Rotation::Normal).unwrap();
+            assert_eq!(frames.len(), 1);
+            assert!(frames[0].contains(&(EV_ABS, ABS_MT_TRACKING_ID, -1)));
+            assert!(frames[0].contains(&(EV_KEY, BTN_TOUCH, 0)));
+            assert!(contacts.active.is_empty());
+            assert!(contacts.used.iter().all(|used| !used));
+        }
+
+        /// 合成器把设备的坐标按输出的旋转解释，所以转过的屏上两条轴要换过来报。
+        #[test]
+        fn a_rotated_output_moves_the_axes_the_panel_reports() {
+            let mut contacts = Contacts::default();
+            // 屏幕上的 (0.25, 0.6)：面板逆时针转 90° 之后落在面板的 (0.6, 0.75)
+            let frames = contacts
+                .step(2, &[contact(1, 0.25, 0.6)], Rotation::Rotate90)
+                .unwrap();
+            let frame = &frames[0];
+            assert!(frame.contains(&(EV_ABS, ABS_MT_POSITION_X, touch_value(0.6))));
+            assert!(frame.contains(&(EV_ABS, ABS_MT_POSITION_Y, touch_value(0.75))));
+            assert!(!frame.contains(&(EV_ABS, ABS_MT_POSITION_X, touch_value(0.25))));
+        }
+
+        /// 两根手指各占一个槽位，抬起其中一根不能碰到另一根，槽位还得还回来。
+        #[test]
+        fn two_contacts_take_two_slots_and_a_gone_one_frees_only_its_own() {
+            let mut contacts = Contacts::default();
+            contacts
+                .step(
+                    2,
+                    &[contact(1, 0.1, 0.1), contact(2, 0.9, 0.9)],
+                    Rotation::Normal,
+                )
+                .unwrap();
+            assert_eq!(contacts.active.len(), 2);
+            assert_eq!(contacts.used.iter().filter(|used| **used).count(), 2);
+
+            // 第二根手指抬起，第一根还在：帧里抬起后分配的那个槽位，面板仍然是按下的
+            let frames = contacts
+                .step(2, &[contact(1, 0.2, 0.2)], Rotation::Normal)
+                .unwrap();
+            assert_eq!(frames.len(), 1);
+            let frame = &frames[0];
+            assert!(frame.contains(&(EV_ABS, ABS_MT_SLOT, 1)));
+            assert!(frame.contains(&(EV_ABS, ABS_MT_TRACKING_ID, -1)));
+            assert!(!frame.contains(&(EV_KEY, BTN_TOUCH, 0)));
+            assert!(frame.contains(&(EV_ABS, ABS_MT_POSITION_X, touch_value(0.2))));
+            assert_eq!(contacts.active.len(), 1);
+            assert!(!contacts.used[1]);
+            assert!(contacts.used[0]);
+        }
+
+        /// 「触点集合从现在开始」这一类帧，先抬起旧的一套，再按下新的一套。
+        #[test]
+        fn a_new_set_lifts_the_old_contacts_in_a_frame_of_their_own() {
+            let mut contacts = Contacts::default();
+            contacts
+                .step(2, &[contact(1, 0.5, 0.5)], Rotation::Normal)
+                .unwrap();
+            let frames = contacts
+                .step(1, &[contact(9, 0.5, 0.5)], Rotation::Normal)
+                .unwrap();
+            assert_eq!(frames.len(), 2);
+            assert!(frames[0].contains(&(EV_KEY, BTN_TOUCH, 0)));
+            assert!(frames[1].contains(&(EV_KEY, BTN_TOUCH, 1)));
+            assert_eq!(contacts.active.keys().copied().collect::<Vec<_>>(), [9]);
+        }
+
+        /// 取消和抬起一样：触点全抬起，再收到一次抬起不必再发一帧。
+        #[test]
+        fn a_cancelled_set_lifts_every_contact() {
+            let mut contacts = Contacts::default();
+            contacts
+                .step(2, &[contact(1, 0.5, 0.5)], Rotation::Normal)
+                .unwrap();
+            let frames = contacts
+                .step(4, &[contact(1, 0.5, 0.5)], Rotation::Normal)
+                .unwrap();
+            assert_eq!(frames.len(), 1);
+            assert!(frames[0].contains(&(EV_KEY, BTN_TOUCH, 0)));
+            assert!(contacts.active.is_empty());
+            assert!(contacts.step(3, &[], Rotation::Normal).unwrap().is_empty());
+        }
+
+        /// 触点数超过槽位时报错，而不是把触点悄悄丢掉或者panic。
+        #[test]
+        fn the_panel_refuses_more_contacts_than_it_has_slots() {
+            let mut contacts = Contacts::default();
+            let points: Vec<Touch> = (0..TOUCH_SLOTS as u32 + 1)
+                .map(|id| contact(id, 0.5, 0.5))
+                .collect();
+            assert!(contacts.step(2, &points, Rotation::Normal).is_err());
         }
     }
 }
@@ -783,6 +1144,8 @@ pub(crate) struct Injector {
     /// 由合成器按它自己的全局布局解算的绝对指针。问得到合成器布局时才有，
     /// 没有就退回下面这条相对路径。
     absolute: Option<Absolute>,
+    /// 多点触摸屏，拿不到就没有：触摸退回单指模拟。
+    touchscreen: Option<uinput::Touchscreen>,
     /// X11 矩形 → Hyprland 逻辑矩形的映射（按显示器名对齐）。
     screen_maps: Vec<(String, (i32, i32, i32, i32), (i32, i32, i32, i32))>,
     /// 原生 Wayland 客户端的文字输入（可携带自定义 keymap）。
@@ -835,6 +1198,22 @@ impl Injector {
         } else {
             None
         };
+        // 触摸屏没有别的后备：没有它就退回用指针模拟单指，见 engine 里的 touch。
+        // 一块从来收不到触点的触摸屏什么也不影响，所以它和设备一起常驻。
+        let touchscreen = if uinput.is_some() {
+            match uinput::Touchscreen::create() {
+                Ok(touchscreen) => {
+                    tracing::info!("虚拟触摸屏已就绪，控制器用平板触摸模式时由合成器派发多点触摸");
+                    Some(touchscreen)
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "没有虚拟触摸屏，触摸退回单指模拟");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let screen_maps = if uinput.is_some() && hyprland() {
             let maps = screen_rect_maps();
             if maps.is_empty() {
@@ -867,6 +1246,7 @@ impl Injector {
             max_keycode,
             uinput,
             absolute,
+            touchscreen,
             screen_maps,
             virtual_keyboard,
         })
@@ -875,6 +1255,25 @@ impl Injector {
     /// 有没有虚拟绝对指针。有它，引擎才可能按合成器布局定位。
     pub fn has_absolute_pointer(&self) -> bool {
         self.absolute.is_some()
+    }
+
+    /// 真实的多点触摸，由合成器派发给应用。返回 false 表示这个后端没有触摸屏，
+    /// 调用方要退回单指模拟。
+    pub fn touch(&mut self, kind: u8, points: &[Touch], rotation: Rotation) -> Result<bool> {
+        let Some(touchscreen) = &mut self.touchscreen else {
+            return Ok(false);
+        };
+        touchscreen.touch(kind, points, rotation)?;
+        Ok(true)
+    }
+
+    /// 抬起所有触点。会话结束、换屏、取消时都要走一遍：合成器那边一个没抬起来
+    /// 的触点会一直按着，应用也收不到结束。
+    pub fn release_touch(&mut self) -> Result<()> {
+        match &mut self.touchscreen {
+            Some(touchscreen) => touchscreen.release(),
+            None => Ok(()),
+        }
     }
 
     /// 移到合成器全局空间里的一点，由合成器按 `bounds`（它全部输出的外接
@@ -1438,7 +1837,7 @@ mod tests {
 #[cfg(test)]
 mod absolute_tests {
     use super::{Desktop, axis_value, layout_bounds, nudge, uinput::AXIS_MAX};
-    use crate::platform::{CompositorLayout, CompositorOutput};
+    use crate::platform::{CompositorLayout, CompositorOutput, Rotation};
 
     /// What libinput hands the compositor (`value × extent / (max − min + 1)`)
     /// and the pixel that position falls on.
@@ -1485,6 +1884,7 @@ mod absolute_tests {
             top,
             width,
             height,
+            rotation: Rotation::default(),
         };
         let layout = CompositorLayout {
             outputs: vec![
@@ -1539,5 +1939,28 @@ mod session_tests {
             .unwrap()
             .text(&text, || true)
             .unwrap();
+    }
+
+    /// 需要真实会话和可写的 `/dev/uinput`：`cargo test -- --ignored`。
+    ///
+    /// 在屏幕右下角按下再抬起一次，验证这块触摸屏真能建起来、内核收下这些帧。
+    /// 触点会落到那个位置的窗口上，所以跑的时候右下角最好什么都没有。
+    #[test]
+    #[ignore = "injects a real touch into the live session"]
+    fn a_touchscreen_takes_a_contact_and_lets_it_go() {
+        let mut injector = super::Injector::open().unwrap();
+        let point = super::Touch {
+            id: 1,
+            x: 0.999,
+            y: 0.999,
+            radius: 0.01,
+        };
+        let rotation = crate::platform::Rotation::Normal;
+        if !injector.touch(2, &[point], rotation).unwrap() {
+            println!("这个会话没有触摸屏设备");
+            return;
+        }
+        injector.release_touch().unwrap();
+        injector.flush().unwrap();
     }
 }

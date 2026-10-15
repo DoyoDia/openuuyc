@@ -233,10 +233,13 @@ impl Engine {
         }
         Ok(())
     }
-    /// Emulated touch: X Test has no touch devices, so the primary contact
-    /// drives the pointer with the left button, as a touchscreen's pointer
-    /// emulation would. Further contacts are not delivered.
+    /// 触摸。合成的触摸屏设备才是这些触点该去的地方：合成器拿到的是一个真正的
+    /// 多点设备，触点有几个就是几个，双指滚动、捏合、手势和触摸面积都是真的，
+    /// 而不是把一个触点翻成鼠标左键。拿不到设备时（X Test 后端）才退回单指模拟。
     fn touch(&mut self, kind: u8, points: &[super::wire::Point]) -> Result<()> {
+        if self.deliver_touch(kind, points)? {
+            return Ok(());
+        }
         if kind == 1 || kind >= 3 {
             if self.touch.take().is_some() {
                 self.button(1, false)?;
@@ -262,6 +265,29 @@ impl Engine {
         }
         Ok(())
     }
+    /// 把触点交给触摸屏设备。返回 false 表示这一帧没走成设备，调用方退回模拟。
+    fn deliver_touch(&mut self, kind: u8, points: &[super::wire::Point]) -> Result<bool> {
+        let (rotation, width) = match self.geometry.screen(None) {
+            Ok(screen) => (screen.rotation, f64::from(screen.width).max(1.0)),
+            // 连目标屏都查不到，也就没有「屏幕比例」可换算了。交给下面那条老路：
+            // 它本来就会为移动报错，而抬手指那一帧仍然能照常收尾。
+            Err(_) => return Ok(false),
+        };
+        let touches = points
+            .iter()
+            .map(|point| native::Touch {
+                id: point.id,
+                x: point.x as f32,
+                y: point.y as f32,
+                // 接触面积。协议给的是像素半径，触摸屏的量程是屏幕比例，所以按
+                // 屏幕宽度换算；旋转过的屏上两条轴的半径混在了一起，取平均，
+                // 这个值只影响合成器和应用看到的触摸大小。
+                radius: (((point.radius_x + point.radius_y) / 2.0) / width) as f32,
+            })
+            .collect::<Vec<_>>();
+        self.injector.touch(kind, &touches, rotation)
+    }
+
     fn chord(&mut self, keys: &[u16], permitted: &impl Fn() -> bool) -> Result<()> {
         for &key in keys {
             ensure!(permitted(), "快捷输入已撤销");
@@ -406,6 +432,10 @@ impl Engine {
                 failure = Some(e);
             }
         }
+        // 触摸屏上的触点也要抬起来，否则合成器会一直以为有一根手指按着。
+        if let Err(e) = self.injector.release_touch() {
+            failure = Some(e);
+        }
         self.touch = None;
         self.wheel = [0; 2];
         self.interruptible = false;
@@ -509,6 +539,7 @@ mod tests {
             top,
             width,
             height,
+            rotation: crate::platform::Rotation::default(),
         }
     }
 
@@ -525,6 +556,7 @@ mod tests {
                 right: o.left + o.width as i32,
                 bottom: o.top + o.height as i32,
             }),
+            rotation: logical.map_or_else(Default::default, |o| o.rotation),
         }
     }
 

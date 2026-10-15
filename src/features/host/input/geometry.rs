@@ -24,6 +24,11 @@ pub(crate) struct Screen {
     /// is the compositor.
     #[serde(default)]
     pub logical: Option<Rect>,
+    /// How far the compositor has turned this panel. A touchscreen reports its
+    /// own panel's coordinates and the compositor rotates them into the screen,
+    /// so a touch has to be turned back; nothing else names a panel position.
+    #[serde(default)]
+    pub rotation: crate::platform::Rotation,
 }
 impl Screen {
     pub fn rect(&self) -> Result<Rect> {
