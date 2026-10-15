@@ -44,6 +44,10 @@ fn now_ms() -> u32 {
 const SIDE: i32 = 512;
 /// 一直没等到拖放就安静收工。整体超时由 `tick` 管（30 秒），这里不必等那么久。
 const LIMIT: Duration = Duration::from_secs(20);
+/// 摆好之后等合成器把拖放交过来。指针底下换了 surface 就会重新判定一次，正常一个
+/// roundtrip 就到；等不到就是这台合成器不吃这一套，和 X11 那条一样趁早报
+/// `Unavailable`（对齐 `portal.rs` 的 `CAPTURE_WAIT`）。
+const ENTER_WAIT: Duration = Duration::from_millis(600);
 /// 接住之后还要等原来那次拖动收场，等不到也最多等这么久：主控那头等的是这一句
 /// （见 `run` 末尾），一直不吭声它就一直卡在「正在准备文件」。
 const RELEASE: Duration = Duration::from_secs(2);
@@ -75,10 +79,11 @@ impl Catcher {
         std::thread::Builder::new()
             .name("Wayland drag catch".into())
             .spawn(move || {
-                // 失败不报给状态机：X11 那条还在跑，这里一次摆设不成功不该把整个
-                // 拖放判死。真的一直没结果，`tick` 的超时会收场。
+                // 这是 Wayland 会话里唯一的一条路，接取不了必须让主控知道原因：一声
+                // 不吭地收工，主控只会等 3 秒看门狗然后显示一句「取消了」。`notify`
+                // 走的是 `Command::Portal`，对已经结束的条目会被忽略。
                 if let Err(error) = run(&device, &ending, &allowed, &notify) {
-                    tracing::debug!(error = format!("{error:#}"), "Wayland 拖放接取失败");
+                    notify(Event::Failed(format!("{error:#}")));
                 }
             })?;
         Ok(Self { stop })
@@ -153,10 +158,10 @@ fn run(
             .compositor
             .clone()
             .context("合成器没有 wl_compositor")?,
-        state
-            .layer
-            .clone()
-            .context("合成器没有 zwlr_layer_shell_v1")?,
+        // 缺 layer-shell 的合成器上这条路走不通，得让主控看到原因，不能一声不吭。
+        state.layer.clone().context(
+            "这个合成器不提供 wlr-layer-shell（GNOME 就是这样），没法在指针底下接取拖放",
+        )?,
         state.shm.clone().context("合成器没有 wl_shm")?,
         state.seat.clone().context("合成器没有 wl_seat")?,
         state
@@ -172,7 +177,7 @@ fn run(
     let xdg = state
         .xdg
         .clone()
-        .context("合成器没有 zxdg_output_manager_v1")?;
+        .context("合成器没有 zxdg_output_manager_v1，读不到屏幕的逻辑尺寸")?;
     state.described = state
         .outputs
         .iter()
@@ -243,13 +248,28 @@ fn run(
     // 之后被控端的指针就不动了——中途摆出来的 surface 于是永远收不到 `enter`。
     // X11 那条路（`portal.rs`）同样为此用 XTEST 推一下指针。顺便这也把光标从屏幕
     // 边缘挪开：按着键停在边缘会触发 niri 的边缘手势。
-    move_pointer(
-        &mut state,
-        &handle,
-        &connection,
-        local,
-        (logical, (logical_width, logical_height)),
-    );
+    move_pointer(&mut state, &handle, &connection, local, (logical, (logical_width, logical_height)));
+
+    // 推完指针等合成器把这次拖放交过来：`enter` 到不了就没戏了，趁早收工，别让主控
+    // 干等 3 秒看门狗（那时界面上只会有一句没头没脑的「取消了」）。和 X11 那条一样
+    // 报 `Unavailable`——也可能只是这次拖动本来就结束了。
+    let deadline = Instant::now() + ENTER_WAIT;
+    while !state.entered
+        && !state.closed
+        && !stop.load(Ordering::Acquire)
+        && allowed()
+        && Instant::now() < deadline
+    {
+        dispatch(&mut queue, &mut state, &connection)?;
+        wait(&mut queue, &mut state, &connection, POLL)?;
+    }
+    if !state.entered {
+        tracing::debug!(device, "合成器没有把这次拖放交给摆出来的 surface");
+        shell.destroy();
+        surface.destroy();
+        notify(Event::Unavailable);
+        return Ok(());
+    }
 
     let deadline = Instant::now() + LIMIT;
     while state.paths.is_none()
