@@ -58,6 +58,10 @@ const MAX_SESSIONS: usize = 16;
 /// matching the limit keeps the two in agreement instead of failing at the
 /// client after the server already accepted it.
 const MAX_NAME: usize = 64;
+/// Output kept per shell so a reattach can replay the screen the controller
+/// last saw. The client keeps its own scrollback, so a screenful and a little
+/// history is enough.
+const SCROLLBACK_LIMIT: usize = 128 * 1024;
 
 /// Frame kinds, in the declaration order the shipped enum uses.
 ///
@@ -177,6 +181,9 @@ struct Session {
     state: SessionState,
     created_ms: i64,
     last_active_ms: i64,
+    /// Output the shell has produced, so a reattach can replay the screen the
+    /// controller last saw instead of showing it blank.
+    scrollback: Vec<u8>,
 }
 
 /// Owns every shell opened by the controller, keyed by the controller's handle.
@@ -213,12 +220,26 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+impl Session {
+    /// Records output for a later reattach, dropping the oldest bytes once the
+    /// limit is reached so a chatty shell cannot grow without bound.
+    fn push_scrollback(&mut self, data: &[u8]) {
+        self.scrollback.extend_from_slice(data);
+        if self.scrollback.len() > SCROLLBACK_LIMIT {
+            let excess = self.scrollback.len() - SCROLLBACK_LIMIT;
+            self.scrollback.drain(..excess);
+        }
+    }
+}
+
 impl Sessions {
-    /// Opens a shell and returns the handle it is reachable under plus its name.
+    /// Opens a shell and returns its handle, name, and any output to replay.
     ///
     /// The controller normally picks the handle, but its `open` frame may
     /// carry zero when it wants the host to allocate one; the returned handle
-    /// is what later `stdin`/`resize` frames must use.
+    /// is what later `stdin`/`resize` frames must use. Re-opening an existing
+    /// handle re-uses the shell and returns its scrollback, which is what the
+    /// controller redraws on reattach.
     pub(crate) fn open(
         &mut self,
         handle: u32,
@@ -226,19 +247,19 @@ impl Sessions {
         name: Option<String>,
         cols: u16,
         rows: u16,
-    ) -> Result<(u32, String), SessionError> {
+    ) -> Result<(u32, String, Vec<u8>), SessionError> {
         let handle = if handle == 0 {
             self.free_handle()
         } else {
             handle
         };
-        // Re-opening an existing handle happens on reconnect and on resize;
-        // replacing the pty would hang up a shell the controller is using.
+        // Re-opening an existing handle happens on reconnect and when the
+        // size changes; replacing the pty would hang up a shell in use.
         if let Some(existing) = self.sessions.get_mut(&handle) {
             existing.pty.resize(cols, rows).map_err(|_| SessionError::Gone)?;
             existing.state = SessionState::Running;
             existing.last_active_ms = now_ms();
-            return Ok((handle, existing.name.clone()));
+            return Ok((handle, existing.name.clone(), existing.scrollback.clone()));
         }
         if self.sessions.len() >= MAX_SESSIONS {
             return Err(SessionError::TooMany);
@@ -265,9 +286,10 @@ impl Sessions {
                 state: SessionState::Running,
                 created_ms: stamp,
                 last_active_ms: stamp,
+                scrollback: Vec::new(),
             },
         );
-        Ok((handle, name))
+        Ok((handle, name, Vec::new()))
     }
 
     /// The lowest handle no live session uses; the controller's handle space
@@ -382,11 +404,10 @@ impl Sessions {
             loop {
                 match session.pty.read(&mut buffer) {
                     Ok(Some(0)) | Err(_) => break,
-                    Ok(Some(read)) => out.push((
-                        *handle,
-                        FrameType::Stdout,
-                        buffer[..read].to_vec(),
-                    )),
+                    Ok(Some(read)) => {
+                        session.push_scrollback(&buffer[..read]);
+                        out.push((*handle, FrameType::Stdout, buffer[..read].to_vec()));
+                    }
                     Ok(None) => break,
                 }
             }
@@ -658,8 +679,8 @@ async fn handle_frame(
                 let mut sessions = sessions.lock().unwrap_or_else(|e| e.into_inner());
                 sessions.open(frame.session, &shell, name, cols.unwrap_or(80), rows.unwrap_or(24))
             };
-            let (payload, session) = match result {
-                Ok((handle, name)) => (
+            let (payload, session, replay) = match result {
+                Ok((handle, name, replay)) => (
                     json!({
                         // The client reads `code`/`message` and a session id;
                         // the exact spelling of the id key is not certain, so
@@ -675,6 +696,7 @@ async fn handle_frame(
                         "shell": shell,
                     }),
                     handle,
+                    replay,
                 ),
                 Err(error) => (
                     json!({
@@ -683,6 +705,7 @@ async fn handle_frame(
                         "session_id": frame.session,
                     }),
                     frame.session,
+                    Vec::new(),
                 ),
             };
             outgoing.push((
@@ -690,6 +713,15 @@ async fn handle_frame(
                 session,
                 serde_json::to_vec(&payload).unwrap_or_default(),
             ));
+            if !replay.is_empty() {
+                // Redraw what the screen last held. Clearing first stops a
+                // reattach from appending the history to what is already
+                // there.
+                let mut redraw = Vec::with_capacity(replay.len() + 12);
+                redraw.extend_from_slice(b"\x1b[2J\x1b[3J\x1b[H");
+                redraw.extend_from_slice(&replay);
+                outgoing.push((FrameType::Stdout, session, redraw));
+            }
         }
         FrameType::Stdin => {
             let state = screens.lock().await;
@@ -884,6 +916,33 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         panic!("shell produced: {:?}", String::from_utf8_lossy(&seen));
+    }
+
+    #[test]
+    fn a_reattach_replays_the_screen() {
+        let mut sessions = Sessions::default();
+        let (handle, _, replay) = sessions.open(0, shell(), None, 80, 24).expect("open");
+        assert!(replay.is_empty(), "a fresh session has nothing to replay");
+        sessions.write(handle, b"echo HISTORY\n").expect("write");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            let output: Vec<u8> = sessions
+                .pump()
+                .into_iter()
+                .filter(|(_, kind, _)| *kind == FrameType::Stdout)
+                .flat_map(|(_, _, payload)| payload)
+                .collect();
+            if String::from_utf8_lossy(&output).contains("HISTORY") {
+                break;
+            }
+        }
+        let (again, _, replay) = sessions.open(handle, shell(), None, 100, 40).expect("open");
+        assert_eq!(again, handle, "reattach keeps the same shell");
+        assert!(
+            String::from_utf8_lossy(&replay).contains("HISTORY"),
+            "reattach replays the screen: {:?}",
+            String::from_utf8_lossy(&replay)
+        );
     }
 
     #[test]

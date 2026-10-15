@@ -57,6 +57,14 @@ impl Session {
         let slave_raw = slave.as_raw_fd();
 
         let mut command = Command::new(shell);
+        // The service environment carries no terminal type, and curses
+        // programs (`top`, `less`, `vi`) refuse to start without one. The
+        // reference server sets the same pair before forking the pty.
+        command.env("TERM", "xterm-256color");
+        command.env("COLORTERM", "truecolor");
+        if std::env::var_os("LANG").is_none() {
+            command.env("LANG", "C.UTF-8");
+        }
         // The child gets the slave as its three standard streams; the parent
         // keeps the master. stdin/out/err start null so that a failure before
         // the dup2 calls cannot leave the child writing to our own terminal.
