@@ -2,13 +2,18 @@
 //!
 //! X11 那条路是 `portal.rs`（一个临时 XDND 交接窗口）。Wayland 上不需要「合成
 //! 一个 drop」——那也做不到，drop 只有合成器能投递。要的东西其实更简单：**我们
-//! 自己当那个合法的 drop target**。拖放本来就是合成器按指针位置投递给指针底下
-//! 那个客户端的；我们只要在那时候是那个客户端就行。所以这里一个事件都不合成，
-//! 只是在指针底下摆一块我们自己的 surface 等着被投递。
+//! 自己当那个合法的 drop target**。拖放本来就是合成器按指针位置投递给指针底下那
+//! 个客户端的，我们只要在那时候是那个客户端就行。
 //!
-//! 和 X11 那条并存：两个世界的拖放互相看不见（XWayland 不会把 XDND 拖拽桥接给
-//! Wayland 客户端，反过来也一样），谁先接住算谁的，所以两边一起摆。
-use super::{portal::Event, xdnd};
+//! 一个输入事件都不合成。被控这边的指针本来就停在拖动点上（那个点主控随 `Probe`
+//! 一起给了），所以只要把这块透明的 layer surface 摆到拖动点上去，指针就在它里
+//! 面，合成器下一轮判定就会把这次拖放交给它——niri 与 wlroots 系（sway、labwc）
+//! 都会在「指针底下的 surface 换了」时重新判定一次，不必再去推指针。
+//!
+//! 和 X11 那条并存但只走一条（会话类型说了算，见 `features/drag_drop/mod.rs`）：
+//! 两个世界的拖放互相看不见（XWayland 不会把 XDND 拖拽桥接给 Wayland 客户端，
+//! 反过来也一样）。
+use super::{Position, portal::Event, xdnd};
 use anyhow::{Context as _, Result, bail};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::path::PathBuf;
@@ -24,19 +29,6 @@ use wayland_client::protocol::{
 use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle};
 use wayland_protocols::xdg::xdg_output::zv1::client::{zxdg_output_manager_v1, zxdg_output_v1};
 use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
-use wayland_protocols_wlr::virtual_pointer::v1::client::{
-    zwlr_virtual_pointer_manager_v1, zwlr_virtual_pointer_v1,
-};
-
-/// 挪指针时用的时间戳。协议只要求单调，用进程自己的时钟就行。
-fn now_ms() -> u32 {
-    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
-    START
-        .get_or_init(Instant::now)
-        .elapsed()
-        .as_millis()
-        .min(u128::from(u32::MAX)) as u32
-}
 
 /// 接取用的方形 surface 边长，以指针为中心。用户拖着东西在动，指针每动一次合成器
 /// 就重新判定一次指针底下是谁，所以只要他还在这块里就一定会交给我们；开这么大是
@@ -67,9 +59,12 @@ pub(crate) struct Catcher {
     stop: Arc<AtomicBool>,
 }
 impl Catcher {
-    /// 摆在这块屏的正中，并且把指针也挪过去（见 `run` 里那段说明）。
+    /// 摆到 `point` 上：这块屏内的像素坐标，和采集那边（`screen_position`）同一套。
+    /// `size` 是这块屏在同一套坐标里的尺寸，用来把点换算成合成器的逻辑坐标。
     pub fn start(
         device: &str,
+        size: (u32, u32),
+        point: Position,
         allowed: Arc<dyn Fn() -> bool + Send + Sync>,
         notify: Arc<dyn Fn(Event) + Send + Sync>,
     ) -> Result<Self> {
@@ -82,7 +77,7 @@ impl Catcher {
                 // 这是 Wayland 会话里唯一的一条路，接取不了必须让主控知道原因：一声
                 // 不吭地收工，主控只会等 3 秒看门狗然后显示一句「取消了」。`notify`
                 // 走的是 `Command::Portal`，对已经结束的条目会被忽略。
-                if let Err(error) = run(&device, &ending, &allowed, &notify) {
+                if let Err(error) = run(&device, size, point, &ending, &allowed, &notify) {
                     notify(Event::Failed(format!("{error:#}")));
                 }
             })?;
@@ -105,10 +100,9 @@ struct State {
     xdg: Option<zxdg_output_manager_v1::ZxdgOutputManagerV1>,
     /// 每块屏的 xdg-output，顺序和 `outputs` 一致。要一直拿着，丢了就收不到尺寸。
     described: Vec<zxdg_output_v1::ZxdgOutputV1>,
-    /// 每块屏的逻辑位置与尺寸，顺序同上。`layer_shell` 的边距按逻辑算，而虚拟指针
-    /// 的绝对位置要按整个布局的比例给——两样都得知道这些数才算得对。
+    /// 每块屏的逻辑位置与尺寸，顺序同上。`layer_shell` 的边距按逻辑算，采集给的
+    /// 拖动点按物理算，两边差着一个缩放。
     logical: Vec<Option<((i32, i32), (i32, i32))>>,
-    pointer: Option<zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1>,
     /// 合成器的输出，以及它们报上来的名字（名字要等绑定之后再走一轮才到）。
     outputs: Vec<(wl_output::WlOutput, String)>,
     /// 这次拖放带的 offer，以及它报出来的类型。
@@ -128,8 +122,26 @@ struct State {
     closed: bool,
 }
 
+/// 拖动点（这块屏内的像素坐标）换算成合成器那边的逻辑坐标：`size` 是采集报的屏幕
+/// 尺寸，`logical` 是 `xdg-output` 报的逻辑尺寸，两者差着一个缩放。
+///
+/// 转过 90 度的屏不用特殊处理：这两个尺寸是同一块屏的两种度量，都还是「用户看着的
+/// 那个方向」，轴对轴各按自己的比例缩放就够了（DP-3 那种 2560x1600、1.6 倍、转 90
+/// 度的屏上，1600x2560 对 1000x1600，两个轴的比例都是 0.625）。
+fn logical_point(point: Position, size: (u32, u32), logical: (i32, i32)) -> (i32, i32) {
+    let axis = |at: i32, physical: u32, logical: i32| {
+        (f64::from(at) * f64::from(logical) / f64::from(physical.max(1))).round() as i32
+    };
+    (
+        axis(point.x, size.0, logical.0),
+        axis(point.y, size.1, logical.1),
+    )
+}
+
 fn run(
     device: &str,
+    size: (u32, u32),
+    point: Position,
     stop: &AtomicBool,
     allowed: &Arc<dyn Fn() -> bool + Send + Sync>,
     notify: &Arc<dyn Fn(Event) + Send + Sync>,
@@ -147,33 +159,31 @@ fn run(
         .roundtrip(&mut state)
         .context("读取 Wayland 输出描述失败")?;
 
-    let (target, compositor, layer, shm, seat, manager) = (
-        state
-            .outputs
-            .iter()
-            .find(|(_, name)| name == device)
-            .map(|(output, _)| output.clone())
-            .with_context(|| format!("合成器没有名为 {device} 的输出"))?,
-        state
-            .compositor
-            .clone()
-            .context("合成器没有 wl_compositor")?,
-        // 缺 layer-shell 的合成器上这条路走不通，得让主控看到原因，不能一声不吭。
-        state.layer.clone().context(
-            "这个合成器不提供 wlr-layer-shell（GNOME 就是这样），没法在指针底下接取拖放",
-        )?,
-        state.shm.clone().context("合成器没有 wl_shm")?,
-        state.seat.clone().context("合成器没有 wl_seat")?,
-        state
-            .manager
-            .clone()
-            .context("合成器没有 wl_data_device_manager")?,
-    );
+    let index = state
+        .outputs
+        .iter()
+        .position(|(_, name)| name == device)
+        .with_context(|| format!("合成器没有名为 {device} 的输出"))?;
+    let target = state.outputs[index].0.clone();
+    let compositor = state
+        .compositor
+        .clone()
+        .context("合成器没有 wl_compositor")?;
+    // 缺 layer-shell 的合成器上这条路走不通，得让主控看到原因，不能一声不吭。
+    let layer = state
+        .layer
+        .clone()
+        .context("这个合成器不提供 wlr-layer-shell（GNOME 就是这样），没法在指针底下接取拖放")?;
+    let shm = state.shm.clone().context("合成器没有 wl_shm")?;
+    let seat = state.seat.clone().context("合成器没有 wl_seat")?;
+    let manager = state
+        .manager
+        .clone()
+        .context("合成器没有 wl_data_device_manager")?;
 
-    // 逻辑坐标只能问 xdg-output：`wl_output` 给的永远是物理尺寸，两者之间差着一个
-    // 缩放（本机 DP-1 是 1.35 倍、DP-3 是 1.6 倍），而 layer surface 的边距和虚拟
-    // 指针的位置都是按逻辑算的。每块屏都要问：虚拟指针的位置是按**整个布局**的比例
-    // 给的，只知道目标屏多大是换算不出来的。
+    // 逻辑坐标只能问 xdg-output：`wl_output` 给的是物理尺寸，两者之间差着一个缩放
+    // （本机 DP-1 是 1.35 倍、DP-3 是 1.6 倍），而 layer surface 的边距是按逻辑算
+    // 的。采集那边报的屏幕尺寸和拖动点都在物理这边，两个一除就是缩放。
     let xdg = state
         .xdg
         .clone()
@@ -184,21 +194,20 @@ fn run(
         .map(|(output, _)| xdg.get_xdg_output(output, &handle, ()))
         .collect();
     state.logical = vec![None; state.outputs.len()];
+    // 只等目标屏：别的屏的逻辑尺寸跟这块摆哪儿没有关系。
+    let known = |state: &State| {
+        state.logical[index].is_some_and(|(_, (width, height))| width > 0 && height > 0)
+    };
     let deadline = Instant::now() + SETUP;
-    while state.logical.iter().any(Option::is_none) && Instant::now() < deadline {
+    while !known(&state) && Instant::now() < deadline {
         dispatch(&mut queue, &mut state, &connection)?;
         wait(&mut queue, &mut state, &connection, POLL)?;
     }
-    let index = state
-        .outputs
-        .iter()
-        .position(|(bound, _)| bound == &target)
-        .context("目标输出不见了")?;
-    let (logical, (logical_width, logical_height)) =
-        state.logical[index].context("输出没有给出逻辑尺寸")?;
-    // 摆在这块屏的正中间，指针也挪过去。中间是最稳的地方：不会碰到别的层，
-    // 也离屏幕边缘最远。
-    let local = (logical_width / 2, logical_height / 2);
+    let (_, (logical_width, logical_height)) = state.logical[index]
+        .filter(|(_, (width, height))| *width > 0 && *height > 0)
+        .context("合成器没有给出这块屏的逻辑尺寸")?;
+
+    let local = logical_point(point, size, (logical_width, logical_height));
 
     let surface = compositor.create_surface(&handle, ());
     let shell = layer.get_layer_surface(
@@ -209,14 +218,16 @@ fn run(
         &handle,
         (),
     );
-    // 锚左上角加边距就是绝对定位：把这块方形摆在指针中心。
+    // 锚左上角加边距就是绝对定位：把这块方形摆在拖动点上，指针本来就在那儿。
+    // 贴边时往里收，别让这块露到屏幕外面去（收进来那点也还盖着这个点）。
+    let margin = |at: i32, total: i32| (at - SIDE / 2).clamp(0, (total - SIDE).max(0));
     shell.set_size(SIDE as u32, SIDE as u32);
     shell.set_anchor(zwlr_layer_surface_v1::Anchor::Top | zwlr_layer_surface_v1::Anchor::Left);
     shell.set_margin(
-        (local.1 - SIDE / 2).max(0),
+        margin(local.1, logical_height),
         0,
         0,
-        (local.0 - SIDE / 2).max(0),
+        margin(local.0, logical_width),
     );
     // 不占键盘焦点，也绝不参与布局：`-1` 就是「别把这块算进排布里」，否则
     // niri 会为了它把底下的窗口挤走。
@@ -242,17 +253,11 @@ fn run(
 
     let data = manager.get_data_device(&seat, &handle, ());
     state.device = Some(data);
-    // 把光标挪到这块 surface 中间。
-    //
-    // 合成器只在收到 motion 事件时才会重新判定指针底下是谁，而用户把指针拖出窗口
-    // 之后被控端的指针就不动了——中途摆出来的 surface 于是永远收不到 `enter`。
-    // X11 那条路（`portal.rs`）同样为此用 XTEST 推一下指针。顺便这也把光标从屏幕
-    // 边缘挪开：按着键停在边缘会触发 niri 的边缘手势。
-    move_pointer(&mut state, &handle, &connection, local, (logical, (logical_width, logical_height)));
 
-    // 推完指针等合成器把这次拖放交过来：`enter` 到不了就没戏了，趁早收工，别让主控
-    // 干等 3 秒看门狗（那时界面上只会有一句没头没脑的「取消了」）。和 X11 那条一样
-    // 报 `Unavailable`——也可能只是这次拖动本来就结束了。
+    // 摆好了就等合成器把这次拖放交过来。这一步就是全部：不必再推指针，指针底下
+    // 换了 surface，合成器会重新判定一次（niri 与 wlroots 系都如此，PR 里有实测）。
+    // 等不到就当这条路在这台合成器上走不通，和 X11 那条一样报 `Unavailable` 收工
+    // ——别在这里说「失败」：也可能只是这次拖动本来就结束了。
     let deadline = Instant::now() + ENTER_WAIT;
     while !state.entered
         && !state.closed
@@ -330,51 +335,6 @@ fn run(
         notify(Event::Released);
     }
     Ok(())
-}
-
-/// 用虚拟指针把光标挪到目标屏的正中（`local` 是这块屏内的逻辑坐标）。
-///
-/// 位置要按**整个布局**的比例给：`motion_absolute` 的 x/y 取值范围是 0..extent，
-/// 合成器再按布局的宽高换算，所以 extent 要给整个布局的包围盒，而不是这一块屏的。
-fn move_pointer(
-    state: &mut State,
-    handle: &QueueHandle<State>,
-    connection: &Connection,
-    local: (i32, i32),
-    target: ((i32, i32), (i32, i32)),
-) {
-    let Some(manager) = state.pointer.as_ref() else {
-        tracing::debug!("合成器没有 zwlr_virtual_pointer_manager_v1，指针不会挪");
-        return;
-    };
-    let Some(seat) = state.seat.as_ref() else {
-        return;
-    };
-    // 布局的包围盒：所有输出的逻辑矩形并起来。
-    let (mut left, mut top, mut right, mut bottom) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
-    for entry in state.logical.iter().flatten() {
-        let ((x, y), (width, height)) = *entry;
-        left = left.min(x);
-        top = top.min(y);
-        right = right.max(x + width);
-        bottom = bottom.max(y + height);
-    }
-    if left >= right || top >= bottom {
-        return;
-    }
-    let ((origin_x, origin_y), _) = target;
-    let (x, y) = (origin_x + local.0 - left, origin_y + local.1 - top);
-    let pointer = manager.create_virtual_pointer(Some(seat), handle, ());
-    pointer.motion_absolute(
-        now_ms(),
-        x.max(0) as u32,
-        y.max(0) as u32,
-        (right - left) as u32,
-        (bottom - top) as u32,
-    );
-    // 这一版协议的 `frame` 不带时间戳。
-    pointer.frame();
-    let _ = connection.flush();
 }
 
 /// 读一遍待处理事件。
@@ -594,17 +554,6 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                     ),
                 )
             }
-            "zwlr_virtual_pointer_manager_v1" => {
-                state.pointer = Some(
-                    registry
-                        .bind::<zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1, _, _>(
-                            name,
-                            version.min(2),
-                            handle,
-                            (),
-                        ),
-                )
-            }
             "zxdg_output_manager_v1" => {
                 state.xdg = Some(
                     registry.bind::<zxdg_output_manager_v1::ZxdgOutputManagerV1, _, _>(
@@ -769,6 +718,19 @@ mod tests {
     /// 要的只是一个 `QueueHandle`，它只要求一条连接、不要求对面坐着合成器。所以
     /// 用一对 unix socket 自己喂一条连接进去：CI 和 Xorg 会话里没有 Wayland 显示，
     /// `connect_to_env` 会直接失败，而这条测试不该只在有合成器的机器上跑得起来。
+    /// 拖动点的换算：这块屏是本机 DP-3 那样转过 90 度、1.6 倍缩放的，采集那边报
+    /// 1600x2560，合成器报逻辑 1000x1600。
+    #[test]
+    fn the_drag_point_scales_with_the_output() {
+        let point = Position { x: 800, y: 1280 };
+        assert_eq!(logical_point(point, (1600, 2560), (1000, 1600)), (500, 800));
+        // 没缩放的屏原样过去。
+        assert_eq!(
+            logical_point(point, (1600, 2560), (1600, 2560)),
+            (800, 1280)
+        );
+    }
+
     #[test]
     fn data_offer_has_a_child_specialization() {
         let (ours, _theirs) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -782,8 +744,6 @@ mod tests {
 }
 
 wayland_client::delegate_noop!(State: ignore zxdg_output_manager_v1::ZxdgOutputManagerV1);
-wayland_client::delegate_noop!(State: ignore zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1);
-wayland_client::delegate_noop!(State: ignore zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1);
 wayland_client::delegate_noop!(State: ignore wl_compositor::WlCompositor);
 wayland_client::delegate_noop!(State: ignore wl_shm::WlShm);
 wayland_client::delegate_noop!(State: ignore wl_shm_pool::WlShmPool);

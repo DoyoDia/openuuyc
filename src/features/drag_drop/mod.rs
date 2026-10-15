@@ -1379,9 +1379,20 @@ impl Actor {
                 // （`xdnd::connect`），问题是它拒绝的方式是报错——那会直接把整次
                 // 拖放判死，另一条路连机会都没有。
                 if crate::platform::capture::wayland_session() {
-                    // 摆在哪、指针挪到哪，都由平台那边按逻辑坐标自己算：采集给的
-                    // 是物理像素，两边差着一个缩放，传过去只会算错。
-                    match native::Catcher::start(&screen.device_name, guard, notify) {
+                    // 摆到拖动点上：接取者按这个点自己换算成合成器的逻辑坐标。
+                    // 采集给的是物理像素（`screen_position` 那套），换算要这块屏的
+                    // 逻辑尺寸，只有平台那边问得到。
+                    let local = native::Position {
+                        x: position.x - screen.left,
+                        y: position.y - screen.top,
+                    };
+                    match native::Catcher::start(
+                        &screen.device_name,
+                        (screen.width, screen.height),
+                        local,
+                        guard,
+                        notify,
+                    ) {
                         Ok(catcher) => entry.catch = Some(catcher),
                         // 起不来只是少一条路，不该让整个拖放失败：真没结果的话
                         // `tick` 的超时会收场。

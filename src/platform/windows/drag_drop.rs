@@ -107,6 +107,8 @@ pub(crate) struct Catcher;
 impl Catcher {
     pub fn start(
         _device: &str,
+        _size: (u32, u32),
+        _point: Position,
         _allowed: Arc<dyn Fn() -> bool + Send + Sync>,
         _notify: Arc<dyn Fn(portal::Event) + Send + Sync>,
     ) -> Result<Self> {
