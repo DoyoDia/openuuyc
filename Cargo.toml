@@ -193,6 +193,7 @@ wl-clipboard-rs = { version = "0.9", default-features = false }
 # Wayland 文本输入：zwp_virtual_keyboard 允许自带 keymap，能输入键位表里没有的字符
 # （中文等）。XTest 只能影响 XWayland 客户端，uinput 又无法携带 keymap。
 wayland-client = { version = "0.31", default-features = false }
+wayland-protocols = { version = "0.32", default-features = false, features = ["client", "unstable"] }
 wayland-protocols-misc = { version = "0.3", default-features = false, features = ["client"] }
 libc = "0.2"
 fuser = { version = "0.15", default-features = false }

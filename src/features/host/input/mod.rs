@@ -26,7 +26,7 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
-pub(crate) use geometry::{Geometry, Screen};
+pub(crate) use geometry::{Geometry, Rect, Screen};
 
 // Drain only already queued movement. No batching timer, no summed relative
 // deltas, and no reordering across a key/button/contact boundary.

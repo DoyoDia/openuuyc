@@ -8,8 +8,18 @@ use display_info::DisplayInfo;
 pub(crate) mod recovery;
 pub(crate) mod topology;
 pub(crate) mod virtual_driver;
+pub(crate) mod wayland;
 
 pub(crate) use crate::media::capture::source_id;
+
+/// The compositor's own layout, when there is one to describe it.
+///
+/// Never waits: a watcher thread follows the compositor and this returns its
+/// latest snapshot (see [`wayland`]). Without one the caller keeps the display
+/// server's rectangles, which is what it would use anyway.
+pub(crate) fn compositor_layout() -> Option<std::sync::Arc<crate::platform::CompositorLayout>> {
+    wayland::layout()
+}
 
 pub fn detect_local_display() -> Result<LocalDisplayInfo> {
     let displays = DisplayInfo::all().context("failed to enumerate local displays")?;
