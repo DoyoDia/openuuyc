@@ -207,7 +207,10 @@ impl Transport {
         bounds: super::parameters::Bounds,
         policy: super::network::Policy,
     ) -> Self {
-        let rate = bounds.initial;
+        // 还没选路，所以起步速率按保守值走；选中直连以后 route_changed 会按证据
+        // 把它抬上去。pacer 的速率只在有欠账时单调上升（见 emit 路径的 .max），
+        // 所以宁可先低：低不会卡住，高会。
+        let rate = super::parameters::startup(bounds, super::parameters::LinkEvidence::default());
         let connection = Arc::new(Network {
             pacer: tokio::sync::Mutex::new(Pacer {
                 at: Instant::now(),
@@ -221,7 +224,10 @@ impl Transport {
             cancel,
             lease,
             feedback_wake: tokio::sync::Notify::new(),
-            controller: Mutex::new(super::congestion::Controller::new(bounds)),
+            controller: Mutex::new(super::congestion::Controller::new(
+                bounds,
+                super::parameters::LinkEvidence::default(),
+            )),
             queued: AtomicU64::new(0),
             network: AtomicBool::new(false),
             egress: tokio::sync::Mutex::new(()),
@@ -329,7 +335,17 @@ impl Transport {
         let bounds = super::allocation::total(&allocations);
         drop(allocations);
         if bounds.maximum > 0 {
-            lock(&self.0.controller).configure(bounds, false);
+            let link = self.link();
+            lock(&self.0.controller).configure(bounds, false, link);
+        }
+    }
+    /// 起步速率能用的链路证据：选中的路由 + 量到的 RTT + 当前估计的丢包。
+    fn link(&self) -> super::parameters::LinkEvidence {
+        let (relay, rtt) = lock(&self.0.automatic).evidence();
+        super::parameters::LinkEvidence {
+            relay,
+            rtt,
+            loss: lock(&self.0.controller).loss,
         }
     }
     pub(crate) fn configure(&self, bounds: super::parameters::Bounds) {
@@ -338,7 +354,8 @@ impl Transport {
             streams.insert(self.0.index, bounds);
             super::allocation::total(&streams)
         };
-        lock(&self.0.controller).configure(bounds, true);
+        let link = self.link();
+        lock(&self.0.controller).configure(bounds, true, link);
     }
     fn allocation(&self, target: u32, view: super::allocation::View) -> u32 {
         super::allocation::share(&lock(&self.0.allocations), self.0.index, target, view)
@@ -353,7 +370,8 @@ impl Transport {
             super::allocation::total(&streams)
         };
         if bounds.maximum > 0 {
-            lock(&self.0.controller).configure(bounds, false);
+            let link = self.link();
+            lock(&self.0.controller).configure(bounds, false, link);
         }
         self.invalidate();
     }
@@ -488,7 +506,8 @@ impl Transport {
         self.0.feedback_wake.notify_waiters();
     }
     pub(crate) fn route_changed(&self) {
-        lock(&self.0.controller).route_changed();
+        let link = self.link();
+        lock(&self.0.controller).route_changed(link);
         lock(&self.0.automatic).reset_samples();
         for stream in self.streams() {
             lock(&stream.0.budget).reset(true);

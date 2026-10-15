@@ -46,7 +46,7 @@ struct Tracked {
 }
 
 impl Controller {
-    pub fn new(bounds: super::parameters::Bounds) -> Self {
+    pub fn new(bounds: super::parameters::Bounds, link: super::parameters::LinkEvidence) -> Self {
         let maximum = bounds.network_maximum();
         let mut field_trials = FieldTrials::default();
         // T541A30 defaults robust estimator OFF in this UU SDK.
@@ -74,10 +74,18 @@ impl Controller {
         field_trials.loss_based_control.enabled = false;
         field_trials.loss_based_bwe_v2.enabled = false;
         let at = Timestamp::from_micros(1_000_000);
+        let start = super::parameters::startup(bounds, link);
+        tracing::info!(
+            maximum_bps = maximum,
+            startup_bps = start,
+            link_relay = ?link.relay,
+            link_rtt_ms = link.rtt.map(|rtt| rtt.as_secs_f64() * 1000.),
+            "host congestion controller created"
+        );
         let core = GoogCcNetworkController::new(
             NetworkControllerConfig {
                 field_trials,
-                constraints: constraints(at, maximum, Some(bounds.initial)),
+                constraints: constraints(at, maximum, Some(start)),
                 stream_based_config: StreamsConfig {
                     at_time: at,
                     pacing_factor: Some(1.6),
@@ -107,8 +115,8 @@ impl Controller {
             available: false,
             generation: 0,
             route_at: at,
-            target: bounds.initial,
-            pacing: bounds.initial.saturating_mul(16) / 10,
+            target: start,
+            pacing: start.saturating_mul(16) / 10,
             loss: 0.0,
             rtt: TimeDelta::from_millis(50),
             cwnd: usize::MAX,
@@ -195,12 +203,22 @@ impl Controller {
             self.probes.clear();
         }
     }
-    pub fn route_changed(&mut self) {
+    pub fn route_changed(&mut self, link: super::parameters::LinkEvidence) {
         self.generation = self.generation.wrapping_add(1);
         self.route_at = self.now();
+        // 选路之后才知道是不是中继，所以起步速率在这里按证据重算一次：直连才
+        // 允许抬到 STARTUP_CEILING，中继/高 RTT/丢包仍然从 3 Mbps 起步。
+        let start = super::parameters::startup(self.bounds, link);
+        tracing::info!(
+            startup_bps = start,
+            relay = ?link.relay,
+            rtt_ms = link.rtt.map(|rtt| rtt.as_secs_f64() * 1000.),
+            loss = link.loss,
+            "host startup rate follows the selected route"
+        );
         let update = self.core.on_network_route_change(NetworkRouteChange {
             at_time: self.now(),
-            constraints: constraints(self.now(), self.maximum, Some(self.bounds.initial)),
+            constraints: constraints(self.now(), self.maximum, Some(start)),
         });
         self.history.clear();
         self.flight = 0;
@@ -211,11 +229,17 @@ impl Controller {
         self.probes.clear();
         self.apply(update);
     }
-    pub fn configure(&mut self, bounds: super::parameters::Bounds, video: bool) {
+    pub fn configure(
+        &mut self,
+        bounds: super::parameters::Bounds,
+        video: bool,
+        link: super::parameters::LinkEvidence,
+    ) {
         // File/audio connections may attach their first video later. Seed that
         // first video once, but never treat a quality/FPS revision as a route
         // change: a starting_rate overwrites both live bandwidth estimators.
-        let start = (video && !self.video_configured).then_some(bounds.initial);
+        let start =
+            (video && !self.video_configured).then(|| super::parameters::startup(bounds, link));
         self.video_configured |= video;
         if bounds == self.bounds && start.is_none() {
             return;

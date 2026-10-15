@@ -586,8 +586,10 @@ impl Peer {
                     local_relay_protocol=%pair.local.relay_protocol,
                     remote_relay_protocol=%pair.remote.relay_protocol,
                     "host selected transport path");
-                route_transport.route_changed();
+                // 先记下这条路（中继/直连），起步速率要用它：route_changed 之后
+                // 再写就晚了，那一次 starting_rate 已经发出去了。
                 route_transport.selected_route(&pair);
+                route_transport.route_changed();
                 let transport = route_transport.clone();
                 Box::pin(async move {
                     let ip = if pair

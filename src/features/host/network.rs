@@ -72,6 +72,9 @@ pub(super) struct AutoSwitch {
     at: Option<Instant>,
     route: Option<(bool, bool)>,
     attempt: u8,
+    /// 起步速率的链路证据：选中的是不是中继，以及量到的 RTT。
+    relay: Option<bool>,
+    rtt: Option<Duration>,
 }
 impl AutoSwitch {
     pub fn attempt(&self) -> u8 {
@@ -84,6 +87,8 @@ impl AutoSwitch {
             at: None,
             route: None,
             attempt: 0,
+            relay: None,
+            rtt: None,
         }
     }
     pub fn quality(&mut self, index: usize, automatic: bool, quality: i32, settings_changed: bool) {
@@ -111,18 +116,27 @@ impl AutoSwitch {
         }
     }
     pub fn route(&mut self, pair: &RTCIceCandidatePair) {
+        let relay = pair.local.typ == RTCIceCandidateType::Relay
+            || pair.remote.typ == RTCIceCandidateType::Relay;
         self.route = Some((
-            pair.local.typ == RTCIceCandidateType::Relay
-                || pair.remote.typ == RTCIceCandidateType::Relay,
+            relay,
             pair.local.relay_protocol.eq_ignore_ascii_case("tls")
                 && pair.remote.relay_protocol.eq_ignore_ascii_case("tls"),
         ));
+        // 换路以后旧路的 RTT 不再是证据：起步速率只认当前这条路的实测。
+        self.relay = Some(relay);
+        self.rtt = None;
         self.reset_samples();
+    }
+    /// 起步速率能用的链路证据。选路之前 relay 是 None（未知），RTT 要等第一个反馈。
+    pub fn evidence(&self) -> (Option<bool>, Option<Duration>) {
+        (self.relay, self.rtt)
     }
     pub fn report(&mut self, index: usize, loss: u8, rtt: Duration) {
         // Late reports from paused/removed streams do not recreate observers.
         if let Some(stream) = self.streams.get_mut(&index) {
             stream.latest = Some((loss, rtt));
+            self.rtt = Some(rtt);
         }
     }
     pub fn tick(&mut self, connected: bool, now: Instant) -> Option<u8> {
