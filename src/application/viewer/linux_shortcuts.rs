@@ -96,6 +96,8 @@ struct State {
     /// until it answers. A compositor that asks the user first answers only
     /// after the user did; one that refuses never answers.
     active: Option<bool>,
+    /// The first grant is logged at info, later ones (each focus-in) at debug.
+    granted_once: bool,
 }
 
 impl Inhibitor {
@@ -151,12 +153,16 @@ impl Inhibitor {
         let _ = self.queue.dispatch_pending(&mut self.state);
         if self.state.active != previous {
             match self.state.active {
-                Some(true) => tracing::info!("the compositor holds its shortcuts back"),
-                // Sent when the user takes the shortcuts back with the
-                // compositor's escape shortcut. The inhibitor is left alone
-                // until the gate closes and reopens, so the user's choice
+                Some(true) if !self.state.granted_once => {
+                    self.state.granted_once = true;
+                    tracing::info!("the compositor holds its shortcuts back");
+                }
+                Some(true) => tracing::debug!("the compositor holds its shortcuts back"),
+                // Sent on focus loss, and when the user takes the shortcuts
+                // back with the compositor's escape shortcut. The inhibitor is
+                // left alone until the gate closes and reopens, so that choice
                 // stands.
-                Some(false) => tracing::info!("the compositor restored its own shortcuts"),
+                Some(false) => tracing::debug!("the compositor restored its own shortcuts"),
                 None => {}
             }
         }
