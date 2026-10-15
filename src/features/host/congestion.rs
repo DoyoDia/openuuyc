@@ -39,8 +39,14 @@ fn field_trials() -> FieldTrials {
         start_budget_level_ratio: 0.40,
         stop_budget_level_ratio: -0.60,
     };
-    // ALR 周期性探测的频率与步长暂时留在库默认（5 秒 / 2 倍）：这个旋钮直接
-    // 决定弱网下每次探测压进瓶颈多少数据，单独一个提交再打开，好单独评估。
+    // 共享桌面是彻底的 app-limited：一屏静止画面只要一两 Mbps，链路再空也测不出
+    // 来，估计值只能靠 ALR 探测往上走。libwebrtc 的默认值是按视频通话调的（ALR
+    // 偶尔出现、几分钟就过去），照搬过来就是实测到的那个台阶——500 Mbps 档要 90
+    // 秒才从 3 Mbps 爬到 100 Mbps。代价：每次探测往瓶颈后面压进
+    // (alr_scale - 1) × 当前估计 × min_probe_duration 的队列，这里是 3 秒一次。
+    // 真正定参数要靠 probes() 的实测日志，见那里的注释。
+    field_trials.probing_configuration.alr_interval = TimeDelta::from_seconds(3);
+    field_trials.probing_configuration.alr_scale = 4.0;
     field_trials.probing_configuration.probe_max_allocation = true;
     field_trials.min_alloc_as_lower_bound = false;
     field_trials.ignore_probes_lower_than_network_state_estimate = false;
@@ -663,5 +669,16 @@ mod tests {
             trials.alr_experiment_settings.pacing_factor,
             inert.pacing_factor
         );
+    }
+
+    #[test]
+    fn probing_configuration_is_the_one_that_is_read() {
+        let trials = field_trials();
+        assert_eq!(
+            trials.probing_configuration.alr_interval,
+            TimeDelta::from_seconds(3)
+        );
+        assert_eq!(trials.probing_configuration.alr_scale, 4.0);
+        assert_eq!(trials.probing_configuration.step_size, 2.0);
     }
 }
