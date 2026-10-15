@@ -403,6 +403,15 @@ pub(super) enum PbRpcResponsePayload {
     EnterSuperScreenRep(Vec<u8>),
     #[prost(message, tag = "23")]
     DrawResp(annotation::PbDrawResponse),
+    // `main.proto`'s oneof continues past the draw response. The matching
+    // requests (`TerminalCheck` = 28, `TerminalRename` = 29) are already
+    // declared, so without these two the host has no reply to encode for
+    // `terminal_check_env_req` / `terminal_rename_session_req`, and a client
+    // sees a component that never answers its environment check.
+    #[prost(bytes, tag = "24")]
+    TerminalCheckEnvRsp(Vec<u8>),
+    #[prost(bytes, tag = "25")]
+    TerminalRenameSessionRsp(Vec<u8>),
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
