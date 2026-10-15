@@ -189,7 +189,12 @@ pub(crate) async fn receive_session(
                         retry: u64,
                     }
                     let _ = CheckEnvReq::decode(bytes.as_slice())?;
-                    let allowed = session.authorization().terminal_allowed();
+                    // A platform without a terminal backend says so; otherwise
+                    // the answer is the host's permission.
+                    let refusal = crate::platform::terminal::UNSUPPORTED.or_else(|| {
+                        (!session.authorization().terminal_allowed()).then_some("本机未允许终端")
+                    });
+                    let allowed = refusal.is_none();
                     #[derive(Clone, PartialEq, prost::Message)]
                     struct CheckEnvResp {
                         #[prost(int32, tag = "1")]
@@ -202,11 +207,7 @@ pub(crate) async fn receive_session(
                     // than waiting for a reply that never comes.
                     let resp = CheckEnvResp {
                         code: if allowed { 0 } else { 1 },
-                        detail: if allowed {
-                            String::new()
-                        } else {
-                            "本机未允许终端".to_owned()
-                        },
+                        detail: refusal.unwrap_or_default().to_owned(),
                     };
                     tracing::info!(allowed, "host terminal environment check answered");
                     return Ok(response(

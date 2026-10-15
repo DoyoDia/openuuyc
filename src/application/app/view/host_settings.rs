@@ -62,6 +62,8 @@ impl DeviceCenterApp {
         let mut ports = host.port_mapping_allowed();
         let mut power = host.power_allowed();
         let mut wol = host.wol_allowed();
+        // Only where this platform can actually run a shell.
+        let terminal_supported = crate::platform::terminal::UNSUPPORTED.is_none();
         let mut terminal = host.terminal_allowed();
         let mut clipboard = host.clipboard_settings();
         let before = (files, ports, power, wol, terminal, clipboard);
@@ -70,12 +72,16 @@ impl DeviceCenterApp {
             + if guest {
                 0
             } else {
-                [files, ports, power, wol, terminal]
+                [files, ports, power, wol, terminal && terminal_supported]
                     .into_iter()
                     .filter(|v| *v)
                     .count()
             };
-        let total = if guest { 2 } else { 7 };
+        let total = if guest {
+            2
+        } else {
+            6 + usize::from(terminal_supported)
+        };
         let id = egui::Id::new(("host-access-settings", self.login_generation));
         let mut open = ui.data(|data| data.get_temp::<bool>(id).unwrap_or(false));
         form_row(
@@ -116,12 +122,14 @@ impl DeviceCenterApp {
                             ui.checkbox(&mut power, "关机和重启");
                             ui.checkbox(&mut ports, "端口转发");
                             ui.checkbox(&mut wol, "局域网唤醒协助");
-                            ui.checkbox(&mut terminal, "终端");
-                            ui.label(
-                                RichText::new("终端可让主控在本机运行命令")
-                                    .small()
-                                    .color(MUTED),
-                            );
+                            if terminal_supported {
+                                ui.checkbox(&mut terminal, "终端");
+                                ui.label(
+                                    RichText::new("终端可让主控在本机运行命令")
+                                        .small()
+                                        .color(MUTED),
+                                );
+                            }
                         }
                     });
                 });

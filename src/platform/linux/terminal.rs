@@ -26,6 +26,9 @@ use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+/// Linux can serve a terminal; Windows states why it cannot here.
+pub(crate) const UNSUPPORTED: Option<&str> = None;
+
 /// A shell running on a pty, with the master side owned by this process.
 pub(crate) struct Session {
     master: OwnedFd,

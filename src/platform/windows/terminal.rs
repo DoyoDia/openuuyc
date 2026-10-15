@@ -2,15 +2,20 @@
 //!
 //! UU's controllers can open a shell on the controlled machine (connection
 //! `kind = 8`); Linux runs it on a pty (`platform/linux/terminal.rs`). Windows
-//! has no backend yet: [`Session`] is uninhabited, so no session can ever
-//! exist, and opening one fails with a message the controller can show.
+//! has no backend yet, so this module states that honestly instead of
+//! pretending: [`UNSUPPORTED`] makes the host refuse terminal connections and
+//! the environment check and hides the permission switch, and [`Session`] is
+//! uninhabited, so no session can ever exist.
 //!
 //! This is a stopgap. The real backend is ConPTY (`CreatePseudoConsole`) with
-//! the same `Session` shape.
+//! the same `Session` shape, at which point `UNSUPPORTED` becomes `None`.
 
 use anyhow::{Result, anyhow};
 
 const MESSAGE: &str = "Windows 版暂不支持终端";
+
+/// Why this machine cannot serve a terminal; shown to the controller.
+pub(crate) const UNSUPPORTED: Option<&str> = Some(MESSAGE);
 
 /// A shell session. Windows cannot create one yet.
 pub(crate) enum Session {}
