@@ -12,7 +12,10 @@
 //! 交接窗口假装的，图由源程序自己画，没这一步。
 pub(crate) use crate::protocol::drag_drop::DragImage;
 use anyhow::{Context as _, Result, bail, ensure};
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
 
 /// 单张图的边长，跟 Windows 端 Shell 给的 64 对齐。
 const SIDE: u32 = 64;
@@ -22,6 +25,48 @@ const STACK: u32 = 80;
 const MAX_SOURCE: u32 = 4096;
 /// 位图图标至少要有这么大才值得用，再小放大出来是一团糊。
 const MIN_BITMAP: u32 = 48;
+/// 图标工具的超时。这两张图只是「拖起来好看一点」，而图标主题和文件都可能待在网络
+/// 盘或 FUSE 上：`gio` 一卡住，整次拖出就跟着卡在「正在准备文件」上（图是在发布
+/// 文件清单之前生成的）。超时就杀掉，当没有这张图。
+const TOOL_LIMIT: Duration = Duration::from_secs(2);
+
+/// 跑一个只看输出的子进程，把它的 stdout 拿回来；超过 `TOOL_LIMIT` 就杀掉它。
+fn capture(command: &mut std::process::Command, tool: &str) -> Result<Vec<u8>> {
+    use std::io::Read as _;
+    let mut child = command
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .with_context(|| format!("调用 {tool} 失败"))?;
+    // 边跑边读：等它退出了再读，输出填满管道时两边一起卡住。
+    let mut pipe = child.stdout.take().context("子进程没有标准输出")?;
+    let reader = std::thread::spawn(move || {
+        let mut data = Vec::new();
+        let _ = pipe.read_to_end(&mut data);
+        data
+    });
+    let deadline = Instant::now() + TOOL_LIMIT;
+    let mut over = false;
+    let status = loop {
+        if let Some(status) = child
+            .try_wait()
+            .with_context(|| format!("等待 {tool} 失败"))?
+        {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            over = true;
+            let _ = child.kill();
+            break child.wait().with_context(|| format!("回收 {tool} 失败"))?;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let data = reader.join().unwrap_or_default();
+    ensure!(!over, "{tool} 没有在时限内给出结果");
+    ensure!(status.success(), "{tool} 没能给出结果");
+    Ok(data)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Identity {
@@ -88,13 +133,12 @@ fn preview(path: &Path) -> Option<DragImage> {
 /// 这个文件算哪几类图标，交给 GIO 定（它带着 MIME 库和主题）：`standard::icon` 给的
 /// 是有先后的候选，越靠前越是这一类的准确名字；`-symbolic` 那几枚是单色版本，不要。
 fn type_icons(path: &Path) -> Result<Vec<String>> {
-    let output = std::process::Command::new("gio")
+    let mut command = std::process::Command::new("gio");
+    command
         .args(["info", "-a", "standard::icon", "--"])
-        .arg(path)
-        .output()
-        .context("调用 gio 失败")?;
-    ensure!(output.status.success(), "gio 认不出这个文件");
-    let text = String::from_utf8_lossy(&output.stdout);
+        .arg(path);
+    let stdout = capture(&mut command, "gio")?;
+    let text = String::from_utf8_lossy(&stdout);
     let line = text
         .lines()
         .find_map(|line| line.trim().strip_prefix("standard::icon:"))
@@ -253,12 +297,20 @@ fn stacked(icons: &[DragImage]) -> DragImage {
                 let at = (dy * STACK as usize + dx) * 4;
                 let source = &icon.pixels[from..from + 4];
                 let alpha = u32::from(source[3]);
-                // 两张都是直通 alpha，按 alpha 混，不然下面那张会从透明处透出来。
-                for channel in 0..4 {
-                    pixels[at + channel] = (u32::from(source[channel])
-                        + u32::from(pixels[at + channel]) * (255 - alpha) / 255)
-                        .min(255) as u8;
+                let behind = u32::from(pixels[at + 3]);
+                let inverse = 255 - alpha;
+                // 线路上是**直通** alpha（不是预乘），所以这里有两步：先把上面那层
+                // 按自己的 alpha 加权、和下面那层（也按它的 alpha 加权）叠成预乘
+                // 结果，再除以合成出来的 alpha 换回直通。少乘那个 alpha，半透明的
+                // 边缘会整体发亮。
+                let over = alpha + behind * inverse / 255;
+                for channel in 0..3 {
+                    let mut mixed = u32::from(source[channel]) * alpha
+                        + u32::from(pixels[at + channel]) * behind / 255 * inverse;
+                    mixed /= over.max(1);
+                    pixels[at + channel] = mixed.min(255) as u8;
                 }
+                pixels[at + 3] = over.min(255) as u8;
             }
         }
     }
