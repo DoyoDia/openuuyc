@@ -73,7 +73,7 @@ impl Output {
 /// compositor reads the memory through them.
 struct Shm {
     _fd: OwnedFd,
-    _pool: wl_shm_pool::WlShmPool,
+    pool: wl_shm_pool::WlShmPool,
     map: *mut u8,
     length: usize,
     buffer: wl_buffer::WlBuffer,
@@ -134,7 +134,15 @@ impl Shm {
 
 impl Drop for Shm {
     fn drop(&mut self) {
-        // Safe because the mapping was made for this length in `Shm::new`.
+        // wayland-client sends no destructor when a proxy is dropped, so both
+        // objects have to be released by hand: `copy` replaces this pair
+        // whenever the output's shape changes, and the compositor would
+        // otherwise keep the buffer, the pool and the memory behind them until
+        // the connection ends. The buffer goes first — the pool is where its
+        // memory came from.
+        self.buffer.destroy();
+        self.pool.destroy();
+        // Safe because the mapping was made for this length in `allocate`.
         unsafe { libc::munmap(self.map.cast(), self.length) };
     }
 }
@@ -159,6 +167,8 @@ struct State {
     /// The compositor has finished drawing the frame already requested.
     ready: bool,
     failed: bool,
+    /// `flags` said the frame is copied upside down.
+    y_invert: bool,
     error: Option<String>,
 }
 
@@ -263,6 +273,11 @@ impl Grab {
                     .outputs
                     .get(self.output)
                     .map_or(Transform::Normal, |output| output.transform);
+                let transform = if self.state.y_invert {
+                    invert(transform)
+                } else {
+                    transform
+                };
                 let picture = self
                     .state
                     .shm_buffer
@@ -334,22 +349,42 @@ impl Grab {
             events: libc::POLLIN,
             revents: 0,
         };
-        // Safe because `poll` only writes into the one descriptor it was given.
-        let ready = unsafe { libc::poll(&mut poll, 1, millis(timeout)) };
-        if ready < 0 {
-            let error = std::io::Error::last_os_error();
-            drop(guard);
-            bail!("等待 Wayland 事件失败：{error}");
-        }
-        if ready == 0 {
-            // Dropping the guard releases the prepared read.
-            drop(guard);
-            return Ok(());
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            // Safe because `poll` only writes into the one descriptor it was
+            // given.
+            let ready = unsafe { libc::poll(&mut poll, 1, millis(remaining)) };
+            if ready < 0 {
+                let error = std::io::Error::last_os_error();
+                // A signal — SIGCHLD, the SIGTERM of a shutdown — cuts `poll`
+                // short without anything being wrong with the capture: wait
+                // out what is left of the timeout instead of reporting it as a
+                // failure. The deadline is fixed, so a stream of signals
+                // cannot stretch the wait.
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                drop(guard);
+                bail!("等待 Wayland 事件失败：{error}");
+            }
+            if ready == 0 {
+                // Dropping the guard releases the prepared read.
+                drop(guard);
+                return Ok(());
+            }
+            break;
         }
         match guard.read() {
             Ok(_) => {}
-            // The socket can report readable with nothing left to read.
-            Err(WaylandError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            // The socket can report readable with nothing left to read, and a
+            // signal can interrupt the read itself.
+            Err(WaylandError::Io(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) =>
+            {
                 return Ok(());
             }
             Err(error) => return Err(error).context("读取 Wayland 事件失败"),
@@ -399,6 +434,41 @@ fn orient(source: Vec<u8>, width: u32, height: u32, transform: Transform) -> (Ve
         }
     }
     (out, out_width, out_height)
+}
+
+/// `Y_INVERT` says the compositor copied the framebuffer bottom-up, and
+/// undoing that is the same as swapping the output's transform for its mirror
+/// image: flipping the source of `orient` vertically and then applying `t`
+/// lands on the pixel this `t'` picks out of the original source, for all
+/// eight transforms. Nothing is moved, only the mapping changes, which also
+/// keeps a flag that no compositor is known to send from costing a pass over
+/// every frame.
+fn invert(transform: Transform) -> Transform {
+    match transform {
+        Transform::Normal => Transform::Flipped180,
+        Transform::Flipped180 => Transform::Normal,
+        Transform::_90 => Transform::Flipped90,
+        Transform::Flipped90 => Transform::_90,
+        Transform::_180 => Transform::Flipped,
+        Transform::Flipped => Transform::_180,
+        Transform::_270 => Transform::Flipped270,
+        Transform::Flipped270 => Transform::_270,
+        // Whatever a later revision adds: left alone rather than guessed at.
+        other => other,
+    }
+}
+
+/// The plain reading of `Y_INVERT`, row by row. It is not used to draw
+/// anything; it is what `invert` is held against in the tests.
+#[cfg(test)]
+fn invert_rows(pixels: &mut [u8], width: usize, height: usize) {
+    let row = width * 4;
+    for y in 0..height / 2 {
+        let (top, bottom) = (y * row, (height - 1 - y) * row);
+        for x in 0..row {
+            pixels.swap(top + x, bottom + x);
+        }
+    }
 }
 
 fn millis(timeout: Duration) -> i32 {
@@ -584,6 +654,11 @@ impl Dispatch<zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1, ()> for State {
                     state.error = Some(format!("{error:#}"));
                 }
             }
+            zwlr_screencopy_frame_v1::Event::Flags { flags } => {
+                state.y_invert = flags
+                    .into_result()
+                    .is_ok_and(|flags| flags.contains(zwlr_screencopy_frame_v1::Flags::YInvert));
+            }
             zwlr_screencopy_frame_v1::Event::Ready { .. } => state.ready = true,
             zwlr_screencopy_frame_v1::Event::Failed => state.failed = true,
             // A dma-buf offer is not taken up: see the module comment.
@@ -696,7 +771,7 @@ fn allocate(
     }
     Ok(Shm {
         _fd: fd,
-        _pool: pool,
+        pool,
         map: map.cast(),
         length,
         buffer,
@@ -817,5 +892,37 @@ mod tests {
         assert_eq!(values(&pixels), vec![3, 2, 1, 6, 5, 4]);
         let (pixels, _, _) = orient(numbered(3, 2), 3, 2, Transform::Flipped180);
         assert_eq!(values(&pixels), vec![4, 5, 6, 1, 2, 3]);
+    }
+
+    #[test]
+    fn an_inverted_frame_is_a_flipped_transform() {
+        use super::{invert, invert_rows};
+        let source = numbered(4, 3);
+        for transform in [
+            Transform::Normal,
+            Transform::_90,
+            Transform::_180,
+            Transform::_270,
+            Transform::Flipped,
+            Transform::Flipped90,
+            Transform::Flipped180,
+            Transform::Flipped270,
+        ] {
+            // The same frame, read two ways: flip the framebuffer the
+            // compositor laid out bottom-up and keep the transform, or leave
+            // the pixels alone and move the transform to its mirror.
+            let mut memory = source.clone();
+            invert_rows(&mut memory, 4, 3);
+            let (flipped, width, height) = orient(memory, 4, 3, transform);
+            let (mapped, mapped_width, mapped_height) =
+                orient(source.clone(), 4, 3, invert(transform));
+            assert_eq!(
+                (width, height),
+                (mapped_width, mapped_height),
+                "{transform:?}"
+            );
+            assert_eq!(flipped, mapped, "{transform:?}");
+            assert_eq!(invert(invert(transform)), transform, "{transform:?}");
+        }
     }
 }
