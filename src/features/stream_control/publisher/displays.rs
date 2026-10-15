@@ -218,16 +218,21 @@ pub(crate) async fn receive_session(
                 Some(PbRpcRequestPayload::TerminalRename(bytes)) => {
                     #[derive(Clone, PartialEq, prost::Message)]
                     struct RenameReq {
-                        #[prost(string, tag = "1")]
-                        session_id: String,
+                        // The controller sends the handle as a number; the
+                        // capture showed a varint where a string was expected.
+                        #[prost(uint32, tag = "1")]
+                        session_id: u32,
                         #[prost(string, tag = "2")]
                         new_name: String,
                     }
                     let request = RenameReq::decode(bytes.as_slice())?;
-                    let result = lock(&session.terminal()).rename(
-                        &request.session_id,
-                        &request.new_name,
+                    tracing::info!(
+                        session = request.session_id,
+                        name = %request.new_name,
+                        "host terminal rename requested"
                     );
+                    let result = lock(&session.terminal())
+                        .rename(request.session_id, &request.new_name);
                     let (code, detail) = match &result {
                         Ok(()) => (0, String::new()),
                         Err(error) => (1, error.to_string()),
@@ -241,12 +246,21 @@ pub(crate) async fn receive_session(
                         code: i32,
                         #[prost(string, tag = "2")]
                         detail: String,
+                        // The controller logs `RenameSessionResp sessionId=`,
+                        // so echo the handle back alongside the result.
+                        #[prost(uint32, tag = "3")]
+                        session_id: u32,
                     }
                     return Ok(response(
                         &message,
                         header,
                         PbRpcResponsePayload::TerminalRenameSessionRsp(
-                            RenameResp { code, detail }.encode_to_vec(),
+                            RenameResp {
+                                code,
+                                detail,
+                                session_id: request.session_id,
+                            }
+                            .encode_to_vec(),
                         ),
                     ));
                 }

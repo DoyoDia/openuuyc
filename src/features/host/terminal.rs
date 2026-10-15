@@ -356,12 +356,8 @@ impl Sessions {
         Ok(())
     }
 
-    /// Renames a session, which is what the client's rename action does.
-    ///
-    /// The rename RPC identifies a session by its handle rendered as text,
-    /// while frames carry the handle as a number; both land here.
-    pub(crate) fn rename(&mut self, id: &str, name: &str) -> Result<(), SessionError> {
-        let handle: u32 = id.parse().map_err(|_| SessionError::Gone)?;
+    /// Renames a session by its handle.
+    pub(crate) fn rename(&mut self, handle: u32, name: &str) -> Result<(), SessionError> {
         let name = validate_name(name)?;
         if self
             .sessions
