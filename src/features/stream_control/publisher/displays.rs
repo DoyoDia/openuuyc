@@ -231,8 +231,8 @@ pub(crate) async fn receive_session(
                         name = %request.new_name,
                         "host terminal rename requested"
                     );
-                    let result = lock(&session.terminal())
-                        .rename(request.session_id, &request.new_name);
+                    let result =
+                        lock(&session.terminal()).rename(request.session_id, &request.new_name);
                     let (code, detail) = match &result {
                         Ok(()) => (0, String::new()),
                         Err(error) => (1, error.to_string()),

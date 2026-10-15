@@ -256,7 +256,10 @@ impl Sessions {
         // Re-opening an existing handle happens on reconnect and when the
         // size changes; replacing the pty would hang up a shell in use.
         if let Some(existing) = self.sessions.get_mut(&handle) {
-            existing.pty.resize(cols, rows).map_err(|_| SessionError::Gone)?;
+            existing
+                .pty
+                .resize(cols, rows)
+                .map_err(|_| SessionError::Gone)?;
             existing.state = SessionState::Running;
             existing.last_active_ms = now_ms();
             return Ok((handle, existing.name.clone(), existing.scrollback.clone()));
@@ -351,7 +354,10 @@ impl Sessions {
     /// Applies a new size, which the shell sees as `SIGWINCH`.
     pub(crate) fn resize(&mut self, handle: u32, cols: u16, rows: u16) -> Result<(), SessionError> {
         let session = self.sessions.get_mut(&handle).ok_or(SessionError::Gone)?;
-        session.pty.resize(cols, rows).map_err(|_| SessionError::Gone)?;
+        session
+            .pty
+            .resize(cols, rows)
+            .map_err(|_| SessionError::Gone)?;
         session.last_active_ms = now_ms();
         Ok(())
     }
@@ -526,9 +532,7 @@ pub(crate) fn bind(
             let responses = {
                 let mut state = screens.lock().await;
                 crate::features::stream_control::publisher::receive_session(
-                    &mut state,
-                    &data,
-                    false,
+                    &mut state, &data, false,
                 )
                 .await
             };
@@ -651,7 +655,8 @@ async fn handle_frame(
                 let sessions = sessions.lock().unwrap_or_else(|e| e.into_inner());
                 sessions.list()
             };
-            let payload = serde_json::to_vec(&Value::Array(listed)).unwrap_or_else(|_| b"[]".into());
+            let payload =
+                serde_json::to_vec(&Value::Array(listed)).unwrap_or_else(|_| b"[]".into());
             outgoing.push((FrameType::ListSessionsResp, frame.session, payload));
         }
         FrameType::Open => {
@@ -673,7 +678,13 @@ async fn handle_frame(
                 let state = screens.lock().await;
                 let sessions = state.terminal();
                 let mut sessions = sessions.lock().unwrap_or_else(|e| e.into_inner());
-                sessions.open(frame.session, &shell, name, cols.unwrap_or(80), rows.unwrap_or(24))
+                sessions.open(
+                    frame.session,
+                    &shell,
+                    name,
+                    cols.unwrap_or(80),
+                    rows.unwrap_or(24),
+                )
             };
             let (payload, session, replay) = match result {
                 Ok((handle, name, replay)) => (
@@ -982,7 +993,10 @@ mod tests {
 
     #[test]
     fn geometry_accepts_json_and_binary() {
-        assert_eq!(geometry(br#"{"cols":100,"rows":40}"#), (Some(100), Some(40)));
+        assert_eq!(
+            geometry(br#"{"cols":100,"rows":40}"#),
+            (Some(100), Some(40))
+        );
         assert_eq!(geometry(&[50, 0, 20, 0]), (Some(50), Some(20)));
         assert_eq!(geometry(b""), (None, None));
     }

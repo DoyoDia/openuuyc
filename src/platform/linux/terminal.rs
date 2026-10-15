@@ -145,13 +145,8 @@ impl Session {
     /// Writes keyboard input to the shell.
     pub(crate) fn write(&self, data: &[u8]) -> Result<usize> {
         // SAFETY: as `read`, with a slice valid for reads of its own length.
-        let written = unsafe {
-            libc::write(
-                self.master.as_raw_fd(),
-                data.as_ptr().cast(),
-                data.len(),
-            )
-        };
+        let written =
+            unsafe { libc::write(self.master.as_raw_fd(), data.as_ptr().cast(), data.len()) };
         if written < 0 {
             let error = std::io::Error::last_os_error();
             match error.raw_os_error() {
@@ -173,8 +168,13 @@ impl Session {
             ws_ypixel: 0,
         };
         // SAFETY: the descriptor is open and `size` is a live winsize.
-        let applied =
-            unsafe { libc::ioctl(self.master.as_raw_fd(), libc::TIOCSWINSZ as libc::c_ulong, &size) };
+        let applied = unsafe {
+            libc::ioctl(
+                self.master.as_raw_fd(),
+                libc::TIOCSWINSZ as libc::c_ulong,
+                &size,
+            )
+        };
         if applied != 0 {
             bail!("设置 pty 尺寸失败");
         }
@@ -263,9 +263,7 @@ mod tests {
         let session = Session::open("/bin/sh", 80, 24).expect("open pty");
         session.resize(120, 40).expect("resize");
         // Read the size back the way the shell sees it.
-        session
-            .write(b"stty size\n")
-            .expect("write input");
+        session.write(b"stty size\n").expect("write input");
         let mut session = session;
         let seen = read_until(&mut session, b"40 120", Duration::from_secs(5));
         let text = String::from_utf8_lossy(&seen);
