@@ -65,6 +65,9 @@ impl Redactor {
         )
     }
     pub fn text(&self, text: &str) -> String {
+        self.text_with_http(text, false)
+    }
+    fn text_with_http(&self, text: &str, http_record: bool) -> String {
         let mut s = text.to_owned();
         for known in &self.known {
             s = s.replace(known, &self.alias("private", known));
@@ -98,6 +101,8 @@ impl Redactor {
                             | "username"
                     );
                 let opaque = v.starts_with('"')
+                    && !(http_record
+                        && matches!(key, "request_body" | "response_body" | "http_headers"))
                     && !matches!(
                         key,
                         "codec"
@@ -131,6 +136,17 @@ impl Redactor {
         s
     }
     pub fn line(&self, line: &str) -> String {
+        // This sole producer removes actual credential fields before logging.
+        // Retain its bodies/headers instead of discarding a whole response just
+        // because a masked field is named "token" or the record contains JSON.
+        let http_record =
+            line.split_once(" openuuyc::transport::http: ")
+                .is_some_and(|(_, message)| {
+                    message.starts_with("HTTP request ") || message.starts_with("HTTP response ")
+                });
+        if http_record && (line.starts_with("session=") || line.starts_with("pid=")) {
+            return self.text_with_http(line, true) + "\n";
+        }
         if self.secrets.is_match(line) || line.contains("{\"") || line.contains(r#"{\""#) {
             // Raw protocol/authentication dumps are excluded as a whole, including unquoted tails.
             return "[已移除认证或原始协议内容]\n".into();

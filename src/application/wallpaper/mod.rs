@@ -287,7 +287,12 @@ async fn download(address: &str) -> Result<Vec<u8>> {
         .redirect(reqwest::redirect::Policy::limited(3))
         .timeout(Duration::from_secs(12))
         .build()?;
-    let mut response = client.get(url).send().await?.error_for_status()?;
+    let mut response = crate::transport::http::send(
+        crate::transport::http::Operation::WallpaperDownload,
+        client.get(url),
+    )
+    .await?
+    .error_for_status()?;
     const LIMIT: usize = 8 * 1024 * 1024;
     if response.content_length().is_some_and(|n| n > LIMIT as u64) {
         bail!("wallpaper too large");

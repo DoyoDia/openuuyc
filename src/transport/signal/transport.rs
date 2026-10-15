@@ -220,6 +220,9 @@ impl Worker {
     fn command(&mut self, command: Option<Command>, socket_open: bool) {
         match command {
             Some(Command::SendConnected(messages, done)) => {
+                if done.is_closed() {
+                    return;
+                }
                 // A room-wide stop must be admitted by the current namespace,
                 // never saved during reconnect for a later control session.
                 // Acknowledge admission before the host processes a new peer.

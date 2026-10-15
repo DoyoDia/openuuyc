@@ -4,28 +4,40 @@
 use std::{
     error::Error as _,
     io,
-    sync::{Arc, Mutex, OnceLock},
-    time::Duration,
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use reqwest::{Client, Method, StatusCode, header::HeaderMap};
+use tracing::Instrument;
 
 pub(crate) const PRIMARY: &str = "https://api.nrd.nie.163.com";
 const SECONDARY: &str = "https://api-dcdn.nrd.nie.163.com";
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RetryPolicy {
-    Recovery { replay_ambiguous: bool },
-    Never,
+    /// Queries and protocol replies which permit resending the same body.
+    Replayable,
+    /// Recover only when DNS/TCP/TLS failed before an HTTP request was sent.
+    ConnectOnly,
 }
 
 #[derive(Default)]
 struct Route {
     index: usize,
-    generation: u32,
+    generation: u64,
     requests: u32,
+}
+
+#[derive(Clone, Copy)]
+struct RouteAttempt {
+    index: usize,
+    generation: u64,
 }
 
 #[derive(Clone)]
@@ -45,6 +57,10 @@ impl NrdHttp {
                 .https_only(true)
                 .http1_only()
                 .redirect(reqwest::redirect::Policy::none())
+                .retry(reqwest::retry::never())
+                // Leave time in the 30s API budget for another HTTPS endpoint
+                // when DNS, TCP or TLS on the preferred route stops responding.
+                .connect_timeout(Duration::from_secs(5))
                 .gzip(true)
                 .user_agent(concat!("OpenUUYC/", env!("CARGO_PKG_VERSION")))
                 .build()
@@ -71,7 +87,10 @@ impl NrdHttp {
         timeout: Duration,
         retry: RetryPolicy,
     ) -> Result<(StatusCode, Bytes)> {
-        let generation = {
+        static NEXT_REQUEST: AtomicU64 = AtomicU64::new(1);
+        let request_group = NEXT_REQUEST.fetch_add(1, Ordering::Relaxed);
+        let deadline = Instant::now() + timeout;
+        let mut selected = {
             let mut route = self
                 .route
                 .lock()
@@ -80,46 +99,61 @@ impl NrdHttp {
             if route.requests != 0 && route.requests.is_multiple_of(100) && route.index != 0 {
                 route.index = 0;
                 route.generation = route.generation.wrapping_add(1);
-                tracing::debug!("NRD HTTPS routing returned to primary endpoint");
+                tracing::info!("NRD HTTPS routing returned to primary endpoint");
             }
-            route.generation
+            RouteAttempt {
+                index: route.index,
+                generation: route.generation,
+            }
         };
-
-        // Re-read the shared route on every attempt. A concurrent primary probe
-        // must not be undone by an old failure; bound even that interleaving.
-        for attempt in 0..=4 {
-            let index = self
-                .route
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .index;
+        let mut visited = vec![false; self.endpoints.len()];
+        for attempt in 0..self.endpoints.len() {
+            let index = selected.index;
+            visited[index] = true;
             let endpoint = &self.endpoints[index];
             let mut request = self
                 .client
                 .request(method.clone(), format!("{endpoint}{path}"))
                 .headers(headers.clone())
-                .timeout(timeout);
-            if method == Method::POST || method == Method::PUT {
+                .timeout(deadline.saturating_duration_since(Instant::now()));
+            if !body.is_empty() || method == Method::POST || method == Method::PUT {
                 request = request.body(body.clone());
             }
-            tracing::trace!(path, %method, endpoint, attempt, "sending NRD HTTPS request");
-            let response = request.send().await;
+            let span = tracing::info_span!(
+                "nrd_http",
+                request_group,
+                route_index = index,
+                attempt,
+                ?retry
+            );
+            let response =
+                crate::transport::http::send(crate::transport::http::Operation::Nrd, request)
+                    .instrument(span.clone())
+                    .await;
             let outcome = match response {
                 Ok(response) => {
                     let status = response.status();
-                    match response.bytes().await {
+                    match response.bytes().instrument(span).await {
                         Ok(bytes) => {
-                            if status == StatusCode::NOT_FOUND
-                                && retry != RetryPolicy::Never
-                                && self.advance(index, generation, attempt)
-                            {
-                                tracing::warn!(
-                                    path,
-                                    endpoint,
-                                    attempt,
-                                    "NRD HTTPS 404; trying backup endpoint"
-                                );
-                                continue;
+                            if status == StatusCode::NOT_FOUND {
+                                let next = self.failed(selected, &visited);
+                                if retry == RetryPolicy::Replayable
+                                    && Instant::now() < deadline
+                                    && let Some(next) = next
+                                {
+                                    tracing::warn!(
+                                        request_group,
+                                        path,
+                                        route_index = index,
+                                        next_route = next.index,
+                                        attempt,
+                                        "NRD HTTPS 404; trying another endpoint"
+                                    );
+                                    selected = next;
+                                    continue;
+                                }
+                            } else {
+                                self.succeeded(selected);
                             }
                             return Ok((status, bytes));
                         }
@@ -129,22 +163,29 @@ impl NrdHttp {
                 Err(error) => (error, true),
             };
             let (error, before_response) = outcome;
-            if retry != RetryPolicy::Never
-                && (matches!(
-                    retry,
-                    RetryPolicy::Recovery {
-                        replay_ambiguous: true
-                    }
-                ) || error.is_connect())
-                && retryable_transport_error(&error, before_response)
-                && self.advance(index, generation, attempt)
-            {
-                tracing::warn!(path, endpoint, attempt, %error, "NRD HTTPS transport failed; trying backup endpoint");
-                continue;
+            if retryable_transport_error(&error, before_response) {
+                // Repair the route for subsequent operations even when this
+                // particular business operation cannot safely be sent again.
+                let next = self.failed(selected, &visited);
+                if (retry == RetryPolicy::Replayable || (before_response && error.is_connect()))
+                    && Instant::now() < deadline
+                    && let Some(next) = next
+                {
+                    tracing::warn!(
+                        request_group,
+                        path,
+                        route_index = index,
+                        next_route = next.index,
+                        attempt,
+                        "NRD HTTPS transport failed; trying another endpoint"
+                    );
+                    selected = next;
+                    continue;
+                }
             }
             return Err(error).with_context(|| {
                 format!(
-                    "NRD HTTPS request failed ({endpoint}{path}, attempt {})",
+                    "NRD HTTPS request failed (route {index}, attempt {})",
                     attempt + 1
                 )
             });
@@ -152,18 +193,43 @@ impl NrdHttp {
         unreachable!("the last attempt always returns its response or error")
     }
 
-    fn advance(&self, index: usize, generation: u32, attempt: usize) -> bool {
-        if attempt >= 4 || index + 1 >= self.endpoints.len() {
-            return false;
-        }
+    fn failed(&self, selected: RouteAttempt, visited: &[bool]) -> Option<RouteAttempt> {
         let mut route = self
             .route
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if route.generation == generation && route.index < index + 1 {
-            route.index = index + 1;
+        let current = route.generation == selected.generation && route.index == selected.index;
+        if current {
+            route.index = (selected.index + 1) % self.endpoints.len();
+            route.generation = route.generation.wrapping_add(1);
         }
-        true
+        // A concurrent request may have found a working route. Prefer it, but
+        // never revisit an endpoint already attempted by this logical request.
+        (0..self.endpoints.len())
+            .map(|offset| (route.index + offset) % self.endpoints.len())
+            .find(|&index| !visited[index])
+            .map(|index| RouteAttempt {
+                index,
+                // Once superseded, this operation may finish using another
+                // endpoint, but must not republish an obsolete route decision.
+                generation: if current {
+                    route.generation
+                } else {
+                    selected.generation
+                },
+            })
+    }
+
+    fn succeeded(&self, selected: RouteAttempt) {
+        let mut route = self
+            .route
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if route.generation == selected.generation {
+            route.index = selected.index;
+            // Also protect success on the same endpoint from older failures.
+            route.generation = route.generation.wrapping_add(1);
+        }
     }
 }
 

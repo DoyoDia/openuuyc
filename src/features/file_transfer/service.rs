@@ -611,22 +611,7 @@ async fn run(
         let result: Result<()> = async {
             match command {
                 Command::PauseAll => {
-                    for (c, _) in running.values() {
-                        c.cancel();
-                    }
-                    for (_, (_, task)) in running.drain() {
-                        task.await?;
-                    }
-                    let mut records = lock(&repo.records);
-                    let mut next = records.clone();
-                    for r in &mut next {
-                        if r.state == TaskState::Queued {
-                            r.state = TaskState::Paused;
-                        }
-                    }
-                    repo.store.save(&next)?;
-                    *records = next;
-                    lock(&state).records = records.iter().cloned().map(Arc::new).collect();
+                    pause_all(&repo, &mut running).await?;
                 }
                 Command::ResumeAll => {
                     ensure!(wire.is_some(), "请先连接设备");
@@ -878,6 +863,45 @@ async fn run(
     }
     Ok(())
 }
+async fn pause_all(
+    repo: &Repository,
+    running: &mut HashMap<String, (CancellationToken, tokio::task::JoinHandle<()>)>,
+) -> Result<()> {
+    for (c, _) in running.values() {
+        c.cancel();
+    }
+    let mut failure = None;
+    for (key, (_, task)) in running.drain() {
+        if let Err(error) = task.await {
+            let message = format!("文件工作线程已停止：{error}");
+            if let Some(mut record) = repo.get(&key) {
+                record.state = TaskState::Failed;
+                record.error = Some(message.clone());
+                if let Err(error) = repo.save(&record) {
+                    failure.get_or_insert_with(|| error.to_string());
+                }
+            }
+            failure.get_or_insert(message);
+        }
+    }
+    let mut records = lock(&repo.records);
+    let mut next = records.clone();
+    for r in &mut next {
+        if r.state == TaskState::Queued {
+            r.state = TaskState::Paused;
+        }
+    }
+    repo.store.save(&next)?;
+    *records = next;
+    lock(&repo.view).records = records.iter().cloned().map(Arc::new).collect();
+    // An error from one worker must not detach the remainder,
+    // otherwise ResumeAll can overlap their unfinished cleanup.
+    if let Some(error) = failure {
+        anyhow::bail!(error);
+    }
+    Ok(())
+}
+
 fn pause_queued(repo: &Repository) -> Result<()> {
     let queued = lock(&repo.records)
         .iter()
@@ -1016,6 +1040,7 @@ async fn manage(c: Command, wire: Option<Arc<Transport>>, stop: CancellationToke
             .map(|_| ())
     } else {
         tokio::task::spawn_blocking(move || -> Result<()> {
+            ensure!(!stop.is_cancelled(), "文件操作已取消，未执行");
             let p = PathBuf::from(path);
             let parent = storage::canonical_dir(if kind == 0 {
                 &p
@@ -1033,10 +1058,12 @@ async fn manage(c: Command, wire: Option<Arc<Transport>>, stop: CancellationToke
             };
             let _locks = storage::parents(&parent, &relative, false)?;
             let target = parent.join(&relative);
+            ensure!(!stop.is_cancelled(), "文件操作已取消，未执行");
             match kind {
                 0 => std::fs::create_dir(target)?,
                 1 => {
                     ensure!(!parent.join(&name).exists(), "目标名称已经存在");
+                    ensure!(!stop.is_cancelled(), "文件操作已取消，未执行");
                     std::fs::rename(target, parent.join(name))?;
                 }
                 2 => std::fs::remove_file(target)?,

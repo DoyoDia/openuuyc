@@ -2,6 +2,7 @@ use super::*;
 use crate::account::power::{PowerAction, PowerReceipt};
 
 const WAKE: Contract = Contract {
+    retry: RetryPolicy::ConnectOnly,
     method: Method::Post,
     path: "/api/v1/device/{id}/wake_on_lan/req",
     json_content_type: true,
@@ -20,10 +21,6 @@ const RESPONSE: Contract = Contract {
     path: "/api/v1/transport/rpc/response",
     ..WAKE
 };
-
-pub(super) fn is_write(contract: Contract) -> bool {
-    matches!(contract, WAKE | REBOOT | SHUTDOWN | RESPONSE)
-}
 
 impl NrdApi {
     pub(crate) async fn device_power(

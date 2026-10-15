@@ -10,20 +10,24 @@ const MODE: Contract = Contract {
     ..DEVICE_LIST
 };
 const JOIN: Contract = Contract {
+    retry: RetryPolicy::ConnectOnly,
     path: "/api/v2/room/join/share/by_code",
     ..MODE
 };
 const CONFIRM: Contract = Contract {
+    retry: RetryPolicy::ConnectOnly,
     path: "/api/v2/room/join/share/by_confirmation",
     timeout: Duration::from_secs(65),
     ..MODE
 };
 const CANCEL: Contract = Contract {
+    retry: RetryPolicy::ConnectOnly,
     path: "/api/v2/room/share/cancel_remote_assist",
     json_content_type: false,
     ..MODE
 };
 const REFETCH: Contract = Contract {
+    retry: RetryPolicy::ConnectOnly,
     path: "/api/v1/room/join/refetch",
     ..MODE
 };
@@ -33,11 +37,13 @@ const SAVED: Contract = Contract {
     ..DEVICE_LIST
 };
 const FAVORITE: Contract = Contract {
+    retry: RetryPolicy::ConnectOnly,
     path: "/api/v1/device/share/saved/favorites",
     method: Method::Post,
     ..SAVED
 };
 const DELETE: Contract = Contract {
+    retry: RetryPolicy::ConnectOnly,
     method: Method::Delete,
     ..SAVED
 };
@@ -47,9 +53,6 @@ pub(super) fn is_join(contract: Contract) -> bool {
 }
 pub(super) fn is_sensitive(contract: Contract) -> bool {
     is_join(contract) || contract == REFETCH
-}
-pub(super) fn is_write(contract: Contract) -> bool {
-    is_sensitive(contract) || contract == CANCEL || contract == FAVORITE || contract == DELETE
 }
 
 impl NrdApi {
