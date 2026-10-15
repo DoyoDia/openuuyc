@@ -10,7 +10,7 @@ pub(crate) fn transfer_preferences(to_service: bool) -> anyhow::Result<()> {
 use super::{Lease, capture, lock};
 use crate::platform::display::{
     self,
-    topology::{SavedTarget, SavedTopology, Target, Topology},
+    topology::{self, SavedTarget, SavedTopology, Target, Topology},
     virtual_driver::Driver,
 };
 use anyhow::{Context, Result, ensure};
@@ -329,11 +329,12 @@ impl Session {
                 "不能用删除扩展屏操作退出超级屏"
             );
             ensure!(lease.requested(), "显示操作已取消");
+            // 辅助程序认的是连接器名，identity 只是我们这边的说法。
             state
                 .virtual_display
                 .as_mut()
                 .context("虚拟显示器辅助程序不可用")?
-                .remove(&identity)?;
+                .remove(topology::output_name(&identity))?;
             state.journal.owned.remove(index);
             state.update_preferences()
         })
@@ -515,8 +516,9 @@ impl Session {
                 .iter()
                 .position(|o| o.identity.as_deref() == Some(target.identity.as_str()));
             let hz = owned.map(|index| state.journal.owned[index].hz);
+            // 合成器认的是输出名（连接器名），不是屏幕清单里的 identity。
             crate::platform::linux::display::compositor::set_mode(
-                &target.identity,
+                topology::output_name(&target.identity),
                 width,
                 height,
                 hz,
@@ -664,22 +666,45 @@ impl Drop for Session {
     }
 }
 
+/// 在屏幕清单里找刚接上的那块虚拟输出。
+///
+/// 先按 identity 找；有的合成器会给 X11 的输出另起名字（GNOME 那边是 XWAYLAND*），
+/// 那时按「创建之前没有、现在多了」认——这一刻清单里只可能多出刚接的这块。
+#[cfg(not(windows))]
+fn virtual_screen<'a>(
+    screens: &'a [capture::Screen],
+    identity: &str,
+    before: &[String],
+) -> Option<&'a capture::Screen> {
+    screens
+        .iter()
+        .find(|s| s.identity.as_deref() == Some(identity))
+        .or_else(|| {
+            screens
+                .iter()
+                .find(|s| s.identity.as_ref().is_some_and(|id| !before.contains(id)))
+        })
+}
+
 /// 等采集那边看见这块新屏。
 ///
-/// 采集枚举的是合成器报出来的输出，而合成器要处理完热插拔才有它；中间这一小段
-/// 空档里创建还不算成功，所以宁可在这里等，也不要先把一块还看不见的屏报给主控。
+/// 采集枚举的是合成器报出来的输出，而合成器要处理完热插拔才有它；中间这一小段空档里
+/// 创建还不算成功，所以宁可在这里等，也不要先把一块还看不见的屏报给主控。
+///
+/// 辅助程序给的是连接器名，而屏幕清单里是平台自己的 identity（X11 下是
+/// `x11/<输出名>`），两者不是一回事：拿连接器名去比 identity 会一直等不到，于是
+/// 明明建出来了也报「没有出现在桌面里」。
 #[cfg(not(windows))]
-fn wait_for_screen(connector: &str, lease: &Lease) -> Result<capture::Screen> {
+fn wait_for_screen(connector: &str, before: &[String], lease: &Lease) -> Result<capture::Screen> {
+    let identity = topology::identity(connector);
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         ensure!(lease.requested(), "显示操作已取消");
         // 合成器刚接上新输出时枚举本身也可能短暂失败，所以失败不算数，只看期限。
         if let Ok(screens) = capture::screens()
-            && let Some(screen) = screens
-                .into_iter()
-                .find(|s| s.identity.as_deref() == Some(connector))
+            && let Some(screen) = virtual_screen(&screens, &identity, before)
         {
-            return Ok(screen);
+            return Ok(screen.clone());
         }
         ensure!(
             std::time::Instant::now() < deadline,
@@ -1051,6 +1076,7 @@ impl State {
             "超级屏内不能添加扩展屏"
         );
         let screens = capture::screens()?;
+        let before: Vec<String> = screens.iter().filter_map(|s| s.identity.clone()).collect();
         ensure!(
             screens.len() < 5
                 && self
@@ -1075,9 +1101,12 @@ impl State {
         // 那边就多了一块屏，采集随时可能把它报上去，那时候它得已经是「我们造的」。
         let connector = self.virtual_display()?.create(width, height, VIRTUAL_HZ)?;
         let guid = uuid::Uuid::new_v4().to_string();
+        // 日志里记的是平台的 identity 而不是连接器名：owns、恢复、首屏选择比的都是
+        // identity，只有跟辅助程序打交道时才换回连接器名（`topology::output_name`）。
+        let identity = topology::identity(&connector);
         self.journal.owned.push(Virtual {
             guid: guid.clone(),
-            identity: Some(connector.clone()),
+            identity: Some(identity.clone()),
             width,
             height,
             hz: VIRTUAL_HZ,
@@ -1087,12 +1116,12 @@ impl State {
             modes: vec![(width, height)],
             layout: None,
         });
-        let mut screen = match wait_for_screen(&connector, lease) {
+        let mut screen = match wait_for_screen(&connector, &before, lease) {
             Ok(screen) => screen,
             Err(error) => {
                 self.journal
                     .owned
-                    .retain(|o| o.identity.as_deref() != Some(connector.as_str()));
+                    .retain(|o| o.identity.as_deref() != Some(identity.as_str()));
                 if let Err(rollback) = self.virtual_display().and_then(|s| s.remove(&connector)) {
                     tracing::error!(%rollback, connector, "虚拟屏回滚失败");
                 }
@@ -1451,5 +1480,48 @@ impl State {
             Err(e) => return Err(e.into()),
         }
         Ok(())
+    }
+}
+
+#[cfg(all(test, not(windows)))]
+mod tests {
+    use super::*;
+
+    fn screen(identity: &str) -> capture::Screen {
+        capture::Screen {
+            id: 0,
+            device_name: identity.rsplit('/').next().unwrap_or(identity).to_owned(),
+            display_name: identity.to_owned(),
+            width: 1920,
+            height: 1080,
+            left: 0,
+            top: 0,
+            primary: false,
+            fps: 60,
+            dpi_scale: None,
+            hdr: false,
+            adapter: 0,
+            render_adapter: None,
+            identity: Some(identity.to_owned()),
+        }
+    }
+
+    /// 虚拟屏在日志里记的是平台的 identity（`x11/Virtual-1`），而辅助程序给的是连接器名
+    /// （`Virtual-1`）。拿连接器名直接去比 identity 的那版代码永远等不到，于是建出来了
+    /// 也报「没有出现在桌面里」，主控收到 -1。
+    #[test]
+    fn the_new_virtual_output_is_found_by_identity_not_by_connector_name() {
+        let disks = [screen("x11/DP-3"), screen("x11/Virtual-1")];
+        let before = ["x11/DP-3".to_owned()];
+        let found = virtual_screen(&disks, &topology::identity("Virtual-1"), &before).unwrap();
+        assert_eq!(found.identity.as_deref(), Some("x11/Virtual-1"));
+        // 名字对不上时（GNOME 给 X11 的输出起 XWAYLAND*）退回「比创建之前多出来的那块」。
+        let disks = [screen("x11/DP-3"), screen("x11/XWAYLAND0")];
+        let found = virtual_screen(&disks, &topology::identity("Virtual-1"), &before).unwrap();
+        assert_eq!(found.identity.as_deref(), Some("x11/XWAYLAND0"));
+        // 没有多出任何屏就是没找到，别把别的屏认成自己刚建的那块。
+        let disks = [screen("x11/DP-3"), screen("x11/DP-1")];
+        let before = ["x11/DP-3".to_owned(), "x11/DP-1".to_owned()];
+        assert!(virtual_screen(&disks, &topology::identity("Virtual-1"), &before).is_none());
     }
 }

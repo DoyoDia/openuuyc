@@ -134,6 +134,28 @@ mod tests {
             connector.starts_with("Virtual-"),
             "连接器名异常：{connector}"
         );
+        // 采集那边必须能按连接器名算出屏幕清单里的 identity 看见它——主控点「添加虚拟屏」
+        // 就是在等这一步，等不到会报 -1（屏幕上明明多了一块）。
+        let identity = crate::platform::display::topology::identity(&connector);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let screen = loop {
+            if let Ok(screens) = crate::platform::capture::screens()
+                && let Some(screen) = screens
+                    .into_iter()
+                    .find(|s| s.identity.as_deref() == Some(identity.as_str()))
+            {
+                break screen;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{connector}（identity {identity}）没进屏幕清单"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        };
+        println!(
+            "{connector}: identity={:?} device_name={} {}x{}",
+            screen.identity, screen.device_name, screen.width, screen.height
+        );
         session.release_all();
     }
 }

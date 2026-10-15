@@ -105,6 +105,26 @@ pub(crate) fn identity(name: &str) -> String {
     format!("x11/{name}")
 }
 
+/// [`identity`] 的逆：合成器和虚拟屏辅助程序认的是输出名本身（X11/DRM 的连接器名），
+/// 只有屏幕清单和日志里才用带前缀的 identity。混了这两套说法就会得到
+/// 「明明建出来了却说没出现在桌面里」这种结果。
+pub(crate) fn output_name(identity: &str) -> &str {
+    identity.strip_prefix("x11/").unwrap_or(identity)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{identity, output_name};
+
+    #[test]
+    fn an_identity_can_be_turned_back_into_the_output_name() {
+        assert_eq!(output_name(&identity("DP-3")), "DP-3");
+        assert_eq!(output_name(&identity("Virtual-1")), "Virtual-1");
+        // 已经是不带前缀的名字时原样返回，免得把别的写法弄坏。
+        assert_eq!(output_name("eDP-1"), "eDP-1");
+    }
+}
+
 struct Output {
     id: randr::Output,
     name: String,
