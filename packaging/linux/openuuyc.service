@@ -4,12 +4,20 @@
 # 上：没人登录时它没有被控可言，会话结束它也该停。这与 Sunshine 的 Linux 服务是
 # 同一个形态；「登录前被控」需要 KMS 抓屏或虚拟显示器，那是另一件事。
 #
+# 代价是桌面得自己接进 graphical-session.target（GNOME、KDE、uwsm 会；XFCE、MATE、
+# Cinnamon 与直接启动的 sway、Hyprland 不会），程序里的开关在这些桌面上会置灰。
+#
 # 便携运行（没装包）时这份单元不存在，程序会按当前可执行文件在
 # ~/.config/systemd/user/ 里自己写一份同名单元，内容与这里一致。
 [Unit]
 Description=OpenUUYC 远程被控
 PartOf=graphical-session.target
 After=graphical-session.target xdg-desktop-portal.service
+# 程序不在时（例如已卸载，只剩这份写在 ~/.config 里的单元）跳过这次启动：
+# 条件不满足是 skipped 而不是 failed，Restart= 不会每 3 秒再试一次。
+ConditionFileIsExecutable=/usr/bin/OpenUUYC
+# 崩了要一直回来，所以不要默认的启动限速。
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -17,6 +25,9 @@ ExecStart=/usr/bin/OpenUUYC gui --background
 # 崩了自动回来；从托盘退出是正常退出，不会又被拉起来。
 Restart=on-failure
 RestartSec=3
+# 默认的 control-group 会把子进程一起杀掉：显示恢复守护（`process_group(0)`）
+# 本该跨崩溃活着，`xdg-open` 打开的浏览器也不该跟着退。
+KillMode=process
 
 [Install]
 WantedBy=graphical-session.target
