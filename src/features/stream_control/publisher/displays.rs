@@ -178,6 +178,78 @@ pub(crate) async fn receive_session(
                 request_id: h.request_id,
             });
             match request.payload {
+                Some(PbRpcRequestPayload::TerminalCheck(bytes)) => {
+                    // `terminal_check_env_req` asks whether this machine can
+                    // serve a terminal at all. The client retries on timeout
+                    // and shows `componentUnavailable` when it never hears
+                    // back, so this must answer even when the grant is off.
+                    #[derive(Clone, PartialEq, prost::Message)]
+                    struct CheckEnvReq {
+                        #[prost(uint64, tag = "1")]
+                        retry: u64,
+                    }
+                    let _ = CheckEnvReq::decode(bytes.as_slice())?;
+                    let allowed = session.authorization().terminal_allowed();
+                    #[derive(Clone, PartialEq, prost::Message)]
+                    struct CheckEnvResp {
+                        #[prost(int32, tag = "1")]
+                        code: i32,
+                        #[prost(string, tag = "2")]
+                        detail: String,
+                    }
+                    // 0 is the success code the other RPCs use; a refusal is
+                    // reported so the client can show its own message rather
+                    // than waiting for a reply that never comes.
+                    let resp = CheckEnvResp {
+                        code: if allowed { 0 } else { 1 },
+                        detail: if allowed {
+                            String::new()
+                        } else {
+                            "本机未允许终端".to_owned()
+                        },
+                    };
+                    tracing::info!(allowed, "host terminal environment check answered");
+                    return Ok(response(
+                        &message,
+                        header,
+                        PbRpcResponsePayload::TerminalCheckEnvRsp(resp.encode_to_vec()),
+                    ));
+                }
+                Some(PbRpcRequestPayload::TerminalRename(bytes)) => {
+                    #[derive(Clone, PartialEq, prost::Message)]
+                    struct RenameReq {
+                        #[prost(string, tag = "1")]
+                        session_id: String,
+                        #[prost(string, tag = "2")]
+                        new_name: String,
+                    }
+                    let request = RenameReq::decode(bytes.as_slice())?;
+                    let result = lock(&session.terminal()).rename(
+                        &request.session_id,
+                        &request.new_name,
+                    );
+                    let (code, detail) = match &result {
+                        Ok(()) => (0, String::new()),
+                        Err(error) => (1, error.to_string()),
+                    };
+                    if let Err(error) = &result {
+                        tracing::warn!(%error, "host terminal rename rejected");
+                    }
+                    #[derive(Clone, PartialEq, prost::Message)]
+                    struct RenameResp {
+                        #[prost(int32, tag = "1")]
+                        code: i32,
+                        #[prost(string, tag = "2")]
+                        detail: String,
+                    }
+                    return Ok(response(
+                        &message,
+                        header,
+                        PbRpcResponsePayload::TerminalRenameSessionRsp(
+                            RenameResp { code, detail }.encode_to_vec(),
+                        ),
+                    ));
+                }
                 Some(PbRpcRequestPayload::MouseSwitch(bytes)) => {
                     #[derive(Clone, PartialEq, prost::Message)]
                     struct Switch {
