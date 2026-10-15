@@ -82,6 +82,14 @@ interaction with the encoder. All of them link the production
   two threads, to catch leaks or lifetime races in the EGL/GL/VA objects.
 - `cycle` — creates and drops `Converter` repeatedly, sequentially and on two
   concurrent threads, to exercise the `eglTerminate`/`gbm_device_destroy` path.
+- `scale` — verifies the GPU scaler. Confirms the equal-size pass stays an
+  exact `texelFetch` and that a scaled pass keeps BT.601 limited-range colours
+  and bar orientation across repeated conversions.
+- `mismatch` — measures the cost of a controller quality whose output geometry
+  differs from the source, comparing the native pass with the scaled one. This
+  is the regression the scaler fixed: reading the NV12 back to the CPU and
+  scaling in Rust cost 90-172 ms/frame at 2880x1800; scaling on the GPU costs
+  9-14 ms/frame, below the native pass at the largest targets.
 
 ```sh
 cargo run --release --manifest-path devtools/probes/gpu-conversion/Cargo.toml --bin overlap -- 2880 1800 128

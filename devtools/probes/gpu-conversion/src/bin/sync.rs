@@ -146,7 +146,7 @@ fn main() -> anyhow::Result<()> {
         let bar = (n as usize) % 8;
         paint(bar)?;
         // Producer returns immediately after submitting the shader.
-        let nv: Arc<gpu_convert::OwnedNv12> = gpu.convert(&rgb, (0, 0, w, h))?;
+        let nv: Arc<gpu_convert::OwnedNv12> = gpu.convert(&rgb, (0, 0, w, h), (w, h))?;
         // Immediately reuse the source with a different colour.
         paint((bar + 1) % 8)?;
         // Import on the encoder's own display and read the pixels the encoder

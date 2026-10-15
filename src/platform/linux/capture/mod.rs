@@ -351,6 +351,12 @@ impl Desktop {
         {
             self.backend = Backend::NvFbc(nvfbc::Grab::open(&self.screen, cursor, wanted)?);
         }
+        // The portal converter derives its output from each picture's own size.
+        // Hand it the current request so a controller quality that differs from
+        // the source is scaled on the GPU instead of read back to the CPU.
+        if let Backend::Portal(grab) = &self.backend {
+            grab.set_target(Some((quality, maximum)));
+        }
         self.cursor = match self.sampler.sample() {
             Ok(pointer) => Some(pointer),
             Err(error) => {
@@ -407,6 +413,9 @@ impl Desktop {
                     Ok(Some(picture)) => {
                         let size = output(picture.width, picture.height, quality, maximum);
                         if let Some(frame) = picture.nv12 {
+                            // The converter already produced `size`; a mismatch
+                            // would mean a stale target, so keep the GPU frame
+                            // only when it matches and fall back otherwise.
                             if size == frame.size() {
                                 self.available = true;
                                 self.last_size = size;
@@ -419,10 +428,20 @@ impl Desktop {
                                     hdr_metadata: None,
                                 }));
                             }
+                            // The converter produced a different geometry than
+                            // the current request (a stale target during a
+                            // quality change). Scale from the frame's own size,
+                            // not the source crop, and let the next frame use
+                            // the refreshed target.
                             let pixels = frame.pixels()?;
+                            let from = frame.size();
                             Ok(Some((
                                 size,
-                                scale(&pixels, (picture.width, picture.height), size),
+                                if from == size {
+                                    pixels
+                                } else {
+                                    scale(&pixels, from, size)
+                                },
                             )))
                         } else {
                             let image = if size == (picture.width, picture.height) {

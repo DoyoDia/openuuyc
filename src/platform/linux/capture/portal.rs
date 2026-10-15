@@ -211,6 +211,11 @@ impl Grab {
         self.session.cursor
     }
 
+    /// Output geometry request for the GPU converter: `(quality, maximum)`.
+    pub fn set_target(&self, target: Option<(i32, (u32, u32))>) {
+        self.stream.set_target(target);
+    }
+
     pub fn next(&mut self, timeout: Duration) -> Result<Option<Picture>> {
         self.stream.next(timeout)
     }
