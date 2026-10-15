@@ -39,8 +39,13 @@ impl Actor {
         let Some(entry) = self.entries.get_mut(&id) else {
             return Ok(());
         };
+        // Wait for the drag image only when the peer will send one: it sends
+        // it under the same test as `Command::Image`, which needs both sides
+        // to take a drag back.
         if (entry.reverse && !entry.preserve_source && !entry.source_released)
-            || (self.shared.return_capable.load(Ordering::Acquire) && entry.image.is_none())
+            || (native::RETURN_CAPABLE
+                && self.shared.return_capable.load(Ordering::Acquire)
+                && entry.image.is_none())
         {
             return Ok(());
         }
