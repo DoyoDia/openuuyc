@@ -30,9 +30,9 @@ else
     SUDO=(sudo)
 fi
 
-# Earlier versions of this script installed and enabled a systemd user unit.
-# Login startup is now the settings page's switch (an XDG autostart entry);
-# leaving both would start two copies.
+# Earlier versions of this script installed and enabled a unit of their own
+# (openuuyc-gui.service). Login startup is now the settings page's switch, which
+# enables openuuyc.service; leaving both would start two copies.
 remove_legacy_service() {
     if [[ -e /usr/lib/systemd/user/openuuyc-gui.service ]]; then
         systemctl --user disable --now openuuyc-gui.service 2>/dev/null || true
@@ -43,11 +43,20 @@ remove_legacy_service() {
 
 uninstall() {
     say "移除 OpenUUYC"
+    # 先关掉自启：单元文件删掉之后 systemctl 找不到它，disable 会剩下悬空的
+    # graphical-session.target.wants 符号链接。
+    systemctl --user disable openuuyc.service 2>/dev/null || true
     "${SUDO[@]}" rm -f \
         "$PREFIX/bin/OpenUUYC" \
+        "$PREFIX/lib/systemd/user/openuuyc.service" \
         "$PREFIX/share/applications/openuuyc.desktop" \
         "$PREFIX/share/icons/hicolor/256x256/apps/openuuyc.png" \
         /usr/lib/udev/rules.d/60-openuuyc-uinput.rules
+    # 便携运行（没走这个脚本）时程序会自己写一份到用户配置目录，一并清掉。
+    # 不接 graphical-session.target 的桌面上，开关写的是 XDG 自启动条目。
+    rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/openuuyc.service" \
+        "${XDG_CONFIG_HOME:-$HOME/.config}/autostart/openuuyc.desktop"
+    systemctl --user daemon-reload 2>/dev/null || true
     # Only remove the menu extension if it is exactly the one we wrote; an
     # extension the user merged our entry into stays.
     if [[ -e $MENU ]] && cmp -s packaging/omarchy/omarchy-menu.jsonc "$MENU"; then
@@ -56,7 +65,7 @@ uninstall() {
         warn "$MENU 含有 OpenUUYC 菜单项，请手动删除该条目"
     fi
     remove_legacy_service
-    say "已移除。用户数据保留在 ~/.local/share/OpenUUYC/，开机自启项在 ~/.config/autostart/openuuyc.desktop"
+    say "已移除。用户数据保留在 ~/.local/share/OpenUUYC/，登录自启（systemd 用户单元与 XDG 自启动条目）已关闭并删除"
     exit 0
 }
 
@@ -74,6 +83,23 @@ if [[ ! -x $BINARY ]]; then
 EOF
     exit 1
 fi
+
+# 自启单元里要写 $PREFIX/bin/OpenUUYC。systemd 只认绝对路径，路径里的引号、反斜杠
+# 与换行在单元里表达不了（Executable path contains special characters），所以在动
+# 系统之前就拒绝。空格与 % 没问题：前者靠引号，后者写成 %%。
+case $PREFIX in
+/*) ;;
+*)
+    echo "PREFIX 必须是绝对路径：$PREFIX" >&2
+    exit 1
+    ;;
+esac
+case $PREFIX in
+*[\"\\]* | *$'\n'*)
+    echo "PREFIX 含引号、反斜杠或换行，无法写进 systemd 单元：$PREFIX" >&2
+    exit 1
+    ;;
+esac
 
 say "安装依赖"
 "${SUDO[@]}" pacman -S --needed --noconfirm \
@@ -104,6 +130,24 @@ say "安装程序文件"
     "$PREFIX/share/applications/openuuyc.desktop"
 "${SUDO[@]}" install -Dm644 assets/icon-256.png \
     "$PREFIX/share/icons/hicolor/256x256/apps/openuuyc.png"
+
+say "安装登录自启单元"
+# 打包的那份单元把程序路径写死成 /usr/bin/OpenUUYC；这个脚本装到 $PREFIX，
+# 按实际位置改掉，否则单元启动的是另一个（或不存在）的程序。逐行替换而不用 sed，
+# 路径里的 # & 之类不会被当成 sed 的语法；% 是 systemd 的说明符，写成 %%。
+unit_image="$PREFIX/bin/OpenUUYC"
+unit_image=${unit_image//\%/%%}
+unit=$(mktemp)
+trap 'rm -f "$unit"' EXIT
+while IFS= read -r line; do
+    case $line in
+    ExecStart=*) printf 'ExecStart="%s" gui --background\n' "$unit_image" ;;
+    ConditionFileIsExecutable=*) printf 'ConditionFileIsExecutable=%s\n' "$unit_image" ;;
+    *) printf '%s\n' "$line" ;;
+    esac
+done <packaging/linux/openuuyc.service >"$unit"
+"${SUDO[@]}" install -Dm644 "$unit" "$PREFIX/lib/systemd/user/openuuyc.service"
+systemctl --user daemon-reload 2>/dev/null || true
 remove_legacy_service
 
 # Omarchy only: add an Install → Service row so the app is discoverable there.
