@@ -122,7 +122,7 @@ pub(crate) struct Deferred {
     pub encoding: crate::features::host::EncodingSettings,
 }
 impl Screens {
-    pub(super) fn update_media_intent(&self) -> VideoConfig {
+    pub(crate) fn update_media_intent(&self) -> VideoConfig {
         self.base
     }
     pub(crate) async fn resume_capture(&mut self) -> Result<()> {
@@ -469,6 +469,24 @@ impl Screens {
         } else {
             self.base
         };
+        self.start_at(index, screen, config).await
+    }
+    pub(crate) async fn start_configured(
+        &mut self,
+        screen: capture::Screen,
+        config: VideoConfig,
+    ) -> Result<()> {
+        ensure!(
+            self.lease.requested() && !self.cancel.is_cancelled(),
+            "被控许可已失效"
+        );
+        ensure!(
+            self.registered.len() == 1 && self.deferred.is_none(),
+            "指定屏幕切换需要已准备的单视频轨道"
+        );
+        let index = self.registered[0];
+        ensure!(self.slots[index].screen.is_some(), "当前视频采集已停止");
+        self.headless.choose(screen.id);
         self.start_at(index, screen, config).await
     }
     async fn start_at(
