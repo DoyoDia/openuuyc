@@ -104,15 +104,22 @@ pub fn decorate(_data: &super::Files, _image: &DragImage) -> Result<()> {
 /// 拖动预览图。跑在阻塞线程上（会去翻图标主题、可能还要起 rsvg 画一张）。
 pub fn selection(paths: &[PathBuf]) -> Result<DragImage> {
     ensure!(!paths.is_empty(), "文件选择为空");
-    let first = icon(&paths[0])?;
     if paths.len() == 1 {
-        return Ok(first);
+        return icon(&paths[0]);
     }
-    let mut icons = vec![first];
-    for path in paths.iter().skip(1).take(2) {
-        if let Ok(icon) = icon(path) {
-            icons.push(icon);
+    // 叠的是前三项里拼得出来的那几张：哪一项拼不出来就跳过它，全都拼不出来才算没图。
+    let mut icons = Vec::new();
+    let mut failure = None;
+    for path in paths.iter().take(3) {
+        match icon(path) {
+            Ok(icon) => icons.push(icon),
+            Err(error) => {
+                failure.get_or_insert(error);
+            }
         }
+    }
+    if icons.is_empty() {
+        return Err(failure.unwrap_or_else(|| anyhow::anyhow!("文件选择为空")));
     }
     Ok(stacked(&icons))
 }
@@ -124,13 +131,23 @@ fn icon(path: &Path) -> Result<DragImage> {
     }
     let names = type_icons(path)?;
     // 候选是有先后的，但装着的主题不一定每一枚都有（`application-toml` 这种就常常缺），
-    // 所以按顺序找，第一个真找得到的算数。
+    // 所以按顺序找，第一个真画得出来的算数：矢量图画不出来（没装 `rsvg-convert`）
+    // 就用同名的位图，同名的都不行再看下一个名字。
+    let mut failure = None;
     for name in &names {
-        if let Ok(file) = lookup(name) {
-            return render(&file);
+        for file in lookup(name).unwrap_or_default() {
+            match render(&file) {
+                Ok(image) => return Ok(image),
+                Err(error) => {
+                    failure.get_or_insert(error);
+                }
+            }
         }
     }
-    bail!("图标主题里没有这个类型的图（{}）", names.join("、"))
+    match failure {
+        Some(error) => Err(error),
+        None => bail!("图标主题里没有这个类型的图（{}）", names.join("、")),
+    }
 }
 
 /// 图片文件自己的缩略图。读不动（不是图片、太大、这种格式没编进来）就当没有。
@@ -172,12 +189,15 @@ fn type_icons(path: &Path) -> Result<Vec<String>> {
     Ok(names)
 }
 
-/// 在装着的图标主题里找这个名字的文件。
+/// 在装着的图标主题里找这个名字的文件，按该试的先后排好。
 ///
-/// 矢量图优先：多大都画得清楚。位图则要挑够大的——主题里往往只有 16×16，放大到 64
-/// 只会是一团糊，那就干脆当没有，让主控显示它自己的图标。两边都找不到时也当没有。
-fn lookup(name: &str) -> Result<PathBuf> {
-    let mut best: Option<(u32, PathBuf)> = None;
+/// 矢量图在前：多大都画得清楚。可它要靠 `rsvg-convert` 才画得出来，没装就画不了，
+/// 所以后面再跟一张同名的位图垫底。位图要挑够大的——主题里往往只有 16×16，放大到
+/// 64 只会是一团糊，那就干脆不要，让主控显示它自己的图标。两样都没有时报错。
+fn lookup(name: &str) -> Result<Vec<PathBuf>> {
+    // `scalable` 目录里的矢量图优先于尺寸目录里的（`true` 排在 `false` 后面）。
+    let mut vector: Option<(bool, PathBuf)> = None;
+    let mut bitmap: Option<(u32, PathBuf)> = None;
     for root in roots() {
         let Ok(themes) = std::fs::read_dir(&root) else {
             continue;
@@ -189,24 +209,33 @@ fn lookup(name: &str) -> Result<PathBuf> {
             for entry in entries.flatten() {
                 let directory = entry.file_name().to_string_lossy().into_owned();
                 // 尺寸目录名就是尺寸（`64x64`、`128x128@2`），`scalable` 是矢量那一份。
-                let found = if directory == "scalable" {
-                    find_in(&entry.path(), name).map(|file| (u32::MAX, file))
-                } else {
-                    parse_size(&directory)
-                        .and_then(|size| find_in(&entry.path(), name).map(|file| (size, file)))
-                };
-                if let Some((size, file)) = found
-                    && best.as_ref().is_none_or(|(known, _)| *known < size)
+                let scalable = directory == "scalable";
+                let size = parse_size(&directory);
+                if !scalable && size.is_none() {
+                    continue;
+                }
+                if vector.as_ref().is_none_or(|(known, _)| scalable && !known)
+                    && let Some(file) = find_in(&entry.path(), name, "svg")
                 {
-                    best = Some((size, file));
+                    vector = Some((scalable, file));
+                }
+                if let Some(size) = size
+                    && bitmap.as_ref().is_none_or(|(known, _)| *known < size)
+                    && let Some(file) = find_in(&entry.path(), name, "png")
+                {
+                    bitmap = Some((size, file));
                 }
             }
         }
     }
-    match best {
-        Some((size, file)) if size >= MIN_BITMAP || size == u32::MAX => Ok(file),
-        _ => bail!("图标主题里没有够大的 {name}"),
-    }
+    let mut files: Vec<PathBuf> = vector.into_iter().map(|(_, file)| file).collect();
+    files.extend(
+        bitmap
+            .filter(|(size, _)| *size >= MIN_BITMAP)
+            .map(|(_, file)| file),
+    );
+    ensure!(!files.is_empty(), "图标主题里没有够大的 {name}");
+    Ok(files)
 }
 
 /// 图标主题可能待着的几个地方。
@@ -230,14 +259,12 @@ fn roots() -> Vec<PathBuf> {
     roots
 }
 
-/// 一个尺寸目录（或者 `scalable`）里有没有这个名字的图。
-fn find_in(directory: &Path, name: &str) -> Option<PathBuf> {
+/// 一个尺寸目录（或者 `scalable`）里有没有这个名字、这种格式的图。
+fn find_in(directory: &Path, name: &str, extension: &str) -> Option<PathBuf> {
     for context in std::fs::read_dir(directory).ok()?.flatten() {
-        for extension in ["svg", "png"] {
-            let file = context.path().join(format!("{name}.{extension}"));
-            if file.is_file() {
-                return Some(file);
-            }
+        let file = context.path().join(format!("{name}.{extension}"));
+        if file.is_file() {
+            return Some(file);
         }
     }
     None
@@ -263,7 +290,7 @@ fn render(file: &Path) -> Result<DragImage> {
 }
 
 /// 矢量图标转成位图。自己拖进一整棵 SVG 实现不值当：本机装着的 `rsvg-convert` 就够了，
-/// 没有它这条就当没图。
+/// 没有它这条就报错，`icon` 会改用同名的位图。
 fn rasterize(file: &Path) -> Result<image::RgbaImage> {
     let mut command = std::process::Command::new("rsvg-convert");
     command.args(["-w", "64", "-h", "64"]).arg(file);
