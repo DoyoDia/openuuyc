@@ -499,6 +499,18 @@ impl Retained {
     }
 }
 
+/// Whether `set_visible(false)` takes the window off screen. X11 unmaps it;
+/// winit's Wayland backend ignores the call because a Wayland client cannot
+/// unmap a toplevel, so the control center destroys its window there and
+/// keeps the drawing resources in [`Retained`].
+pub(crate) fn can_hide(window: &Window) -> bool {
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    !matches!(
+        window.window_handle().map(|handle| handle.as_raw()),
+        Ok(RawWindowHandle::Wayland(_))
+    )
+}
+
 /// egui writes gamma-space colors, so a non-sRGB 8-bit format is the match.
 fn surface_format(capabilities: &wgpu::SurfaceCapabilities) -> wgpu::TextureFormat {
     const PREFERRED: [wgpu::TextureFormat; 2] = [

@@ -291,21 +291,30 @@ impl Drop for UiPresenter {
     }
 }
 
-/// Windows 的窗口可以直接隐藏，不销毁重建，所以没有跨窗口要留下的绘制资源。
-pub(crate) struct Retained;
+/// Win32 hides a window in place (`can_hide` is always true), so the control
+/// center never destroys its window while it lives in the tray: the updater
+/// and notification activation find the process by that HWND, and the
+/// presenter's composition tree stays bound to it. No drawing resources ever
+/// outlive their window here, hence an uninhabited type.
+pub(crate) enum Retained {}
 
 impl Retained {
     pub(crate) fn take(_presenter: UiPresenter) -> Self {
-        Self
+        unreachable!("Windows hides the control center instead of destroying its window")
     }
 
     pub(crate) fn reuse(
         self,
-        window: std::sync::Arc<Window>,
-        graphics: &Graphics,
+        _window: std::sync::Arc<Window>,
+        _graphics: &Graphics,
     ) -> Result<UiPresenter> {
-        UiPresenter::new(window, graphics)
+        match self {}
     }
+}
+
+/// `set_visible(false)` takes a Win32 window off screen.
+pub(crate) fn can_hide(_window: &Window) -> bool {
+    true
 }
 
 pub(crate) fn window_hwnd(window: &Window) -> Result<HWND> {

@@ -12,7 +12,7 @@ pub(crate) use crate::platform::graphics::window_hwnd;
     reason = "The platform-neutral names of the presenter types; not every caller spells them out."
 )]
 pub(crate) use crate::platform::graphics::{
-    Graphics, Retained, UiPresenter, create_device, split_output,
+    Graphics, Retained, UiPresenter, can_hide, create_device, split_output,
 };
 
 /// Opt-in, aggregated UI-only diagnostics. No RTP hot-path counters or HUD.

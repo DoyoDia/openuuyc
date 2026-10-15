@@ -1,4 +1,4 @@
-use super::gfx::{Retained, UiPresenter, create_device, split_output};
+use super::gfx::{Retained, UiPresenter, can_hide, create_device, split_output};
 use super::window_manager::{self, Event, Repaint, Request};
 use super::{AppFactory, AppSession, WindowConfig};
 use crate::application::viewer::presenter::ConnectingWindowsRunner;
@@ -114,6 +114,7 @@ struct DesktopWindow {
     viewport: egui::ViewportInfo,
     close_requested: bool,
     /// 关闭请求已经转成「收进托盘」，等这一帧结束由 [`Runner`] 拆掉窗口资源。
+    /// Only where the window cannot be hidden in place (Wayland).
     hide_requested: bool,
     tray: Option<super::tray::Tray>,
     exiting: bool,
@@ -143,7 +144,12 @@ impl Runner {
     }
 
     /// 把主窗口收进托盘：窗口放掉，应用、egui 上下文、托盘与绘制资源留下。托盘再
-    /// 打开时按收起来之前的尺寸重建窗口，并把这些资源接到新窗口上。
+    /// 打开时按收起来之前的尺寸重建窗口，并把这些资源接到新窗口上。Only where
+    /// the window cannot be hidden in place; see [`can_hide`].
+    // Windows always hides in place, so its `Retained` is uninhabited and the
+    // compiler rightly sees everything after `Retained::take` as unreachable
+    // there; the destroy-and-recreate path exists for Wayland only.
+    #[cfg_attr(windows, allow(unreachable_code, unused_variables, unused_mut))]
     fn hide_main(&mut self) {
         let Some(state) = self.state.take() else {
             return;
@@ -488,16 +494,15 @@ impl DesktopWindow {
         {
             self.close_requested = false;
             self.show_after_present = false;
-            self.app.0.on_focus_changed(false);
             // Windows 的窗口能直接隐藏，而且必须留着：更新器和通知激活都按
-            // 控制中心 HWND 找进程。Wayland 的 set_visible 是空操作，只能销毁窗口
-            // 和它的 surface，等托盘再打开时重建。
-            #[cfg(windows)]
-            self.window.set_visible(false);
-            #[cfg(not(windows))]
-            {
+            // 控制中心 HWND 找进程；X11 也能直接隐藏。Wayland 的 set_visible
+            // 是空操作，只能销毁窗口和它的 surface，等托盘再打开时重建。
+            if can_hide(&self.window) {
+                self.window.set_visible(false);
+            } else {
                 self.hide_requested = true;
             }
+            self.app.0.on_focus_changed(false);
         }
         if self.close_requested && !self.app.0.on_close_requested() {
             self.close_requested = false;
