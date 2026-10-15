@@ -283,8 +283,16 @@ impl Grab {
                     .shm_buffer
                     .as_ref()
                     .map(|shm| shm.picture(transform));
-                // Ask for the next frame before returning, so the compositor
-                // draws into the buffer while the caller encodes this one.
+                // Ask for the next frame before returning. The request is
+                // only buffered: it leaves with the flush in the next `wait`,
+                // and the copy itself follows once `buffer_done` answers it,
+                // so nothing is drawn while the caller encodes this picture.
+                // `request` deliberately does not flush. It would gain nothing
+                // measurable, and in `probe` it parts the request from the
+                // round trip after it, which then sends the probe's copy on
+                // its own, ahead of its `destroy`: the compositor can complete
+                // that copy and use up the damage the first real frame waits
+                // for, and a still desktop then sends no frame at all.
                 self.request()?;
                 if let Some(picture) = picture {
                     return Ok(Some(picture));
