@@ -383,7 +383,7 @@ struct LocalFiles {
 }
 
 /// What this client currently owns locally, as the remote would see it.
-#[derive(Default, Clone, PartialEq, Eq)]
+#[derive(Default, Clone, PartialEq, Eq, Debug)]
 pub(super) struct LocalSnapshot {
     pub(super) text: Option<String>,
     pub(super) image: Option<Vec<u8>>,
@@ -599,6 +599,49 @@ impl LocalFiles {
     }
 }
 
+/// 本地剪贴板的「写次数」。
+///
+/// 判「本地剪贴板变了没有」不能只看内容：同一个文件复制第二遍，路径、文本、像素
+/// 全都一样，可它仍然是一次新的复制——对端可能已经把上一次那份用掉了（官方
+/// Windows 客户端粘完就不再拿那个 offer），不重新广播它就一直粘不上。
+///
+/// Windows 那边用的是 `GetClipboardSequenceNumber()`，Linux 这边没有这个调用，
+/// 但等价的信号是现成的：Wayland 监听每认领一次剪贴板就发一个 `LocalChanged`
+/// （内容相同也发，见 `start_watcher`）。收不到它的会话（纯 X11、合成器不给
+/// data-control）里计数不前进，调用方自动退回按内容判断。
+#[derive(Default)]
+struct Writes {
+    /// 收到过多少个 `LocalChanged`。
+    generation: u64,
+    /// 上面这个数字对应的是我们已经知道的那一次。
+    seen: u64,
+    /// 我们自己写了几次还没被数到。合成器把我们自己的写也数进去，那不是用户复制。
+    pending: u32,
+}
+
+impl Writes {
+    /// 收到一次 `LocalChanged`。
+    fn tick(&mut self) {
+        self.generation = self.generation.saturating_add(1);
+    }
+
+    /// 我们马上要写剪贴板了。**要在写之前**记：写下去到事件到达之间用户完全
+    /// 可能自己复制一次，那一次要认得出来。
+    fn wrote(&mut self) {
+        self.pending = self.pending.saturating_add(1);
+    }
+
+    /// 这一轮观察到的写次数里，有没有「用户自己又复制了一遍」。
+    fn observe(&mut self) -> bool {
+        let advanced = self.generation.saturating_sub(self.seen);
+        // 前 `pending` 次前进是我们自己写的那几次，一次吃掉一个。
+        let ours = advanced.min(u64::from(self.pending));
+        self.pending -= ours as u32;
+        self.seen = self.generation;
+        advanced > ours
+    }
+}
+
 struct State {
     receiver: Receiver<Command>,
     clipboard: Option<arboard::Clipboard>,
@@ -636,6 +679,8 @@ struct State {
     /// Set once a Wayland watcher is posting `LocalChanged`, which makes the
     /// loop block instead of polling on a timer.
     watching: bool,
+    /// 本地剪贴板的写次数，见 `Writes`。
+    writes: Writes,
 }
 
 impl State {
@@ -729,6 +774,7 @@ fn run(receiver: Receiver<Command>, watcher_sender: SyncSender<Command>) {
         drag_tasks: HashMap::new(),
         writing: false,
         watching: false,
+        writes: Writes::default(),
     };
     // A Wayland watcher turns the poll into an event. X11 has no equivalent, so
     // it keeps the timer; either way `poll_local` does the reading.
@@ -762,6 +808,9 @@ fn run(receiver: Receiver<Command>, watcher_sender: SyncSender<Command>) {
         }
         if matches!(command, Command::WatchEnded) {
             state.watching = false;
+        }
+        if matches!(command, Command::LocalChanged) {
+            state.writes.tick();
         }
         if matches!(command, Command::LocalChanged | Command::WatchEnded) {
             if let Err(error) = poll_local(&mut state) {
@@ -1143,6 +1192,7 @@ fn utf16_text(bytes: &[u8]) -> Result<String> {
 
 fn write_text(state: &mut State, text: &str) -> Result<()> {
     let clipboard = state.clipboard.as_mut().context("系统剪贴板不可用")?;
+    state.writes.wrote();
     state.writing = true;
     let result = clipboard.set_text(text.to_owned());
     state.writing = false;
@@ -1162,6 +1212,7 @@ fn write_text(state: &mut State, text: &str) -> Result<()> {
 ///
 /// Which clipboard that is takes some care: see `publish_files`.
 fn write_files(state: &mut State, paths: &[PathBuf]) -> Result<()> {
+    state.writes.wrote();
     state.writing = true;
     let result = publish_files(state, paths);
     state.writing = false;
@@ -1241,6 +1292,7 @@ fn arboard_files(state: &mut State, paths: &[PathBuf]) -> Result<()> {
 fn write_image(state: &mut State, dib: &[u8]) -> Result<()> {
     let image = dib_to_rgba(dib)?;
     let clipboard = state.clipboard.as_mut().context("系统剪贴板不可用")?;
+    state.writes.wrote();
     state.writing = true;
     let result = clipboard.set_image(arboard::ImageData {
         width: image.0 as usize,
@@ -1278,6 +1330,42 @@ fn trim_uri_path(path: PathBuf) -> PathBuf {
     PathBuf::from(std::ffi::OsString::from_vec(bytes[..trimmed].to_vec()))
 }
 
+/// 这一轮该广播哪一份。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Copy {
+    /// 什么都不用发。
+    None,
+    /// 发 Wayland 那一侧读到的。
+    Wayland,
+    /// 发 X11 那一侧读到的。
+    X11,
+    /// 内容没变，把手里这份重发一遍。
+    Again,
+}
+
+/// 这一轮该广播哪一份。
+///
+/// 单独拆出来是为了能测：里面几条规则都是踩过的坑，而它们只在真实的合成器与
+/// 桌面下才走得到。
+fn decide(changed: (bool, bool), current: &LocalSnapshot, again: bool) -> Copy {
+    let (wayland_changed, x11_changed) = changed;
+    match (x11_changed, wayland_changed) {
+        // 两侧同一轮都变了时让给 X11：XWayland 里的程序只在那一侧看得见，而
+        // Wayland 那一侧的变化更可能是我们自己的东西在动。
+        (true, _) => Copy::X11,
+        (false, true) => Copy::Wayland,
+        // 内容没变，但写次数前进了：有人把同一份又复制了一遍。对面（官方
+        // Windows 客户端粘完就把 offer 放掉）要一次新的 FormatList 才会重新
+        // 武装，所以照着手里的内容再广播一遍。
+        //
+        // 这一条**不能**顺手把两侧都当成「变了」去走上面第一条：那样会挑中
+        // X11，把 X11 上的旧内容广播出去；它带 sources 的时候还会把本地那份
+        // 路径当成文件清单发给对端。
+        (false, false) if again && !current.is_empty() => Copy::Again,
+        (false, false) => Copy::None,
+    }
+}
+
 /// Read the local clipboard and, when it changed, announce the new formats.
 ///
 /// 两个剪贴板都要读。X11 与 Wayland 在这里互不相通（见 `publish_files`）：XWayland
@@ -1290,26 +1378,32 @@ fn poll_local(state: &mut State) -> Result<()> {
     let x11 = super::x11_read::read();
     // 自己挂上去的远端副本不算「本地复制」：发回去等于向远端要它刚给我们的东西。
     let (own_wayland, own_x11) = (own_copy(&wayland.sources), own_copy(&x11.sources));
-    let (wayland_changed, x11_changed) = (
-        !own_wayland && wayland != state.wayland,
-        !own_x11 && x11 != state.x11,
-    );
+    // 内容一个字节都没变时，只有写次数看得出来「又复制了一遍」。手里这份是远端
+    // 的副本时不算：那不是本地复制。
+    let again = state.writes.observe() && !own_copy(&state.local.sources);
+    let wayland_changed = !own_wayland && wayland != state.wayland;
+    // X11 那一侧「没人持有选择区」是常态（在 Wayland 里复制的东西 X11 那侧就没
+    // 有），空的对比不算变化。
+    let x11_changed = !own_x11 && x11 != state.x11 && !x11.is_empty();
+    let choice = decide((wayland_changed, x11_changed), &state.local, again);
     if !own_wayland {
         state.wayland = wayland.clone();
     }
     if !own_x11 {
         state.x11 = x11.clone();
     }
-    // 两边同一轮都变了时让给 X11：XWayland 里的程序只在那一侧看得见，而 Wayland
-    // 那一侧的变化更可能是我们自己的东西在动。
-    let snapshot = if x11_changed && !x11.is_empty() {
-        x11
-    } else if wayland_changed {
-        wayland
-    } else {
-        return Ok(());
+    let snapshot = match choice {
+        Copy::None => return Ok(()),
+        // 内容没变，只是又复制了一遍：手里这份重发。
+        Copy::Again => state.local.clone(),
+        Copy::Wayland => wayland,
+        Copy::X11 => x11,
     };
-    if snapshot == state.local {
+    // 内容一模一样就不必再发。`Again` 那条要的正是「再发一遍」，另外两条不能省：
+    // 刚把远端发来的文本写进本地剪贴板（`write_text`）之后，下一轮读回来的就是
+    // 那段文字本身，当成新复制发回去就是回声——文本和图片没有 `own_copy` 那样的
+    // 记号可认。
+    if choice != Copy::Again && snapshot == state.local {
         return Ok(());
     }
     if !snapshot.sources.is_empty() || !state.local.sources.is_empty() {
@@ -1753,6 +1847,90 @@ pub(super) fn rgba_to_dib(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn local_text(text: &str) -> LocalSnapshot {
+        LocalSnapshot {
+            text: Some(text.into()),
+            ..Default::default()
+        }
+    }
+
+    fn local_paths(paths: &[&str]) -> LocalSnapshot {
+        LocalSnapshot {
+            sources: paths.iter().map(PathBuf::from).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// 复制完 A 之后又复制了一遍 A：内容逐字段相同，只有写次数前进。这时要重
+    /// 发手里这份。原先的实现（靠一个 `written` 标志）会把两侧都当成「变了」，
+    /// 于是走「两边都变了让给 X11」那条，把 X11 上的旧内容广播出去——带
+    /// `sources` 时还会把本地路径当文件清单发给对端。
+    #[test]
+    fn a_repeated_copy_of_the_same_thing_is_announced_again() {
+        let files = local_paths(&["/home/a/b.txt"]);
+        assert_eq!(
+            decide((false, false), &files, true),
+            Copy::Again,
+            "写次数前进、内容没变时要重发手里这份"
+        );
+        assert_eq!(
+            decide((false, false), &files, false),
+            Copy::None,
+            "内容没变、写次数也没动就不该发"
+        );
+    }
+
+    /// 手里什么都没有时没有可重发的。
+    #[test]
+    fn nothing_to_repeat_when_the_clipboard_is_empty() {
+        assert_eq!(
+            decide((false, false), &LocalSnapshot::default(), true),
+            Copy::None
+        );
+    }
+
+    /// 两侧同一轮都变了让给 X11：XWayland 里的程序只在那一侧看得见，而 Wayland
+    /// 那一侧的变化更可能是我们自己的东西在动。
+    #[test]
+    fn x11_wins_when_both_sides_changed() {
+        let current = local_text("手里这份");
+        // 参数是 (Wayland 变了, X11 变了)。
+        assert_eq!(decide((true, true), &current, false), Copy::X11);
+        assert_eq!(decide((false, true), &current, false), Copy::X11);
+        assert_eq!(decide((true, false), &current, false), Copy::Wayland);
+        assert_eq!(decide((false, false), &current, false), Copy::None);
+    }
+
+    /// 自己写进剪贴板的那几次会被合成器数进去，不能当成用户复制。
+    #[test]
+    fn our_own_writes_are_not_counted_as_user_copies() {
+        let mut writes = Writes::default();
+        // 把远端发来的文本写进本地剪贴板：那一次前进是自己的。
+        writes.wrote();
+        writes.tick();
+        assert!(!writes.observe(), "自己写的那一次不该被当成用户复制");
+        // 用户随后复制了同一份东西：这一次才算。
+        writes.tick();
+        assert!(writes.observe(), "用户自己的那一次要认出来");
+        // 又一次自己的写。
+        writes.wrote();
+        writes.tick();
+        assert!(!writes.observe());
+    }
+
+    /// 写下去到事件到达之间用户自己复制了一次：写次数一次前进两格，一格是自己
+    /// 的、一格是用户的，不能把用户那次一起吃掉。
+    #[test]
+    fn a_user_copy_between_our_write_and_its_event_still_counts() {
+        let mut writes = Writes::default();
+        writes.wrote();
+        writes.tick();
+        writes.tick();
+        assert!(writes.observe());
+        // 已经吃过的那一格不会再吃第二遍。
+        assert!(!writes.observe());
+    }
 
     /// 本机这台 Wayland 桌面上，X11 与 Wayland 的剪贴板互不相通（实测 `xclip`
     /// 写的 `wl-paste` 看不见，反过来也一样），所以文件复制只写 X11 那条 offer
