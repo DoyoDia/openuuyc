@@ -214,7 +214,11 @@ fn now_ms() -> i64 {
 }
 
 impl Sessions {
-    /// Opens a shell under the controller's handle and returns its name.
+    /// Opens a shell and returns the handle it is reachable under plus its name.
+    ///
+    /// The controller normally picks the handle, but its `open` frame may
+    /// carry zero when it wants the host to allocate one; the returned handle
+    /// is what later `stdin`/`resize` frames must use.
     pub(crate) fn open(
         &mut self,
         handle: u32,
@@ -222,8 +226,21 @@ impl Sessions {
         name: Option<String>,
         cols: u16,
         rows: u16,
-    ) -> Result<String, SessionError> {
-        if !self.sessions.contains_key(&handle) && self.sessions.len() >= MAX_SESSIONS {
+    ) -> Result<(u32, String), SessionError> {
+        let handle = if handle == 0 {
+            self.free_handle()
+        } else {
+            handle
+        };
+        // Re-opening an existing handle happens on reconnect and on resize;
+        // replacing the pty would hang up a shell the controller is using.
+        if let Some(existing) = self.sessions.get_mut(&handle) {
+            existing.pty.resize(cols, rows).map_err(|_| SessionError::Gone)?;
+            existing.state = SessionState::Running;
+            existing.last_active_ms = now_ms();
+            return Ok((handle, existing.name.clone()));
+        }
+        if self.sessions.len() >= MAX_SESSIONS {
             return Err(SessionError::TooMany);
         }
         let name = match name {
@@ -250,7 +267,15 @@ impl Sessions {
                 last_active_ms: stamp,
             },
         );
-        Ok(name)
+        Ok((handle, name))
+    }
+
+    /// The lowest handle no live session uses; the controller's handle space
+    /// starts at 1, leaving 0 free to mean "assign one".
+    fn free_handle(&self) -> u32 {
+        (1..u32::MAX)
+            .find(|handle| !self.sessions.contains_key(handle))
+            .unwrap_or(1)
     }
 
     /// `shell-N`, skipping names already taken so a closed session's number
@@ -270,7 +295,7 @@ impl Sessions {
     pub(crate) fn default_shell() -> String {
         std::env::var("SHELL")
             .ok()
-            .filter(|shell| !shell.is_empty())
+            .filter(|shell| !shell.is_empty() && std::path::Path::new(shell).exists())
             .unwrap_or_else(|| "/bin/bash".to_owned())
     }
 
@@ -383,6 +408,30 @@ impl Sessions {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.sessions.is_empty()
+    }
+}
+
+/// Maps the controller's shell choice to a real program.
+///
+/// The `open` payload names a shell *kind* (`powershell`, `cmd`, `bash`), not
+/// a path. The Windows names have no Linux equivalent, so they fall back to
+/// the user's login shell rather than failing the request; the client shows
+/// its generic creation error when `open` is refused.
+fn resolve_shell(requested: &str) -> String {
+    let candidate = match requested.trim().to_ascii_lowercase().as_str() {
+        "bash" => Some("/bin/bash"),
+        "zsh" => Some("/bin/zsh"),
+        "sh" => Some("/bin/sh"),
+        "fish" => Some("/usr/bin/fish"),
+        "pwsh" | "powershell" => Some("/usr/bin/pwsh"),
+        // `cmd` and friends are Windows-only; a POSIX shell is the closest
+        // thing that can actually run.
+        "cmd" | "cmd.exe" | "powershell.exe" => Some("/bin/sh"),
+        _ => None,
+    };
+    match candidate {
+        Some(path) if std::path::Path::new(path).exists() => path.to_owned(),
+        _ => Sessions::default_shell(),
     }
 }
 
@@ -547,6 +596,22 @@ async fn handle_frame(
         tracing::warn!(bytes = data.len(), "host terminal frame unparsed");
         return;
     };
+    let verbose = !matches!(frame.kind, FrameType::Stdin);
+    if verbose {
+        tracing::info!(
+            kind = ?frame.kind,
+            session = frame.session,
+            bytes = frame.payload.len(),
+            payload = %String::from_utf8_lossy(&frame.payload[..frame.payload.len().min(200)]),
+            "host terminal frame"
+        );
+    } else {
+        tracing::debug!(
+            session = frame.session,
+            bytes = frame.payload.len(),
+            "host terminal input"
+        );
+    }
     let mut outgoing = Vec::new();
     match frame.kind {
         FrameType::ListSessionsReq => {
@@ -562,12 +627,14 @@ async fn handle_frame(
         FrameType::Open => {
             let text = serde_json::from_slice::<Value>(&frame.payload).ok();
             let (cols, rows) = geometry(&frame.payload);
-            let shell = text
+            let shell = match text
                 .as_ref()
                 .and_then(|v| v.get("shell").and_then(Value::as_str))
-                .filter(|shell| !shell.is_empty())
-                .map(str::to_owned)
-                .unwrap_or_else(Sessions::default_shell);
+            {
+                Some(requested) if !requested.is_empty() => resolve_shell(requested),
+                _ => Sessions::default_shell(),
+            };
+            tracing::info!(requested = shell, "host terminal shell selected");
             let name = text
                 .as_ref()
                 .and_then(|v| v.get("name").and_then(Value::as_str))
@@ -578,22 +645,36 @@ async fn handle_frame(
                 let mut sessions = sessions.lock().unwrap_or_else(|e| e.into_inner());
                 sessions.open(frame.session, &shell, name, cols.unwrap_or(80), rows.unwrap_or(24))
             };
-            let payload = match result {
-                Ok(name) => json!({
-                    "code": 0,
-                    "message": "",
-                    "session_id": frame.session,
-                    "name": name,
-                }),
-                Err(error) => json!({
-                    "code": 1,
-                    "message": error.to_string(),
-                    "session_id": frame.session,
-                }),
+            let (payload, session) = match result {
+                Ok((handle, name)) => (
+                    json!({
+                        // The client reads `code`/`message` and a session id;
+                        // the exact spelling of the id key is not certain, so
+                        // every plausible one carries the same value and the
+                        // client's decoder picks up whichever it knows.
+                        "code": 0,
+                        "message": "",
+                        "session_id": handle,
+                        "resp_session_id": handle,
+                        "respSessionId": handle,
+                        "handle": handle,
+                        "name": name,
+                        "shell": shell,
+                    }),
+                    handle,
+                ),
+                Err(error) => (
+                    json!({
+                        "code": 1,
+                        "message": error.to_string(),
+                        "session_id": frame.session,
+                    }),
+                    frame.session,
+                ),
             };
             outgoing.push((
                 FrameType::OpenResp,
-                frame.session,
+                session,
                 serde_json::to_vec(&payload).unwrap_or_default(),
             ));
         }
@@ -667,6 +748,13 @@ async fn handle_frame(
             return;
         }
         let frame = Frame::encode(kind, handle, &payload);
+        tracing::info!(
+            kind = ?kind,
+            session = handle,
+            bytes = payload.len(),
+            payload = %String::from_utf8_lossy(&payload[..payload.len().min(200)]),
+            "host terminal reply"
+        );
         if let Err(error) = channel.send(&Bytes::from(frame)).await {
             tracing::warn!(%error, "host terminal reply failed");
             return;
@@ -813,6 +901,15 @@ mod tests {
         assert_eq!(sessions.kill(1), Ok(()));
         assert_eq!(sessions.kill(1), Err(SessionError::Gone));
         assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn windows_shell_kinds_fall_back_to_a_posix_shell() {
+        // The Android client always asks for `powershell`; refusing it is what
+        // made the phone report a failed session creation.
+        assert!(std::path::Path::new(&resolve_shell("powershell")).exists());
+        assert!(std::path::Path::new(&resolve_shell("cmd")).exists());
+        assert!(std::path::Path::new(&resolve_shell("bash")).exists());
     }
 
     #[test]
