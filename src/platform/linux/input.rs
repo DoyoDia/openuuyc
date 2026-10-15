@@ -458,8 +458,10 @@ mod uinput {
         /// 一帧触点。`kind` 是 UU 的说法：1 是「触点集合从现在开始」，2 是移动，
         /// 3 是抬起，4 是取消。返回要写进设备的帧。
         ///
-        /// 一次同步里不能把「抬起旧触点」和「按下新触点」当成同一批，所以 kind 1
-        /// 的取消自己是一个完整的帧。
+        /// 一次同步里不能把「抬起旧触点」和「按下新触点」当成同一批：新触点常常拿到
+        /// 刚空出来的槽位，同一帧里同一个槽位先写 -1 再写新 id，libinput
+        /// （`evdev-fallback.c`）会当成内核的错误，抬起和按下一起丢掉。所以抬起
+        /// 总是自己一帧，和 Windows 的 `Touch::update` 先单独注入一帧 UP 一样。
         fn step(&mut self, kind: u8, points: &[Touch], rotation: Rotation) -> Result<Vec<Frame>> {
             let mut frames = Vec::new();
             if kind == 1 || kind >= 3 {
@@ -469,7 +471,6 @@ mod uinput {
                     return Ok(frames);
                 }
             }
-            let mut frame = Frame::new();
             // 这一帧里没有了的触点先抬起，槽位空出来给新触点用。
             let gone: Vec<u32> = self
                 .active
@@ -477,14 +478,23 @@ mod uinput {
                 .copied()
                 .filter(|id| !points.iter().any(|point| point.id == *id))
                 .collect();
+            let mut lifts = Frame::new();
             for id in gone {
                 let Some(contact) = self.active.remove(&id) else {
                     continue;
                 };
                 self.used[usize::from(contact.slot)] = false;
-                frame.push((EV_ABS, ABS_MT_SLOT, i32::from(contact.slot)));
-                frame.push((EV_ABS, ABS_MT_TRACKING_ID, -1));
+                lifts.push((EV_ABS, ABS_MT_SLOT, i32::from(contact.slot)));
+                lifts.push((EV_ABS, ABS_MT_TRACKING_ID, -1));
             }
+            if !lifts.is_empty() {
+                if self.active.is_empty() && self.touching {
+                    self.touching = false;
+                    lifts.push((EV_KEY, BTN_TOUCH, 0));
+                }
+                frames.push(lifts);
+            }
+            let mut frame = Frame::new();
             for point in points {
                 let (x, y) = position(point, rotation);
                 match self.active.get(&point.id) {
@@ -625,19 +635,94 @@ mod uinput {
             assert_eq!(contacts.active.len(), 2);
             assert_eq!(contacts.used.iter().filter(|used| **used).count(), 2);
 
-            // 第二根手指抬起，第一根还在：帧里抬起后分配的那个槽位，面板仍然是按下的
+            // 第二根手指抬起，第一根还在：抬起自己一帧，面板仍然是按下的；剩下那根的
+            // 移动在下一帧
             let frames = contacts
                 .step(2, &[contact(1, 0.2, 0.2)], Rotation::Normal)
                 .unwrap();
-            assert_eq!(frames.len(), 1);
-            let frame = &frames[0];
-            assert!(frame.contains(&(EV_ABS, ABS_MT_SLOT, 1)));
-            assert!(frame.contains(&(EV_ABS, ABS_MT_TRACKING_ID, -1)));
-            assert!(!frame.contains(&(EV_KEY, BTN_TOUCH, 0)));
-            assert!(frame.contains(&(EV_ABS, ABS_MT_POSITION_X, touch_value(0.2))));
+            assert_eq!(frames.len(), 2);
+            assert_eq!(
+                frames[0],
+                [(EV_ABS, ABS_MT_SLOT, 1), (EV_ABS, ABS_MT_TRACKING_ID, -1)]
+            );
+            assert!(!frames[1].contains(&(EV_KEY, BTN_TOUCH, 0)));
+            assert!(frames[1].contains(&(EV_ABS, ABS_MT_SLOT, 0)));
+            assert!(frames[1].contains(&(EV_ABS, ABS_MT_POSITION_X, touch_value(0.2))));
             assert_eq!(contacts.active.len(), 1);
             assert!(!contacts.used[1]);
             assert!(contacts.used[0]);
+        }
+
+        /// 每一帧里每个槽位写过的 tracking id。libinput 在同一帧里看到一个槽位先
+        /// 写 -1 再写新 id，会把抬起和按下一起丢掉。
+        fn ends_and_begins_in_one_frame(frames: &[Frame]) -> bool {
+            frames.iter().any(|frame| {
+                let mut slot = None;
+                let mut written: BTreeMap<i32, Vec<i32>> = BTreeMap::new();
+                for &(kind, code, value) in frame {
+                    match (kind, code) {
+                        (EV_ABS, ABS_MT_SLOT) => slot = Some(value),
+                        (EV_ABS, ABS_MT_TRACKING_ID) => {
+                            written.entry(slot.unwrap()).or_default().push(value)
+                        }
+                        _ => {}
+                    }
+                }
+                written
+                    .values()
+                    .any(|ids| ids.contains(&-1) && ids.iter().any(|id| *id >= 0))
+            })
+        }
+
+        /// 一根手指抬起、另一根同时按下（主控在两次点击之间没有发抬起）：抬起和按下
+        /// 落在两帧里，按下的那一帧可以复用刚空出来的槽位。
+        #[test]
+        fn a_contact_replaced_in_one_step_lifts_and_presses_in_separate_frames() {
+            let mut contacts = Contacts::default();
+            contacts
+                .step(2, &[contact(1, 0.5, 0.5)], Rotation::Normal)
+                .unwrap();
+            let frames = contacts
+                .step(2, &[contact(2, 0.3, 0.3)], Rotation::Normal)
+                .unwrap();
+            assert_eq!(frames.len(), 2);
+            // 先抬起，面板也跟着松开
+            assert_eq!(
+                frames[0],
+                [
+                    (EV_ABS, ABS_MT_SLOT, 0),
+                    (EV_ABS, ABS_MT_TRACKING_ID, -1),
+                    (EV_KEY, BTN_TOUCH, 0),
+                ]
+            );
+            // 再按下新触点，同一个槽位、新的 tracking id
+            assert!(frames[1].contains(&(EV_ABS, ABS_MT_SLOT, 0)));
+            assert!(frames[1].contains(&(EV_ABS, ABS_MT_TRACKING_ID, 2)));
+            assert!(!frames[1].contains(&(EV_ABS, ABS_MT_TRACKING_ID, -1)));
+            assert!(frames[1].contains(&(EV_KEY, BTN_TOUCH, 1)));
+            assert!(!ends_and_begins_in_one_frame(&frames));
+        }
+
+        /// 一串换手指的帧里，没有哪一帧对同一个槽位既写 -1 又写新 id。
+        #[test]
+        fn no_frame_ends_and_begins_a_contact_in_the_same_slot() {
+            let mut contacts = Contacts::default();
+            let steps: [&[Touch]; 6] = [
+                &[contact(1, 0.1, 0.1), contact(2, 0.2, 0.2)],
+                // 1 抬起，3 按下：3 拿到 1 空出来的槽位 0
+                &[contact(2, 0.2, 0.3), contact(3, 0.4, 0.4)],
+                // 两根都换掉
+                &[contact(4, 0.5, 0.5), contact(5, 0.6, 0.6)],
+                &[contact(5, 0.6, 0.7)],
+                &[contact(6, 0.7, 0.7)],
+                &[],
+            ];
+            for points in steps {
+                let frames = contacts.step(2, points, Rotation::Normal).unwrap();
+                assert!(!ends_and_begins_in_one_frame(&frames), "{frames:?}");
+            }
+            assert!(contacts.active.is_empty());
+            assert!(!contacts.touching);
         }
 
         /// 「触点集合从现在开始」这一类帧，先抬起旧的一套，再按下新的一套。
