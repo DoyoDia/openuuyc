@@ -8,9 +8,10 @@ Two packages for Arch and Omarchy users:
 | `openuuyc-git` | `linux-port` branch of DoyoDia/openuuyc-linux | 20–40 min |
 
 Both install the same files: `/usr/bin/OpenUUYC`, the desktop entry, the
-icon, the uinput udev rule and the license texts. Login startup is the
-settings page's 「开机自启」 switch (an XDG autostart entry), so the packages
-ship no systemd unit.
+icon, the uinput udev rule, `openuuyc.service` (a systemd user unit) and the
+license texts. Login startup is the settings page's 「开机自启」 switch, which
+enables that unit — the same as `systemctl --user enable openuuyc.service`.
+The packages never enable it themselves.
 
 ## Releases
 

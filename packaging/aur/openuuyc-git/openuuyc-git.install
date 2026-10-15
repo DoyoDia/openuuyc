@@ -36,8 +36,8 @@ pre_remove() {
 OpenUUYC 已移除。以下用户数据被保留：
 
     ~/.local/share/OpenUUYC/          日志与屏幕共享授权令牌
-    ~/.config/autostart/openuuyc.desktop  （若开启过开机自启或远程开机）
+    ~/.config/systemd/user/           登录自启（openuuyc.service 及其 enable 符号链接）
 
-需要时手动删除。
+需要时手动删除；先 `systemctl --user disable openuuyc.service` 再删更干净。
 EOF
 }
