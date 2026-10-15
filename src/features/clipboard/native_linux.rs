@@ -1156,20 +1156,23 @@ fn accept_files(state: &mut State, session: &Arc<Inner>, epoch: u64) -> Result<(
             )
         })
     };
-    let mount = super::fuse::Mount::new(&parent, super::fuse::generation(), tree, reader)?;
+    let generation = super::fuse::generation();
+    let mount = super::fuse::Mount::new(&parent, generation, tree, reader)?;
     let paths = mount.paths();
     // 每次远端复制都会走到这里，而且只此一次。这条把两个关键事实分开记：「清单
-    // 里是什么」说明远端给的目录是不是新那一份，「发布到了哪里」说明本地剪贴板有
+    // 里是什么」说明远端给的目录是不是新那一份，「挂到了哪一代」说明本地剪贴板有
     // 没有跟着换过去。两件事坏掉的样子完全不同（内容还是旧的 / 粘贴根本不动），
     // 光看现象分不出来。
     //
-    // 名字不记：文件名本身是远端用户的内容，而「是不是新那份」看大小与改动时间
-    // 就够了（改两个字长度可能一样，改动时间一定不一样）。
+    // 名字不记：文件名本身是远端用户的内容，而发布出去的路径就是挂载点加上这些
+    // 名字，所以只记挂载代号和顶层项数。「是不是新那份」看大小与改动时间就够了
+    // （改两个字长度可能一样，改动时间一定不一样）。
     tracing::info!(
+        mount = generation,
+        roots = paths.len(),
         files = descriptors.len(),
         size = descriptors[0].file_size,
         modified = descriptors[0].last_write_time,
-        published = %paths.first().map(|path| path.display().to_string()).unwrap_or_default(),
         "已挂载远端剪贴板文件"
     );
     write_files(state, &paths)?;
@@ -1475,7 +1478,7 @@ fn poll_local(state: &mut State) -> Result<()> {
 /// 所以清单要在这里就登记成任务，否则下一步的 `FileContentsRequest` 会答
 /// 「文件任务已失效」。登记用的是双方约定好的固定任务号。
 fn descriptor_blob(state: &mut State, session: &Arc<Inner>) -> Result<Vec<u8>> {
-    tracing::info!("对面来问 FileGroupDescriptorW 描述符块");
+    tracing::debug!("对面来问 FileGroupDescriptorW 描述符块");
     let files = state.local_files()?;
     if state.tasks.len() < 32 {
         state
@@ -1606,7 +1609,7 @@ fn serve(
         ClipboardRequestKind::FileDescListRequest(ask) => {
             // 对面走的是哪一条路，只有这里看得出来：官方客户端压根不发这一条
             // （见 `descriptor_blob`），所以「它有没来过」本身就是证据。
-            tracing::info!(
+            tracing::debug!(
                 task_id = ask.task_id,
                 "对面来问文件清单（FileDescListRequest）"
             );
@@ -1691,7 +1694,7 @@ fn serve(
         ClipboardRequestKind::FileContentsRequest(ask) => {
             // 和上一条配着看：不走 FileDescListRequest 的对面会直接来这里，
             // task_id 也说明它是接着哪一次答的清单。
-            tracing::info!(
+            tracing::debug!(
                 task_id = ask.task_id,
                 list_index = ask.list_index,
                 pos_offset = ask.pos_offset,
