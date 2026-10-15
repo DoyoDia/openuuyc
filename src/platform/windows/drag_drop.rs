@@ -102,8 +102,9 @@ impl Shared {
 }
 /// Windows 上没有这条路。那边的拖放全是 OLE：由正在拖的那一方把数据交出去
 /// （见 `portal`），不存在「在指针底下摆个窗口去接住别人的拖放」这件事，也就
-/// 没有对应能力。留着这个空壳是为了让共享代码两侧形状一致，调用处不必分平台。
-pub(crate) struct Catcher;
+/// 没有对应能力。它是个无值类型：共享代码两侧形状一致、调用处不必分平台，
+/// 却造不出一个假装能用的接取者。
+pub(crate) enum Catcher {}
 impl Catcher {
     pub fn start(
         _device: &str,
@@ -114,7 +115,9 @@ impl Catcher {
     ) -> Result<Self> {
         anyhow::bail!("Windows 不在指针底下接取拖放")
     }
-    pub fn cancel(&self) {}
+    pub fn cancel(&self) {
+        match *self {}
+    }
 }
 
 pub(crate) struct Session {
