@@ -631,22 +631,14 @@ async fn handle_frame(
         tracing::warn!(bytes = data.len(), "host terminal frame unparsed");
         return;
     };
-    let verbose = !matches!(frame.kind, FrameType::Stdin);
-    if verbose {
-        tracing::info!(
-            kind = ?frame.kind,
-            session = frame.session,
-            bytes = frame.payload.len(),
-            payload = %String::from_utf8_lossy(&frame.payload[..frame.payload.len().min(200)]),
-            "host terminal frame"
-        );
-    } else {
-        tracing::debug!(
-            session = frame.session,
-            bytes = frame.payload.len(),
-            "host terminal input"
-        );
-    }
+    // Metadata only: payloads carry keystrokes, screen contents and replayed
+    // history, none of which may reach the log files or a diagnostics bundle.
+    tracing::debug!(
+        kind = ?frame.kind,
+        session = frame.session,
+        bytes = frame.payload.len(),
+        "host terminal frame"
+    );
     let mut outgoing = Vec::new();
     match frame.kind {
         FrameType::ListSessionsReq => {
@@ -801,11 +793,10 @@ async fn handle_frame(
             return;
         }
         let frame = Frame::encode(kind, handle, &payload);
-        tracing::info!(
+        tracing::debug!(
             kind = ?kind,
             session = handle,
             bytes = payload.len(),
-            payload = %String::from_utf8_lossy(&payload[..payload.len().min(200)]),
             "host terminal reply"
         );
         if let Err(error) = channel.send(&Bytes::from(frame)).await {
