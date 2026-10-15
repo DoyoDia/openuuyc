@@ -41,6 +41,11 @@ use wayland_protocols_wlr::screencopy::v1::client::{
 /// with the one the caller asked for.
 const OUTPUT_VERSION: u32 = 4;
 
+/// The one thing a compositor says when it will not copy: a `failed` event,
+/// which covers an output that has been turned off as well as any other
+/// refusal.
+const COPY_REFUSED: &str = "合成器拒绝了屏幕复制（输出可能已关闭）";
+
 /// One output the compositor offers to copy.
 struct Output {
     proxy: wl_output::WlOutput,
@@ -76,6 +81,9 @@ struct Shm {
     width: u32,
     height: u32,
     stride: u32,
+    /// The compositor's pixels have red and blue the other way round from the
+    /// BGRA the encoder wants; see `swapped_channels`.
+    swap: bool,
 }
 
 impl Shm {
@@ -94,14 +102,24 @@ impl Shm {
         // compositor has finished with it: a `ready` event preceded this.
         let all = unsafe { std::slice::from_raw_parts(self.map, self.length) };
         let mut pixels = Vec::with_capacity(row * self.height as usize);
-        if self.stride as usize == row {
+        if self.stride as usize == row && all.len() >= row * self.height as usize {
             pixels.extend_from_slice(&all[..row * self.height as usize]);
         } else {
             for line in all
                 .chunks_exact(self.stride as usize)
                 .take(self.height as usize)
             {
-                pixels.extend_from_slice(&line[..row]);
+                // A stride narrower than a row is refused in `allocate`, so
+                // this takes whole rows; the clamp is only there to keep a
+                // short mapping from panicking.
+                pixels.extend_from_slice(&line[..row.min(line.len())]);
+            }
+        }
+        if self.swap {
+            // The alpha byte of an `abgr8888` frame sits in byte 3 like the
+            // encoder's, so only the two colour bytes move.
+            for pixel in pixels.chunks_exact_mut(4) {
+                pixel.swap(0, 2);
             }
         }
         let (pixels, width, height) = orient(pixels, self.width, self.height, transform);
@@ -163,6 +181,12 @@ impl Grab {
         queue
             .roundtrip(&mut state)
             .context("读取 Wayland 输出描述失败")?;
+        // The registry reports what it could not bind; a compositor too old
+        // for `buffer_done` says so there. Refusing here leaves the next
+        // candidate — the portal — to try.
+        if let Some(error) = &state.error {
+            bail!("{error}");
+        }
         ensure!(
             state.manager.is_some(),
             "合成器没有提供 zwlr_screencopy_manager_v1"
@@ -176,12 +200,43 @@ impl Grab {
             transform = ?state.outputs[output].transform,
             "host wlr-screencopy output selected"
         );
-        Ok(Self {
+        let mut grab = Self {
             queue,
             state,
             cursor,
             output,
-        })
+        };
+        grab.probe()?;
+        Ok(grab)
+    }
+
+    /// Takes one frame before the grab is handed over. Serving the protocol is
+    /// not the same as being able to copy: the Vulkan renderer of wlroots has
+    /// no read-back at all, an output that is off answers `failed`, and a
+    /// format this backend refuses is only known once a frame announces it.
+    /// `Backend::select` moves on to the next candidate only when `open`
+    /// returns an error, so all three have to be found out here or the portal
+    /// below is never reached.
+    fn probe(&mut self) -> Result<()> {
+        self.request()?;
+        // `buffer` and `buffer_done` leave the compositor as it handles the
+        // request itself, so this answers at once even on a still desktop
+        // where no frame would be drawn for a while.
+        self.queue
+            .roundtrip(&mut self.state)
+            .context("读取 Wayland 事件失败")?;
+        if let Some(error) = self.state.error.take() {
+            bail!("{error}");
+        }
+        ensure!(!self.state.failed, "{COPY_REFUSED}");
+        ensure!(self.state.wanted.is_some(), "合成器没有说明帧的缓冲格式");
+        // The probe's frame is single-use and is not wanted: drop it, and let
+        // the first `next` open a frame of its own. The buffer is kept, and is
+        // taken up again when the next frame asks for the same shape.
+        self.drop_frame();
+        self.state.wanted = None;
+        self.state.ready = false;
+        Ok(())
     }
 
     pub fn name(&self) -> &'static str {
@@ -196,7 +251,10 @@ impl Grab {
     pub fn next(&mut self, timeout: Duration) -> Result<Option<Picture>> {
         let deadline = Instant::now() + timeout;
         loop {
-            if let Some(error) = self.state.error.take() {
+            // Kept rather than taken: the compositor is not going to change
+            // its mind on its own, and `Ok(None)` every frame would leave the
+            // caller with a black picture and nothing to report.
+            if let Some(error) = &self.state.error {
                 bail!("{error}");
             }
             if std::mem::take(&mut self.state.ready) {
@@ -219,7 +277,7 @@ impl Grab {
             }
             if std::mem::take(&mut self.state.failed) {
                 self.request()?;
-                bail!("合成器拒绝了屏幕复制");
+                bail!("{COPY_REFUSED}");
             }
             if self.state.frame.is_none() {
                 self.request()?;
@@ -237,22 +295,26 @@ impl Grab {
     fn request(&mut self) -> Result<()> {
         let handle = self.queue.handle();
         let manager = self.state.manager.clone().context("采集已关闭")?;
+        self.state.wanted = None;
+        self.drop_frame();
         let output = self
             .state
             .outputs
             .get(self.output)
             .context("采集的输出已消失")?;
-        self.state.wanted = None;
-        // wayland-client sends no destructor when a proxy is dropped, and a
-        // frame object serves one copy, so the frame of the previous request
-        // has to be destroyed here or every copy leaves an object behind on
-        // the compositor's side.
-        if let Some(frame) = self.state.frame.take() {
-            frame.destroy();
-        }
         self.state.frame =
             Some(manager.capture_output(i32::from(self.cursor), &output.proxy, &handle, ()));
         Ok(())
+    }
+
+    /// Drops the frame of the previous request. wayland-client sends no
+    /// destructor when a proxy is dropped, and a frame object serves one copy,
+    /// so it has to be destroyed here or every copy leaves an object behind on
+    /// the compositor's side.
+    fn drop_frame(&mut self) {
+        if let Some(frame) = self.state.frame.take() {
+            frame.destroy();
+        }
     }
 
     /// Dispatches until an event arrives or `timeout` runs out. Events already
@@ -408,6 +470,18 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
         {
             match interface.as_str() {
                 "zwlr_screencopy_manager_v1" => {
+                    if version < 3 {
+                        // The copy is asked for from `buffer_done`, which
+                        // arrived at 3: an older compositor would never
+                        // deliver a frame, and the caller would sit on a black
+                        // picture with nothing to report. Every compositor
+                        // that serves the protocol today is at 3 or above, so
+                        // this is a guard, not a fix.
+                        state.error = Some(format!(
+                            "合成器的 zwlr_screencopy_manager_v1 只有版本 {version}，缺少 buffer_done，无法采集"
+                        ));
+                        return;
+                    }
                     state.manager = Some(
                         registry.bind::<zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1, _, _>(
                             name,
@@ -545,6 +619,20 @@ impl State {
     }
 }
 
+/// Whether the compositor's pixels arrive with red and blue the other way
+/// round, for the formats this backend takes. `argb8888` and `xrgb8888` store
+/// B,G,R,X — what the encoder wants. `abgr8888` and `xbgr8888` store R,G,B,X
+/// and have to be swapped. Everything else is refused: a 10-bit format read as
+/// 8-bit is noise, and a YUV one is not even the right shape.
+fn swapped_channels(format: u32) -> Result<bool> {
+    use wayland_client::protocol::wl_shm::Format;
+    Ok(match Format::try_from(format) {
+        Ok(Format::Argb8888) | Ok(Format::Xrgb8888) => false,
+        Ok(Format::Abgr8888) | Ok(Format::Xbgr8888) => true,
+        _ => bail!("不支持的共享内存像素格式 {format:#x}（只支持 32 位 ARGB/XRGB/ABGR/XBGR）"),
+    })
+}
+
 /// The shared memory the compositor writes into: a memfd, mapped here and
 /// exported as a pool with a single buffer over the whole of it.
 fn allocate(
@@ -557,7 +645,17 @@ fn allocate(
 ) -> Result<Shm> {
     use wayland_client::protocol::wl_shm::Format;
     let format = Format::try_from(format)
-        .map_err(|()| anyhow::anyhow!("不支持的共享内存像素格式 {format:#x}"))?;
+        .map_err(|()| anyhow::anyhow!("未知的共享内存像素格式 {format:#x}"))?;
+    let swap = swapped_channels(format as u32)?;
+    // A row of this buffer is four bytes per pixel wide, and a compositor that
+    // says otherwise is describing something this backend cannot read: every
+    // compositor in use writes `4 * width`, but `picture` indexes rows by that
+    // width, so it is checked rather than trusted.
+    ensure!(
+        u64::from(stride) >= u64::from(width) * 4,
+        "合成器给出的行距 {stride} 小于一行的宽度 {}",
+        u64::from(width) * 4
+    );
     let length = stride as usize * height as usize;
     let name = c"openuuyc-screencopy";
     // Safe because the name is a valid C string and the flags are plain bits.
@@ -606,6 +704,7 @@ fn allocate(
         width,
         height,
         stride,
+        swap,
     })
 }
 
@@ -693,6 +792,23 @@ mod tests {
         let (flipped, _, _) = orient(source, 2, 3, Transform::Flipped270);
         assert_eq!(values(&plain), vec![2, 4, 6, 1, 3, 5]);
         assert_eq!(values(&flipped), vec![6, 4, 2, 5, 3, 1]);
+    }
+
+    #[test]
+    fn only_the_two_byte_orders_of_32_bit_are_taken() {
+        use super::swapped_channels;
+        use wayland_client::protocol::wl_shm::Format;
+        // What the encoder reads as BGRA already.
+        assert!(!swapped_channels(Format::Argb8888 as u32).unwrap());
+        assert!(!swapped_channels(Format::Xrgb8888 as u32).unwrap());
+        // Red and blue the other way round, which `picture` swaps.
+        assert!(swapped_channels(Format::Abgr8888 as u32).unwrap());
+        assert!(swapped_channels(Format::Xbgr8888 as u32).unwrap());
+        // 10-bit, YUV and anything unknown is refused rather than misread.
+        assert!(swapped_channels(Format::Xbgr2101010 as u32).is_err());
+        assert!(swapped_channels(Format::Rgb565 as u32).is_err());
+        assert!(swapped_channels(Format::Nv12 as u32).is_err());
+        assert!(swapped_channels(0xdead_beef).is_err());
     }
 
     #[test]
