@@ -208,9 +208,11 @@ fn rasterize(file: &Path) -> Result<image::RgbaImage> {
         .output()
         .context("调用 rsvg-convert 失败")?;
     ensure!(output.status.success(), "rsvg-convert 画不出这张图标");
-    Ok(image::load_from_memory_with_format(&output.stdout, image::ImageFormat::Png)
-        .context("解析画出来的图标失败")?
-        .into_rgba8())
+    Ok(
+        image::load_from_memory_with_format(&output.stdout, image::ImageFormat::Png)
+            .context("解析画出来的图标失败")?
+            .into_rgba8(),
+    )
 }
 
 /// 等比缩到长边 `SIDE`，再转成线路上约定的 BGRA（`image` 给的是 RGBA）。
@@ -308,7 +310,10 @@ mod probes {
                         .unwrap()
                         .save(&file)
                         .unwrap();
-                    println!("{index}: {paths:?} -> {file} {}x{}", image.width, image.height);
+                    println!(
+                        "{index}: {paths:?} -> {file} {}x{}",
+                        image.width, image.height
+                    );
                 }
                 Err(error) => println!("{index}: {paths:?} -> 没有预览图：{error:#}"),
             }

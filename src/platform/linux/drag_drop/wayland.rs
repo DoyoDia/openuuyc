@@ -149,8 +149,14 @@ fn run(
             .find(|(_, name)| name == device)
             .map(|(output, _)| output.clone())
             .with_context(|| format!("合成器没有名为 {device} 的输出"))?,
-        state.compositor.clone().context("合成器没有 wl_compositor")?,
-        state.layer.clone().context("合成器没有 zwlr_layer_shell_v1")?,
+        state
+            .compositor
+            .clone()
+            .context("合成器没有 wl_compositor")?,
+        state
+            .layer
+            .clone()
+            .context("合成器没有 zwlr_layer_shell_v1")?,
         state.shm.clone().context("合成器没有 wl_shm")?,
         state.seat.clone().context("合成器没有 wl_seat")?,
         state
@@ -218,7 +224,9 @@ fn run(
         dispatch(&mut queue, &mut state, &connection)?;
         wait(&mut queue, &mut state, &connection, POLL)?;
     }
-    let (serial, width, height) = state.configure.context("合成器没有给出这块 surface 的尺寸")?;
+    let (serial, width, height) = state
+        .configure
+        .context("合成器没有给出这块 surface 的尺寸")?;
 
     // 全透明：memfd 的页是内核给的零页，一个字节都不用写就是透明的。透明不代表
     // 收不到输入——surface 有缓冲才算上屏，上了屏才会被判定成指针底下的那个。
@@ -235,7 +243,13 @@ fn run(
     // 之后被控端的指针就不动了——中途摆出来的 surface 于是永远收不到 `enter`。
     // X11 那条路（`portal.rs`）同样为此用 XTEST 推一下指针。顺便这也把光标从屏幕
     // 边缘挪开：按着键停在边缘会触发 niri 的边缘手势。
-    move_pointer(&mut state, &handle, &connection, local, (logical, (logical_width, logical_height)));
+    move_pointer(
+        &mut state,
+        &handle,
+        &connection,
+        local,
+        (logical, (logical_width, logical_height)),
+    );
 
     let deadline = Instant::now() + LIMIT;
     while state.paths.is_none()
@@ -329,10 +343,7 @@ fn move_pointer(
         return;
     }
     let ((origin_x, origin_y), _) = target;
-    let (x, y) = (
-        origin_x + local.0 - left,
-        origin_y + local.1 - top,
-    );
+    let (x, y) = (origin_x + local.0 - left, origin_y + local.1 - top);
     let pointer = manager.create_virtual_pointer(Some(seat), handle, ());
     pointer.motion_absolute(
         now_ms(),
@@ -392,7 +403,7 @@ fn wait(
         Err(wayland_client::backend::WaylandError::Io(error))
             if error.kind() == std::io::ErrorKind::WouldBlock =>
         {
-            return Ok(())
+            return Ok(());
         }
         Err(error) => return Err(error).context("读取 Wayland 事件失败"),
     }
@@ -463,13 +474,7 @@ fn read_list(fd: &OwnedFd, timeout: Duration) -> Result<Vec<u8>> {
             continue;
         }
         // Safe because `buffer` is a live slice and the descriptor is open.
-        let read = unsafe {
-            libc::read(
-                fd.as_raw_fd(),
-                buffer.as_mut_ptr().cast(),
-                buffer.len(),
-            )
-        };
+        let read = unsafe { libc::read(fd.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len()) };
         match read {
             0 => break,
             size if size > 0 => {
@@ -552,51 +557,53 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                 ))
             }
             "wl_shm" => {
-                state.shm = Some(registry.bind::<wl_shm::WlShm, _, _>(
-                    name,
-                    version.min(1),
-                    handle,
-                    (),
-                ))
+                state.shm =
+                    Some(registry.bind::<wl_shm::WlShm, _, _>(name, version.min(1), handle, ()))
             }
             "wl_seat" => {
-                state.seat = Some(registry.bind::<wl_seat::WlSeat, _, _>(
-                    name,
-                    version.min(1),
-                    handle,
-                    (),
-                ))
+                state.seat =
+                    Some(registry.bind::<wl_seat::WlSeat, _, _>(name, version.min(1), handle, ()))
             }
             "wl_data_device_manager" => {
-                state.manager = Some(registry.bind::<wl_data_device_manager::WlDataDeviceManager, _, _>(
-                    name,
-                    version.min(1),
-                    handle,
-                    (),
-                ))
+                state.manager = Some(
+                    registry.bind::<wl_data_device_manager::WlDataDeviceManager, _, _>(
+                        name,
+                        version.min(1),
+                        handle,
+                        (),
+                    ),
+                )
             }
             "zwlr_virtual_pointer_manager_v1" => {
-                state.pointer = Some(registry.bind::<
-                    zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1,
-                    _,
-                    _,
-                >(name, version.min(2), handle, ()))
+                state.pointer = Some(
+                    registry
+                        .bind::<zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1, _, _>(
+                            name,
+                            version.min(2),
+                            handle,
+                            (),
+                        ),
+                )
             }
             "zxdg_output_manager_v1" => {
-                state.xdg = Some(registry.bind::<zxdg_output_manager_v1::ZxdgOutputManagerV1, _, _>(
-                    name,
-                    version.min(3),
-                    handle,
-                    (),
-                ))
+                state.xdg = Some(
+                    registry.bind::<zxdg_output_manager_v1::ZxdgOutputManagerV1, _, _>(
+                        name,
+                        version.min(3),
+                        handle,
+                        (),
+                    ),
+                )
             }
             "zwlr_layer_shell_v1" => {
-                state.layer = Some(registry.bind::<zwlr_layer_shell_v1::ZwlrLayerShellV1, _, _>(
-                    name,
-                    version.min(1),
-                    handle,
-                    (),
-                ))
+                state.layer = Some(
+                    registry.bind::<zwlr_layer_shell_v1::ZwlrLayerShellV1, _, _>(
+                        name,
+                        version.min(1),
+                        handle,
+                        (),
+                    ),
+                )
             }
             // `wl_output.name` 是 v4 才有的，也就是认这块屏靠的那个字段。
             "wl_output" => state.outputs.push((
@@ -731,7 +738,6 @@ impl Dispatch<zxdg_output_v1::ZxdgOutputV1, ()> for State {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -761,4 +767,3 @@ wayland_client::delegate_noop!(State: ignore wl_seat::WlSeat);
 wayland_client::delegate_noop!(State: ignore wl_surface::WlSurface);
 wayland_client::delegate_noop!(State: ignore wl_data_device_manager::WlDataDeviceManager);
 wayland_client::delegate_noop!(State: ignore zwlr_layer_shell_v1::ZwlrLayerShellV1);
-
