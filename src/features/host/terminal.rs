@@ -186,6 +186,31 @@ struct Session {
     scrollback: Vec<u8>,
 }
 
+/// Sessions taken out of the table.
+///
+/// Dropping a session ends its shell, which can block for the pty's hangup
+/// grace period while a shell that ignores `SIGHUP` is killed. The table
+/// therefore hands ended sessions back instead of dropping them under its
+/// lock, and [`Ended::finish`] drops them once the caller has let go.
+#[must_use = "dropping ended sessions can block; call `finish` after releasing the table"]
+pub(crate) struct Ended(Vec<Session>);
+
+impl Ended {
+    /// Ends the shells on the blocking pool when called from the runtime, so
+    /// no async worker waits for a shell to die.
+    pub(crate) fn finish(self) {
+        if self.0.is_empty() {
+            return;
+        }
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn_blocking(move || drop(self));
+            }
+            Err(_) => drop(self),
+        }
+    }
+}
+
 /// Owns every shell opened by the controller, keyed by the controller's handle.
 ///
 /// The controller picks the handle, so the host only has to remember which
@@ -377,10 +402,10 @@ impl Sessions {
         Ok(())
     }
 
-    /// Ends a session and removes it from the list.
-    pub(crate) fn kill(&mut self, handle: u32) -> Result<(), SessionError> {
-        self.sessions.remove(&handle).ok_or(SessionError::Gone)?;
-        Ok(())
+    /// Removes a session from the list; finishing the result ends the shell.
+    pub(crate) fn kill(&mut self, handle: u32) -> Result<Ended, SessionError> {
+        let session = self.sessions.remove(&handle).ok_or(SessionError::Gone)?;
+        Ok(Ended(vec![session]))
     }
 
     /// Marks a session detached without ending the shell.
@@ -423,10 +448,20 @@ impl Sessions {
         out
     }
 
-    /// Drops sessions that have already reported their exit.
-    pub(crate) fn reap(&mut self) {
-        self.sessions
-            .retain(|_, session| session.state != SessionState::Exited);
+    /// Takes out the sessions that have already reported their exit.
+    pub(crate) fn reap(&mut self) -> Ended {
+        let exited: Vec<u32> = self
+            .sessions
+            .iter()
+            .filter(|(_, session)| session.state == SessionState::Exited)
+            .map(|(handle, _)| *handle)
+            .collect();
+        Ended(
+            exited
+                .iter()
+                .filter_map(|handle| self.sessions.remove(handle))
+                .collect(),
+        )
     }
 
     #[cfg(test)]
@@ -591,9 +626,12 @@ pub(crate) fn bind(
             if failed {
                 return;
             }
-            let state = pump_screens.lock().await;
-            let sessions = state.terminal();
-            sessions.lock().unwrap_or_else(|e| e.into_inner()).reap();
+            let ended = {
+                let state = pump_screens.lock().await;
+                let sessions = state.terminal();
+                sessions.lock().unwrap_or_else(|e| e.into_inner()).reap()
+            };
+            ended.finish();
         }
     });
 }
@@ -749,6 +787,8 @@ async fn handle_frame(
                 let mut sessions = sessions.lock().unwrap_or_else(|e| e.into_inner());
                 sessions.kill(frame.session)
             };
+            // End the shell only once both locks are released.
+            let result = result.map(Ended::finish);
             if frame.kind == FrameType::KillSessionReq {
                 let payload = match result {
                     Ok(()) => json!({"code": 0, "message": "", "session_id": frame.session}),
@@ -779,10 +819,15 @@ async fn handle_frame(
             outgoing.push((FrameType::UnlockResp, frame.session, b"{}".to_vec()));
         }
         FrameType::Signal => {
-            let state = screens.lock().await;
-            let sessions = state.terminal();
-            let mut sessions = sessions.lock().unwrap_or_else(|e| e.into_inner());
-            let _ = sessions.kill(frame.session);
+            let ended = {
+                let state = screens.lock().await;
+                let sessions = state.terminal();
+                let mut sessions = sessions.lock().unwrap_or_else(|e| e.into_inner());
+                sessions.kill(frame.session)
+            };
+            if let Ok(ended) = ended {
+                ended.finish();
+            }
         }
         other => {
             tracing::debug!(?other, "host terminal frame ignored");
@@ -956,7 +1001,7 @@ mod tests {
                 .iter()
                 .any(|(_, kind, _)| *kind == FrameType::Exit)
             {
-                sessions.reap();
+                sessions.reap().finish();
                 assert!(sessions.is_empty());
                 return;
             }
@@ -969,8 +1014,8 @@ mod tests {
     fn killing_removes_a_session_and_a_second_kill_is_gone() {
         let mut sessions = Sessions::default();
         sessions.open(1, shell(), None, 80, 24).expect("open");
-        assert_eq!(sessions.kill(1), Ok(()));
-        assert_eq!(sessions.kill(1), Err(SessionError::Gone));
+        sessions.kill(1).expect("kill").finish();
+        assert_eq!(sessions.kill(1).err(), Some(SessionError::Gone));
         assert!(sessions.is_empty());
     }
 

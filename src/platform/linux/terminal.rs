@@ -24,6 +24,7 @@ use anyhow::{Context, Result, bail};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
 
 /// A shell running on a pty, with the master side owned by this process.
 pub(crate) struct Session {
@@ -182,14 +183,44 @@ impl Session {
     }
 }
 
+/// How long a hung-up shell gets to exit before its process group is killed.
+const HANGUP_GRACE: Duration = Duration::from_millis(500);
+
 impl Drop for Session {
+    /// Hangs up the shell, then kills its process group if it is still
+    /// running after [`HANGUP_GRACE`], and reaps it so it does not linger as a
+    /// zombie. `master` closes with the struct.
+    ///
+    /// This blocks for up to the grace period, so the shared session table
+    /// hands ended sessions back to be dropped off its lock and off the async
+    /// workers.
     fn drop(&mut self) {
-        // Best effort: hang up the shell, then reap it so it does not linger
-        // as a zombie. `master` closes with the struct.
-        let pid = self.child.id() as i32;
-        // SAFETY: `pid` is our child and this is the last use of it.
+        // `try_wait` keeps the status once it has reaped the child, so a shell
+        // already seen to exit is never signalled: its pid and process group
+        // may by now belong to an unrelated process.
+        if !matches!(self.child.try_wait(), Ok(None)) {
+            return;
+        }
+        // While the child is unreaped its pid, and so its process group id,
+        // cannot be reused, so both signals reach only the shell's group.
+        let group = -(self.child.id() as i32);
+        // SAFETY: kill takes no pointers; `group` is our unreaped child's
+        // process group, which it leads since it called `setsid()`.
         unsafe {
-            libc::kill(-pid, libc::SIGHUP);
+            libc::kill(group, libc::SIGHUP);
+        }
+        let deadline = Instant::now() + HANGUP_GRACE;
+        while Instant::now() < deadline {
+            if !matches!(self.child.try_wait(), Ok(None)) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // A shell that ignores SIGHUP (`trap '' HUP`) would otherwise keep
+        // this thread waiting forever.
+        // SAFETY: as above; the child is still unreaped.
+        unsafe {
+            libc::kill(group, libc::SIGKILL);
         }
         let _ = self.child.wait();
     }
@@ -246,7 +277,6 @@ fn set_nonblocking(fd: RawFd) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{Duration, Instant};
 
     /// Drains the pty until `needle` appears, the shell exits, or time runs out.
     fn read_until(session: &mut Session, needle: &[u8], timeout: Duration) -> Vec<u8> {
@@ -323,6 +353,25 @@ mod tests {
                 "second shell holds another terminal: {target}"
             );
         }
+    }
+
+    #[test]
+    fn dropping_kills_a_shell_that_ignores_hangup() {
+        let mut session = Session::open("/bin/sh", 80, 24).expect("open pty");
+        session
+            .write(b"trap '' HUP; echo HUP_'IGNORED'\n")
+            .expect("write input");
+        let seen = read_until(&mut session, b"HUP_IGNORED", Duration::from_secs(5));
+        assert!(String::from_utf8_lossy(&seen).contains("HUP_IGNORED"));
+        let pid = session.child.id() as i32;
+
+        let started = Instant::now();
+        drop(session);
+        let took = started.elapsed();
+        assert!(took < Duration::from_secs(1), "drop took {took:?}");
+        // SAFETY: signal 0 only probes whether the pid exists.
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        assert!(!alive, "shell {pid} survived the drop");
     }
 
     #[test]
