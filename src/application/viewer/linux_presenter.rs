@@ -578,9 +578,14 @@ impl ApplicationHandler<UiEvent> for ConnectingWindowsRunner {
         let consumed = response.consumed;
         if let Stage::Playing(player) = &mut self.stage {
             let forwarded = player.on_window_event(&window, &shell.context, &event, consumed);
-            // A key can end control (the release shortcut); the shortcuts
-            // follow at once rather than at the next frame.
-            player.update_shortcuts(&shell.context, &window);
+            if matches!(
+                event,
+                WindowEvent::KeyboardInput { .. } | WindowEvent::MouseInput { .. }
+            ) {
+                // A key or click can start or end control (the release
+                // shortcut); the shortcuts follow at once, not a frame later.
+                player.update_shortcuts(&shell.context, &window);
+            }
             if forwarded && matches!(event, WindowEvent::KeyboardInput { .. }) {
                 // A remote Tab must not also focus a local toolbar button.
                 shell
@@ -823,10 +828,9 @@ impl Player {
             menu_open: self.stream_control_ui.open,
             has_video: self.video_size.is_some(),
         };
-        let wanted = gate.holds_unless_unfocused(context)
-            && super::input_gate::intercepts_shortcuts(input, self.intercept_shortcuts);
+        let intercepts = super::input_gate::intercepts_shortcuts(input, self.intercept_shortcuts);
         if let Some(shortcuts) = self.shortcuts.as_mut() {
-            shortcuts.update(wanted);
+            shortcuts.update(gate, context, intercepts);
         }
     }
 

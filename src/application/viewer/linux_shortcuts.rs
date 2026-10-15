@@ -1,13 +1,20 @@
 //! Keeps the desktop from acting on the shortcuts a remote desktop needs.
 //!
 //! "Intercept shortcuts" promises that a key the viewer forwards stops here,
-//! which the Windows viewer keeps with a low-level keyboard hook. A Wayland
-//! compositor takes its bindings before the focused window sees them.
-//! `zwp_keyboard_shortcuts_inhibit_v1` is the compositor's own answer: a
-//! window that holds an inhibitor gets its keys while it has the keyboard, and
-//! the compositor's bindings stand down. The compositor scopes it to focus, may
-//! ask the user first (GNOME does, once) and keeps an escape shortcut of its
-//! own.
+//! which the Windows viewer keeps with a low-level keyboard hook. A Linux
+//! desktop takes its bindings before the focused window sees them: an X11
+//! window manager through passive key grabs, a Wayland compositor before it
+//! delivers anything. Each has its own answer, and this module picks the one
+//! the window lives on:
+//!
+//! - Wayland: `zwp_keyboard_shortcuts_inhibit_v1`, the compositor's own
+//!   protocol. A window that holds an inhibitor gets its keys while it has the
+//!   keyboard, and the compositor's bindings stand down. The compositor scopes
+//!   it to focus, may ask the user first (GNOME does, once) and keeps an escape
+//!   shortcut of its own.
+//! - X11: an active keyboard grab on the viewer window, taken on winit's own
+//!   connection so the keys keep arriving through winit, and only while the
+//!   window has the X input focus, so taking it moves no focus.
 //!
 //! Whether to hold the shortcuts back is decided by the shared input gate; this
 //! module is only the mechanism.
@@ -26,6 +33,7 @@ use winit::raw_window_handle::{
 /// The desktop's shortcuts, held back or let go for one viewer window.
 pub(super) enum Shortcuts {
     Wayland(Inhibitor),
+    X11(super::linux_keyboard_grab::KeyboardGrab),
 }
 
 impl Shortcuts {
@@ -42,18 +50,32 @@ impl Shortcuts {
                 }
                 inhibitor.map(Self::Wayland)
             }
+            RawDisplayHandle::Xlib(_) => {
+                super::linux_keyboard_grab::KeyboardGrab::new(window).map(Self::X11)
+            }
             _ => None,
         }
     }
 
-    /// `wanted` is the shared gate with focus left out. Called every frame;
-    /// repeating the current state costs nothing.
-    pub(super) fn update(&mut self, wanted: bool) {
+    /// Follows the shared gate. `intercepts` is the shortcut rule (setting,
+    /// remote keyboard, no recorder or text field). Called on every frame and
+    /// window event; repeating the current state costs nothing.
+    pub(super) fn update(
+        &mut self,
+        gate: super::input_gate::InputGate,
+        context: &egui::Context,
+        intercepts: bool,
+    ) {
         match self {
-            // The compositor scopes an inhibitor to the focused surface, so
-            // it is kept across focus changes rather than renewed on each one
+            // The compositor scopes an inhibitor to the focused surface, so it
+            // is kept across focus changes rather than renewed on each one
             // (which would also ask GNOME's permission again).
-            Self::Wayland(inhibitor) => inhibitor.set_active(wanted),
+            Self::Wayland(inhibitor) => {
+                inhibitor.set_active(intercepts && gate.holds_unless_unfocused(context))
+            }
+            // An X11 grab takes the keyboard from every window, so it follows
+            // the full gate and is gone the moment focus leaves this window.
+            Self::X11(grab) => grab.set_active(intercepts && gate.holds(context)),
         }
     }
 }
