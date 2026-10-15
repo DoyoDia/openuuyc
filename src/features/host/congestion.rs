@@ -138,6 +138,23 @@ impl Controller {
             if rate.network_estimate.round_trip_time.is_finite() {
                 self.rtt = rate.network_estimate.round_trip_time;
             }
+            if self.target != previous {
+                // ALR 状态和「限制估计值的原因」决定这次探测能不能发出去：探测被
+                // 静默抑制时（probe_controller.rs:576 里 DelayBasedLimitedDelay-
+                // Increased），只有这两项能说明为什么。
+                let (alr, cause) = self.core.probing_state();
+                tracing::debug!(
+                    target_bps = self.target,
+                    previous_bps = previous,
+                    bounded_target_bps = self.core.bounded_target_rate().bps_or(0),
+                    alr,
+                    cause = ?cause,
+                    delay_state = ?self.core.delay_state(),
+                    loss = self.loss,
+                    rtt_ms = self.rtt.ms(),
+                    "host bandwidth estimate changed"
+                );
+            }
             if previous >= 600_000 && self.target < previous / 2 {
                 tracing::info!(
                     previous_bps = previous,

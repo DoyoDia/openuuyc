@@ -129,6 +129,16 @@ impl GoogCcNetworkController {
     pub fn delay_state(&self) -> BandwidthUsage {
         self.delay_based_bwe.last_state()
     }
+    /// 观测用：当前是否处在 application-limited region（周期性 ALR 探测的前提），
+    /// 以及限制估计值的原因（探测被静默抑制时的直接原因）。
+    pub fn probing_state(&self) -> (bool, BandwidthLimitedCause) {
+        (
+            self.alr_detector
+                .get_application_limited_region_start_time()
+                .is_some(),
+            self.probe_controller.bandwidth_limited_cause(),
+        )
+    }
     // From RTCPSender video report interval.
     const LOSS_UPDATE_INTERVAL: TimeDelta = TimeDelta::from_millis(1000);
 
