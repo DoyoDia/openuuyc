@@ -578,6 +578,14 @@ impl ApplicationHandler<UiEvent> for ConnectingWindowsRunner {
         let consumed = response.consumed;
         if let Stage::Playing(player) = &mut self.stage {
             let forwarded = player.on_window_event(&window, &shell.context, &event, consumed);
+            if matches!(
+                event,
+                WindowEvent::KeyboardInput { .. } | WindowEvent::MouseInput { .. }
+            ) {
+                // A key or click can start or end control (the release
+                // shortcut); the shortcuts follow at once, not a frame later.
+                player.update_shortcuts(&shell.context, &window);
+            }
             if forwarded && matches!(event, WindowEvent::KeyboardInput { .. }) {
                 // A remote Tab must not also focus a local toolbar button.
                 shell
@@ -598,6 +606,7 @@ impl ApplicationHandler<UiEvent> for ConnectingWindowsRunner {
                 }
                 if let Stage::Playing(player) = &mut self.stage {
                     player.on_focus_changed(&window, focused);
+                    player.update_shortcuts(&shell.context, &window);
                 }
                 crate::application::viewer_shortcuts::set_focused_window(if focused {
                     u64::from(id)
@@ -749,6 +758,9 @@ struct Player {
     diagnostics_at: [Option<Instant>; 2],
     /// When the remote first said its pointer was hidden, for [`CURSOR_HIDE_GRACE`].
     hidden_since: Option<Instant>,
+    /// Holds the compositor's own shortcuts back while this window has the
+    /// keyboard, so the keys the remote desktop wants arrive here instead.
+    shortcuts: Option<super::linux_shortcuts::Shortcuts>,
     /// Files dropped on the window, and drags carried out of it.
     drag: super::linux_drag::WindowDrag,
     /// Mouse mode of the previous frame, to notice control being dropped.
@@ -766,6 +778,7 @@ impl Player {
         let wake = FrameWakeBridge::install(&session, proxy, window.id())?;
         let drag = super::linux_drag::WindowDrag::new(owner, &session.stream_control);
         Ok(Self {
+            shortcuts: super::linux_shortcuts::Shortcuts::new(window),
             drag,
             _shortcuts: crate::application::viewer_shortcuts::Watcher::new()?,
             session,
@@ -798,6 +811,27 @@ impl Player {
             hidden_since: None,
             last_mouse_mode: MouseMode::View,
         })
+    }
+
+    /// Holds the desktop's own shortcuts back while this window owns input for
+    /// the remote, under the same gate and setting as the Windows keyboard hook.
+    fn update_shortcuts(&mut self, context: &egui::Context, window: &Window) {
+        if self.shortcuts.is_none() {
+            return;
+        }
+        let input = self.session.stream_control.mouse();
+        let gate = super::input_gate::InputGate {
+            focused: self.focused,
+            minimized: window.is_minimized() == Some(true),
+            controlling: input.mode() != MouseMode::View,
+            dragging: self.session.stream_control.drag_drop().interactive(),
+            menu_open: self.stream_control_ui.open,
+            has_video: self.video_size.is_some(),
+        };
+        let intercepts = super::input_gate::intercepts_shortcuts(input, self.intercept_shortcuts);
+        if let Some(shortcuts) = self.shortcuts.as_mut() {
+            shortcuts.update(gate, context, intercepts);
+        }
     }
 
     /// Control that failed updates cursor and clipboard policy; control
@@ -1014,6 +1048,7 @@ impl Player {
         self.update_input_gate(ui.ctx(), window);
         self.restore_control(ui.ctx(), window);
         self.update_pointer_lock(window);
+        self.update_shortcuts(ui.ctx(), window);
         self.draw_remote_cursor(ui, window);
         placement
     }

@@ -27,6 +27,7 @@ mod stream_menu;
 mod annotation;
 mod display_transition;
 mod fullscreen_chrome;
+mod input_gate;
 mod polling_warning;
 
 #[cfg(windows)]
@@ -36,6 +37,10 @@ mod windows_cursor;
 mod linux_drag;
 #[cfg(not(windows))]
 pub(crate) mod linux_keyboard;
+#[cfg(not(windows))]
+mod linux_keyboard_grab;
+#[cfg(not(windows))]
+mod linux_shortcuts;
 #[cfg(windows)]
 mod windows_keyboard;
 
@@ -54,7 +59,8 @@ pub(crate) mod linux_presenter;
 pub(crate) use linux_presenter as presenter;
 
 /// Windows installs a low-level keyboard hook so system keys reach the remote
-/// desktop. X11 and Wayland deliver keys through the focused window instead.
+/// desktop. On Linux each player window holds the desktop's shortcuts back
+/// itself (`linux_shortcuts`), so there is nothing process-wide to install.
 pub(crate) struct DesktopInputHook {
     #[cfg(windows)]
     _hook: windows_keyboard::KeyboardHook,
