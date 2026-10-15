@@ -209,13 +209,15 @@ impl ScreenTabBar {
 
 struct PendingScreen {
     id: i32,
-    task: tokio::task::JoinHandle<()>,
+    task: Option<tokio::task::AbortHandle>,
     result: tokio::sync::oneshot::Receiver<Result<Arc<NativeViewerSession>>>,
     connecting: Option<WindowsConnectionApp>,
 }
 impl Drop for PendingScreen {
     fn drop(&mut self) {
-        self.task.abort();
+        if let Some(task) = &self.task {
+            task.abort();
+        }
     }
 }
 

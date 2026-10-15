@@ -199,7 +199,7 @@ pub(super) async fn run(
                 // file RPCs retain their original both-channels-ready gate.
                 if !file_ready && executor::settings_requested(&packet).unwrap_or(false) {
                     if let Ok(Some(reply)) = executor::reject(&packet, 8) {
-                        if let Err(e) = send(&receiver,generation,reply,&cancel,&lease,&sequence).await {
+                        if let Err(e) = send(&receiver,generation,reply,&cancel,&lease,&connected,&sequence).await {
                             lease.file_status(Status{active:false,error:Some(e.to_string())});break;
                         }
                     }
@@ -215,7 +215,7 @@ pub(super) async fn run(
             packet=async{match &mut backend{Some((_,b))=>b.output.recv().await,None=>std::future::pending().await}}=>{
                 if let Some((packet_revision,packet))=packet {
                     if packet_revision!=revision {continue;}
-                    if let Err(e)=send(&receiver,generation,packet,&cancel,&lease,&sequence).await{lease.file_status(Status{active:false,error:Some(e.to_string())});break;}
+                    if let Err(e)=send(&receiver,generation,packet,&cancel,&lease,&connected,&sequence).await{lease.file_status(Status{active:false,error:Some(e.to_string())});break;}
                 } else {break;}
             }
         }
@@ -232,6 +232,7 @@ async fn send(
     mut packet: executor::Packet,
     cancel: &CancellationToken,
     lease: &Lease,
+    connected: &AtomicBool,
     sequence: &std::sync::atomic::AtomicI64,
 ) -> Result<()> {
     // METRIC_SETTING is shared by the video and file pages. Its control flag
@@ -244,7 +245,10 @@ async fn send(
         rejection,
         "host file response sending"
     );
-    if !lease.requested() || (!lease.file_access() && !rejection && settings.is_none()) {
+    if !lease.requested()
+        || !connected.load(Ordering::Acquire)
+        || (!lease.file_access() && !rejection && settings.is_none())
+    {
         return Ok(());
     }
     let channel = {
@@ -261,7 +265,10 @@ async fn send(
     };
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while channel.buffered_amount().await + packet.data.len() > 2 * 1024 * 1024 {
-        if !lease.requested() || (!lease.file_access() && !rejection && settings.is_none()) {
+        if !lease.requested()
+            || !connected.load(Ordering::Acquire)
+            || (!lease.file_access() && !rejection && settings.is_none())
+        {
             return Ok(());
         }
         ensure!(
@@ -274,12 +281,16 @@ async fn send(
         !cancel.is_cancelled() && channel.ready_state() == RTCDataChannelState::Open,
         "文件通道未就绪"
     );
-    if !lease.requested() || (!lease.file_access() && !rejection && settings.is_none()) {
+    if !lease.requested()
+        || !connected.load(Ordering::Acquire)
+        || (!lease.file_access() && !rejection && settings.is_none())
+    {
         return Ok(());
     }
     ensure!(lock(&receiver.0).generation == generation, "文件通道已替换");
+    let file_allowed = lease.file_access();
+    let is_settings = settings.is_some();
     if let Some(settings) = settings {
-        let file_allowed = lease.file_access();
         packet = settings.authorized(file_allowed);
         tracing::debug!(
             control_allowed = 2,
@@ -289,13 +300,28 @@ async fn send(
     }
     let data = packet.stamped(sequence.fetch_add(1, Ordering::Relaxed))?;
     let bytes = bytes::Bytes::from(data);
-    tokio::time::timeout_at(deadline, async {
-        if packet.file {
-            channel.send(&bytes).await
-        } else {
-            channel.send_text_bytes(&bytes).await
-        }
-    })
-    .await??;
+    let current = || {
+        lease.requested()
+            && connected.load(Ordering::Acquire)
+            && lease.file_access() == file_allowed
+            && (file_allowed || rejection || is_settings)
+            && lock(&receiver.0).generation == generation
+    };
+    if let Some(sent) = crate::lifecycle::while_current(
+        cancel,
+        Duration::from_millis(5),
+        current,
+        tokio::time::timeout_at(deadline, async {
+            if packet.file {
+                channel.send(&bytes).await
+            } else {
+                channel.send_text_bytes(&bytes).await
+            }
+        }),
+    )
+    .await
+    {
+        sent??;
+    }
     Ok(())
 }

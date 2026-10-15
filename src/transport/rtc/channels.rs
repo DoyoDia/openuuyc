@@ -46,7 +46,7 @@ impl DataChannels {
         uu_kcp: UuKcpControl,
         connection: Weak<RTCPeerConnection>,
     ) -> Self {
-        let workers = SessionWorkers::new();
+        let workers = SessionWorkers::new("RTC peer");
         let streamer_sender_started = Arc::new(AtomicBool::new(false));
         let (stream_control, control_messages, echo_responses) =
             StreamControlHandle::new(profile, performance.clone());
@@ -365,14 +365,21 @@ pub(super) async fn send_official_control_messages(
                 }
             }
             message = messages.recv() => {
-                let Some(message) = message else { break; };
+                let Some(mut message) = message else { break; };
+                if message.completion.as_ref().is_some_and(|done| done.is_closed()) { continue; }
                 if let Some(generation) = message.annotation_generation {
                     if !stream_control.annotation_message_current(message.sequence, generation) { continue; }
                 }
                 let is_annotation = message.annotation_generation.is_some();
                 let payload = Bytes::from(message.payload);
                 let is_screen_request = message.completion.is_some();
-                match text_channel.send_text_bytes(&payload).await {
+                let sent = text_channel.send_text_bytes(&payload);
+                let result = if let Some(done) = &mut message.completion {
+                    // Capacity reservation precedes atomic SCTP packetization.
+                    // Withdrawal cannot retract an already admitted message.
+                    tokio::select! { biased; _=done.closed()=>continue, result=sent=>result }
+                } else { sent.await };
+                match result {
                     Ok(bytes) => {
                         if let Some(done) = message.completion { let _ = done.send(Ok(())); }
                         if is_annotation { tracing::debug!(sequence = message.sequence, bytes, "annotation request sent"); }

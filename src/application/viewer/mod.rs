@@ -464,11 +464,14 @@ impl NativeViewerSession {
     }
 
     pub(crate) fn resume_decode(&self) -> bool {
+        if self.shutdown.load(Ordering::Acquire) {
+            return false;
+        }
         let paused = !self.decode_activity.enabled.swap(true, Ordering::AcqRel);
         if paused {
             self.manager_wake.unpark();
         }
-        paused
+        paused && !self.shutdown.load(Ordering::Acquire)
     }
     pub(crate) fn decode_paused(&self) -> bool {
         !self.decode_activity.enabled.load(Ordering::Acquire)

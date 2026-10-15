@@ -234,13 +234,15 @@ async fn fetch(
     url: &str,
     maximum_bytes: usize,
 ) -> Result<Option<Vec<u8>>> {
-    let mut response = client
-        .get(url)
-        .header("Accept", "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", "2026-03-10")
-        .send()
-        .await
-        .context("无法连接 GitHub，请检查网络后重试")?;
+    let mut response = crate::transport::http::send(
+        crate::transport::http::Operation::Update,
+        client
+            .get(url)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2026-03-10"),
+    )
+    .await
+    .context("无法连接 GitHub，请检查网络后重试")?;
     match response.status() {
         reqwest::StatusCode::NOT_FOUND => return Ok(None),
         reqwest::StatusCode::FORBIDDEN | reqwest::StatusCode::TOO_MANY_REQUESTS => {

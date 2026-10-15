@@ -590,11 +590,13 @@ fn poll_platform_decoder(
 
 pub(crate) fn detect_native_decoder_support(
     profile: ConnectionMediaProfile,
+    stop: tokio_util::sync::CancellationToken,
 ) -> Result<DeviceCapability> {
     std::thread::spawn(move || {
+        anyhow::ensure!(!stop.is_cancelled(), "native capability probe cancelled");
         let mut capabilities = Vec::new();
         if profile.decoder.mode.hardware()
-            && let Ok(probe) = hardware_probe()
+            && let Ok(probe) = hardware_probe(stop.clone())
         {
             for (codec, id) in [
                 (VideoCodec::H264, 1),
@@ -607,6 +609,10 @@ pub(crate) fn detect_native_decoder_support(
                 for chroma in [1, 3] {
                     for depth in [8, 10] {
                         for &(width, height) in QUALITY_DIMENSIONS[1..].iter().rev() {
+                            anyhow::ensure!(
+                                !stop.is_cancelled(),
+                                "native capability probe cancelled"
+                            );
                             if probe(codec, width as u32, height as u32, depth, chroma) {
                                 capabilities.push(CodecCapability {
                                     video_codec: id,
@@ -655,6 +661,7 @@ pub(crate) fn detect_native_decoder_support(
             if let Ok(writer) = windows_surface::D3D11SurfaceWriter::new() {
                 for chroma in [1, 3] {
                     for depth in [8, 10] {
+                        anyhow::ensure!(!stop.is_cancelled(), "native capability probe cancelled");
                         // Advertise support independently of other codecs. Only
                         // the common capabilities can establish a usable hardware
                         // alternative; DualCapability selects that after negotiation.
@@ -673,6 +680,7 @@ pub(crate) fn detect_native_decoder_support(
             }
         }
 
+        anyhow::ensure!(!stop.is_cancelled(), "native capability probe cancelled");
         if capabilities.is_empty() {
             bail!("no decoder supports the selected codec and decoding mode");
         }
@@ -693,26 +701,32 @@ pub(crate) fn detect_native_decoder_support(
 /// A closure that answers whether the platform decodes a format in hardware.
 /// On Windows every D3D11 device is asked; on Linux the VA-API driver is.
 #[cfg(windows)]
-fn hardware_probe() -> Result<impl Fn(VideoCodec, u32, u32, u8, u8) -> bool> {
+fn hardware_probe(
+    stop: tokio_util::sync::CancellationToken,
+) -> Result<impl Fn(VideoCodec, u32, u32, u8, u8) -> bool> {
     let writers = windows_surface::D3D11SurfaceWriter::available()?;
     Ok(move |codec, width, height, depth, chroma| {
         writers.iter().any(|writer| {
-            PlatformDecoder::probe_format(
-                writer.device_handle(),
-                codec,
-                width,
-                height,
-                depth,
-                chroma,
-            )
+            !stop.is_cancelled()
+                && PlatformDecoder::probe_format(
+                    writer.device_handle(),
+                    codec,
+                    width,
+                    height,
+                    depth,
+                    chroma,
+                )
         })
     })
 }
 
 #[cfg(not(windows))]
-fn hardware_probe() -> Result<impl Fn(VideoCodec, u32, u32, u8, u8) -> bool> {
-    Ok(|codec, width, height, depth, chroma| {
-        crate::platform::decoder::probe_hardware(codec, width, height, depth, chroma)
+fn hardware_probe(
+    stop: tokio_util::sync::CancellationToken,
+) -> Result<impl Fn(VideoCodec, u32, u32, u8, u8) -> bool> {
+    Ok(move |codec, width, height, depth, chroma| {
+        !stop.is_cancelled()
+            && crate::platform::decoder::probe_hardware(codec, width, height, depth, chroma)
     })
 }
 

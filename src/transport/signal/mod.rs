@@ -290,7 +290,10 @@ impl SignalSession {
         purpose: crate::session::negotiation::ControlPurpose,
     ) -> Result<ControlSessionInfo> {
         tracing::debug!(?profile, "starting control handshake");
-        let decoder_support = detect_native_decoder_support(profile)?;
+        let decoder_support =
+            crate::lifecycle::blocking(move |stop| detect_native_decoder_support(profile, stop))
+                .await
+                .context("native capability probe task interrupted")??;
         tracing::info!(
             ?decoder_support,
             "advertising native decoder configuration capabilities"
