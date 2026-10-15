@@ -22,7 +22,7 @@ pub(crate) struct ScreenPlayback {
     profile: ConnectionMediaProfile,
     alias: String,
     visible: watch::Sender<Vec<i32>>,
-    runtime: tokio::runtime::Handle,
+    tasks: Arc<crate::lifecycle::TaskScope>,
     decoders: Arc<std::sync::Mutex<HashMap<i32, Arc<NativeViewerSession>>>>,
     opening: Arc<tokio::sync::Mutex<()>>,
     capture_lock: Arc<tokio::sync::Mutex<HashSet<i32>>>,
@@ -41,7 +41,8 @@ impl ScreenPlayback {
         let activity_control = control.clone();
         let capture_lock = Arc::new(tokio::sync::Mutex::new(HashSet::new()));
         let activity_lock = Arc::clone(&capture_lock);
-        peer.spawn_viewing_task(async move {
+        let tasks = peer.viewing_scope();
+        tasks.spawn(async move {
             let mut inactive = HashMap::<i32, Instant>::new();
             let mut tick = tokio::time::interval(Duration::from_millis(250));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -80,7 +81,7 @@ impl ScreenPlayback {
             profile,
             alias: alias.to_owned(),
             visible,
-            runtime: tokio::runtime::Handle::current(),
+            tasks,
             decoders: Arc::new(std::sync::Mutex::new(HashMap::new())),
             opening: Arc::new(tokio::sync::Mutex::new(())),
             capture_lock,
@@ -102,6 +103,9 @@ impl ScreenPlayback {
     }
 
     pub(crate) fn set_visible(&self, mut screens: Vec<i32>) {
+        if self.tasks.shutdown.is_cancelled() {
+            return;
+        }
         screens.sort_unstable();
         screens.dedup();
         let changed = self.visible.send_if_modified(|current| {
@@ -121,7 +125,10 @@ impl ScreenPlayback {
             return;
         }
         let factory = self.clone();
-        self.runtime.spawn(async move {
+        let flag = self.visibility_update.clone();
+        let reset = crate::lifecycle::OnDrop::new(move || flag.store(false, Ordering::Release));
+        self.tasks.spawn(async move {
+            let _reset = reset;
             let _opening = factory.opening.lock().await;
             let visible = factory.visible.borrow().clone();
             let sessions = super::mutex_lock(&factory.decoders)
@@ -155,7 +162,6 @@ impl ScreenPlayback {
                     }
                 }
             }
-            factory.visibility_update.store(false, Ordering::Release);
         });
     }
 
@@ -179,7 +185,7 @@ impl ScreenPlayback {
         cancelled_pending: Option<i32>,
         ready: impl FnOnce() + Send + 'static,
     ) -> (
-        tokio::task::JoinHandle<()>,
+        Option<tokio::task::AbortHandle>,
         tokio::sync::oneshot::Receiver<Result<Arc<NativeViewerSession>>>,
     ) {
         let replace_software = replace.is_some_and(|id| {
@@ -197,19 +203,27 @@ impl ScreenPlayback {
         });
         let (send, receive) = tokio::sync::oneshot::channel();
         let factory = self.clone();
-        let task = self.runtime.spawn(async move {
-            let result = factory.open_screen(screen_id, display, replace).await;
-            let _ = send.send(result);
-            ready();
-        });
+        let task = self
+            .tasks
+            .spawn_in(self.tasks.shutdown.clone(), async move {
+                let result = factory.open_screen(screen_id, display, replace).await;
+                let _ = send.send(result);
+                ready();
+            });
         (task, receive)
     }
 
     pub(crate) fn register(&self, session: Arc<NativeViewerSession>) {
-        super::mutex_lock(&self.decoders).insert(session.track_index, session);
+        let mut decoders = super::mutex_lock(&self.decoders);
+        if self.tasks.shutdown.is_cancelled() {
+            session.close_handle().close();
+        } else {
+            decoders.insert(session.track_index, session);
+        }
     }
 
     pub(crate) fn close_decoders(&self) {
+        self.tasks.cancel();
         for session in super::mutex_lock(&self.decoders).values() {
             session.close_handle().close();
         }
@@ -223,6 +237,7 @@ impl ScreenPlayback {
     ) -> Result<Arc<VideoTrackSource>> {
         let generation = {
             let mut stopped = self.capture_lock.lock().await;
+            anyhow::ensure!(!self.tasks.shutdown.is_cancelled(), "观看窗口已关闭");
             let snapshot = self.control.snapshot();
             let screen = snapshot
                 .screens
@@ -272,6 +287,7 @@ impl ScreenPlayback {
     ) -> Result<Arc<NativeViewerSession>> {
         let switch_started = Instant::now();
         let _opening = self.opening.lock().await;
+        anyhow::ensure!(!self.tasks.shutdown.is_cancelled(), "观看窗口已关闭");
         let peer = self.peer.upgrade().context("观看连接已关闭")?;
         let existing_sessions = super::mutex_lock(&self.decoders)
             .values()

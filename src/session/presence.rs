@@ -38,6 +38,7 @@ pub(crate) enum PresenceEvent {
 
 pub(crate) struct ActivePresence {
     cancel: CancellationToken,
+    _cancel_on_drop: tokio_util::sync::DropGuard,
     pub(crate) task: JoinHandle<Result<()>>,
     pub(crate) events: Receiver<PresenceEvent>,
 }
@@ -72,6 +73,7 @@ impl ActivePresence {
             }
         });
         Self {
+            _cancel_on_drop: cancel.clone().drop_guard(),
             cancel,
             task,
             events: receiver,
@@ -165,7 +167,7 @@ async fn run_presence(
             if push_cancel.is_cancelled() || !push_client.is_active() {
                 return;
             }
-            if push_client.host.assistance.push(push) {
+            if push_client.host.assistance.push(push, &push_cancel) {
                 return;
             }
             if push_client.is_guest() {

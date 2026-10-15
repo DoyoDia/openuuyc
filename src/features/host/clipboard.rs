@@ -214,8 +214,21 @@ async fn binding(
     let bulk_receiver = receiver.clone();
     let bulk_lease = lease.clone();
     let bulk_stop = stop.clone();
+    let bulk_enabled = Arc::new(AtomicBool::new(false));
+    let bulk_policy = bulk_enabled.clone();
+    let bulk_connected = connected.clone();
     let bulk_worker = tokio::spawn(async move {
-        bulk(bulk_receiver, bulk_lease, bulk_stop, bulk_rx, fault_tx).await;
+        bulk(
+            bulk_receiver,
+            bulk_lease,
+            generation,
+            bulk_policy,
+            bulk_connected,
+            bulk_stop,
+            bulk_rx,
+            fault_tx,
+        )
+        .await;
     });
     let mut native_failed = false;
     let mut tick = tokio::time::interval(Duration::from_millis(100));
@@ -229,8 +242,10 @@ async fn binding(
             if !routes.borrow().text.as_ref().is_some_and(|c| c.ptr_eq(&Arc::downgrade(&channel))) { break; }
             let settings = lease.clipboard_settings();
             let level = routes.borrow().clipboard;
+            let file_allowed = lease.file_access();
+            let link_connected = connected.load(Ordering::Acquire);
             let policy = Settings {
-                enabled: settings.enabled && level >= 1 && connected.load(Ordering::Acquire),
+                enabled: settings.enabled && level >= 1 && link_connected,
                 files: settings.files && level >= 2,
             };
             let (current_screens, viewing) = screens();
@@ -238,7 +253,7 @@ async fn binding(
                 let s = super::lock(&receiver.0);
                 crate::features::drag_drop::HostPolicy {
                     token: if s.native { s.token } else { 0 },
-                    enabled: s.native && viewing && !native_failed && lease.file_access() && connected.load(Ordering::Acquire)
+                    enabled: s.native && viewing && !native_failed && file_allowed && link_connected
                         && s.file.upgrade().is_some_and(|c| c.ready_state() == webrtc::data_channel::data_channel_state::RTCDataChannelState::Open),
                     screens: current_screens,
                 }
@@ -247,17 +262,32 @@ async fn binding(
                 tracing::info!(enabled=native.enabled, capability=native.token!=0, viewing, "native file drag availability changed");
                 native_permission=Some(native.enabled);
             }
-            let official_drop = viewing && !native.enabled && policy.enabled && policy.files && lease.file_access()
+            bulk_enabled.store(native.enabled, Ordering::Release);
+            let official_drop = viewing && !native.enabled && policy.enabled && policy.files && file_allowed
                 && super::lock(&receiver.0).official_drop.as_ref().is_some_and(|c|
                     c.published(platform, crate::account::feature_ability::Feature::FileDrop));
             if send_permission != Some(official_drop) {
                 tracing::info!(?platform, enabled=official_drop, "official file send permission");
                 send_permission=Some(official_drop);
             }
+            let send_routes = routes.clone();
+            let current = || {
+                lease.requested()
+                    && lease.clipboard_settings() == settings
+                    && lease.file_access() == file_allowed
+                    && connected.load(Ordering::Acquire) == link_connected
+                    && screens().1 == viewing
+                    && super::lock(&receiver.0).generation == generation
+                    && send_routes.borrow().clipboard == level
+                    && send_routes.borrow().text.as_ref().is_some_and(|c| c.ptr_eq(&Arc::downgrade(&channel)))
+            };
             backend.policy(policy, native, official_drop);
             if permission != Some(policy.files && policy.enabled) {
                 let files = policy.files && policy.enabled;
-                channel.send_text_bytes(&bytes::Bytes::from(crate::features::stream_control::publisher::clipboard_permission(files))).await?;
+                let data = bytes::Bytes::from(crate::features::stream_control::publisher::clipboard_permission(files));
+                let Some(sent) = crate::lifecycle::while_current(cancel, Duration::from_millis(100), &current,
+                    tokio::time::timeout(Duration::from_secs(30), channel.send_text_bytes(&data))).await else { continue; };
+                sent??;
                 permission = Some(files);
             }
             let status = backend.status();
@@ -280,11 +310,14 @@ async fn binding(
                     // The user agent publishes pointer ownership before its
                     // handoff reply. Apply it before the peer can resume input.
                     input.drag_pointer(backend.status().dragging);
-                    // Finish each SCTP enqueue, then observe cancellation; never tear a reliable message in half.
+                    // SCTP reserves capacity before its non-suspending message
+                    // commit, so policy changes may cancel admission safely.
                     if packet.bulk {
                         if bulk_tx.try_send(packet).is_err() { native_failed=true; }
                     } else {
-                        channel.send_text_bytes(&bytes::Bytes::from(packet.data)).await?;
+                        let data = bytes::Bytes::from(packet.data);
+                        if let Some(sent) = crate::lifecycle::while_current(cancel, Duration::from_millis(100), &current,
+                            tokio::time::timeout(Duration::from_secs(30), channel.send_text_bytes(&data))).await { sent??; }
                     }
                 },
             }
@@ -307,6 +340,9 @@ async fn binding(
 async fn bulk(
     receiver: Receiver,
     lease: super::Lease,
+    generation: u64,
+    enabled: Arc<AtomicBool>,
+    connected: Arc<AtomicBool>,
     stop: CancellationToken,
     mut input: mpsc::Receiver<agent::Outbound>,
     errors: mpsc::Sender<String>,
@@ -316,7 +352,10 @@ async fn bulk(
         let current = || {
             let state = super::lock(&receiver.0);
             state.token == packet.revision
+                && state.generation == generation
                 && state.native
+                && enabled.load(Ordering::Acquire)
+                && connected.load(Ordering::Acquire)
                 && lease.file_access()
                 && lease.requested()
         };
@@ -330,7 +369,8 @@ async fn bulk(
                 if !current() { return Ok(()); }
                 tokio::select! { _=stop.cancelled()=>return Ok(()), _=tokio::time::sleep(Duration::from_millis(5))=>{} }
             }
-            if current() && !stop.is_cancelled() { channel.send(&bytes::Bytes::copy_from_slice(&packet.data)).await?; }
+            let data = bytes::Bytes::copy_from_slice(&packet.data);
+            if let Some(result) = crate::lifecycle::while_current(&stop, Duration::from_millis(5), &current, channel.send(&data)).await { result?; }
             Ok::<_,anyhow::Error>(())
         }).await;
         if !matches!(result, Ok(Ok(()))) {

@@ -1,6 +1,6 @@
 [package]
 name = "openuuyc"
-version = "1.0.1"
+version = "1.0.2-beta.1"
 edition = "2024"
 description = "Third-party Rust client for UU Remote protocol interoperability"
 license-file = "LICENSE"
@@ -197,7 +197,7 @@ wayland-protocols = { version = "0.32", default-features = false, features = ["c
 wayland-protocols-misc = { version = "0.3", default-features = false, features = ["client"] }
 libc = "0.2"
 fuser = { version = "0.15", default-features = false }
-x11rb = { version = "0.13", features = ["randr", "shm", "xfixes", "xtest"] }
+x11rb = { version = "0.13", features = ["dpms", "randr", "shm", "xfixes", "xtest"] }
 # Notification-area icon (StatusNotifierItem), the counterpart of the Windows tray.
 # zbus must stay on async-io: its tokio feature is global, and makes the
 # blocking Secret Service calls of the keyring panic inside our runtime.

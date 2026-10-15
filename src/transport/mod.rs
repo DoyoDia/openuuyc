@@ -1,6 +1,7 @@
 //! Transport ownership and module boundaries.
 
 pub(crate) mod flexfec;
+pub(crate) mod http;
 pub mod official_receiver;
 pub(crate) mod rsfec;
 pub mod rtc;

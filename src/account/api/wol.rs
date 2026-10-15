@@ -2,6 +2,7 @@
 use super::*;
 use crate::features::host::wol::packet::LanInfo;
 const INFO: Contract = Contract {
+    retry: RetryPolicy::ConnectOnly,
     method: Method::Post,
     path: "/api/v1/device/wake_on_lan/info",
     json_content_type: true,
@@ -18,11 +19,10 @@ impl NrdApi {
             ..INFO
         };
         let response: ApiEnvelope<serde_json::Value> = self
-            .send_with_policy(
+            .send(
                 contract,
                 contract.path,
                 serde_json::to_vec(&serde_json::json!({"support_wol":enabled}))?,
-                true,
             )
             .await?;
         Ok(ApiEnvelope {
@@ -34,7 +34,6 @@ impl NrdApi {
     pub(crate) async fn wol_info(&self, info: LanInfo) -> Result<ApiEnvelope<Registered>> {
         let mut api = self.clone();
         api.http = self.http.ipv4_route();
-        api.send_with_policy(INFO, INFO.path, serde_json::to_vec(&info)?, true)
-            .await
+        api.send(INFO, INFO.path, serde_json::to_vec(&info)?).await
     }
 }

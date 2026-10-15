@@ -337,6 +337,7 @@ pub(super) fn operation(
                     };
                     let p = parent.join(&name);
                     let _parents = parent_locks(&p)?;
+                    ensure!(!stop.is_cancelled(), "文件操作已撤销");
                     match std::fs::create_dir(&p) {
                         Ok(()) => {
                             made = Some(p);
@@ -365,6 +366,7 @@ pub(super) fn operation(
                 )?;
                 let _parents = parent_locks(&from)?;
                 ensure!(!to.try_exists()?, "目标名称已经存在");
+                ensure!(!stop.is_cancelled(), "文件操作已撤销");
                 std::fs::rename(&from, &to)?;
                 Res::OperationResult(FileOperationResult {
                     file_error: 1,
@@ -377,6 +379,7 @@ pub(super) fn operation(
                 let _lock = Reservation::acquire(store.clone(), &p)?;
                 let _parents = parent_locks(&p)?;
                 ensure!(std::fs::symlink_metadata(&p)?.is_file(), "指定路径不是文件");
+                ensure!(!stop.is_cancelled(), "文件操作已撤销");
                 std::fs::remove_file(&p)?;
                 Res::OperationResult(FileOperationResult {
                     file_error: 1,
@@ -391,6 +394,7 @@ pub(super) fn operation(
                 if v.recursive {
                     remove_tree(&p, stop, 0)?;
                 } else {
+                    ensure!(!stop.is_cancelled(), "文件操作已撤销");
                     std::fs::remove_dir(&p)?;
                 }
                 Res::Result(FileTransferResult {
@@ -401,6 +405,7 @@ pub(super) fn operation(
             }
             Req::ClearSendTemp(v) => {
                 let _lock = Reservation::acquire(store.clone(), &store.directory)?;
+                ensure!(!stop.is_cancelled(), "文件操作已撤销");
                 store.clear(&v.task_unique_id)?;
                 return Ok(None);
             }
@@ -447,6 +452,7 @@ fn remove_tree(path: &Path, stop: &CancellationToken, depth: usize) -> Result<()
         }
     }
     drop(held);
+    ensure!(!stop.is_cancelled(), "目录删除已取消");
     std::fs::remove_dir(path)?;
     Ok(())
 }

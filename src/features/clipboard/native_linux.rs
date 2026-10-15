@@ -882,6 +882,9 @@ fn process(state: &mut State, command: Command) {
             }
         }
         Command::PublishFiles(weak, epoch, files, reply) => {
+            if reply.is_closed() {
+                return;
+            }
             let result = (|| -> Result<()> {
                 let session = weak
                     .upgrade()
