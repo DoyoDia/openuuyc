@@ -32,6 +32,7 @@ pub(crate) mod qsv_allocator;
 mod software_encoder;
 pub(crate) mod surface;
 pub(crate) mod system_power;
+pub(crate) mod terminal;
 pub(crate) mod transfer;
 pub(crate) mod virtual_audio;
 pub(crate) mod wol;

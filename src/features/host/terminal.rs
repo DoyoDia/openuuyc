@@ -3,7 +3,7 @@
 //! UU's Android client opens a shell on the controlled machine. The macOS
 //! server splits the work in two: `TerminalHandler` parses requests off the
 //! wire and `TerminalSession` runs the pty (see
-//! [`crate::platform::linux::terminal`]).
+//! [`crate::platform::terminal`]).
 //!
 //! ## Two protocols on one channel
 //!
@@ -176,7 +176,7 @@ impl SessionState {
 
 /// One shell and the metadata the session list shows.
 struct Session {
-    pty: crate::platform::linux::terminal::Session,
+    pty: crate::platform::terminal::Session,
     name: String,
     state: SessionState,
     created_ms: i64,
@@ -303,7 +303,7 @@ impl Sessions {
         {
             return Err(SessionError::DuplicateName);
         }
-        let pty = crate::platform::linux::terminal::Session::open(shell, cols, rows)
+        let pty = crate::platform::terminal::Session::open(shell, cols, rows)
             .map_err(|_| SessionError::Gone)?;
         let stamp = now_ms();
         self.sessions.insert(
@@ -902,6 +902,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(target_os = "linux"), ignore = "needs a pty, which only Linux has")]
     fn sessions_are_keyed_by_the_controller_handle() {
         let mut sessions = Sessions::default();
         sessions.open(11, shell(), None, 80, 24).expect("open");
@@ -912,6 +913,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(target_os = "linux"), ignore = "needs a pty, which only Linux has")]
     fn a_duplicate_name_is_refused() {
         let mut sessions = Sessions::default();
         sessions
@@ -941,6 +943,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(target_os = "linux"), ignore = "needs a pty, which only Linux has")]
     fn write_and_resize_reach_the_shell() {
         let mut sessions = Sessions::default();
         sessions.open(1, shell(), None, 80, 24).expect("open");
@@ -963,6 +966,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(target_os = "linux"), ignore = "needs a pty, which only Linux has")]
     fn a_reattach_replays_the_screen() {
         let mut sessions = Sessions::default();
         let (handle, _, replay) = sessions.open(0, shell(), None, 80, 24).expect("open");
@@ -990,6 +994,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(target_os = "linux"), ignore = "needs a pty, which only Linux has")]
     fn an_exited_shell_reports_once() {
         let mut sessions = Sessions::default();
         sessions.open(1, shell(), None, 80, 24).expect("open");
@@ -1011,6 +1016,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(target_os = "linux"), ignore = "needs a pty, which only Linux has")]
     fn killing_removes_a_session_and_a_second_kill_is_gone() {
         let mut sessions = Sessions::default();
         sessions.open(1, shell(), None, 80, 24).expect("open");
@@ -1020,6 +1026,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(target_os = "linux"), ignore = "needs a pty, which only Linux has")]
     fn windows_shell_kinds_fall_back_to_a_posix_shell() {
         // The Android client always asks for `powershell`; refusing it is what
         // made the phone report a failed session creation.
