@@ -149,12 +149,25 @@ pub(crate) mod startup {
         })
     }
 
-    fn systemctl(args: &[&str]) -> Result<String> {
-        let output = std::process::Command::new("systemctl")
+    /// 跑一次 `systemctl --user`。没有 systemd 的发行版上根本没有 systemctl，那时
+    /// 返回 `None`，由调用方决定这算不算错。
+    fn run_systemctl(args: &[&str]) -> Result<Option<std::process::Output>> {
+        match std::process::Command::new("systemctl")
             .arg("--user")
             .args(args)
             .output()
-            .context("无法执行 systemctl")?;
+        {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            result => result.context("无法执行 systemctl").map(Some),
+        }
+    }
+
+    fn systemctl(args: &[&str]) -> Result<()> {
+        let output = run_systemctl(args)?.context("找不到 systemctl")?;
+        checked(args, &output)
+    }
+
+    fn checked(args: &[&str], output: &std::process::Output) -> Result<()> {
         // 有的子命令（is-enabled）把状态写在标准输出上、错误时标准错误是空的。
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
         let reason = if stderr.is_empty() {
@@ -167,7 +180,7 @@ pub(crate) mod startup {
             "systemctl --user {} 失败：{reason}",
             args.join(" ")
         );
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        Ok(())
     }
 
     /// 两种机制都用不了时的原因，界面据此把开关置灰并说明。桌面没接
@@ -324,11 +337,11 @@ pub(crate) mod startup {
             if !self.unit_installed() {
                 return Ok(false);
             }
-            let output = std::process::Command::new("systemctl")
-                .arg("--user")
-                .args(["is-enabled", UNIT])
-                .output()
-                .context("无法执行 systemctl")?;
+            // 包里的单元文件在、系统却没有 systemd（systemctl 不存在）时，单元不会被
+            // 任何人启动，就是没启用；别让开关读成「无法读取」，旧条目也还得能关掉。
+            let Some(output) = run_systemctl(&["is-enabled", UNIT])? else {
+                return Ok(false);
+            };
             // 未启用、被 mask 都是非零退出，状态只写在标准输出上。
             let state = String::from_utf8_lossy(&output.stdout).trim().to_owned();
             match state.as_str() {
@@ -374,7 +387,10 @@ pub(crate) mod startup {
             let generated = self.generated_unit();
             if generated.exists() {
                 std::fs::remove_file(&generated).context("删除自启动单元失败")?;
-                systemctl(&["daemon-reload"])?;
+                // 没有 systemd 时也就没有要重新加载的用户管理器。
+                if let Some(output) = run_systemctl(&["daemon-reload"])? {
+                    checked(&["daemon-reload"], &output)?;
+                }
             }
             Ok(())
         }
@@ -500,7 +516,7 @@ pub(crate) mod startup {
         }
 
         /// 临时配置目录、没有包装单元：碰不到真实的用户配置，也不会去问 systemctl。
-        fn scratch(name: &str) -> Places<'static> {
+        fn scratch<'a>(name: &str) -> Places<'a> {
             let config = std::env::temp_dir()
                 .join(format!("openuuyc-startup-{}-{name}", std::process::id()));
             let _ = std::fs::remove_dir_all(&config);
@@ -528,6 +544,25 @@ pub(crate) mod startup {
             assert!(!places.enabled(false).unwrap());
             // 已经关着时再关一次不是错误。
             places.disable().unwrap();
+            let _ = std::fs::remove_dir_all(&places.config);
+        }
+
+        /// 包里的单元文件在而 systemd 不在（或这个用户的管理器里没有它）时，读作关而
+        /// 不是「无法读取」，XDG 条目照样能开能关。只读地问一次 `is-enabled`。
+        #[test]
+        fn a_packaged_unit_without_systemd_reads_as_off() {
+            let mut places = scratch("packaged");
+            std::fs::create_dir_all(&places.config).unwrap();
+            let packaged = places.config.join("openuuyc.service");
+            std::fs::write(&packaged, "").unwrap();
+            let packaged = [packaged.to_str().unwrap()];
+            places.packaged = &packaged;
+            assert!(places.unit_installed());
+            assert!(!places.enabled(true).unwrap());
+            places.enable("/usr/bin/OpenUUYC", false).unwrap();
+            assert!(places.enabled(false).unwrap());
+            places.disable().unwrap();
+            assert!(!places.entry().exists());
             let _ = std::fs::remove_dir_all(&places.config);
         }
 
