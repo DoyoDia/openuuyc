@@ -54,7 +54,7 @@ impl Lock {
 /// 控制器报来的一个触点：它的 id、屏幕上的比例位置和比例半径。
 ///
 /// 平台层不认识 UU 的消息，所以输入引擎先把触点换算成比例；角度和压力在 evdev
-/// 这边没有对应的轴，虚拟触摸屏只报位置和接触面积。
+/// 这边没有对应的轴，虚拟触摸屏只报位置和触点直径（见 `ABS_MT_TOUCH_MAJOR`）。
 #[derive(Clone, Copy)]
 pub(crate) struct Touch {
     pub id: u32,
@@ -74,8 +74,8 @@ pub(crate) struct Touch {
 /// 尺寸与缩放。
 ///
 /// 触摸另有一台多点触摸屏设备：合成器把它当成躺在某一块面板上的直接设备，触点由
-/// 合成器自己派发给应用——双指滚动、捏合、手势和接触面积都是真的，而不是把一个
-/// 触点翻成鼠标左键。
+/// 合成器自己派发给应用——双指滚动、捏合和手势都是真的，而不是把一个触点翻成
+/// 鼠标左键。
 mod uinput {
     use super::Touch;
     use crate::platform::Rotation;
@@ -378,8 +378,12 @@ mod uinput {
     ///
     /// 它比「用指针模拟触摸」多出来的东西，正是合成器愿意认它是一块触摸屏的理由：
     /// `INPUT_PROP_DIRECT` 和多点轴（`ABS_MT_*`）让 libinput 把它判成触摸屏，于是
-    /// 它报的触点被合成器原样派发给应用——双指滚动、捏合、手势、触摸面积都是真的，
-    /// 而不是把一个触点翻译成鼠标左键。
+    /// 它报的触点被合成器原样派发给应用——双指滚动、捏合、手势都是真的，而不是把
+    /// 一个触点翻译成鼠标左键。
+    ///
+    /// 触点大小照实体触摸屏的样子报在 `ABS_MT_TOUCH_MAJOR` 上，但 libinput 处理
+    /// 触摸屏的那条路径不读这个轴，公开接口里也没有触摸屏的接触面积，所以合成器和
+    /// 应用拿不到它。
     ///
     /// 设备坐标是「面板自己」的坐标：合成器读它的时候会套上输出当前的旋转和缩放
     /// （`panel` 就是这件事的逆），所以屏幕大小和缩放都不进这里。
@@ -399,6 +403,7 @@ mod uinput {
                 }
                 set_abs(fd, ABS_MT_SLOT, TOUCH_SLOTS as i32 - 1, 0)?;
                 set_abs(fd, ABS_MT_TRACKING_ID, TRACKING_MAX, 0)?;
+                // 接触椭圆的长轴，按 evdev 的定义是直径，量程和位置轴一样。
                 set_abs(fd, ABS_MT_TOUCH_MAJOR, TOUCH_RANGE as i32, 0)?;
                 set(fd, UI_SET_PROPBIT, INPUT_PROP_DIRECT.into())
             })
@@ -541,7 +546,7 @@ mod uinput {
                 }
                 frame.push((EV_ABS, ABS_MT_POSITION_X, x));
                 frame.push((EV_ABS, ABS_MT_POSITION_Y, y));
-                frame.push((EV_ABS, ABS_MT_TOUCH_MAJOR, touch_value(point.radius)));
+                frame.push((EV_ABS, ABS_MT_TOUCH_MAJOR, touch_value(2.0 * point.radius)));
             }
             // 第一个触点的单点坐标。实体触摸屏也会报，libinput 的单点回退路径读它。
             if let Some(point) = points.first() {
@@ -652,6 +657,8 @@ mod uinput {
             assert!(frame.contains(&(EV_ABS, ABS_MT_TRACKING_ID, 1)));
             assert!(frame.contains(&(EV_ABS, ABS_MT_POSITION_X, touch_value(0.25))));
             assert!(frame.contains(&(EV_ABS, ABS_MT_POSITION_Y, touch_value(0.75))));
+            // 触点大小报的是直径：半径 0.02 的触点是 0.04
+            assert!(frame.contains(&(EV_ABS, ABS_MT_TOUCH_MAJOR, touch_value(0.04))));
             // 单点坐标跟着第一个触点走
             assert!(frame.contains(&(EV_ABS, ABS_X, touch_value(0.25))));
             assert!(frame.contains(&(EV_ABS, ABS_Y, touch_value(0.75))));
