@@ -14,8 +14,12 @@ use anyhow::{Result, anyhow};
 
 const MESSAGE: &str = "Windows 版暂不支持终端";
 
-/// Why this machine cannot serve a terminal; shown to the controller.
-pub(crate) const UNSUPPORTED: Option<&str> = Some(MESSAGE);
+/// Why this machine cannot serve a terminal; Windows always has a reason.
+///
+/// Linux adds a runtime check (running as root) on top of this.
+pub(crate) fn unavailable() -> Option<&'static str> {
+    Some(MESSAGE)
+}
 
 /// A shell session. Windows cannot create one yet.
 pub(crate) enum Session {}

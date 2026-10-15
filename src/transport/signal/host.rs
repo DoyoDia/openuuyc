@@ -436,7 +436,7 @@ impl Session {
                 // A platform without a terminal backend refuses with its own
                 // reason before the permission is considered.
                 if let Some(reason) =
-                    crate::platform::terminal::UNSUPPORTED.filter(|_| terminal_only)
+                    crate::platform::terminal::unavailable().filter(|_| terminal_only)
                 {
                     anyhow::bail!(reason);
                 }

@@ -1082,6 +1082,11 @@ impl Lease {
     pub(crate) fn display_scope(&self) -> &str {
         &self.handle.scope
     }
+    /// The account this lease acts for. Terminal sessions are scoped to it so
+    /// a second account controlling the same machine cannot reach them.
+    pub(crate) fn account(&self) -> &str {
+        &self.handle.account
+    }
     pub(crate) fn begin_stream(&self, track: usize) -> anyhow::Result<Self> {
         let mut state = lock(&self.handle.ownership);
         anyhow::ensure!(self.current(&state), "本次被控许可已失效");

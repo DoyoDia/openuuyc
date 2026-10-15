@@ -26,8 +26,16 @@ use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// Linux can serve a terminal; Windows states why it cannot here.
-pub(crate) const UNSUPPORTED: Option<&str> = None;
+/// Why this machine cannot serve a terminal; `None` when it can.
+///
+/// A shell started as root would let the controller act as root on a machine
+/// whose owner only granted "open a terminal", so that case is refused before
+/// the permission is even considered. The check sits here rather than in
+/// [`Session::open`] so the pty itself stays usable by tests that run as root.
+pub(crate) fn unavailable() -> Option<&'static str> {
+    // SAFETY: `geteuid` takes no arguments and cannot fail.
+    (unsafe { libc::geteuid() } == 0).then_some("以 root 运行时不提供终端")
+}
 
 /// A shell running on a pty, with the master side owned by this process.
 pub(crate) struct Session {
@@ -62,6 +70,14 @@ impl Session {
         command.env("COLORTERM", "truecolor");
         if std::env::var_os("LANG").is_none() {
             command.env("LANG", "C.UTF-8");
+        }
+        // Start where the user's own terminal would, rather than in whatever
+        // directory the service happened to be launched from (usually `/`).
+        if let Some(home) = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .filter(|home| home.is_dir())
+        {
+            command.current_dir(home);
         }
         // The child gets the slave as its three standard streams; the parent
         // keeps the master. stdin/out/err start null so that a failure before

@@ -63,7 +63,7 @@ impl DeviceCenterApp {
         let mut power = host.power_allowed();
         let mut wol = host.wol_allowed();
         // Only where this platform can actually run a shell.
-        let terminal_supported = crate::platform::terminal::UNSUPPORTED.is_none();
+        let terminal_supported = crate::platform::terminal::unavailable().is_none();
         let mut terminal = host.terminal_allowed();
         let mut clipboard = host.clipboard_settings();
         let before = (files, ports, power, wol, terminal, clipboard);

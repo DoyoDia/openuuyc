@@ -62,6 +62,10 @@ const MAX_NAME: usize = 64;
 /// last saw. The client keeps its own scrollback, so a screenful and a little
 /// history is enough.
 const SCROLLBACK_LIMIT: usize = 128 * 1024;
+/// Input a session may hold when the pty will not take it yet.
+const PENDING_LIMIT: usize = 64 * 1024;
+/// Most pty output one session contributes to a single pump tick.
+const PUMP_BUDGET: usize = 256 * 1024;
 
 /// Frame kinds, in the declaration order the shipped enum uses.
 ///
@@ -184,6 +188,26 @@ struct Session {
     /// Output the shell has produced, so a reattach can replay the screen the
     /// controller last saw instead of showing it blank.
     scrollback: Vec<u8>,
+    /// Input the pty would not take yet. A paste or a slow shell fills the
+    /// pty buffer; dropping the rest would lose keystrokes silently.
+    pending: Vec<u8>,
+    /// The account that opened this shell. Another account controlling the
+    /// same machine must not see or reach it.
+    owner: String,
+}
+
+impl Session {
+    /// Pushes as much queued input as the pty accepts right now.
+    fn flush_pending(&mut self) {
+        while !self.pending.is_empty() {
+            match self.pty.write(&self.pending) {
+                Ok(0) | Err(_) => break,
+                Ok(written) => {
+                    self.pending.drain(..written);
+                }
+            }
+        }
+    }
 }
 
 /// Sessions taken out of the table.
@@ -268,6 +292,7 @@ impl Sessions {
     pub(crate) fn open(
         &mut self,
         handle: u32,
+        owner: &str,
         shell: &str,
         name: Option<String>,
         cols: u16,
@@ -279,7 +304,11 @@ impl Sessions {
             handle
         };
         // Re-opening an existing handle happens on reconnect and when the
-        // size changes; replacing the pty would hang up a shell in use.
+        // size changes; replacing the pty would hang up a shell in use. A
+        // handle another account already uses is not this caller's to reopen.
+        if self.sessions.contains_key(&handle) && !self.owns(handle, owner) {
+            return Err(SessionError::Gone);
+        }
         if let Some(existing) = self.sessions.get_mut(&handle) {
             existing
                 .pty
@@ -315,6 +344,8 @@ impl Sessions {
                 created_ms: stamp,
                 last_active_ms: stamp,
                 scrollback: Vec::new(),
+                pending: Vec::new(),
+                owner: owner.to_owned(),
             },
         );
         Ok((handle, name, Vec::new()))
@@ -349,11 +380,19 @@ impl Sessions {
             .unwrap_or_else(|| "/bin/bash".to_owned())
     }
 
-    /// The sessions the client lists, as the objects it parses.
-    pub(crate) fn list(&self) -> Vec<Value> {
+    /// Whether `handle` belongs to `owner`.
+    pub(crate) fn owns(&self, handle: u32, owner: &str) -> bool {
+        self.sessions
+            .get(&handle)
+            .is_some_and(|session| session.owner == owner)
+    }
+
+    /// The sessions `owner` may see, as the objects the client parses.
+    pub(crate) fn list(&self, owner: &str) -> Vec<Value> {
         let mut listed: Vec<_> = self
             .sessions
             .iter()
+            .filter(|(_, session)| session.owner == owner)
             .map(|(handle, session)| {
                 json!({
                     "session_id": handle,
@@ -369,11 +408,19 @@ impl Sessions {
         listed
     }
 
-    /// Writes keyboard input to one session.
+    /// Queues keyboard input and pushes what the pty accepts right now.
     pub(crate) fn write(&mut self, handle: u32, data: &[u8]) -> Result<usize, SessionError> {
         let session = self.sessions.get_mut(&handle).ok_or(SessionError::Gone)?;
         session.last_active_ms = now_ms();
-        session.pty.write(data).map_err(|_| SessionError::Gone)
+        session.pending.extend_from_slice(data);
+        // A controller that pastes faster than the shell reads must not grow
+        // this without bound; the oldest input is the safest to drop.
+        if session.pending.len() > PENDING_LIMIT {
+            let excess = session.pending.len() - PENDING_LIMIT;
+            session.pending.drain(..excess);
+        }
+        session.flush_pending();
+        Ok(data.len())
     }
 
     /// Applies a new size, which the shell sees as `SIGWINCH`.
@@ -402,6 +449,31 @@ impl Sessions {
         Ok(())
     }
 
+    /// Ends every session `owner` owns.
+    pub(crate) fn kill_owned(&mut self, owner: &str) -> Ended {
+        let handles: Vec<u32> = self
+            .sessions
+            .iter()
+            .filter(|(_, session)| session.owner == owner)
+            .map(|(handle, _)| *handle)
+            .collect();
+        Ended(
+            handles
+                .iter()
+                .filter_map(|handle| self.sessions.remove(handle))
+                .collect(),
+        )
+    }
+
+    /// Marks every session `owner` owns as detached without ending it.
+    pub(crate) fn detach_owned(&mut self, owner: &str) {
+        for session in self.sessions.values_mut() {
+            if session.owner == owner {
+                session.state = SessionState::Detached;
+            }
+        }
+    }
+
     /// Removes a session from the list; finishing the result ends the shell.
     pub(crate) fn kill(&mut self, handle: u32) -> Result<Ended, SessionError> {
         let session = self.sessions.remove(&handle).ok_or(SessionError::Gone)?;
@@ -428,12 +500,19 @@ impl Sessions {
             if session.state == SessionState::Exited {
                 continue;
             }
-            loop {
+            session.flush_pending();
+            // Cap how much one session contributes per tick. A shell that
+            // floods output would otherwise fill the data channel and starve
+            // the others; the rest waits for the next tick, which the pty
+            // read side sees as backpressure.
+            let mut budget = PUMP_BUDGET;
+            while budget > 0 {
                 match session.pty.read(&mut buffer) {
                     Ok(Some(0)) | Err(_) => break,
                     Ok(Some(read)) => {
                         session.push_scrollback(&buffer[..read]);
                         out.push((*handle, FrameType::Stdout, buffer[..read].to_vec()));
+                        budget = budget.saturating_sub(read);
                     }
                     Ok(None) => break,
                 }
@@ -482,10 +561,9 @@ fn resolve_shell(requested: &str) -> String {
         "zsh" => Some("/bin/zsh"),
         "sh" => Some("/bin/sh"),
         "fish" => Some("/usr/bin/fish"),
-        "pwsh" | "powershell" => Some("/usr/bin/pwsh"),
-        // `cmd` and friends are Windows-only; a POSIX shell is the closest
-        // thing that can actually run.
-        "cmd" | "cmd.exe" | "powershell.exe" => Some("/bin/sh"),
+        "pwsh" => Some("/usr/bin/pwsh"),
+        // `powershell` and `cmd` are Windows-only. A POSIX shell is not a
+        // substitute for either, so fall through to the login shell.
         _ => None,
     };
     match candidate {
@@ -603,9 +681,11 @@ pub(crate) fn bind(
         loop {
             ticker.tick().await;
             if pump_stop.is_cancelled() {
+                detach_sessions(&pump_screens).await;
                 return;
             }
             let Some(channel) = pump_channel.upgrade() else {
+                detach_sessions(&pump_screens).await;
                 return;
             };
             let frames = {
@@ -634,6 +714,22 @@ pub(crate) fn bind(
             ended.finish();
         }
     });
+}
+
+/// Marks the account's shells detached when the controller goes away.
+///
+/// The shells stay alive for a reconnect, but the session list should not
+/// keep claiming a controller is attached to them.
+async fn detach_sessions(
+    screens: &Arc<tokio::sync::Mutex<crate::features::host::peer::screens::Screens>>,
+) {
+    let state = screens.lock().await;
+    let account = state.authorization().account().to_owned();
+    let sessions = state.terminal();
+    sessions
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .detach_owned(&account);
 }
 
 /// Reads the request payload as JSON, falling back to `u16` columns and rows.
@@ -677,6 +773,39 @@ async fn handle_frame(
         bytes = frame.payload.len(),
         "host terminal frame"
     );
+    // Re-check the grant on every frame, not only when the connection was
+    // accepted: the user can turn the terminal off, or the account can sign
+    // out, while a controller is mid-session. The sessions are ended rather
+    // than left running behind a switch that now says no.
+    let (allowed, account) = {
+        let state = screens.lock().await;
+        let lease = state.authorization();
+        (lease.terminal_allowed(), lease.account().to_owned())
+    };
+    if !allowed {
+        tracing::warn!(kind = ?frame.kind, "host terminal frame refused");
+        let ended = {
+            let state = screens.lock().await;
+            let sessions = state.terminal();
+            let mut sessions = sessions.lock().unwrap_or_else(|e| e.into_inner());
+            sessions.kill_owned(&account)
+        };
+        ended.finish();
+        if frame.kind == FrameType::Open {
+            let payload = json!({
+                "code": 1,
+                "message": "本机未允许终端",
+                "session_id": frame.session,
+            });
+            let reply = Frame::encode(
+                FrameType::OpenResp,
+                frame.session,
+                &serde_json::to_vec(&payload).unwrap_or_default(),
+            );
+            let _ = channel.send(&Bytes::from(reply)).await;
+        }
+        return;
+    }
     let mut outgoing = Vec::new();
     match frame.kind {
         FrameType::ListSessionsReq => {
@@ -684,7 +813,7 @@ async fn handle_frame(
                 let state = screens.lock().await;
                 let sessions = state.terminal();
                 let sessions = sessions.lock().unwrap_or_else(|e| e.into_inner());
-                sessions.list()
+                sessions.list(&account)
             };
             let payload =
                 serde_json::to_vec(&Value::Array(listed)).unwrap_or_else(|_| b"[]".into());
@@ -711,6 +840,7 @@ async fn handle_frame(
                 let mut sessions = sessions.lock().unwrap_or_else(|e| e.into_inner());
                 sessions.open(
                     frame.session,
+                    &account,
                     &shell,
                     name,
                     cols.unwrap_or(80),
@@ -765,7 +895,12 @@ async fn handle_frame(
             let state = screens.lock().await;
             let sessions = state.terminal();
             let mut sessions = sessions.lock().unwrap_or_else(|e| e.into_inner());
-            if let Err(error) = sessions.write(frame.session, &frame.payload) {
+            if !sessions.owns(frame.session, &account) {
+                tracing::debug!(
+                    session = frame.session,
+                    "host terminal input for another account"
+                );
+            } else if let Err(error) = sessions.write(frame.session, &frame.payload) {
                 tracing::warn!(%error, "host terminal write failed");
             }
         }
@@ -775,7 +910,12 @@ async fn handle_frame(
                 let state = screens.lock().await;
                 let sessions = state.terminal();
                 let mut sessions = sessions.lock().unwrap_or_else(|e| e.into_inner());
-                if let Err(error) = sessions.resize(frame.session, cols, rows) {
+                if !sessions.owns(frame.session, &account) {
+                    tracing::debug!(
+                        session = frame.session,
+                        "host terminal resize for another account"
+                    );
+                } else if let Err(error) = sessions.resize(frame.session, cols, rows) {
                     tracing::warn!(%error, "host terminal resize failed");
                 }
             }
@@ -785,7 +925,11 @@ async fn handle_frame(
                 let state = screens.lock().await;
                 let sessions = state.terminal();
                 let mut sessions = sessions.lock().unwrap_or_else(|e| e.into_inner());
-                sessions.kill(frame.session)
+                if sessions.owns(frame.session, &account) {
+                    sessions.kill(frame.session)
+                } else {
+                    Err(SessionError::Gone)
+                }
             };
             // End the shell only once both locks are released.
             let result = result.map(Ended::finish);
@@ -809,7 +953,12 @@ async fn handle_frame(
             let state = screens.lock().await;
             let sessions = state.terminal();
             let mut sessions = sessions.lock().unwrap_or_else(|e| e.into_inner());
-            if let Err(error) = sessions.detach(frame.session) {
+            if !sessions.owns(frame.session, &account) {
+                tracing::debug!(
+                    session = frame.session,
+                    "host terminal detach for another account"
+                );
+            } else if let Err(error) = sessions.detach(frame.session) {
                 tracing::warn!(%error, "host terminal detach failed");
             }
         }
@@ -823,7 +972,11 @@ async fn handle_frame(
                 let state = screens.lock().await;
                 let sessions = state.terminal();
                 let mut sessions = sessions.lock().unwrap_or_else(|e| e.into_inner());
-                sessions.kill(frame.session)
+                if sessions.owns(frame.session, &account) {
+                    sessions.kill(frame.session)
+                } else {
+                    Err(SessionError::Gone)
+                }
             };
             if let Ok(ended) = ended {
                 ended.finish();
@@ -905,9 +1058,13 @@ mod tests {
     #[cfg_attr(not(target_os = "linux"), ignore = "needs a pty, which only Linux has")]
     fn sessions_are_keyed_by_the_controller_handle() {
         let mut sessions = Sessions::default();
-        sessions.open(11, shell(), None, 80, 24).expect("open");
-        sessions.open(22, shell(), None, 80, 24).expect("open");
-        assert_eq!(sessions.list().len(), 2);
+        sessions
+            .open(11, "acct", shell(), None, 80, 24)
+            .expect("open");
+        sessions
+            .open(22, "acct", shell(), None, 80, 24)
+            .expect("open");
+        assert_eq!(sessions.list("acct").len(), 2);
         assert!(sessions.write(11, b"echo A\n").is_ok());
         assert!(sessions.write(33, b"echo B\n").is_err());
     }
@@ -917,10 +1074,10 @@ mod tests {
     fn a_duplicate_name_is_refused() {
         let mut sessions = Sessions::default();
         sessions
-            .open(1, shell(), Some("build".into()), 80, 24)
+            .open(1, "acct", shell(), Some("build".into()), 80, 24)
             .expect("open");
         assert_eq!(
-            sessions.open(2, shell(), Some("build".into()), 80, 24),
+            sessions.open(2, "acct", shell(), Some("build".into()), 80, 24),
             Err(SessionError::DuplicateName)
         );
     }
@@ -929,15 +1086,15 @@ mod tests {
     fn invalid_names_are_refused() {
         let mut sessions = Sessions::default();
         assert_eq!(
-            sessions.open(1, shell(), Some("   ".into()), 80, 24),
+            sessions.open(1, "acct", shell(), Some("   ".into()), 80, 24),
             Err(SessionError::InvalidName)
         );
         assert_eq!(
-            sessions.open(1, shell(), Some("a/b".into()), 80, 24),
+            sessions.open(1, "acct", shell(), Some("a/b".into()), 80, 24),
             Err(SessionError::InvalidName)
         );
         assert_eq!(
-            sessions.open(1, shell(), Some("x".repeat(MAX_NAME + 1)), 80, 24),
+            sessions.open(1, "acct", shell(), Some("x".repeat(MAX_NAME + 1)), 80, 24),
             Err(SessionError::NameTooLong)
         );
     }
@@ -946,7 +1103,9 @@ mod tests {
     #[cfg_attr(not(target_os = "linux"), ignore = "needs a pty, which only Linux has")]
     fn write_and_resize_reach_the_shell() {
         let mut sessions = Sessions::default();
-        sessions.open(1, shell(), None, 80, 24).expect("open");
+        sessions
+            .open(1, "acct", shell(), None, 80, 24)
+            .expect("open");
         sessions.resize(1, 120, 40).expect("resize");
         sessions.write(1, b"echo READY\n").expect("write");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -969,7 +1128,9 @@ mod tests {
     #[cfg_attr(not(target_os = "linux"), ignore = "needs a pty, which only Linux has")]
     fn a_reattach_replays_the_screen() {
         let mut sessions = Sessions::default();
-        let (handle, _, replay) = sessions.open(0, shell(), None, 80, 24).expect("open");
+        let (handle, _, replay) = sessions
+            .open(0, "acct", shell(), None, 80, 24)
+            .expect("open");
         assert!(replay.is_empty(), "a fresh session has nothing to replay");
         sessions.write(handle, b"echo HISTORY\n").expect("write");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -984,7 +1145,9 @@ mod tests {
                 break;
             }
         }
-        let (again, _, replay) = sessions.open(handle, shell(), None, 100, 40).expect("open");
+        let (again, _, replay) = sessions
+            .open(handle, "acct", shell(), None, 100, 40)
+            .expect("open");
         assert_eq!(again, handle, "reattach keeps the same shell");
         assert!(
             String::from_utf8_lossy(&replay).contains("HISTORY"),
@@ -997,7 +1160,9 @@ mod tests {
     #[cfg_attr(not(target_os = "linux"), ignore = "needs a pty, which only Linux has")]
     fn an_exited_shell_reports_once() {
         let mut sessions = Sessions::default();
-        sessions.open(1, shell(), None, 80, 24).expect("open");
+        sessions
+            .open(1, "acct", shell(), None, 80, 24)
+            .expect("open");
         sessions.write(1, b"exit\n").expect("write");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while std::time::Instant::now() < deadline {
@@ -1019,7 +1184,9 @@ mod tests {
     #[cfg_attr(not(target_os = "linux"), ignore = "needs a pty, which only Linux has")]
     fn killing_removes_a_session_and_a_second_kill_is_gone() {
         let mut sessions = Sessions::default();
-        sessions.open(1, shell(), None, 80, 24).expect("open");
+        sessions
+            .open(1, "acct", shell(), None, 80, 24)
+            .expect("open");
         sessions.kill(1).expect("kill").finish();
         assert_eq!(sessions.kill(1).err(), Some(SessionError::Gone));
         assert!(sessions.is_empty());
