@@ -194,6 +194,9 @@ wl-clipboard-rs = { version = "0.9", default-features = false }
 # （中文等）。XTest 只能影响 XWayland 客户端，uinput 又无法携带 keymap。
 wayland-client = { version = "0.31", default-features = false }
 wayland-protocols-misc = { version = "0.3", default-features = false, features = ["client"] }
+# xdg_activation_v1: raising the existing control center with the token a
+# second launch was given (winit applies a token only to a new window).
+wayland-protocols = { version = "0.32", default-features = false, features = ["client", "staging"] }
 libc = "0.2"
 fuser = { version = "0.15", default-features = false }
 x11rb = { version = "0.13", features = ["dpms", "randr", "shm", "xfixes", "xtest"] }
