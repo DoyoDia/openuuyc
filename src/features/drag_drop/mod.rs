@@ -1123,6 +1123,7 @@ impl Actor {
             self.reported = None;
             self.shared.ready.store(false, Ordering::Release);
             self.shared.return_capable.store(false, Ordering::Release);
+            self.shared.image_capable.store(false, Ordering::Release);
             if token != 0 {
                 self.emit(0, Payload::Hello(1), false).await?;
             }
