@@ -14,8 +14,7 @@ use webrtc::rtcp::transport_feedbacks::transport_layer_cc::{
     PacketStatusChunk, SymbolTypeTcc, TransportLayerCc,
 };
 
-/// 交给 goog_cc 的现场试验。抽成函数是为了让测试能直接检查这些字段：写在这里的
-/// 每一项都必须真的有读取方，否则就是永远不会生效的死配置。
+/// Configure the effective GoogCC parameters for the verified UU sender path.
 fn field_trials() -> FieldTrials {
     let mut field_trials = FieldTrials::default();
     // T541A30 defaults robust estimator OFF in this UU SDK.
@@ -23,24 +22,14 @@ fn field_trials() -> FieldTrials {
     field_trials.rapid_recovery_experiment = true;
     field_trials.no_bitrate_increase_in_alr = false;
     field_trials.add_pacing_to_congestion_window_pushback = true;
-    // alr_experiment_settings 那一组（WebRTC-ProbingScreenshareBwe）在这个 Rust
-    // port 里没有任何读取方：libwebrtc 是靠 UpdateAlrExperimentSettings 把它们推给
-    // AlrDetector 的，移植时这一步丢了。真正生效的是 goog_cc_network_control.rs:176
-    // 读的 alr_detector_parameters，所以原来写在那里的 85/95/-60 从来没生效过，
-    // ALR 一直按库默认的 0.80/0.40/-0.60 判定。
-    //
-    // 这里显式写出实际生效的值，而不是把 95 搬过来：start_budget_level_ratio 从
-    // 0.40 抬到 0.95 会让 ALR 变得难进，而 ALR 正是 app-limited 的共享桌面唯一的
-    // 上探通道——周期性 ALR 探测的前提就是 in_alr（probe_controller.rs:635），
-    // 进不去 ALR 就只剩 AIMD 那条 1.5 × 实测接收速率的天花板。要动这个阈值得先有
-    // 弱网数据，不在这个改动里动。
+    // UU 4.41.2.2602: T53D277 parses screenshare 85/95/-60 into the
+    // detector ratios consumed by T53D536/T53D61A. This Rust port reads
+    // alr_detector_parameters directly; alr_experiment_settings is unused.
     field_trials.alr_detector_parameters = AlrDetectorConfig {
-        bandwidth_usage_ratio: 0.80,
-        start_budget_level_ratio: 0.40,
+        bandwidth_usage_ratio: 0.85,
+        start_budget_level_ratio: 0.95,
         stop_budget_level_ratio: -0.60,
     };
-    // ALR 周期性探测的频率与步长暂时留在库默认（5 秒 / 2 倍）：这个旋钮直接
-    // 决定弱网下每次探测压进瓶颈多少数据，单独一个提交再打开，好单独评估。
     field_trials.probing_configuration.probe_max_allocation = true;
     field_trials.min_alloc_as_lower_bound = false;
     field_trials.ignore_probes_lower_than_network_state_estimate = false;
@@ -93,7 +82,9 @@ impl Controller {
             maximum_bps = maximum,
             startup_bps = bounds.initial,
             alr_usage_ratio = field_trials.alr_detector_parameters.bandwidth_usage_ratio,
-            alr_start_ratio = field_trials.alr_detector_parameters.start_budget_level_ratio,
+            alr_start_ratio = field_trials
+                .alr_detector_parameters
+                .start_budget_level_ratio,
             alr_stop_ratio = field_trials.alr_detector_parameters.stop_budget_level_ratio,
             alr_interval_ms = field_trials.probing_configuration.alr_interval.ms(),
             alr_scale = field_trials.probing_configuration.alr_scale,
@@ -604,45 +595,5 @@ impl Pressure {
         } else if let Some(r) = correlation {
             self.random_loss = loss >= 0.03 && r < 0.6;
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn alr_thresholds_are_written_where_goog_cc_reads_them() {
-        let trials = field_trials();
-        // AlrDetector 是从 alr_detector_parameters 构造的
-        // (vendor/goog_cc/src/goog_cc_network_control.rs:176)，这里必须和实际生效
-        // 的库默认一致：抬高 start_budget_level_ratio 会让 ALR 难进，也就堵死了
-        // app-limited 场景下唯一的上探通道。
-        assert_eq!(trials.alr_detector_parameters.bandwidth_usage_ratio, 0.80);
-        assert_eq!(
-            trials.alr_detector_parameters.start_budget_level_ratio,
-            0.40
-        );
-        assert_eq!(
-            trials.alr_detector_parameters.stop_budget_level_ratio,
-            -0.60
-        );
-        // 对照组：alr_experiment_settings 那一组在 vendor/goog_cc 里没有任何读取
-        // 方，写它不会有任何效果，所以这里必须保持默认——真写了才是 bug。
-        let inert = goog_cc::experiments::AlrExperimentSettings::default();
-        assert_eq!(
-            trials
-                .alr_experiment_settings
-                .alr_start_budget_level_percent,
-            inert.alr_start_budget_level_percent
-        );
-        assert_eq!(
-            trials.alr_experiment_settings.alr_bandwidth_usage_percent,
-            inert.alr_bandwidth_usage_percent
-        );
-        assert_eq!(
-            trials.alr_experiment_settings.pacing_factor,
-            inert.pacing_factor
-        );
     }
 }

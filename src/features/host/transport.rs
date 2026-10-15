@@ -175,11 +175,8 @@ impl std::ops::Deref for Shared {
     }
 }
 
-/// 一簇探测退场时留一行：目标速率、实际发出去多少字节、发了几簇、为什么退场。
-/// 这是判断「估计值为什么上不去」的现场记录——`sent_bytes == 0` 或
-/// `reason = "no bytes to send"` 就是探测链断在第一跳上，而 `probe complete`
-/// 之后的成败要看 goog_cc 自己的日志（`--log-level goog_cc=debug` 下
-/// probe_bitrate_estimator.rs 会打实测/目标）。
+/// Record probe retirement. Accounted bytes include estimated network overhead;
+/// they are not a measurement of bytes delivered to the receiver.
 fn retire_probe(
     active: Option<(ProbeClusterConfig, Instant, usize, i64)>,
     reason: &'static str,
@@ -188,7 +185,7 @@ fn retire_probe(
         tracing::debug!(
             cluster = cluster.id,
             target_bps = cluster.target_data_rate.bps_or(0),
-            sent_bytes = sent,
+            accounted_bytes = sent,
             bursts = bursts,
             elapsed_ms = started.elapsed().as_secs_f64() * 1000.,
             reason,
@@ -1076,7 +1073,7 @@ impl Transport {
     }
     pub(crate) async fn probes(&self) {
         let mut active = None::<(ProbeClusterConfig, Instant, usize, i64)>;
-        // 见 retire_probe：这一簇的归宿是判断「探测链有没有断」的唯一现场记录。
+        // Enable openuuyc::features::host=debug for these probe diagnostics.
         while self.active() {
             // Follow the cluster's byte clock. Sleeping another 2ms on every
             // iteration accumulates timer rounding and write time, lowering
@@ -1146,8 +1143,10 @@ impl Transport {
                 .max(200)
                 .min(128_000) as usize;
             let mut bytes = 0;
+            let mut stopped = None;
             while bytes < burst && self.active() {
                 let Some((bound, packet, epoch)) = owner.probe_packet() else {
+                    stopped = Some("no usable RTX payload");
                     break;
                 };
                 let info = PacedPacketInfo {
@@ -1167,12 +1166,19 @@ impl Transport {
                     )
                     .await
                 {
-                    Ok(0) => break,
+                    Ok(0) => {
+                        stopped = Some("packet skipped before send");
+                        break;
+                    }
                     Ok(size) => {
                         bytes += size + self.network_overhead();
                         *sent += size + self.network_overhead();
                     }
-                    Err(_) => break,
+                    Err(error) => {
+                        tracing::debug!(cluster = cluster.id, %error, "host probe send failed");
+                        stopped = Some("send failed or cancelled");
+                        break;
+                    }
                 }
             }
             *bursts += 1;
@@ -1180,13 +1186,14 @@ impl Transport {
             // clock. Retire this attempt instead of spinning on a past deadline.
             if bytes == 0 || (*bursts >= cluster.target_probe_count as i64 && *sent >= minimum) {
                 let reason = if bytes == 0 {
-                    "no bytes to send"
+                    stopped.unwrap_or("transport stopped")
                 } else {
                     "probe complete"
                 };
                 active = retire_probe(active.take(), reason);
             }
         }
+        let _ = retire_probe(active.take(), "transport stopped");
     }
     fn remember(&self, packet: &Packet) {
         if !self.active() {
