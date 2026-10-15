@@ -352,7 +352,7 @@ pub(super) struct PbRpcResponse {
     pub(super) response_header: Option<PbResponseHeader>,
     #[prost(
         oneof = "PbRpcResponsePayload",
-        tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23"
+        tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 26"
     )]
     pub(super) payload: Option<PbRpcResponsePayload>,
 }
@@ -403,14 +403,11 @@ pub(super) enum PbRpcResponsePayload {
     EnterSuperScreenRep(Vec<u8>),
     #[prost(message, tag = "23")]
     DrawResp(annotation::PbDrawResponse),
-    // `main.proto`'s oneof continues past the draw response. The matching
-    // requests (`TerminalCheck` = 28, `TerminalRename` = 29) are already
-    // declared, so without these two the host has no reply to encode for
-    // `terminal_check_env_req` / `terminal_rename_session_req`, and a client
-    // sees a component that never answers its environment check.
+    // UU 4.41.2.2602 rpc_main.proto uses 24 and 26 (25 is absent).
+    // Keep opaque responses in the oneof; terminal execution is not enabled.
     #[prost(bytes, tag = "24")]
     TerminalCheckEnvRsp(Vec<u8>),
-    #[prost(bytes, tag = "25")]
+    #[prost(bytes, tag = "26")]
     TerminalRenameSessionRsp(Vec<u8>),
 }
 
