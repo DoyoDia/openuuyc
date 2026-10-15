@@ -125,6 +125,9 @@ mod uinput {
     const TOUCH_RESOLUTION: i32 = 40;
     /// 触摸屏同时能按住的触点数，和协议允许的一样多。
     const TOUCH_SLOTS: usize = 10;
+    /// 设备声明的 tracking id 上限。id 在 `0..=TRACKING_MAX` 里回绕，和内核
+    /// `input_mt` 一样按位截断，-1 留给「抬起」。
+    const TRACKING_MAX: i32 = 0xffff;
 
     // linux/uinput.h 的 _IOW('U', n, size)；x86、ARM 与 RISC-V 上相同。
     const UI_DEV_CREATE: libc::c_ulong = 0x5501;
@@ -395,7 +398,7 @@ mod uinput {
                     set_abs(fd, axis, TOUCH_RANGE as i32, TOUCH_RESOLUTION)?;
                 }
                 set_abs(fd, ABS_MT_SLOT, TOUCH_SLOTS as i32 - 1, 0)?;
-                set_abs(fd, ABS_MT_TRACKING_ID, 65535, 0)?;
+                set_abs(fd, ABS_MT_TRACKING_ID, TRACKING_MAX, 0)?;
                 set_abs(fd, ABS_MT_TOUCH_MAJOR, TOUCH_RANGE as i32, 0)?;
                 set(fd, UI_SET_PROPBIT, INPUT_PROP_DIRECT.into())
             })
@@ -440,7 +443,7 @@ mod uinput {
     struct Contacts {
         active: BTreeMap<u32, Contact>,
         used: [bool; TOUCH_SLOTS],
-        /// 上一个发出去的 tracking id，每个新触点加一。
+        /// 上一个发出去的 tracking id，每个新触点加一，在声明的范围里回绕。
         tracking: i32,
         /// 上一次发出去的按下状态，只在变化时重发 BTN_TOUCH。
         touching: bool,
@@ -526,10 +529,9 @@ mod uinput {
                             .context("虚拟触摸屏的触点已经用满")?;
                         self.used[slot] = true;
                         // 新触点要一个新的 tracking id；抬起时把那个槽位的 id 写回 -1。
-                        self.tracking = self.tracking.wrapping_add(1);
                         let contact = Contact {
                             slot: slot as u8,
-                            tracking: self.tracking,
+                            tracking: self.next_tracking(),
                         };
                         frame.push((EV_ABS, ABS_MT_SLOT, i32::from(contact.slot)));
                         frame.push((EV_ABS, ABS_MT_TRACKING_ID, contact.tracking));
@@ -555,6 +557,22 @@ mod uinput {
                 frames.push(frame);
             }
             Ok(frames)
+        }
+
+        /// 下一个 tracking id：加一后截到声明的范围里，跳过还按着的触点正在用的 id
+        /// （回绕一圈之后才可能撞上；按着的最多 `TOUCH_SLOTS` 个，所以一定找得到）。
+        fn next_tracking(&mut self) -> i32 {
+            loop {
+                self.tracking = (self.tracking + 1) & TRACKING_MAX;
+                let tracking = self.tracking;
+                if !self
+                    .active
+                    .values()
+                    .any(|contact| contact.tracking == tracking)
+                {
+                    return tracking;
+                }
+            }
         }
 
         /// 抬起所有触点，并把槽位还回去。
@@ -740,6 +758,44 @@ mod uinput {
             }
             assert!(contacts.active.is_empty());
             assert!(!contacts.touching);
+        }
+
+        /// tracking id 在声明的 `0..=TRACKING_MAX` 里回绕，不会是 -1，也不会撞上
+        /// 还按着的触点。
+        #[test]
+        fn tracking_ids_wrap_within_the_declared_range() {
+            let mut contacts = Contacts::default();
+            contacts.tracking = TRACKING_MAX - 1;
+            contacts
+                .step(2, &[contact(1, 0.5, 0.5)], Rotation::Normal)
+                .unwrap();
+            assert_eq!(contacts.active[&1].tracking, TRACKING_MAX);
+            // 1 一直按着；下一个回绕到 0
+            let frames = contacts
+                .step(
+                    2,
+                    &[contact(1, 0.5, 0.5), contact(2, 0.6, 0.6)],
+                    Rotation::Normal,
+                )
+                .unwrap();
+            assert!(frames[0].contains(&(EV_ABS, ABS_MT_TRACKING_ID, 0)));
+            assert_eq!(contacts.active[&2].tracking, 0);
+
+            // 又绕一圈回到 TRACKING_MAX 和 0 时，它们还被 1 和 2 占着，跳过去
+            contacts.tracking = TRACKING_MAX - 1;
+            contacts
+                .step(
+                    2,
+                    &[
+                        contact(1, 0.5, 0.5),
+                        contact(2, 0.6, 0.6),
+                        contact(3, 0.7, 0.7),
+                    ],
+                    Rotation::Normal,
+                )
+                .unwrap();
+            assert_eq!(contacts.active[&1].tracking, TRACKING_MAX);
+            assert_eq!(contacts.active[&3].tracking, 1);
         }
 
         /// 「触点集合从现在开始」这一类帧，先抬起旧的一套，再按下新的一套。
