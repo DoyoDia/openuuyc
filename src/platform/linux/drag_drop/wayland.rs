@@ -745,9 +745,14 @@ mod tests {
     /// 「创建子对象」的事件必须在 `Dispatch` 里给出特化，缺了会在合成器真送来
     /// 事件时 panic，而那个 panic 直接 abort 整个进程。这条就是把这个坑钉住：
     /// 不连真拖放也能查出来。
+    ///
+    /// 要的只是一个 `QueueHandle`，它只要求一条连接、不要求对面坐着合成器。所以
+    /// 用一对 unix socket 自己喂一条连接进去：CI 和 Xorg 会话里没有 Wayland 显示，
+    /// `connect_to_env` 会直接失败，而这条测试不该只在有合成器的机器上跑得起来。
     #[test]
     fn data_offer_has_a_child_specialization() {
-        let connection = Connection::connect_to_env().expect("需要 Wayland 会话");
+        let (ours, _theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        let connection = Connection::from_socket(ours).unwrap();
         let queue = connection.new_event_queue::<State>();
         let _ = <State as Dispatch<wl_data_device::WlDataDevice, ()>>::event_created_child(
             0,
