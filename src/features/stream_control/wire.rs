@@ -333,7 +333,6 @@ pub(super) enum PbRpcRequestPayload {
     #[prost(bytes, tag = "29")]
     TerminalRename(Vec<u8>),
 }
-
 #[derive(Clone, PartialEq, prost::Message)]
 pub(super) struct PbSendVideoTrackRequest {
     #[prost(int32, repeated, tag = "1")]
@@ -403,6 +402,13 @@ pub(super) enum PbRpcResponsePayload {
     EnterSuperScreenRep(Vec<u8>),
     #[prost(message, tag = "23")]
     DrawResp(annotation::PbDrawResponse),
+    // `main.proto`'s oneof continues past the draw response; these two were
+    // missing, so a terminal request had no reply to encode and the client
+    // saw a component that never answers its environment check.
+    #[prost(bytes, tag = "24")]
+    TerminalCheckEnvRsp(Vec<u8>),
+    #[prost(bytes, tag = "25")]
+    TerminalRenameSessionRsp(Vec<u8>),
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
