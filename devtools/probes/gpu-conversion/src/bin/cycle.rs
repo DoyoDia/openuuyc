@@ -58,6 +58,11 @@ mod media {
 mod encoder;
 #[path = "../../../../../src/platform/linux/gpu_convert.rs"]
 mod gpu_convert;
+/// The probe does no CUDA work beside VA-API, so there is no `cuInit` to
+/// order before the VA driver loads.
+mod cuda {
+    pub fn initialize_before_va() {}
+}
 
 fn source(w: u32, h: u32) -> anyhow::Result<(cros_libva::Surface<()>, gpu_convert::RgbDma)> {
     let display = cros_libva::Display::open_drm_display("/dev/dri/renderD128")?;
