@@ -26,7 +26,7 @@ use wayland_client::protocol::{
     wl_buffer, wl_compositor, wl_data_device, wl_data_device_manager, wl_data_offer, wl_output,
     wl_registry, wl_seat, wl_shm, wl_shm_pool, wl_surface,
 };
-use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle};
+use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle, WEnum};
 use wayland_protocols::xdg::xdg_output::zv1::client::{zxdg_output_manager_v1, zxdg_output_v1};
 use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
 
@@ -88,6 +88,14 @@ impl Catcher {
     }
 }
 
+/// 合成器的一块输出：`wl_output` 本身、它报上来的名字（v4 才有，之前恒为空串），
+/// 以及当前模式的物理尺寸（名字对不上时拿它认屏）。
+struct Output {
+    proxy: wl_output::WlOutput,
+    name: String,
+    physical: (i32, i32),
+}
+
 #[derive(Default)]
 struct State {
     compositor: Option<wl_compositor::WlCompositor>,
@@ -103,8 +111,8 @@ struct State {
     /// 每块屏的逻辑位置与尺寸，顺序同上。`layer_shell` 的边距按逻辑算，采集给的
     /// 拖动点按物理算，两边差着一个缩放。
     logical: Vec<Option<((i32, i32), (i32, i32))>>,
-    /// 合成器的输出，以及它们报上来的名字（名字要等绑定之后再走一轮才到）。
-    outputs: Vec<(wl_output::WlOutput, String)>,
+    /// 合成器的输出（名字与模式要等绑定之后再走一轮才到）。
+    outputs: Vec<Output>,
     /// 这次拖放带的 offer，以及它报出来的类型。
     offer: Option<wl_data_offer::WlDataOffer>,
     mimes: Vec<String>,
@@ -138,6 +146,57 @@ fn logical_point(point: Position, size: (u32, u32), logical: (i32, i32)) -> (i32
     )
 }
 
+/// 挑出 `device` 指的是哪块屏。
+///
+/// 名字对不上是常态：XWayland 那边给的可能压根不是合成器的输出名（老版本直接叫
+/// `XWAYLAND0`），而 `wl_output` 在 v4 之前根本不发名字（绑上去拿到的是空串）。
+/// 所以照采集那边的三段式来：按名字 → 只有一块屏就用它 → 都不行就按物理尺寸认
+/// （尺寸按无序对比较，转过 90 度的屏宽高是换过来的）→ 还不行就报错，并把合成器
+/// 有的输出列出来。
+fn pick(state: &State, device: &str, size: (u32, u32)) -> Result<usize> {
+    if let Some(index) = state
+        .outputs
+        .iter()
+        .position(|output| !output.name.is_empty() && output.name == device)
+    {
+        return Ok(index);
+    }
+    if state.outputs.len() == 1 {
+        tracing::debug!(
+            device,
+            name = %state.outputs[0].name,
+            "合成器只有一块屏，就按它接取"
+        );
+        return Ok(0);
+    }
+    let side = |(width, height): (i32, i32)| (width.max(height), width.min(height));
+    let wanted = side((size.0 as i32, size.1 as i32));
+    let matched: Vec<usize> = state
+        .outputs
+        .iter()
+        .enumerate()
+        .filter(|(_, output)| output.physical != (0, 0) && side(output.physical) == wanted)
+        .map(|(index, _)| index)
+        .collect();
+    if let [index] = matched[..] {
+        tracing::debug!(device, "输出名对不上，按物理尺寸认屏");
+        return Ok(index);
+    }
+    bail!(
+        "合成器里没有名为 {device} 的输出（它有：{}）",
+        state
+            .outputs
+            .iter()
+            .map(|output| if output.name.is_empty() {
+                format!("无名 {}x{}", output.physical.0, output.physical.1)
+            } else {
+                output.name.clone()
+            })
+            .collect::<Vec<_>>()
+            .join("、")
+    )
+}
+
 fn run(
     device: &str,
     size: (u32, u32),
@@ -159,12 +218,8 @@ fn run(
         .roundtrip(&mut state)
         .context("读取 Wayland 输出描述失败")?;
 
-    let index = state
-        .outputs
-        .iter()
-        .position(|(_, name)| name == device)
-        .with_context(|| format!("合成器没有名为 {device} 的输出"))?;
-    let target = state.outputs[index].0.clone();
+    let index = pick(&state, device, size)?;
+    let target = state.outputs[index].proxy.clone();
     let compositor = state
         .compositor
         .clone()
@@ -191,7 +246,7 @@ fn run(
     state.described = state
         .outputs
         .iter()
-        .map(|(output, _)| xdg.get_xdg_output(output, &handle, ()))
+        .map(|output| xdg.get_xdg_output(&output.proxy, &handle, ()))
         .collect();
     state.logical = vec![None; state.outputs.len()];
     // 只等目标屏：别的屏的逻辑尺寸跟这块摆哪儿没有关系。
@@ -575,10 +630,11 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                 )
             }
             // `wl_output.name` 是 v4 才有的，也就是认这块屏靠的那个字段。
-            "wl_output" => state.outputs.push((
-                registry.bind::<wl_output::WlOutput, _, _>(name, version.min(4), handle, ()),
-                String::new(),
-            )),
+            "wl_output" => state.outputs.push(Output {
+                proxy: registry.bind::<wl_output::WlOutput, _, _>(name, version.min(4), handle, ()),
+                name: String::new(),
+                physical: (0, 0),
+            }),
             _ => {}
         }
     }
@@ -593,10 +649,27 @@ impl Dispatch<wl_output::WlOutput, ()> for State {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if let wl_output::Event::Name { name } = event
-            && let Some(entry) = state.outputs.iter_mut().find(|(it, _)| it == output)
-        {
-            entry.1 = name;
+        let Some(entry) = state
+            .outputs
+            .iter_mut()
+            .find(|entry| entry.proxy == *output)
+        else {
+            return;
+        };
+        match event {
+            wl_output::Event::Name { name } => entry.name = name,
+            // 合成器可能把几个模式都报一遍，只认标了 current 的那个。
+            wl_output::Event::Mode {
+                flags,
+                width,
+                height,
+                ..
+            } => {
+                if matches!(flags, WEnum::Value(mode) if mode.contains(wl_output::Mode::Current)) {
+                    entry.physical = (width, height);
+                }
+            }
+            _ => {}
         }
     }
 }
