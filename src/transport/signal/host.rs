@@ -556,6 +556,7 @@ impl Session {
                             options.clipboard_level(),
                             options.file_capabilities(),
                             data_only,
+                            terminal_only,
                             update_resume,
                         )
                         .await?;
