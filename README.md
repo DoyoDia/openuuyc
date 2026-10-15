@@ -154,15 +154,15 @@ echo uinput | sudo tee /etc/modules-load.d/uinput.conf
 [`packaging/linux/60-openuuyc-uinput.rules`](packaging/linux/60-openuuyc-uinput.rules)
 放到 `/etc/udev/rules.d/` 即可。没有权限时程序会记录一条警告并回退到 XTest（只影响 XWayland 客户端）。Xorg 会话不使用 uinput，无需这一步。
 
-Wayland 下被控需要 XDG 屏幕共享门户：
+Wayland 下被控先用合成器自己的 wlroots screencopy（Sway、Hyprland、niri 等都提供），不需要门户，也不弹授权。合成器不提供或无法复制画面时（GNOME、KDE 等）改用 XDG 屏幕共享门户：
 
 ```bash
-# Hyprland
-sudo pacman -S --needed xdg-desktop-portal-hyprland
-# GNOME / KDE 使用对应的 xdg-desktop-portal-gnome / -kde
+# GNOME / KDE
+sudo pacman -S --needed xdg-desktop-portal-gnome   # KDE 为 xdg-desktop-portal-kde
+# wlroots 系合成器也走门户时（如 OPENUUYC_CAPTURE=portal）：Hyprland 为 xdg-desktop-portal-hyprland，Sway 等为 xdg-desktop-portal-wlr
 ```
 
-首次被控时会弹出一次共享授权，之后记在 `~/.local/share/OpenUUYC/screencast-restore-token`。
+经门户采集时，首次被控会弹出一次共享授权，之后记在 `~/.local/share/OpenUUYC/screencast-restore-token`。
 
 #### 硬件解码 / 编码
 
