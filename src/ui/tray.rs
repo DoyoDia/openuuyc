@@ -116,19 +116,28 @@ impl Tray {
     }
     /// 被控角标：这台机器正被别人控制时，托盘图标右上角多一个红三角。
     pub(super) fn set_controlled(&self, controlled: bool) {
-        if CONTROLLED.swap(controlled, Ordering::Relaxed) == controlled {
+        if CONTROLLED.load(Ordering::Relaxed) == controlled {
             return;
         }
-        // 合成失败就留回普通图标，别把一个空句柄交给 shell。
-        if controlled {
-            if let Err(error) = badge_icon() {
-                tracing::warn!(error = %format!("{error:#}"), "托盘角标合成失败");
-                CONTROLLED.store(false, Ordering::Relaxed);
-                return;
+        let icon = if controlled {
+            match badge_icon() {
+                Ok(icon) => icon,
+                Err(error) => {
+                    tracing::warn!(error = %format!("{error:#}"), "托盘角标合成失败");
+                    return;
+                }
             }
-        }
-        unsafe {
-            let _ = Shell_NotifyIconW(NIM_MODIFY, &data(self.window));
+        } else {
+            resource_icon()
+        };
+        let mut update = data(self.window);
+        update.hIcon = icon;
+        // Cache only the state accepted by the shell. A failed update must
+        // remain pending for the existing UI refresh to try again.
+        if unsafe { Shell_NotifyIconW(NIM_MODIFY, &update) }.as_bool() {
+            CONTROLLED.store(controlled, Ordering::Relaxed);
+        } else {
+            tracing::debug!(controlled, "tray icon update was not accepted");
         }
     }
 }
