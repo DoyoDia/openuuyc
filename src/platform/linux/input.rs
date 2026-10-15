@@ -409,29 +409,30 @@ mod uinput {
             })
         }
 
-        pub(crate) fn touch(
+        /// 算出这一帧触点要写进设备的帧。触点比槽位多时报错，什么也不改，设备
+        /// 照样能用。
+        pub(crate) fn step(
             &mut self,
             kind: u8,
             points: &[Touch],
             rotation: Rotation,
-        ) -> Result<()> {
-            let frames = self.contacts.step(kind, points, rotation)?;
-            for frame in &frames {
-                if let Err(error) = self.device.send(frame) {
-                    // 写到一半失败，设备里的状态就不知道是什么了，按全抬起来算。
-                    self.contacts = Contacts::default();
-                    return Err(error);
-                }
+        ) -> Result<Vec<Frame>> {
+            self.contacts.step(kind, points, rotation)
+        }
+
+        /// 把帧写进设备。写失败时设备里按着哪些触点就不知道了，调用方要丢掉这块
+        /// 触摸屏：设备一移除，合成器（libinput）会自己把它上面的触点全部收尾。
+        pub(crate) fn write(&self, frames: &[Frame]) -> Result<()> {
+            for frame in frames {
+                self.device.send(frame)?;
             }
             Ok(())
         }
 
+        /// 抬起所有触点。和 `write` 一样，失败了这块触摸屏就不能再用。
         pub(crate) fn release(&mut self) -> Result<()> {
             let frames = self.contacts.lift_all();
-            for frame in &frames {
-                self.device.send(frame)?;
-            }
-            Ok(())
+            self.write(&frames)
         }
     }
 
@@ -456,7 +457,7 @@ mod uinput {
     }
 
     /// 送进设备的一帧：一组事件，内核把它们当成一次同步。
-    type Frame = Vec<(u16, u16, i32)>;
+    pub(crate) type Frame = Vec<(u16, u16, i32)>;
 
     impl Contacts {
         /// 一帧触点。`kind` 是 UU 的说法：1 是「触点集合从现在开始」，2 是移动，
@@ -1449,17 +1450,31 @@ impl Injector {
         let Some(touchscreen) = &mut self.touchscreen else {
             return Ok(false);
         };
-        touchscreen.touch(kind, points, rotation)?;
+        let frames = touchscreen.step(kind, points, rotation)?;
+        let written = touchscreen.write(&frames);
+        self.keep_touchscreen(written)?;
         Ok(true)
     }
 
     /// 抬起所有触点。会话结束、换屏、取消时都要走一遍：合成器那边一个没抬起来
     /// 的触点会一直按着，应用也收不到结束。
     pub fn release_touch(&mut self) -> Result<()> {
-        match &mut self.touchscreen {
-            Some(touchscreen) => touchscreen.release(),
-            None => Ok(()),
+        let Some(touchscreen) = &mut self.touchscreen else {
+            return Ok(());
+        };
+        let released = touchscreen.release();
+        self.keep_touchscreen(released)
+    }
+
+    /// 触摸屏写入失败就不再用它，和绝对指针一样：写到一半时合成器那边可能还按着
+    /// 触点，而这边已经说不清是哪些了。丢掉设备，内核和 libinput 会在它移除时
+    /// 把上面的触点全部抬起；之后的触摸退回单指模拟，日志也只记这一次。
+    fn keep_touchscreen(&mut self, result: Result<()>) -> Result<()> {
+        if let Err(error) = &result {
+            tracing::warn!(%error, "虚拟触摸屏写入失败，停用它，触摸退回单指模拟");
+            self.touchscreen = None;
         }
+        result
     }
 
     /// 移到合成器全局空间里的一点，由合成器按 `bounds`（它全部输出的外接
