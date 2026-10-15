@@ -32,7 +32,7 @@ pub(crate) struct AudioSettings {
 pub(crate) struct AudioSnapshot {
     pub device: String,
     pub error: Option<String>,
-    /// Only a terminal failure prompts; transient recovery stays in diagnostics.
+    /// A persistent outage prompts once; transient recovery stays in diagnostics.
     pub notice_error: Option<String>,
     pub receiving: bool,
 }
@@ -43,14 +43,15 @@ struct OutputStatus {
     error: Option<String>,
     notice_error: Option<String>,
     source_error: Option<String>,
+    notice_suppressed: bool,
 }
 
 impl OutputStatus {
     fn failed(&mut self, message: String, exhausted: bool) {
         self.error = Some(message.clone());
-        if exhausted && self.notice_error.is_none() {
+        if exhausted && !self.notice_suppressed && self.notice_error.is_none() {
             // One message for the outage, even if device discovery changes the
-            // underlying error. Explicit retry or successful playback re-arms it.
+            // underlying error. Only sustained playback re-arms it.
             self.notice_error = Some(message);
         }
     }
@@ -59,6 +60,14 @@ impl OutputStatus {
         self.device = device;
         self.error = None;
         self.notice_error = None;
+        self.notice_suppressed = false;
+    }
+
+    fn retrying(&mut self) {
+        // Retrying acknowledges this outage; another failed attempt belongs to
+        // the same outage and remains visible in audio settings and diagnostics.
+        self.notice_error = None;
+        self.notice_suppressed = true;
     }
 }
 
@@ -66,7 +75,7 @@ impl OutputStatus {
 #[derive(Default)]
 struct OutputFailure {
     error: OnceLock<String>,
-    played: AtomicBool,
+    played: OnceLock<Instant>,
 }
 
 impl OutputFailure {
@@ -115,7 +124,7 @@ struct Shared {
     selected_output: Mutex<Option<cpal::DeviceId>>,
     output_devices: Mutex<OutputDevices>,
     receiving: AtomicBool,
-    output_thread: OnceLock<std::thread::Thread>,
+    output_thread: Mutex<Option<std::thread::Thread>>,
     status: Mutex<OutputStatus>,
     output_samples: AtomicU64,
     concealed: AtomicU64,
@@ -129,7 +138,7 @@ struct Shared {
 
 impl Shared {
     fn notify_output(&self) {
-        if let Some(thread) = self.output_thread.get() {
+        if let Some(thread) = lock(&self.output_thread).as_ref() {
             thread.unpark();
         }
     }
@@ -216,7 +225,7 @@ impl AudioPlayback {
                 selected_output: Mutex::new(None),
                 output_devices: Mutex::new(OutputDevices::default()),
                 receiving: AtomicBool::new(false),
-                output_thread: OnceLock::new(),
+                output_thread: Mutex::new(None),
                 status: Mutex::new(OutputStatus::default()),
                 output_samples: AtomicU64::new(0),
                 concealed: AtomicU64::new(0),
@@ -300,19 +309,23 @@ impl AudioPlayback {
                 .as_ref()
                 .or(status.error.as_ref())
                 .cloned(),
-            notice_error: status
-                .source_error
-                .as_ref()
-                .or(status.notice_error.as_ref())
-                .cloned(),
+            notice_error: (!status.notice_suppressed)
+                .then(|| {
+                    status
+                        .source_error
+                        .as_ref()
+                        .or(status.notice_error.as_ref())
+                        .cloned()
+                })
+                .flatten(),
             receiving: shared.receiving.load(Ordering::Relaxed),
         }
     }
 
     pub fn retry(&self) {
-        lock(&self.0.shared.status).notice_error = None;
-        let _ = self.start();
+        lock(&self.0.shared.status).retrying();
         self.0.shared.retry.store(true, Ordering::Release);
+        let _ = self.start();
         self.0.shared.notify_output();
     }
 
@@ -338,8 +351,9 @@ impl AudioPlayback {
         }
         *selected = device;
         drop(selected);
-        lock(&self.0.shared.status).notice_error = None;
+        lock(&self.0.shared.status).retrying();
         self.0.shared.retry.store(true, Ordering::Release);
+        let _ = self.ensure_worker();
         self.0.shared.notify_output();
     }
 
@@ -397,10 +411,16 @@ impl AudioPlayback {
 
     fn ensure_worker(&self) -> Result<()> {
         let mut worker = lock(&self.0.worker);
+        if worker.as_ref().is_some_and(JoinHandle::is_finished) {
+            if worker.take().unwrap().join().is_err() {
+                tracing::warn!("audio output worker panicked; starting a fresh owner");
+            }
+        }
         if worker.is_some() || self.0.shared.stopped.load(Ordering::Acquire) {
             return Ok(());
         }
         let shared = Arc::clone(&self.0.shared);
+        shared.started.store(true, Ordering::Release);
         let thread = std::thread::Builder::new()
             .name("audio-output".into())
             .spawn(move || output_worker(shared))
@@ -408,13 +428,13 @@ impl AudioPlayback {
         match thread {
             Ok(thread) => *worker = Some(thread),
             Err(error) => {
+                self.0.shared.started.store(false, Ordering::Release);
                 let message = format!("{error:#}");
                 tracing::warn!(error = %message, "audio output worker could not start");
                 lock(&self.0.shared.status).failed(message, true);
                 return Err(error);
             }
         }
-        self.0.shared.started.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -680,7 +700,8 @@ fn build_stream<T: cpal::SizedSample + cpal::FromSample<f32>>(
                 shared.output_level.record(peaks);
                 if !output.is_empty()
                     && decode_failed.error.get().is_none()
-                    && !decode_failed.played.swap(true, Ordering::AcqRel)
+                    && decode_failed.played.get().is_none()
+                    && decode_failed.played.set(Instant::now()).is_ok()
                 {
                     shared.notify_output();
                 }
@@ -725,11 +746,28 @@ fn open_output(
     })
 }
 
+fn resolve_output_device(
+    host: &cpal::Host,
+    selection: Option<&cpal::DeviceId>,
+) -> Option<cpal::Device> {
+    let id = match selection {
+        Some(id) => id.clone(),
+        None => host.default_output_device()?.id().ok()?,
+    };
+    // This owner already follows the default endpoint and rebuilds on changes.
+    // Open that concrete endpoint (IMMDevice::Activate), not CPAL's virtual
+    // default/ActivateAudioInterfaceAsync stream with a second routing lifetime.
+    host.device_by_id(&id).filter(DeviceTrait::supports_output)
+}
+
 fn output_worker(shared: Arc<Shared>) {
-    // CPAL's WASAPI default-device monitor delivers StreamInvalidated /
-    // DeviceNotAvailable to the error callback. Wake this owner immediately;
-    // the periodic check is only a fallback while no stream can report events.
-    let _ = shared.output_thread.set(std::thread::current());
+    // Endpoint invalidation wakes this owner; the periodic check also follows
+    // default-device changes while the previous endpoint is still available.
+    *lock(&shared.output_thread) = Some(std::thread::current());
+    let _exit = crate::lifecycle::OnDrop::new(|| {
+        *lock(&shared.output_thread) = None;
+        shared.started.store(false, Ordering::Release);
+    });
     if let Err(error) = crate::platform::windows::audio_thread::initialize() {
         let message = format!("初始化音频输出线程（COM MTA）失败：{error}");
         tracing::warn!(error = %message,
@@ -746,9 +784,10 @@ fn output_worker(shared: Arc<Shared>) {
     let mut current_id = None;
     let mut current_selection = None;
     let mut current_generation = 0;
-    let mut failures = 0;
+    let mut failures = 0_u32;
     let mut confirmed = false;
     let mut next_check = Instant::now();
+    let mut next_retry = Instant::now();
     while !shared.stopped.load(Ordering::Acquire) {
         while let Some((generation, event)) = shared.audit.pop() {
             if generation != shared.generation.load(Ordering::Acquire) {
@@ -774,10 +813,14 @@ fn output_worker(shared: Arc<Shared>) {
         let refresh = shared.refresh_devices.swap(false, Ordering::AcqRel);
         let generation = shared.generation.load(Ordering::Acquire);
         // A successful Initialize/Start alone is not recovery: some devices
-        // invalidate immediately. Re-arm notifications only after a good callback.
+        // invalidate after a few callbacks. Require sustained playback before
+        // treating a replacement as recovery and re-arming outage notifications.
         if stream.is_some()
             && !confirmed
-            && failed.played.load(Ordering::Acquire)
+            && failed
+                .played
+                .get()
+                .is_some_and(|at| at.elapsed() >= Duration::from_secs(2))
             && failed.error.get().is_none()
         {
             confirmed = true;
@@ -826,10 +869,7 @@ fn output_worker(shared: Arc<Shared>) {
                 *previous = outputs;
             }
             let selection = lock(&shared.selected_output).clone();
-            let device = match &selection {
-                Some(id) => host.device_by_id(id).filter(DeviceTrait::supports_output),
-                None => host.default_output_device(),
-            };
+            let device = resolve_output_device(&host, selection.as_ref());
             let id = device.as_ref().and_then(|device| device.id().ok());
             let name = device
                 .as_ref()
@@ -852,6 +892,7 @@ fn output_worker(shared: Arc<Shared>) {
                     explicit = selection.is_some(), retry, generation,
                     "audio output device or source changed");
                 failures = 0;
+                next_retry = Instant::now();
                 stream = None;
                 confirmed = false;
                 failed = Arc::new(OutputFailure::default());
@@ -863,9 +904,6 @@ fn output_worker(shared: Arc<Shared>) {
                 // Clearing it here re-armed a dismissed popup on every switch.
                 let mut status = lock(&shared.status);
                 status.device = name.clone();
-                if retry {
-                    status.notice_error = None;
-                }
             }
             if let Some(error) = stream_error {
                 stream = None;
@@ -873,15 +911,21 @@ fn output_worker(shared: Arc<Shared>) {
                 failed = Arc::new(OutputFailure::default());
                 shared.clear_levels();
                 if !changed {
-                    failures += 1;
+                    failures = failures.saturating_add(1);
                 }
                 lock(&shared.status).failed(error, failures >= 3);
+                if failures >= 3 {
+                    next_retry = Instant::now() + Duration::from_secs(5);
+                }
             }
-            if stream.is_none() && failures < 3 && shared.receiving.load(Ordering::Acquire) {
+            if stream.is_none()
+                && Instant::now() >= next_retry
+                && shared.receiving.load(Ordering::Acquire)
+            {
                 // Old audio collected while no output was available must not be replayed.
                 while shared.packets.pop().is_some() {}
                 failed = Arc::new(OutputFailure::default());
-                tracing::info!(device = %name, endpoint = ?current_id, attempt = failures + 1,
+                tracing::info!(device = %name, endpoint = ?current_id, attempt = failures.saturating_add(1),
                     "opening audio output");
                 match device.as_ref().map_or_else(
                     || {
@@ -900,10 +944,10 @@ fn output_worker(shared: Arc<Shared>) {
                         tracing::info!(device = %name, "native Opus audio output started");
                     }
                     Err(error) => {
-                        failures += 1;
+                        failures = failures.saturating_add(1);
                         let message = format!("{error:#}");
                         tracing::warn!(device = %name, endpoint = ?current_id,
-                            attempt = failures, exhausted = failures >= 3, error = %message,
+                            attempt = failures, exhausted = failures >= 3, activation = "endpoint", error = %message,
                             com_apartment = %crate::platform::windows::audio_thread::description(),
                             callback_error = ?failed.error.get(),
                             "audio output initialization failed");
@@ -911,6 +955,8 @@ fn output_worker(shared: Arc<Shared>) {
                         // its stream is already gone and must not fail the next one.
                         failed = Arc::new(OutputFailure::default());
                         lock(&shared.status).failed(message, failures >= 3);
+                        next_retry =
+                            Instant::now() + Duration::from_secs(if failures >= 3 { 5 } else { 1 });
                     }
                 }
             }
