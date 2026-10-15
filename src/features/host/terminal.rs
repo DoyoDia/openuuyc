@@ -75,11 +75,18 @@ impl FrameType {
 
 /// Binds the terminal frame handler to `channel`.
 ///
-/// Until the wire layout is confirmed this records each frame instead of
-/// acting on it, so a real client's traffic can be read back and the format
-/// pinned down. It never writes to the channel, which keeps an unverified
-/// encoder from corrupting the session.
-pub(crate) fn bind(channel: &Arc<RTCDataChannel>, cancel: CancellationToken) {
+/// Binds the terminal frame handler to `channel`.
+///
+/// The frame *type* is the one field the shipped binaries prove: the
+/// dispatcher masks the first byte and compares it against the type values.
+/// The remaining fields are still inference, so this records each frame
+/// rather than acting on it — an unverified decoder would corrupt a session,
+/// and the recording is what pins the layout down.
+pub(crate) fn bind(
+    channel: &Arc<RTCDataChannel>,
+    sessions: Arc<std::sync::Mutex<Sessions>>,
+    cancel: CancellationToken,
+) {
     static FRAMES: AtomicU64 = AtomicU64::new(0);
     let stop = cancel.child_token();
     let close = stop.clone();
@@ -105,7 +112,7 @@ pub(crate) fn bind(channel: &Arc<RTCDataChannel>, cancel: CancellationToken) {
         let prefix: String = message
             .data
             .iter()
-            .take(64)
+            .take(96)
             .map(|byte| format!("{byte:02x}"))
             .collect::<Vec<_>>()
             .join(" ");
@@ -114,6 +121,7 @@ pub(crate) fn bind(channel: &Arc<RTCDataChannel>, cancel: CancellationToken) {
             bytes = message.data.len(),
             type_byte = ?kind,
             ?parsed,
+            open_sessions = sessions.lock().map_or(0, |s| s.list().len()),
             prefix,
             "host terminal frame received"
         );

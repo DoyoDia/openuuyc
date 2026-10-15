@@ -719,6 +719,7 @@ impl Peer {
         }
         .start();
         let channel_screens = screens.clone();
+        let channel_terminal = screens.lock().await.terminal();
         let channel_cancel = cancel.clone();
         let channel_kcp = kcp.clone();
         let channel_input = input.receiver();
@@ -750,7 +751,11 @@ impl Peer {
             // diagnostics transfer uses; when the controller did not ask for
             // diagnostics, that channel carries the terminal frames instead.
             if terminal && !diagnostics_extension && channel.label() == "BINARY_DATA_CHANNEL" {
-                crate::features::host::terminal::bind(&channel, channel_cancel.clone());
+                crate::features::host::terminal::bind(
+                    &channel,
+                    channel_terminal.clone(),
+                    channel_cancel.clone(),
+                );
                 return Box::pin(async {});
             }
             let screens = channel_screens.clone();
