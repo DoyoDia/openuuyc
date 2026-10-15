@@ -704,7 +704,11 @@ impl Actor {
             Command::Image(id, image) => {
                 if let Some(entry) = self.entries.get_mut(&id) {
                     entry.image = Some(image.clone());
-                    if self.shared.return_capable.load(Ordering::Acquire) {
+                    // The receiver accepts an image only when it negotiated the
+                    // return with us, i.e. checks *our* capability bit; a side
+                    // that cannot take a drag back must not send one.
+                    if native::RETURN_CAPABLE && self.shared.return_capable.load(Ordering::Acquire)
+                    {
                         self.emit(id, Payload::Image(image), false).await?;
                     }
                 }
