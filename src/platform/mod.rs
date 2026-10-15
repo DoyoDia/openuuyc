@@ -19,13 +19,29 @@ pub(crate) use linux::{
 /// One output as the compositor lays it out, in the global space it resolves
 /// an absolute pointer position in. X11 and Windows have no such thing: their
 /// display rectangles are already the space a pointer is named in.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CompositorOutput {
-    pub name: String,
+    /// The connector name (`DP-1`), which is also the name XWayland gives the
+    /// output. Missing where the compositor states none.
+    pub name: Option<String>,
     pub left: i32,
     pub top: i32,
     pub width: u32,
     pub height: u32,
+}
+
+/// Every output the compositor lays out, named or not.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CompositorLayout {
+    pub outputs: Vec<CompositorOutput>,
+}
+impl CompositorLayout {
+    /// The output a screen of this name is, in the compositor's space.
+    pub fn output(&self, name: &str) -> Option<&CompositorOutput> {
+        self.outputs
+            .iter()
+            .find(|output| output.name.as_deref() == Some(name))
+    }
 }
 
 pub(crate) mod paths;

@@ -166,8 +166,7 @@ pub fn detect_local_display() -> Result<LocalDisplayInfo> {
 /// Windows has no separate compositor layout: the desktop a pointer moves in
 /// is what `EnumDisplayMonitors` already describes, so there is nothing to add
 /// to the rectangles the host aims with.
-pub(crate) fn compositor_layout() -> Option<std::sync::Arc<Vec<crate::platform::CompositorOutput>>>
-{
+pub(crate) fn compositor_layout() -> Option<std::sync::Arc<crate::platform::CompositorLayout>> {
     None
 }
 

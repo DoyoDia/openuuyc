@@ -630,6 +630,7 @@ pub(crate) struct Desktop {
 /// 绝对定位就还是 X 的矩形加 hyprctl 那条路。
 fn compositor_desktop() -> Option<Desktop> {
     let layout = super::display::compositor_layout()?;
+    let layout = &layout.outputs;
     let left = layout.iter().map(|output| output.left).min()?;
     let top = layout.iter().map(|output| output.top).min()?;
     let right = layout

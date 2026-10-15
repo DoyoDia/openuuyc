@@ -449,6 +449,7 @@ impl Peer {
                 screens: {
                     // A compositor resolves an absolute pointer position in its
                     // own layout, which the display server's rectangles are not.
+                    // Only a snapshot is read here: this runs under the input gate.
                     let layout = crate::platform::display::compositor_layout();
                     lock(&input_reports.catalog)
                         .iter()
@@ -460,16 +461,18 @@ impl Peer {
                             height: s.screen.height,
                             logical: layout
                                 .as_ref()
-                                .and_then(|layout| {
-                                    layout
-                                        .iter()
-                                        .find(|output| output.name == s.screen.device_name)
-                                })
-                                .map(|output| super::input::Rect {
-                                    left: output.left,
-                                    top: output.top,
-                                    right: output.left + output.width as i32,
-                                    bottom: output.top + output.height as i32,
+                                .and_then(|layout| layout.output(&s.screen.device_name))
+                                .and_then(|output| {
+                                    Some(super::input::Rect {
+                                        left: output.left,
+                                        top: output.top,
+                                        right: output
+                                            .left
+                                            .checked_add(i32::try_from(output.width).ok()?)?,
+                                        bottom: output
+                                            .top
+                                            .checked_add(i32::try_from(output.height).ok()?)?,
+                                    })
                                 }),
                         })
                         .collect()

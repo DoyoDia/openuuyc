@@ -11,66 +11,234 @@
 //! the protocol rounds it to a whole number (2 for both outputs here, where the
 //! scales are 1.6 and 1.35). `xdg_output` is the only place the logical
 //! position and size are stated.
-use crate::platform::CompositorOutput;
+//!
+//! The input path asks for the layout on every batch of events, often while it
+//! holds the input gate, so it must never wait on the compositor. A watcher
+//! thread keeps one connection open, follows output hotplug and layout changes
+//! as the compositor announces them, and publishes a snapshot; readers only
+//! clone the latest one. A compositor that cannot describe its layout leaves
+//! the snapshot empty and is asked again later, with a growing pause.
+use crate::platform::{CompositorLayout, CompositorOutput};
 use anyhow::{Context, Result, bail};
-use wayland_client::protocol::{wl_output, wl_registry};
-use wayland_client::{Connection, Dispatch, QueueHandle};
+use std::os::fd::AsRawFd;
+use std::sync::{Arc, OnceLock, RwLock};
+use std::time::{Duration, Instant};
+use wayland_client::protocol::{wl_callback, wl_output, wl_registry};
+use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle};
 use wayland_protocols::xdg::xdg_output::zv1::client::{zxdg_output_manager_v1, zxdg_output_v1};
 
 /// `wl_output.name` arrived at 4; older revisions are matched by the name their
 /// `xdg_output` reports instead.
 const OUTPUT_VERSION: u32 = 4;
+/// How long the first description of every output may take. A compositor that
+/// has not answered by then is treated as one that cannot describe its layout.
+const SETUP_TIMEOUT: Duration = Duration::from_secs(3);
+/// The pause before asking again after a failure, doubled up to the maximum.
+const RETRY_FIRST: Duration = Duration::from_secs(2);
+const RETRY_MAX: Duration = Duration::from_secs(60);
 
-#[derive(Default)]
-struct State {
-    manager: Option<zxdg_output_manager_v1::ZxdgOutputManagerV1>,
-    entries: Vec<Entry>,
+static SNAPSHOT: RwLock<Option<Arc<CompositorLayout>>> = RwLock::new(None);
+
+/// The latest layout the compositor described, without waiting for it.
+///
+/// `None` outside a Wayland session, before the first description arrives,
+/// and while the compositor cannot describe its layout.
+pub(crate) fn layout() -> Option<Arc<CompositorLayout>> {
+    static WATCHER: OnceLock<bool> = OnceLock::new();
+    let watching = *WATCHER.get_or_init(|| {
+        if std::env::var_os("WAYLAND_DISPLAY").is_none() {
+            return false;
+        }
+        std::thread::Builder::new()
+            .name("compositor-layout".into())
+            .spawn(watch)
+            .inspect_err(|error| tracing::warn!(%error, "无法启动合成器布局监视线程"))
+            .is_ok()
+    });
+    if !watching {
+        return None;
+    }
+    SNAPSHOT.read().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
-struct Entry {
-    proxy: wl_output::WlOutput,
-    name: Option<String>,
-    /// Asked for once the manager is known: the registry announces the two in
-    /// whatever order the compositor lists its globals.
-    described: Option<zxdg_output_v1::ZxdgOutputV1>,
-    logical: (i32, i32, u32, u32),
+fn publish(layout: Option<CompositorLayout>) {
+    let mut snapshot = SNAPSHOT.write().unwrap_or_else(|e| e.into_inner());
+    if snapshot.as_deref() != layout.as_ref() {
+        tracing::info!(?layout, "合成器输出布局");
+        *snapshot = layout.map(Arc::new);
+    }
 }
 
-/// Every output, in the compositor's global space.
-pub(crate) fn layout() -> Result<Vec<CompositorOutput>> {
+fn watch() {
+    let mut pause = RETRY_FIRST;
+    let mut reported = None::<String>;
+    loop {
+        let mut described = false;
+        let error = match follow(&mut described) {
+            Err(error) => error,
+            Ok(never) => match never {},
+        };
+        publish(None);
+        if described {
+            pause = RETRY_FIRST;
+        }
+        // The same failure every minute is one message, not a log full of it.
+        let message = format!("{error:#}");
+        if reported.as_ref() != Some(&message) {
+            tracing::warn!(error = %message, "合成器输出布局不可用，绝对定位改用相对移动");
+            reported = Some(message);
+        }
+        std::thread::sleep(pause);
+        pause = (pause * 2).min(RETRY_MAX);
+    }
+}
+
+/// Describe the layout and keep describing it until the connection ends.
+/// Returns only on failure; `described` tells whether anything was published.
+fn follow(described: &mut bool) -> Result<std::convert::Infallible> {
     let connection =
         Connection::connect_to_env().context("没有可用的 Wayland 会话（WAYLAND_DISPLAY）")?;
     let mut queue = connection.new_event_queue::<State>();
     let handle = queue.handle();
     connection.display().get_registry(&handle, ());
     let mut state = State::default();
-    queue
-        .roundtrip(&mut state)
-        .context("读取合成器全局对象失败")?;
-    let Some(manager) = state.manager.clone() else {
+    sync(&connection, &mut queue, &mut state, "读取合成器全局对象")?;
+    if state.manager.is_none() {
         bail!("合成器没有提供 zxdg_output_manager_v1，无法得知输出的逻辑位置");
-    };
-    for entry in &mut state.entries {
-        entry.described = Some(manager.get_xdg_output(&entry.proxy, &handle, ()));
     }
-    // The compositor answers a description from its own event loop, so the
-    // logical geometry arrives one round trip after it was asked for.
-    queue.roundtrip(&mut state).context("读取输出描述失败")?;
-    Ok(state
-        .entries
-        .into_iter()
-        .filter_map(|entry| {
-            let (left, top, width, height) = entry.logical;
-            let name = entry.name?;
-            (width > 0 && height > 0).then_some(CompositorOutput {
-                name,
-                left,
-                top,
-                width,
-                height,
-            })
-        })
-        .collect())
+    // The outputs announced before the manager were asked for as soon as it
+    // was bound; the descriptions arrive one round trip later.
+    sync(&connection, &mut queue, &mut state, "读取输出描述")?;
+    publish(Some(state.layout()));
+    *described = true;
+    state.changed = false;
+    loop {
+        dispatch(&connection, &mut queue, &mut state, None)?;
+        if std::mem::take(&mut state.changed) {
+            publish(Some(state.layout()));
+        }
+    }
+}
+
+/// One round trip, bounded by [`SETUP_TIMEOUT`].
+fn sync(
+    connection: &Connection,
+    queue: &mut EventQueue<State>,
+    state: &mut State,
+    what: &str,
+) -> Result<()> {
+    state.synced = false;
+    connection.display().sync(&queue.handle(), ());
+    let deadline = Instant::now() + SETUP_TIMEOUT;
+    while !state.synced {
+        dispatch(connection, queue, state, Some(deadline))
+            .with_context(|| format!("{what}失败"))?;
+    }
+    Ok(())
+}
+
+/// Dispatch whatever has arrived, waiting for more until `deadline`.
+fn dispatch(
+    connection: &Connection,
+    queue: &mut EventQueue<State>,
+    state: &mut State,
+    deadline: Option<Instant>,
+) -> Result<()> {
+    queue.dispatch_pending(state)?;
+    connection.flush()?;
+    let Some(guard) = queue.prepare_read() else {
+        // Events were queued meanwhile; the next call dispatches them.
+        return Ok(());
+    };
+    let timeout = match deadline {
+        Some(deadline) => {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                bail!("合成器没有在 {} 秒内应答", SETUP_TIMEOUT.as_secs());
+            }
+            i32::try_from(left.as_millis()).unwrap_or(i32::MAX).max(1)
+        }
+        None => -1,
+    };
+    let mut poll = libc::pollfd {
+        fd: guard.connection_fd().as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ready = unsafe { libc::poll(&mut poll, 1, timeout) };
+    if ready < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::Interrupted {
+            return Ok(());
+        }
+        return Err(error).context("等待合成器消息失败");
+    }
+    if ready > 0 {
+        match guard.read() {
+            Ok(_) => {}
+            Err(wayland_client::backend::WaylandError::Io(error))
+                if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(error).context("读取合成器消息失败"),
+        }
+    }
+    queue.dispatch_pending(state)?;
+    Ok(())
+}
+
+#[derive(Default)]
+struct State {
+    manager: Option<zxdg_output_manager_v1::ZxdgOutputManagerV1>,
+    entries: Vec<Entry>,
+    synced: bool,
+    /// Set when the compositor finished describing a change.
+    changed: bool,
+}
+
+struct Entry {
+    /// The registry name, which is how the compositor removes it again.
+    global: u32,
+    output: wl_output::WlOutput,
+    description: Option<zxdg_output_v1::ZxdgOutputV1>,
+    name: Option<String>,
+    position: Option<(i32, i32)>,
+    size: Option<(i32, i32)>,
+}
+
+impl State {
+    /// Every described output, named or not: an unnamed one cannot be paired
+    /// with a screen, but it still widens the area an absolute pointer covers.
+    fn layout(&self) -> CompositorLayout {
+        CompositorLayout {
+            outputs: self
+                .entries
+                .iter()
+                .filter_map(|entry| {
+                    let (left, top) = entry.position?;
+                    let (width, height) = entry.size?;
+                    (width > 0 && height > 0).then(|| CompositorOutput {
+                        name: entry.name.clone(),
+                        left,
+                        top,
+                        width: width as u32,
+                        height: height as u32,
+                    })
+                })
+                .collect(),
+        }
+    }
+
+    fn describe(&mut self, global: u32, handle: &QueueHandle<Self>) {
+        let Some(manager) = &self.manager else {
+            return;
+        };
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.global == global && entry.description.is_none())
+        {
+            entry.description = Some(manager.get_xdg_output(&entry.output, handle, global));
+        }
+    }
 }
 
 impl Dispatch<wl_registry::WlRegistry, ()> for State {
@@ -82,77 +250,109 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
         _: &Connection,
         handle: &QueueHandle<Self>,
     ) {
-        if let wl_registry::Event::Global {
-            name,
-            interface,
-            version,
-        } = event
-        {
-            match interface.as_str() {
-                "zxdg_output_manager_v1" => {
+        match event {
+            wl_registry::Event::Global {
+                name,
+                interface,
+                version,
+            } => match interface.as_str() {
+                "zxdg_output_manager_v1" if state.manager.is_none() => {
                     state.manager = Some(registry.bind(name, version.min(3), handle, ()));
+                    let globals: Vec<u32> = state.entries.iter().map(|e| e.global).collect();
+                    for global in globals {
+                        state.describe(global, handle);
+                    }
                 }
-                "wl_output" => state.entries.push(Entry {
-                    proxy: registry.bind(name, version.min(OUTPUT_VERSION), handle, ()),
-                    name: None,
-                    described: None,
-                    logical: (0, 0, 0, 0),
-                }),
+                "wl_output" => {
+                    state.entries.push(Entry {
+                        global: name,
+                        output: registry.bind(name, version.min(OUTPUT_VERSION), handle, name),
+                        description: None,
+                        name: None,
+                        position: None,
+                        size: None,
+                    });
+                    state.describe(name, handle);
+                }
                 _ => {}
+            },
+            wl_registry::Event::GlobalRemove { name } => {
+                if let Some(index) = state.entries.iter().position(|e| e.global == name) {
+                    let entry = state.entries.remove(index);
+                    if let Some(description) = entry.description {
+                        description.destroy();
+                    }
+                    if entry.output.version() >= 3 {
+                        entry.output.release();
+                    }
+                    state.changed = true;
+                }
             }
+            _ => {}
         }
     }
 }
 
-impl Dispatch<wl_output::WlOutput, ()> for State {
+impl Dispatch<wl_output::WlOutput, u32> for State {
     fn event(
         state: &mut Self,
-        output: &wl_output::WlOutput,
+        _: &wl_output::WlOutput,
         event: wl_output::Event,
-        _: &(),
+        global: &u32,
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        let Some(entry) = state
-            .entries
-            .iter_mut()
-            .find(|entry| entry.proxy == *output)
-        else {
-            return;
-        };
-        if let wl_output::Event::Name { name } = event {
-            entry.name = Some(name);
-        }
-    }
-}
-
-impl Dispatch<zxdg_output_v1::ZxdgOutputV1, ()> for State {
-    fn event(
-        state: &mut Self,
-        description: &zxdg_output_v1::ZxdgOutputV1,
-        event: zxdg_output_v1::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        let Some(entry) = state
-            .entries
-            .iter_mut()
-            .find(|entry| entry.described.as_ref() == Some(description))
-        else {
+        let Some(entry) = state.entries.iter_mut().find(|e| e.global == *global) else {
             return;
         };
         match event {
-            zxdg_output_v1::Event::LogicalPosition { x, y } => {
-                entry.logical.0 = x;
-                entry.logical.1 = y;
-            }
-            zxdg_output_v1::Event::LogicalSize { width, height } => {
-                entry.logical.2 = width.max(0) as u32;
-                entry.logical.3 = height.max(0) as u32;
-            }
-            zxdg_output_v1::Event::Name { name } => entry.name = Some(name),
+            wl_output::Event::Name { name } => entry.name = Some(name),
+            // From xdg_output 3 on, a finished description ends here.
+            wl_output::Event::Done => state.changed = true,
             _ => {}
+        }
+    }
+}
+
+impl Dispatch<zxdg_output_v1::ZxdgOutputV1, u32> for State {
+    fn event(
+        state: &mut Self,
+        _: &zxdg_output_v1::ZxdgOutputV1,
+        event: zxdg_output_v1::Event,
+        global: &u32,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let Some(entry) = state.entries.iter_mut().find(|e| e.global == *global) else {
+            return;
+        };
+        match event {
+            zxdg_output_v1::Event::LogicalPosition { x, y } => entry.position = Some((x, y)),
+            zxdg_output_v1::Event::LogicalSize { width, height } => {
+                entry.size = Some((width, height))
+            }
+            // Before xdg_output 3 a finished description ends here instead.
+            zxdg_output_v1::Event::Done => state.changed = true,
+            zxdg_output_v1::Event::Name { name } => {
+                // wl_output's own name, when it has one, is the connector.
+                entry.name.get_or_insert(name);
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<wl_callback::WlCallback, ()> for State {
+    fn event(
+        state: &mut Self,
+        _: &wl_callback::WlCallback,
+        event: wl_callback::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_callback::Event::Done { .. } = event {
+            state.synced = true;
         }
     }
 }
