@@ -135,12 +135,19 @@ pub(super) fn safe_name(s: &str) -> bool {
 /// `FileDescListRequest`, so a producer that cannot answer this one leaves the
 /// paste stuck at its format probe. The inverse lives in `native.rs`
 /// (`parse_descriptors`), which only the Windows side ever needs.
-pub(super) fn descriptor_bytes(items: &[ClipboardFileDescriptor]) -> Result<Vec<u8>> {
+///
+/// `unsafe_name` is the error for a name Windows cannot take. The two callers
+/// encode different lists — the Windows consumer re-encodes the remote's, the
+/// Linux producer its own — so each says whose name it was.
+pub(super) fn descriptor_bytes(
+    items: &[ClipboardFileDescriptor],
+    unsafe_name: &'static str,
+) -> Result<Vec<u8>> {
     ensure!(items.len() <= MAX_FILES, "文件数量过多");
     let mut bytes = vec![0; 4 + items.len() * 592];
     bytes[..4].copy_from_slice(&(items.len() as u32).to_le_bytes());
     for (b, f) in bytes[4..].chunks_exact_mut(592).zip(items) {
-        ensure!(safe_name(&f.file_name), "不安全的文件名称");
+        ensure!(safe_name(&f.file_name), unsafe_name);
         // FD_ATTRIBUTES | FD_WRITESTIME | FD_FILESIZE | FD_PROGRESSUI
         b[..4].copy_from_slice(&0x4064u32.to_le_bytes());
         b[36..40].copy_from_slice(&f.file_attributes.to_le_bytes());
@@ -435,7 +442,7 @@ mod tests {
             last_write_time: 0x1234_5678_9abc_def0,
             file_size: 5,
         }];
-        let bytes = descriptor_bytes(&items).expect("编码失败");
+        let bytes = descriptor_bytes(&items, "不安全的文件名称").expect("编码失败");
         assert_eq!(bytes.len(), 4 + 592);
         assert_eq!(u32::from_le_bytes(bytes[..4].try_into().unwrap()), 1);
         // FD_ATTRIBUTES | FD_WRITESTIME | FD_FILESIZE | FD_PROGRESSUI

@@ -1487,7 +1487,7 @@ fn descriptor_blob(state: &mut State, session: &Arc<Inner>) -> Result<Vec<u8>> {
     let files = state.local_files()?;
     state.tasks.insert(key, files.clone());
     let descriptors: Vec<_> = files.items.iter().map(|file| file.desc.clone()).collect();
-    formats::descriptor_bytes(&descriptors)
+    formats::descriptor_bytes(&descriptors, "不安全的文件名称")
 }
 
 /// Wayland 那一侧：进程里那个 arboard 实例。
