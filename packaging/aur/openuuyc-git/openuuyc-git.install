@@ -28,9 +28,8 @@ XFCE、MATE、Cinnamon 等桌面上它改写 ~/.config/autostart/openuuyc.deskto
 
 登录态保存在系统密钥环（Secret Service），需要 gnome-keyring 或 KWallet。
 
-被控端给主控添加虚拟显示器，需要一个小程序以 root 身份去建内核的 VKMS 输出
-（凭空多一块显示器只能这么来：/sys/kernel/config/vkms 只允许 root 写）。它由套接字
-按需启动，不会常驻。装完不开启也一切照旧，只是诊断页里那一行会显示「服务未启用」。
+被控端给主控添加虚拟显示器，需要一个小程序以 root 身份去建内核的 VKMS 输出。
+它由套接字按需启动，不会常驻。装完不开启也一切照旧，只是诊断页里那一行会显示「服务未启用」。
 用它开启：
 
     sudo systemctl enable --now openuuyc-vkms.socket
