@@ -27,18 +27,23 @@ const MAX: usize = 32 * 1024 * 1024;
 
 /// 这个会话里要不要单独去读 X11 那一侧。
 ///
-/// 要两个变量都在：只有 `DISPLAY`（纯 X11 会话）时进程里那个 arboard 自己就落在
-/// X11 上，再读一遍等于把同一个选择区每轮读两遍——图片要解码两次，还每次都新建
-/// 一条 X 连接。只有 `WAYLAND_DISPLAY` 时没有 XWayland，连不上 X 服务器。
+/// 三件事都得成立：XWayland 在（`DISPLAY`）、Wayland 会话在（`WAYLAND_DISPLAY`），
+/// 而且 arboard 真的落在 Wayland 那一侧（`wayland_clipboard`）。最后一条最要紧：
+/// 合成器不给 data-control 时（GNOME/Mutter 就是这样）arboard 自己会退回 X11，
+/// 那时 `read_wayland` 读的本来就是 X11 那一份，再读一遍等于把同一个选择区每轮读
+/// 两次——图片要解码两次，还每次都新建一条 X 连接。只有 `WAYLAND_DISPLAY` 时没有
+/// XWayland，连不上 X 服务器。
 ///
 /// 调用方也用它决定还能不能阻塞等 Wayland 事件，见 `run`。
-pub(super) fn wanted() -> bool {
-    std::env::var_os("DISPLAY").is_some() && std::env::var_os("WAYLAND_DISPLAY").is_some()
+pub(super) fn wanted(wayland_clipboard: bool) -> bool {
+    wayland_clipboard
+        && std::env::var_os("DISPLAY").is_some()
+        && std::env::var_os("WAYLAND_DISPLAY").is_some()
 }
 
 /// 读一次。读不到（没人持有选择区、对端不支持我们要的类型、超时）就是空的。
-pub(super) fn read() -> LocalSnapshot {
-    if !wanted() {
+pub(super) fn read(wayland_clipboard: bool) -> LocalSnapshot {
+    if !wanted(wayland_clipboard) {
         return LocalSnapshot::default();
     }
     match collect() {

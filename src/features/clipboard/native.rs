@@ -393,8 +393,7 @@ fn process(command: Command) {
                     ),
                     (formats::register("FileContents"), "FileContents".into()),
                 ];
-                let links =
-                    formats::outgoing(&ids, s.platform.load(Ordering::Acquire), true, false);
+                let links = formats::outgoing(&ids, s.platform.load(Ordering::Acquire), true);
                 STATE.with(|v| {
                     if let Some(v) = v.borrow_mut().as_mut() {
                         v.drag_sources.insert(
@@ -445,8 +444,7 @@ fn process(command: Command) {
                     ),
                     (formats::register("FileContents"), "FileContents".into()),
                 ];
-                let links =
-                    formats::outgoing(&ids, s.platform.load(Ordering::Acquire), true, false);
+                let links = formats::outgoing(&ids, s.platform.load(Ordering::Acquire), true);
                 let source = Arc::new(LocalSource {
                     object: None,
                     files: true,
@@ -729,7 +727,7 @@ fn local_change() -> Result<()> {
             has_files = true;
         }
         if f[0].tymed & (TYMED_HGLOBAL.0 | TYMED_ENHMF.0) as u32 != 0
-            && formats::supported(id, &name, false, false)
+            && formats::supported(id, &name, false)
             && !ids.iter().any(|(i, _)| *i == id)
         {
             ids.push((id, name));
@@ -785,7 +783,6 @@ fn local_change() -> Result<()> {
             &ids,
             session.platform.load(Ordering::Acquire),
             session.file_allowed(),
-            false,
         );
         if links.is_empty() && !ids.is_empty() {
             STATE.with(|v| {

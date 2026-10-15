@@ -130,10 +130,11 @@ pub(super) fn safe_name(s: &str) -> bool {
 /// A file list as the Windows `FILEGROUPDESCRIPTORW` blob: a count, then one
 /// 592-byte `FILEDESCRIPTORW` per file.
 ///
-/// Windows peers may ask for this instead of the descriptor list, and the
-/// official client does exactly that: it never follows up with a
-/// `FileDescListRequest`, so a producer that cannot answer this one leaves the
-/// paste stuck at its format probe. The inverse lives in `native.rs`
+/// Windows peers may ask for this instead of the descriptor list, and the official
+/// client is one of them: it asks for this blob by name, and it may not follow up
+/// with a `FileDescListRequest` at all, so a producer that cannot answer this one
+/// can leave the paste stuck at its format probe. Whether it really skips that
+/// request is still open — see `descriptor_blob`. The inverse lives in `native.rs`
 /// (`parse_descriptors`), which only the Windows side ever needs.
 ///
 /// `unsafe_name` is the error for a name Windows cannot take. The two callers
@@ -184,14 +185,14 @@ pub(super) fn file_format(id: u32, name: &str) -> bool {
 }
 /// Whether a format may pass, in either direction.
 ///
-/// `copy_marker` says whether this side is willing to speak `Preferred DropEffect`,
-/// which is how Windows peers say whether a file clipboard holds a copy or a cut.
-/// Only the Linux producer sets it: it answers `DROPEFFECT_COPY` for the copies it
-/// publishes, where a Windows producer would put its own effect on the wire, and a
-/// Windows consumer would read the remote's effect and act on it (a MOVE would
-/// move the remote's files). Tying it to the platform instead would change what
-/// Windows sends and accepts, which is not this change's business.
-pub(super) fn supported(id: u32, name: &str, files: bool, copy_marker: bool) -> bool {
+/// `Preferred DropEffect` is the one file format that stays out: Windows peers use
+/// it to say whether a file clipboard holds a copy or a cut, and a Windows producer
+/// never puts it on the wire (the enumeration in `native.rs` filters it out), so
+/// advertising it from Linux would be a platform difference with nothing behind it.
+/// The Linux side still answers it with `DROPEFFECT_COPY` if it is ever asked (see
+/// `LocalSnapshot::data`) — answering a cut there would let a remote file manager
+/// move the files off this machine.
+pub(super) fn supported(id: u32, name: &str, files: bool) -> bool {
     if name.eq_ignore_ascii_case("OpenUUYC.Clipboard.Remote")
         || name.eq_ignore_ascii_case("DataObject")
         || name.eq_ignore_ascii_case("Ole Private Data")
@@ -200,10 +201,10 @@ pub(super) fn supported(id: u32, name: &str, files: bool, copy_marker: bool) -> 
     }
     if file_format(id, name) {
         return files
-            && (matches!(
+            && matches!(
                 name,
                 "FileGroupDescriptorW" | "FileContents" | "public.file-url"
-            ) || (copy_marker && name.eq_ignore_ascii_case("Preferred DropEffect")));
+            );
     }
     matches!(
         id,
@@ -224,20 +225,15 @@ pub(super) fn incoming(f: ClipboardFormat, platform: i32, files: bool) -> Option
     } else {
         register(&f.name)
     };
-    if local == 0 || (!supported(local, &name(local), files, false) && platform != 4) {
+    if local == 0 || (!supported(local, &name(local), files) && platform != 4) {
         return None;
     }
     Some(Format { wire: f, local })
 }
-pub(super) fn outgoing(
-    ids: &[(u32, String)],
-    platform: i32,
-    files: bool,
-    copy_marker: bool,
-) -> Vec<Format> {
+pub(super) fn outgoing(ids: &[(u32, String)], platform: i32, files: bool) -> Vec<Format> {
     let mut out = Vec::new();
     for (id, n) in ids {
-        if !supported(*id, n, files, copy_marker) {
+        if !supported(*id, n, files) {
             continue;
         }
         if platform != 4 {
