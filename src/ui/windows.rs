@@ -50,6 +50,13 @@ pub(super) fn run(config: WindowConfig, factory: AppFactory) -> Result<()> {
     Ok(())
 }
 
+/// 被控角标：托盘图标右上角那个红三角跟着应用报上来的被控状态走。
+fn sync_tray(tray: Option<&super::tray::Tray>, controlled: bool) {
+    if let Some(tray) = tray {
+        tray.set_controlled(controlled);
+    }
+}
+
 struct Runner {
     root: bool,
     closed: bool,
@@ -193,6 +200,13 @@ impl Runner {
             .and_then(|monitor| monitor.refresh_rate_millihertz())
             .filter(|rate| *rate != 0)
             .unwrap_or(60_000);
+        let tray = if uses_tray {
+            Some(super::tray::Tray::new()?)
+        } else {
+            None
+        };
+        // 主窗口可能一上来就是收进托盘的状态，角标要当场对上。
+        sync_tray(tray.as_ref(), app.0.controlled());
         self.state = Some(DesktopWindow {
             app,
             presenter,
@@ -200,11 +214,7 @@ impl Runner {
             input,
             viewport,
             close_requested: false,
-            tray: if uses_tray {
-                Some(super::tray::Tray::new()?)
-            } else {
-                None
-            },
+            tray,
             exiting: false,
             show_after_present: self.config.viewport.visible.unwrap_or(true),
             focus_after_present: self.config.viewport.active.unwrap_or(true),
@@ -272,6 +282,9 @@ impl DesktopWindow {
         self.window_resize.min_size = self.min_inner_size.map(|size| {
             winit::dpi::LogicalSize::new(size.x, size.y).to_physical(self.window.scale_factor())
         });
+        // 标题栏提示与托盘角标共用这一次判定。
+        let alert = self.app.0.title_bar_alert();
+        let controlled = alert.is_some();
         let output = self.context.run_ui(input, |ui| {
             let ctx = ui.ctx().clone();
             super::chrome::resize_regions(ui, &self.window, |response, direction| {
@@ -285,12 +298,11 @@ impl DesktopWindow {
                 );
             });
             if self.notification.is_none() && self.window.fullscreen().is_none() {
-                let alert = self.app.0.title_bar_alert();
                 super::chrome::title_bar_panel_alert(
                     ui,
                     "desktop-window-chrome",
                     super::chrome::title_bar_height(),
-                    alert.is_some(),
+                    controlled,
                     |ui| {
                         if super::chrome::window_title_bar_alert(
                             ui,
@@ -309,6 +321,8 @@ impl DesktopWindow {
             self.app.0.ui(ui);
             super::controls::show_notices(ui.ctx());
         });
+        // 收进托盘后窗口不再呈现，但这一趟 UI 照跑，角标跟着走。
+        sync_tray(self.tray.as_ref(), controlled);
         let (drawing, platform, mut viewports) = egui_directx11::split_output(output);
         self.input.handle_platform_output(&self.window, platform);
         if let Some(root) = viewports.remove(&egui::ViewportId::ROOT) {

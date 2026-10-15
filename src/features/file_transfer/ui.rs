@@ -18,7 +18,7 @@ pub(crate) fn open(
     let key = format!("files:{}:{}", client.device_id(), device.device_id);
     let viewport = egui::ViewportBuilder::default()
         .with_title(format!("OpenUUYC · {} · 文件传输", device.alias))
-        .with_icon(crate::ui::branding::icon())
+        .with_icon(crate::ui::branding::icon(false))
         .with_inner_size(theme::FILES_WINDOW_SIZE)
         .with_min_inner_size(theme::FILES_WINDOW_MIN);
     window_manager::send(window_manager::Request::Open {
