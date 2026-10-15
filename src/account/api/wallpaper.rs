@@ -6,6 +6,7 @@ pub(super) const TOKEN: Contract = Contract {
     ..DEVICE_LIST
 };
 pub(super) const BIND: Contract = Contract {
+    retry: RetryPolicy::ConnectOnly,
     path: "/api/v1/device/wallpaper",
     ..ROOM_CREATE
 };
@@ -83,13 +84,15 @@ pub(crate) async fn upload_wallpaper(
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(30).min(Duration::from_secs(grant.ttl)))
         .build()?;
-    let mut response = client
-        .post(url)
-        .header(AUTHORIZATION, authorization)
-        .body(image.clone())
-        .send()
-        .await
-        .map_err(|_| anyhow::anyhow!("wallpaper file upload transport failed"))?;
+    let mut response = crate::transport::http::send(
+        crate::transport::http::Operation::WallpaperUpload,
+        client
+            .post(url)
+            .header(AUTHORIZATION, authorization)
+            .body(image.clone()),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("wallpaper file upload transport failed"))?;
     if response.status() != reqwest::StatusCode::OK {
         bail!(
             "wallpaper file upload rejected (HTTP {})",
@@ -133,11 +136,12 @@ pub(crate) async fn upload_wallpaper(
     // upload used HTTPS. Never request HTTP: verify the HTTPS resource first.
     url.set_scheme("https")
         .map_err(|_| anyhow::anyhow!("invalid wallpaper publication scheme"))?;
-    let mut verification = client
-        .get(url.clone())
-        .send()
-        .await
-        .map_err(|_| anyhow::anyhow!("uploaded wallpaper HTTPS verification failed"))?;
+    let mut verification = crate::transport::http::send(
+        crate::transport::http::Operation::WallpaperVerify,
+        client.get(url.clone()),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("uploaded wallpaper HTTPS verification failed"))?;
     if verification.status() != reqwest::StatusCode::OK {
         bail!("uploaded wallpaper HTTPS verification rejected");
     }

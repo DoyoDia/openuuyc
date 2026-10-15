@@ -62,6 +62,11 @@ mod media {
 mod encoder;
 #[path = "../../../../../src/platform/linux/gpu_convert.rs"]
 mod gpu_convert;
+/// The probe does no CUDA work beside VA-API, so there is no `cuInit` to
+/// order before the VA driver loads.
+mod cuda {
+    pub fn initialize_before_va() {}
+}
 
 fn rate() -> media::encoding::Rate {
     media::encoding::Rate {

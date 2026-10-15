@@ -31,6 +31,7 @@ pub(super) fn display() -> Result<Rc<Display>, DecodeError> {
 }
 
 fn open_display() -> Result<Rc<Display>, DecodeError> {
+    crate::platform::linux::cuda::initialize_before_va();
     // `Display::open` walks the render nodes itself; the explicit loop is the
     // fallback for systems where the first node is not the decoding one.
     if let Some(display) = Display::open()

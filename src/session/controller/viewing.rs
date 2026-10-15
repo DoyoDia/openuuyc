@@ -313,6 +313,18 @@ pub(super) async fn run_viewer_connection_owner(
                     return Err(error);
                 }
             };
+            // The viewing attachment owns this lease, independently of windows,
+            // decoder replacement and shared file/port connections. Also keep it
+            // across video/audio-only mode changes: display audio can disappear
+            // when Windows idles the monitor. Each device owns its own request.
+            let power_request = match crate::platform::power_request::Request::viewing() {
+                Ok(request) => Some(request),
+                Err(error) => {
+                    tracing::warn!(error = %format!("{error:#}"),
+                        "viewer automatic display-off/sleep prevention unavailable");
+                    None
+                }
+            };
             if audio_only {
                 reporter(ConnectionProgress::ready("仅音频连接已建立"));
                 viewer_sender.send(ViewerWindowEvent::Listening(crate::application::viewer::AudioView::new(session_control.clone(), None)))
@@ -425,6 +437,7 @@ pub(super) async fn run_viewer_connection_owner(
                     }
                 }
             };
+            drop(power_request);
             let result = result.and(controller.close().await);
             if cancel.is_cancelled() {
                 if let Some(close) = close.as_ref() { close.close(); }

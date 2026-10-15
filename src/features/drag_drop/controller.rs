@@ -280,15 +280,24 @@ async fn write(
     let stop = endpoint.stop_token();
     loop {
         let data = tokio::select! { _=stop.cancelled()=>break, v=input.recv()=>match v {Some(v)=>v,None=>break} };
-        let result = tokio::time::timeout(Duration::from_secs(30), async {
+        let sending = tokio::time::timeout(Duration::from_secs(30), async {
             while channel.buffered_amount().await + data.len() > 2 * 1024 * 1024 {
                 tokio::select! { _=stop.cancelled()=>anyhow::bail!("拖放已结束"), _=tokio::time::sleep(Duration::from_millis(5))=>{} }
             }
-            ensure!(channel.ready_state() == RTCDataChannelState::Open, "拖放数据通道已关闭");
-            if bulk { channel.send(&bytes::Bytes::from(data)).await?; }
-            else { channel.send_text_bytes(&bytes::Bytes::from(data)).await?; }
+            ensure!(
+                channel.ready_state() == RTCDataChannelState::Open,
+                "拖放数据通道已关闭"
+            );
+            if bulk {
+                channel.send(&bytes::Bytes::from(data)).await?;
+            } else {
+                channel.send_text_bytes(&bytes::Bytes::from(data)).await?;
+            }
             Ok::<_, anyhow::Error>(())
-        }).await;
+        });
+        // Closing this endpoint also withdraws a send waiting for SCTP capacity.
+        // Already admitted messages remain whole and are not replayed.
+        let result = tokio::select! { biased; _=stop.cancelled()=>break, result=sending=>result };
         if !matches!(result, Ok(Ok(()))) {
             fail(&state, &endpoint, "拖放发送失败，未自动重试".into());
             break;

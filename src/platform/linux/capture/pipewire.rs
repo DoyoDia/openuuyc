@@ -511,6 +511,7 @@ fn read_dmabuf_picture(
     }
     IMPORT.with(|cell| {
         if cell.get().is_none() {
+            super::super::cuda::initialize_before_va();
             let display = cros_libva::Display::open().context("找不到 VA-API render node")?;
             let mut config = display
                 .create_config(

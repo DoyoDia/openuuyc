@@ -2,6 +2,7 @@
 use super::*;
 
 const CREATE: Contract = Contract {
+    retry: RetryPolicy::ConnectOnly,
     path: "/api/v1/guest/create",
     ..LOGIN_BY_QR
 };
@@ -21,9 +22,8 @@ pub(crate) struct Credentials {
 
 impl NrdApi {
     pub(crate) async fn create_guest(&self) -> Result<Credentials> {
-        let mut response: ApiEnvelope<Credentials> = self
-            .send_with_policy(CREATE, CREATE.path, Vec::new(), true)
-            .await?;
+        let mut response: ApiEnvelope<Credentials> =
+            self.send(CREATE, CREATE.path, Vec::new()).await?;
         if response.code != 0 {
             response.msg = format!("游客身份申请失败（{}）", response.code);
         }
