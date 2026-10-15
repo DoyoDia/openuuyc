@@ -429,17 +429,19 @@ pub(crate) mod startup {
              PartOf=graphical-session.target\n\
              After=graphical-session.target xdg-desktop-portal.service\n\
              # 程序不在时（例如已卸载，只剩这份写在 ~/.config 里的单元）跳过这次启动：\n\
-             # 条件不满足是 skipped 而不是 failed，Restart= 不会每 3 秒再试一次。\n\
+             # 条件不满足是 skipped 而不是 failed，Restart= 不会再试。\n\
              ConditionFileIsExecutable={}\n\
-             # 崩了要一直回来，所以不要默认的启动限速。\n\
-             StartLimitIntervalSec=0\n\
+             # 与 Sunshine 的用户单元相同：偶尔崩溃照样拉起，一启动就崩的约 25 秒后停下，\n\
+             # 不会无休止地重启、刷日志。\n\
+             StartLimitIntervalSec=500\n\
+             StartLimitBurst=5\n\
              \n\
              [Service]\n\
              Type=simple\n\
              ExecStart={} gui --background\n\
              # 崩了自动回来；从托盘退出是正常退出，不会又被拉起来。\n\
              Restart=on-failure\n\
-             RestartSec=3\n\
+             RestartSec=5\n\
              # 默认的 control-group 会把子进程一起杀掉：显示恢复守护（`process_group(0)`）\n\
              # 本该跨崩溃活着，`xdg-open` 打开的浏览器也不该跟着退。\n\
              KillMode=process\n\
@@ -493,10 +495,11 @@ pub(crate) mod startup {
                 "PartOf=graphical-session.target",
                 "After=graphical-session.target",
                 "ConditionFileIsExecutable=/usr/bin/OpenUUYC",
-                "StartLimitIntervalSec=0",
+                "StartLimitIntervalSec=500",
+                "StartLimitBurst=5",
                 "Type=simple",
                 "Restart=on-failure",
-                "RestartSec=3",
+                "RestartSec=5",
                 "KillMode=process",
                 "WantedBy=graphical-session.target",
             ] {
