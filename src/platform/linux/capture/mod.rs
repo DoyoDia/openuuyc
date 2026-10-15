@@ -455,7 +455,11 @@ impl Desktop {
                 .map(|picture| {
                     picture.map(|picture| {
                         let size = output(picture.width, picture.height, quality, maximum);
-                        let image = scale(&picture.pixels, (picture.width, picture.height), size);
+                        let image = if size == (picture.width, picture.height) {
+                            picture.pixels
+                        } else {
+                            scale(&picture.pixels, (picture.width, picture.height), size)
+                        };
                         (size, image)
                     })
                 }),
