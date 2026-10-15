@@ -1479,12 +1479,13 @@ fn poll_local(state: &mut State) -> Result<()> {
 /// 「文件任务已失效」。登记用的是双方约定好的固定任务号。
 fn descriptor_blob(state: &mut State, session: &Arc<Inner>) -> Result<Vec<u8>> {
     tracing::debug!("对面来问 FileGroupDescriptorW 描述符块");
+    let key = (session.id, CLIPBOARD_TASK);
+    ensure!(
+        state.tasks.len() < 32 || state.tasks.contains_key(&key),
+        "文件任务过多"
+    );
     let files = state.local_files()?;
-    if state.tasks.len() < 32 {
-        state
-            .tasks
-            .insert((session.id, CLIPBOARD_TASK), files.clone());
-    }
+    state.tasks.insert(key, files.clone());
     let descriptors: Vec<_> = files.items.iter().map(|file| file.desc.clone()).collect();
     formats::descriptor_bytes(&descriptors)
 }
@@ -1629,7 +1630,7 @@ fn serve(
                 );
                 ensure!(!state.local.sources.is_empty(), "本地剪贴板没有文件");
                 ensure!(state.tasks.len() < 32, "文件任务过多");
-                Ok(Arc::new(collect_files(&state.local.sources)?))
+                state.local_files()
             })();
             let Ok(files) = result else {
                 return session.emit(
