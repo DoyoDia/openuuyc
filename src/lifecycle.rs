@@ -123,11 +123,7 @@ impl Drop for TaskScope {
 }
 
 /// Cleanup on early return, panic or dropped future.
-// Its users are the Windows service workers and the multi-window screen
-// playback, which the Linux viewer does not drive yet.
-#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) struct OnDrop<F: FnOnce()>(Option<F>);
-#[cfg_attr(not(windows), allow(dead_code))]
 impl<F: FnOnce()> OnDrop<F> {
     pub fn new(action: F) -> Self {
         Self(Some(action))

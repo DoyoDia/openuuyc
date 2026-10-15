@@ -1,6 +1,6 @@
 [package]
 name = "openuuyc"
-version = "1.0.2-beta.1"
+version = "1.0.2-beta.3"
 edition = "2024"
 description = "Third-party Rust client for UU Remote protocol interoperability"
 license-file = "LICENSE"
@@ -38,6 +38,7 @@ assets = [
     ["packaging/linux/openuuyc.desktop", "usr/share/applications/", "644"],
     ["assets/icon-256.png", "usr/share/icons/hicolor/256x256/apps/openuuyc.png", "644"],
     ["packaging/linux/60-openuuyc-uinput.rules", "usr/lib/udev/rules.d/", "644"],
+    ["packaging/linux/openuuyc.service", "usr/lib/systemd/user/", "644"],
     ["README.md", "usr/share/doc/openuuyc/", "644"],
     ["THIRD_PARTY_NOTICES", "usr/share/doc/openuuyc/", "644"],
     ["assets/licenses/*", "usr/share/doc/openuuyc/licenses/", "644"],
@@ -199,6 +200,10 @@ wayland-protocols-misc = { version = "0.3", default-features = false, features =
 # 快捷键（两者在 unstable 后面）；再次启动时用 xdg_activation_v1 凭启动令牌把
 # 已在运行的控制中心提到前台（staging）。
 wayland-protocols = { version = "0.32", default-features = false, features = ["client", "staging", "unstable"] }
+# wlr-screencopy, the compositor's own copy protocol: niri, wlroots and
+# everything built on them serve it, and unlike the portal it never asks the
+# local user for consent.
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 libc = "0.2"
 fuser = { version = "0.15", default-features = false }
 x11rb = { version = "0.13", features = ["dpms", "randr", "shm", "xfixes", "xtest"] }
