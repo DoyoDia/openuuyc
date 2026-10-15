@@ -439,11 +439,31 @@ pub(super) fn generation() -> u64 {
 }
 
 /// The directory mounts go under, without creating it.
+///
+/// Resolved once, through any symlink in `XDG_RUNTIME_DIR`: the paths a remote
+/// copy publishes come back from the clipboard canonicalized (arboard resolves
+/// them when it writes `text/uri-list`), and `own_copy` compares them against
+/// this. With the raw path, a symlinked runtime directory would make our own
+/// mount look like a local copy and send it back to the remote.
 pub(super) fn mount_root() -> Option<PathBuf> {
-    std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .map(|base| base.join("openuuyc").join("clipboard"))
+    static ROOT: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    ROOT.get_or_init(|| {
+        std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .map(|base| root_under(&base))
+    })
+    .clone()
+}
+
+/// The mount root under `base`, with `base` resolved through symlinks. The
+/// directories below it are ours and may not exist yet, so only `base` is
+/// resolved; if that fails the raw path is the best answer there is.
+pub(super) fn root_under(base: &Path) -> PathBuf {
+    std::fs::canonicalize(base)
+        .unwrap_or_else(|_| base.to_path_buf())
+        .join("openuuyc")
+        .join("clipboard")
 }
 
 /// Where this process mounts clipboard offers. Under the runtime directory, so
