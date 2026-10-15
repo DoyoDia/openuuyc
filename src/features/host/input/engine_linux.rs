@@ -90,6 +90,12 @@ impl Engine {
     pub fn take_sas(&mut self) -> bool {
         false
     }
+    /// 请合成器重新判定一次指针底下是谁：把指针在原地重报一次。Wayland 的拖放接取
+    /// 面摆在指针底下，而合成器只在指针真的动过之后才重判（见
+    /// `platform::linux::input::realign_pointer`）。
+    pub fn realign_pointer(&mut self) -> Result<bool> {
+        self.injector.realign()
+    }
     pub fn configure(&mut self, configuration: super::config::Configuration) -> Result<()> {
         configuration.validate()?;
         self.configuration = configuration;

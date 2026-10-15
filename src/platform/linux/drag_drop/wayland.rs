@@ -40,6 +40,9 @@ const LIMIT: Duration = Duration::from_secs(20);
 /// roundtrip 就到；等不到就是这台合成器不吃这一套，和 X11 那条一样趁早报
 /// `Unavailable`（对齐 `portal.rs` 的 `CAPTURE_WAIT`）。
 const ENTER_WAIT: Duration = Duration::from_millis(600);
+/// 摆好之后按这几个时刻各请指针在原地动一下（见 `realign`）。先等一小会儿是给
+/// wlroots 系留的：它们自己会在面上屏时重判，那就不必注入任何东西了。
+const REALIGN_AT: [Duration; 2] = [Duration::from_millis(50), Duration::from_millis(300)];
 /// 接住之后还要等原来那次拖动收场，等不到也最多等这么久：主控那头等的是这一句
 /// （见 `run` 末尾），一直不吭声它就一直卡在「正在准备文件」。
 const RELEASE: Duration = Duration::from_secs(2);
@@ -368,11 +371,19 @@ fn run(
     shell.ack_configure(serial);
     surface.commit();
 
-    // 摆好了就等合成器把这次拖放交过来。这一步就是全部：不必再推指针，指针底下
-    // 换了 surface，合成器会重新判定一次（niri 与 wlroots 系都如此，PR 里有实测）。
-    // 等不到就当这条路在这台合成器上走不通，和 X11 那条一样报 `Unavailable` 收工
-    // ——别在这里说「失败」：也可能只是这次拖动本来就结束了。
+    // 摆好了就等合成器把这次拖放交过来。指针底下换了 surface 时，wlroots 系会自己
+    // 重新判定一次，所以先等一小会儿、什么也不注入；等不到再请引擎把指针在原地重报
+    // 一次——niri 只在指针真的动过之后才更新拖放目标（`layout.dnd_update` 只在
+    // `on_pointer_motion*` 里调用），没有这一下它永远不会把拖放交过来。走的是引擎平时
+    // 那条绝对定位，没有第二台注入设备。
+    //
+    // 两个时刻各推一次：通道满了、或者引擎那一刻正忙时，第一次可能没接上。
+    //
+    // 还是等不到就当这条路在这台合成器上走不通，和 X11 那条一样报 `Unavailable`
+    // 收工——别在这里说「失败」：也可能只是这次拖动本来就结束了。
     let deadline = Instant::now() + ENTER_WAIT;
+    let started = Instant::now();
+    let mut realigns = REALIGN_AT.into_iter().map(|at| started + at).peekable();
     while !state.entered
         && !state.closed
         && !stop.load(Ordering::Acquire)
@@ -380,6 +391,11 @@ fn run(
         && Instant::now() < deadline
     {
         dispatch(&mut queue, &mut state, &connection)?;
+        if realigns.peek().is_some_and(|at| Instant::now() >= *at) {
+            let _ = realigns.next();
+            let accepted = crate::platform::linux::input::realign_pointer();
+            tracing::debug!(accepted, "请指针在原地动一下，让合成器重新判定指针底下是谁");
+        }
         wait(&mut queue, &mut state, &connection, POLL)?;
     }
     if !state.entered {

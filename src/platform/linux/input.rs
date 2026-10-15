@@ -736,6 +736,12 @@ impl Absolute {
         Ok(())
     }
 
+    /// 把指针在原地重报一次。`emit` 对同一个值会先在单独一帧里挪开一个单位再回
+    /// 来：合成器看到的是两次真的移动，而指针最终停在原地。
+    fn realign(&mut self) -> Result<()> {
+        self.emit(self.last)
+    }
+
     /// 把合成器空间里的一点写进设备，设备还新的时候安排补写。
     fn aim(&mut self, x: i32, y: i32, bounds: Desktop) -> Result<()> {
         let value = (
@@ -771,6 +777,34 @@ impl Absolute {
         let value = repeat.value;
         self.emit(value)
     }
+}
+
+/// 「请指针在原地动一下」的入口。
+///
+/// 合成器只在指针真的动过之后才重新判定指针底下是谁：niri 的 `layout.dnd_update`
+/// 只在 `on_pointer_motion*` 里调用，没有任何 surface 上屏时的重判。而 Wayland 拖放
+/// 的接取面正是摆在指针底下的（见 `drag_drop::wayland`），所以摆好之后要有人推指针
+/// 一把，合成器才会把那次拖放交过来。
+///
+/// 那条路在 `features/host/input` 之外，拿不到引擎句柄，所以引擎启动时在这里登记一
+/// 条只有「动一下」的通道——走的就是它平时那条绝对定位，不新建任何注入设备。
+static REALIGN: std::sync::Mutex<Option<std::sync::mpsc::SyncSender<()>>> =
+    std::sync::Mutex::new(None);
+
+/// 引擎启动时登记，拿到的接收端由引擎自己在循环里清。
+pub(crate) fn realign_channel() -> std::sync::mpsc::Receiver<()> {
+    let (tx, rx) = std::sync::mpsc::sync_channel(4);
+    *REALIGN.lock().unwrap_or_else(|error| error.into_inner()) = Some(tx);
+    rx
+}
+
+/// 请指针在原地动一下。引擎没起来、或者这一下没人接（通道满了）时返回 false。
+pub(crate) fn realign_pointer() -> bool {
+    REALIGN
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .as_ref()
+        .is_some_and(|tx| tx.try_send(()).is_ok())
 }
 
 pub(crate) struct Injector {
@@ -879,6 +913,15 @@ impl Injector {
 
     /// 移到合成器全局空间里的一点，由合成器按 `bounds`（它全部输出的外接
     /// 矩形）解算。设备写入失败就不再用它，之后的绝对定位回到相对移动。
+    /// 请合成器重新判定一次指针底下是谁。返回「真的报了没有」：没有绝对指针
+    /// （X11 会话、或者合成器认不出这台设备）时这条路催不动它。
+    pub fn realign(&mut self) -> Result<bool> {
+        match self.absolute.as_mut() {
+            Some(absolute) => absolute.realign().map(|()| true),
+            None => Ok(false),
+        }
+    }
+
     pub fn aim(&mut self, x: i32, y: i32, bounds: Desktop) -> Result<()> {
         let absolute = self.absolute.as_mut().context("虚拟绝对指针不可用")?;
         let result = absolute.aim(x, y, bounds);
