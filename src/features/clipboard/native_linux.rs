@@ -671,8 +671,8 @@ struct State {
     /// The remote copy currently published locally, mounted for as long as the
     /// clipboard points at it.
     mounted: Option<super::fuse::Mount>,
-    /// Holds the clipboard selection while those paths are the copy on it.
-    offer: Option<super::x11_offer::FileOffer>,
+    /// 我们替这次复制持有的 X11 选择区（远端发来的文件、或者远端发来的文本）。
+    offer: Option<super::x11_offer::Offer>,
     /// Files offered to one session for a drag or a drop rather than through
     /// the clipboard: a drop's list is handed out once, to the descriptor
     /// request that answers it; a drag's stays for every read of its session.
@@ -1241,6 +1241,18 @@ fn write_text(state: &mut State, text: &str) -> Result<()> {
         state.writes.not_written();
     }
     result.context("写入系统剪贴板失败")?;
+    // XWayland 的程序只看得到 X11 那一侧的选择区，而 arboard 在 Wayland 会话里写的是
+    // 另一座孤岛（niri 这类合成器不桥接），光靠它远端发来的文本在 XWayland 程序里粘不
+    // 出来。所以文本也像文件那样自己挂一份到 X11 上——`x11_read::wanted` 说的正是「这
+    // 个会话里 arboard 落在 Wayland 那一侧、而且另有一座 X11 孤岛」，也只有那时才需
+    // 要（它落回 X11 时，上面那次 `set_text` 写的就是 X11）。
+    state.offer = None;
+    if super::x11_read::wanted(state.wayland_clipboard) {
+        match super::x11_offer::Offer::publish_text(text.to_owned()) {
+            Ok(offer) => state.offer = Some(offer),
+            Err(error) => tracing::debug!(error = format!("{error:#}"), "接管 X11 剪贴板失败"),
+        }
+    }
     state.local = LocalSnapshot {
         text: Some(text.to_owned()),
         ..Default::default()
@@ -1248,7 +1260,6 @@ fn write_text(state: &mut State, text: &str) -> Result<()> {
     state.remote = true;
     state.retire();
     state.mounted = None;
-    state.offer = None;
     Ok(())
 }
 
@@ -1315,7 +1326,7 @@ fn publish_files(state: &mut State, paths: &[PathBuf]) -> Result<bool> {
             }
         }
     }
-    match super::x11_offer::FileOffer::publish(paths.to_vec()) {
+    match super::x11_offer::Offer::publish_files(paths.to_vec()) {
         Ok(offer) => {
             state.offer = Some(offer);
             written = true;

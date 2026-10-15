@@ -1,16 +1,17 @@
-//! Owning the X11 clipboard for a file copy.
+//! Owning the X11 clipboard for what this adapter publishes.
 //!
-//! A file copy is not one payload but several descriptions of the same thing,
-//! and which one a paste reads depends on the application: GTK's file managers
-//! take `x-special/gnome-copied-files`, because it also says whether the copy
-//! was a cut, while most everything else reads `text/uri-list` or falls back to
-//! the paths as plain text. Only the owner of a selection can answer for more
-//! than one target, and the clipboard library used for text and images offers
-//! `text/uri-list` alone, so this takes the selection itself.
+//! 这个会话里 X11 与 Wayland 的选择区是两座互不相通的孤岛（niri 这类合成器不桥接，
+//! 实测 `xclip` 写进去的东西 `wl-paste` 看不见，反过来也一样），而 arboard 只落在
+//! Wayland 那一侧，所以想让 XWayland 的程序粘得到，就得自己去占 X11 的选择区。
 //!
-//! Ownership passes back the moment anything else claims the clipboard,
-//! including this process putting text on it: the owner thread is told, and
-//! stops.
+//! 一份复制往往不是一个载荷而是同一件事的好几种说法，读哪一种看程序：GTK 的文件管理
+//! 器认 `x-special/gnome-copied-files`（它还带「是复制还是剪切」），别的多半读
+//! `text/uri-list`，再老一点的直接读路径文本；文本那边现代程序问 `UTF8_STRING`，只认
+//! `STRING` 的老程序也还有。只有选择区的持有者能替一种以上的类型作答，而 arboard 一次
+//! 只挂一个名字，所以这里把选择区整个接过来。
+//!
+//! Ownership passes back the moment anything else claims the clipboard, including
+//! this process publishing something else: the owner thread is told, and stops.
 
 use anyhow::{Context as _, Result, bail};
 use std::path::Path;
@@ -29,9 +30,9 @@ use x11rb::wrapper::ConnectionExt as _;
 /// has been asked to stop.
 const POLL: Duration = Duration::from_millis(50);
 
-/// The targets this offers, most specific first, which is the order `TARGETS`
-/// should list them in.
-const TARGETS: [&str; 6] = [
+/// The targets a file copy offers, most specific first, which is the order
+/// `TARGETS` should list them in.
+const FILE_TARGETS: [&str; 6] = [
     "x-special/gnome-copied-files",
     "text/uri-list",
     "UTF8_STRING",
@@ -39,6 +40,49 @@ const TARGETS: [&str; 6] = [
     "STRING",
     "TEXT",
 ];
+
+/// 文本那几种。GTK 与 Qt 问的是 `UTF8_STRING`（或者带字符集的 `text/plain`），
+/// XTerm 和老的 Java 程序还只认 `STRING` / `TEXT`，那两个按 ICCCM 是 ISO-8859-1。
+const TEXT_TARGETS: [&str; 5] = [
+    "UTF8_STRING",
+    "text/plain;charset=utf-8",
+    "text/plain",
+    "STRING",
+    "TEXT",
+];
+
+/// 我们放在选择区上的东西。
+enum Content {
+    Files(Vec<std::path::PathBuf>),
+    Text(String),
+}
+
+impl Content {
+    /// 对外提供的类型，最具体的排前面。
+    fn targets(&self) -> &'static [&'static str] {
+        match self {
+            Self::Files(_) => &FILE_TARGETS,
+            Self::Text(_) => &TEXT_TARGETS,
+        }
+    }
+
+    /// 某个类型上要给的字节。
+    fn payload(&self, target: &str) -> Vec<u8> {
+        match self {
+            Self::Files(paths) => files_payload(target, paths),
+            // `STRING` / `TEXT` 是 ISO-8859-1，其余按 UTF-8。落在 Latin-1 之外的
+            // 字符换个 `?`：只认这两个类型的程序本来也显示不出它们，而拿 UTF-8 去
+            // 冒充 Latin-1 会把整段文字变成乱码。
+            Self::Text(text) => match target {
+                "STRING" | "TEXT" => text
+                    .chars()
+                    .map(|c| if (c as u32) <= 0xff { c as u8 } else { b'?' })
+                    .collect(),
+                _ => text.as_bytes().to_vec(),
+            },
+        }
+    }
+}
 
 /// Percent-encode a path for a `file:` URI.
 ///
@@ -60,7 +104,7 @@ fn encode(path: &Path) -> String {
 }
 
 /// The bytes each target carries for `paths`.
-fn payload(target: &str, paths: &[std::path::PathBuf]) -> Vec<u8> {
+fn files_payload(target: &str, paths: &[std::path::PathBuf]) -> Vec<u8> {
     let uris: Vec<String> = paths.iter().map(|path| encode(path)).collect();
     match target {
         // The first line is the operation; a paste that reads this one is
@@ -87,7 +131,7 @@ struct Atoms {
     clipboard: Atom,
     targets: Atom,
     timestamp: Atom,
-    /// One per entry in [`TARGETS`], in the same order.
+    /// One per entry in the content's target list, in the same order.
     data: Vec<Atom>,
 }
 
@@ -99,19 +143,28 @@ fn intern(connection: &impl Connection, name: &str) -> Result<Atom> {
         .atom)
 }
 
-/// A file copy published on the clipboard, owned until this is dropped or
-/// something else takes the selection.
-pub(super) struct FileOffer {
+/// A copy published on the clipboard, owned until this is dropped or something
+/// else takes the selection.
+pub(super) struct Offer {
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
-impl FileOffer {
+impl Offer {
     /// Take the clipboard and answer for `paths` until told otherwise.
-    pub(super) fn publish(paths: Vec<std::path::PathBuf>) -> Result<Self> {
+    pub(super) fn publish_files(paths: Vec<std::path::PathBuf>) -> Result<Self> {
         if paths.is_empty() {
             bail!("没有要发布的文件");
         }
+        Self::publish(Content::Files(paths))
+    }
+
+    /// 同上，内容是这段文本。
+    pub(super) fn publish_text(text: String) -> Result<Self> {
+        Self::publish(Content::Text(text))
+    }
+
+    fn publish(content: Content) -> Result<Self> {
         let (connection, screen) = x11rb::connect(None).context("连接 X11 显示失败")?;
         let root = connection.setup().roots[screen].root;
         let window = connection.generate_id().context("分配 X11 窗口失败")?;
@@ -136,7 +189,8 @@ impl FileOffer {
             clipboard: intern(&connection, "CLIPBOARD")?,
             targets: intern(&connection, "TARGETS")?,
             timestamp: intern(&connection, "TIMESTAMP")?,
-            data: TARGETS
+            data: content
+                .targets()
                 .iter()
                 .map(|name| intern(&connection, name))
                 .collect::<Result<_>>()?,
@@ -176,8 +230,8 @@ impl FileOffer {
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
         let thread = std::thread::Builder::new()
-            .name("UU clipboard files".into())
-            .spawn(move || serve(&connection, window, &atoms, &paths, &worker_stop))
+            .name("UU clipboard owner".into())
+            .spawn(move || serve(&connection, window, &atoms, &content, &worker_stop))
             .context("启动剪贴板所有权线程失败")?;
         Ok(Self {
             stop,
@@ -186,7 +240,7 @@ impl FileOffer {
     }
 }
 
-impl Drop for FileOffer {
+impl Drop for Offer {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
         if let Some(thread) = self.thread.take() {
@@ -200,7 +254,7 @@ fn serve(
     connection: &impl Connection,
     window: x11rb::protocol::xproto::Window,
     atoms: &Atoms,
-    paths: &[std::path::PathBuf],
+    content: &Content,
     stop: &AtomicBool,
 ) {
     while !stop.load(Ordering::Acquire) {
@@ -219,7 +273,7 @@ fn serve(
             // Something else took the clipboard, which retires this offer.
             Event::SelectionClear(event) if event.owner == window => return,
             Event::SelectionRequest(request) => {
-                if let Err(error) = answer(connection, atoms, paths, &request) {
+                if let Err(error) = answer(connection, atoms, content, &request) {
                     tracing::debug!(%error, "回应剪贴板请求失败");
                 }
             }
@@ -244,7 +298,7 @@ fn serve(
 fn answer(
     connection: &impl Connection,
     atoms: &Atoms,
-    paths: &[std::path::PathBuf],
+    content: &Content,
     request: &SelectionRequestEvent,
 ) -> Result<()> {
     // A requestor that sent no property is using the obsolete convention; the
@@ -274,7 +328,7 @@ fn answer(
             &[request.time],
         )?;
     } else if let Some(index) = atoms.data.iter().position(|atom| *atom == request.target) {
-        let data = payload(TARGETS[index], paths);
+        let data = content.payload(content.targets()[index]);
         connection.change_property8(
             PropMode::REPLACE,
             request.requestor,
@@ -299,4 +353,48 @@ fn answer(
     connection.send_event(false, request.requestor, EventMask::NO_EVENT, notify)?;
     connection.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// 文本那几种：现代程序问的 `UTF8_STRING` 给 UTF-8，ICCCM 里是 Latin-1 的
+    /// `STRING` / `TEXT` 得转过来，落不下的字符换个问号——拿 UTF-8 去冒充 Latin-1
+    /// 会让整段文字变乱码。
+    #[test]
+    fn a_text_copy_answers_in_the_encoding_each_target_asks_for() {
+        let content = Content::Text("caf\u{e9} 中文".into());
+        assert_eq!(
+            content.payload("UTF8_STRING"),
+            "caf\u{e9} 中文".as_bytes(),
+            "现代程序读的是 UTF-8"
+        );
+        assert_eq!(
+            content.payload("text/plain;charset=utf-8"),
+            "caf\u{e9} 中文".as_bytes()
+        );
+        // `\u{e9}` 在 Latin-1 里是 0xE9，汉字不在，换问号。
+        assert_eq!(
+            content.payload("STRING"),
+            [0x63, 0x61, 0x66, 0xe9, 0x20, b'?', b'?']
+        );
+        assert_eq!(content.payload("TEXT"), content.payload("STRING"));
+    }
+
+    /// 文件那份还是老样子：`text/uri-list` 是 file URI，其余类型给路径文本。
+    #[test]
+    fn a_file_copy_keeps_its_own_targets() {
+        let content = Content::Files(vec![PathBuf::from("/tmp/a b.txt")]);
+        assert_eq!(content.targets(), FILE_TARGETS);
+        assert_eq!(
+            String::from_utf8(content.payload("text/uri-list")).unwrap(),
+            "file:///tmp/a%20b.txt\r\n"
+        );
+        assert_eq!(
+            String::from_utf8(content.payload("UTF8_STRING")).unwrap(),
+            "/tmp/a b.txt"
+        );
+    }
 }
