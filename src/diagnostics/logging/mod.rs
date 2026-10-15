@@ -347,6 +347,9 @@ pub fn init(level: Option<&str>, path: Option<&Path>) -> Result<LoggingGuard> {
         tracing_subscriber::fmt::layer()
             .with_writer(std::io::stderr)
             .with_ansi(false)
+            .event_format(JournalEventFormat(
+                tracing_subscriber::fmt::format().without_time(),
+            ))
     });
     // 过滤器挂在订阅者上而不是某一层上：两层（文件与 stderr）用同一份，改设置后
     // 两层一起跟随。
@@ -442,6 +445,48 @@ where
     }
 }
 
+/// journal 那一层的行格式：journald 自己记时间，不再写一遍；行首加 sd-daemon 的
+/// `<N>` 级别前缀，journald 读标准输出、标准错误时默认（`SyslogLevelPrefix=yes`）
+/// 据此记优先级，`journalctl -p warning` 才筛得出来。多行事件每行都加，否则后面
+/// 几行会按默认的 info 记。
+struct JournalEventFormat<F>(F);
+
+impl<S, N, F> tracing_subscriber::fmt::format::FormatEvent<S, N> for JournalEventFormat<F>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    N: for<'a> tracing_subscriber::fmt::format::FormatFields<'a> + 'static,
+    F: tracing_subscriber::fmt::format::FormatEvent<S, N>,
+{
+    fn format_event(
+        &self,
+        context: &tracing_subscriber::fmt::FmtContext<'_, S, N>,
+        mut writer: tracing_subscriber::fmt::format::Writer<'_>,
+        event: &tracing::Event<'_>,
+    ) -> std::fmt::Result {
+        let mut text = String::new();
+        self.0.format_event(
+            context,
+            tracing_subscriber::fmt::format::Writer::new(&mut text),
+            event,
+        )?;
+        let priority = syslog_priority(event.metadata().level());
+        for line in text.strip_suffix('\n').unwrap_or(&text).split('\n') {
+            writeln!(writer, "<{priority}>{line}")?;
+        }
+        Ok(())
+    }
+}
+
+/// syslog 优先级：err、warning、info、debug。
+fn syslog_priority(level: &tracing::Level) -> u8 {
+    match *level {
+        tracing::Level::ERROR => 3,
+        tracing::Level::WARN => 4,
+        tracing::Level::INFO => 6,
+        _ => 7,
+    }
+}
+
 pub(crate) fn open_folder(path: &Path) -> Result<()> {
     files::open_directory(path)
 }
@@ -450,5 +495,72 @@ pub(crate) fn open_folder(path: &Path) -> Result<()> {
 pub(crate) fn sync_written() {
     if let Some(runtime) = RUNTIME.get() {
         files::sync_pending(&runtime.files);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self {
+            self.clone()
+        }
+    }
+
+    /// 每一行（多行事件的每一行）都带 journald 认的 `<N>` 前缀，且没有时间戳。
+    #[test]
+    fn journal_lines_carry_the_syslog_priority() {
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(captured.clone())
+                .with_ansi(false)
+                .event_format(JournalEventFormat(
+                    tracing_subscriber::fmt::format().without_time(),
+                )),
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::error!("broken");
+            tracing::warn!("careful");
+            tracing::info!("hello");
+            tracing::debug!("detail");
+            tracing::trace!("noise");
+            tracing::warn!("first\nsecond");
+        });
+        let text = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        let expected = [
+            ("<3>", "ERROR", "broken"),
+            ("<4>", "WARN", "careful"),
+            ("<6>", "INFO", "hello"),
+            ("<7>", "DEBUG", "detail"),
+            ("<7>", "TRACE", "noise"),
+            ("<4>", "WARN", "first"),
+        ];
+        assert_eq!(lines.len(), expected.len() + 1, "{text}");
+        for (line, (prefix, level, message)) in lines.iter().zip(expected) {
+            let rest = line
+                .strip_prefix(prefix)
+                .unwrap_or_else(|| panic!("{line}"));
+            assert!(rest.trim_start().starts_with(level), "{line}");
+            assert!(line.ends_with(message), "{line}");
+        }
+        assert_eq!(lines[6], "<4>second");
     }
 }
