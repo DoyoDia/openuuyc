@@ -31,7 +31,9 @@ depends = """$auto, fuse3, libx11-6, libx11-xcb1, libxcursor1, libxrandr2, libxi
 libxfixes3, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, \
 libvulkan1 | libegl1, \
 fonts-noto-cjk | fonts-wqy-microhei | fonts-arphic-uming"""
-recommends = "libpulse0, libpipewire-0.3-0, gnome-keyring | kwalletmanager"
+# gio (libglib2.0-bin) and rsvg-convert (librsvg2-bin) draw the host's drag
+# preview images; without them a drag goes out with no image.
+recommends = "libpulse0, libpipewire-0.3-0, gnome-keyring | kwalletmanager, libglib2.0-bin, librsvg2-bin"
 suggests = "ethtool"
 assets = [
     ["target/release/OpenUUYC", "usr/bin/", "755"],
