@@ -963,24 +963,31 @@ async fn handle_frame(
             }
         }
         FrameType::UnlockReq => {
-            // The lock screen is a mobile concept; a Linux desktop is never
-            // locked from the terminal's point of view.
-            outgoing.push((FrameType::UnlockResp, frame.session, b"{}".to_vec()));
+            // The controller drives a locked machine's unlock sheet with this:
+            // the macOS server checks `com.apple.screenIsUnlocked` and, for the
+            // auto-unlock action, runs the system unlock, then replies with an
+            // `UnlockResp` JSON carrying `code`/`message`/`success`. Linux has
+            // no equivalent check here, and an empty `{}` leaves `code` at 0,
+            // which the controller reads as success -- it would show a locked
+            // machine as open. Refuse plainly instead of implying a state we
+            // never verified.
+            let payload = json!({
+                "success": false,
+                "code": 1,
+                "message": "本机不支持远程解锁",
+            });
+            outgoing.push((
+                FrameType::UnlockResp,
+                frame.session,
+                serde_json::to_vec(&payload).unwrap_or_default(),
+            ));
         }
         FrameType::Signal => {
-            let ended = {
-                let state = screens.lock().await;
-                let sessions = state.terminal();
-                let mut sessions = sessions.lock().unwrap_or_else(|e| e.into_inner());
-                if sessions.owns(frame.session, &account) {
-                    sessions.kill(frame.session)
-                } else {
-                    Err(SessionError::Gone)
-                }
-            };
-            if let Ok(ended) = ended {
-                ended.finish();
-            }
+            // The payload's signal semantics are unverified, and killing the
+            // shell on an unknown signal would lose the session. Ignore it
+            // until the frame is understood; Ctrl-C reaches the shell as a
+            // byte on stdin anyway.
+            tracing::debug!(session = frame.session, "host terminal signal ignored");
         }
         other => {
             tracing::debug!(?other, "host terminal frame ignored");
