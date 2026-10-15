@@ -1,7 +1,7 @@
 //! The Linux input engine: the same ownership contract as the Windows engine
 //! (every down it sends is released on loss, interruption or disconnect) on
 //! top of the X Test injector.
-use super::geometry::Geometry;
+use super::geometry::{Geometry, Rect, Screen};
 use super::wire::{Event, KeyOrButton};
 use crate::platform::linux::input::{self as native, Injector, Lock};
 use anyhow::{Result, ensure};
@@ -41,6 +41,9 @@ pub(crate) struct Engine {
     configuration: super::config::Configuration,
     foreground: Option<Option<u32>>,
     mouse_policy: super::config::MousePolicy,
+    /// Why absolute positions last went where they did, so a change is
+    /// logged once rather than on every event.
+    aim_space: Option<Result<(), String>>,
 }
 
 impl Engine {
@@ -76,6 +79,7 @@ impl Engine {
             configuration: Default::default(),
             foreground: None,
             mouse_policy: Default::default(),
+            aim_space: None,
         })
     }
     pub fn backend(&self) -> &'static str {
@@ -121,20 +125,18 @@ impl Engine {
             return;
         }
         let mut restore = None;
+        // The pointer is read from X, so it is compared with X's rectangle:
+        // the compositor's logical one is a different space.
         if mode == 2
             && let Ok(screen) = self.geometry.screen(None)
-            && let Ok(rect) = self.absolute_rect(screen)
+            && let Ok(rect) = screen.rect()
             && let Ok((x, y)) = self.injector.pointer()
             && (rect.left..rect.right).contains(&x)
             && (rect.top..rect.bottom).contains(&y)
         {
-            let (width, height) = (
-                f64::from(rect.right - rect.left),
-                f64::from(rect.bottom - rect.top),
-            );
             restore = Some([
-                f64::from(x - rect.left) / width,
-                f64::from(y - rect.top) / height,
+                f64::from(x - rect.left) / f64::from(screen.width),
+                f64::from(y - rect.top) / f64::from(screen.height),
             ]);
         }
         self.mouse_policy = super::config::MousePolicy {
@@ -143,64 +145,29 @@ impl Engine {
         };
     }
 
-    /// The rectangle an absolute position on this screen is named in. A
-    /// compositor resolves the virtual devices' absolute axes in its own
-    /// layout, which is not what the display server's rectangles describe:
-    /// XWayland sizes each output in that output's own pixels while keeping the
-    /// compositor's logical position, so aiming with the X numbers lands short
-    /// or long by exactly the output's scale. X Test is resolved by X, in X's
-    /// rectangles.
-    fn absolute_rect(&self, screen: &super::geometry::Screen) -> Result<super::geometry::Rect> {
-        if self.injector.aims_in_compositor_layout()
-            && let Some(logical) = screen.logical
-        {
-            return Ok(logical);
+    /// The compositor's layout bounds when absolute positions can be aimed in
+    /// it, or `None` to aim in X's rectangles. A change of answer is logged.
+    fn compositor_bounds(&mut self) -> Option<native::Desktop> {
+        if !self.injector.has_absolute_pointer() {
+            return None;
         }
-        screen.rect()
-    }
-
-    /// The bounding box of every screen, which is the desk an absolute position
-    /// is resolved against.
-    fn desktop(&self) -> native::Desktop {
-        let mut left = i32::MAX;
-        let mut top = i32::MAX;
-        let mut right = i32::MIN;
-        let mut bottom = i32::MIN;
-        for screen in &self.geometry.screens {
-            let Ok(rect) = self.absolute_rect(screen) else {
-                continue;
-            };
-            left = left.min(rect.left);
-            top = top.min(rect.top);
-            right = right.max(rect.right);
-            bottom = bottom.max(rect.bottom);
+        let layout = crate::platform::display::compositor_layout();
+        let chosen = compositor_bounds(&self.geometry.screens, layout.as_deref());
+        let state = chosen.as_ref().map(|_| ()).map_err(Clone::clone);
+        if self.aim_space.as_ref() != Some(&state) {
+            match &state {
+                Ok(()) => tracing::info!("绝对定位按合成器布局（xdg-output）解算"),
+                Err(reason) => tracing::warn!(%reason, "绝对定位改用按指针位置换算的相对移动"),
+            }
+            self.aim_space = Some(state);
         }
-        if left >= right || top >= bottom {
-            return native::Desktop {
-                left: 0,
-                top: 0,
-                width: 0,
-                height: 0,
-            };
-        }
-        native::Desktop {
-            left,
-            top,
-            width: (right - left) as u32,
-            height: (bottom - top) as u32,
-        }
+        chosen.ok()
     }
 
     pub fn synchronize(&mut self, geometry: Geometry) -> Result<()> {
         if geometry != self.geometry {
             self.release()?;
             self.geometry = geometry;
-            // The backends that name a position rather than a displacement
-            // need the desk those positions are in. A backend that cannot make
-            // the device it needs is not worth losing the whole session over.
-            if let Err(error) = self.injector.set_geometry(self.desktop()) {
-                tracing::warn!(%error, "injector geometry unavailable");
-            }
         }
         self.observe_foreground();
         Ok(())
@@ -237,14 +204,19 @@ impl Engine {
         Ok(())
     }
     fn absolute(&mut self, screen: Option<i32>, x: f64, y: f64) -> Result<()> {
-        let r = self.absolute_rect(self.geometry.screen(screen)?)?;
-        let px = (f64::from(r.left) + f64::from(r.right - r.left) * x)
-            .round()
-            .clamp(f64::from(r.left), f64::from(r.right - 1));
-        let py = (f64::from(r.top) + f64::from(r.bottom - r.top) * y)
-            .round()
-            .clamp(f64::from(r.top), f64::from(r.bottom - 1));
-        self.injector.move_to(px as i32, py as i32)
+        let screen = self.geometry.screen(screen)?;
+        let (logical, rect) = (screen.logical, screen.rect());
+        // Every screen in the compositor's space, or every screen in X's:
+        // a position named in one and resolved in the other lands off by the
+        // output's scale.
+        if let Some(bounds) = self.compositor_bounds()
+            && let Some(logical) = logical
+        {
+            let (px, py) = point_in(logical, x, y);
+            return self.injector.aim(px, py, bounds);
+        }
+        let (px, py) = point_in(rect?, x, y);
+        self.injector.move_to(px, py)
     }
     fn wheel(&mut self, horizontal: bool, delta: i32) -> Result<()> {
         // 120 units per notch as on Windows. X wheels only click, so partial
@@ -438,6 +410,7 @@ impl Engine {
         self.wheel = [0; 2];
         self.interruptible = false;
         self.backspace = false;
+        self.injector.forget_aim();
         let flushed = self.injector.flush();
         match failure {
             Some(e) => Err(e),
@@ -469,5 +442,167 @@ impl Engine {
 impl Drop for Engine {
     fn drop(&mut self) {
         let _ = self.release();
+    }
+}
+
+/// A position given as a fraction of `rect`, on a whole pixel inside it.
+fn point_in(rect: Rect, x: f64, y: f64) -> (i32, i32) {
+    let px = (f64::from(rect.left) + f64::from(rect.right - rect.left) * x)
+        .round()
+        .clamp(f64::from(rect.left), f64::from(rect.right - 1));
+    let py = (f64::from(rect.top) + f64::from(rect.bottom - rect.top) * y)
+        .round()
+        .clamp(f64::from(rect.top), f64::from(rect.bottom - 1));
+    (px as i32, py as i32)
+}
+
+/// The bounds an absolute pointer covers, when every screen has its place in
+/// the compositor's layout and lies inside it; otherwise why not. All or
+/// nothing: one screen aimed in X's rectangles beside others aimed in the
+/// compositor's would mix two spaces.
+fn compositor_bounds(
+    screens: &[Screen],
+    layout: Option<&crate::platform::CompositorLayout>,
+) -> Result<native::Desktop, String> {
+    let layout = layout.ok_or("合成器没有提供输出布局（xdg-output）")?;
+    let bounds = native::layout_bounds(layout).ok_or("合成器布局里没有输出")?;
+    if screens.is_empty() {
+        return Err("没有可定位的屏幕".into());
+    }
+    let (left, top) = (i64::from(bounds.left), i64::from(bounds.top));
+    let (right, bottom) = (
+        left + i64::from(bounds.width),
+        top + i64::from(bounds.height),
+    );
+    for screen in screens {
+        let Some(logical) = screen.logical else {
+            return Err(format!("屏幕 {} 在合成器布局里没有同名输出", screen.id));
+        };
+        let inside = logical.left < logical.right
+            && logical.top < logical.bottom
+            && i64::from(logical.left) >= left
+            && i64::from(logical.top) >= top
+            && i64::from(logical.right) <= right
+            && i64::from(logical.bottom) <= bottom;
+        if !inside {
+            return Err(format!("屏幕 {} 的合成器位置不在布局范围内", screen.id));
+        }
+    }
+    Ok(bounds)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::platform::{CompositorLayout, CompositorOutput};
+
+    fn output(
+        name: Option<&str>,
+        left: i32,
+        top: i32,
+        width: u32,
+        height: u32,
+    ) -> CompositorOutput {
+        CompositorOutput {
+            name: name.map(Into::into),
+            left,
+            top,
+            width,
+            height,
+        }
+    }
+
+    fn screen(id: i32, x11: (i32, i32, u32, u32), logical: Option<&CompositorOutput>) -> Screen {
+        Screen {
+            id,
+            left: x11.0,
+            top: x11.1,
+            width: x11.2,
+            height: x11.3,
+            logical: logical.map(|o| Rect {
+                left: o.left,
+                top: o.top,
+                right: o.left + o.width as i32,
+                bottom: o.top + o.height as i32,
+            }),
+        }
+    }
+
+    /// The layout from the PR description: DP-3 at 1.6x rotated, DP-1 at 1.35x.
+    fn scaled() -> CompositorLayout {
+        CompositorLayout {
+            outputs: vec![
+                output(Some("DP-3"), 0, 0, 1000, 1600),
+                output(Some("DP-1"), 1000, 0, 3793, 1600),
+            ],
+        }
+    }
+
+    #[test]
+    fn every_screen_paired_aims_in_the_compositor_layout() {
+        let layout = scaled();
+        let screens = [
+            screen(1, (0, 0, 1600, 2560), layout.output("DP-3")),
+            screen(2, (1000, 0, 5120, 2160), layout.output("DP-1")),
+        ];
+        let bounds = compositor_bounds(&screens, Some(&layout)).unwrap();
+        assert_eq!(
+            bounds,
+            native::Desktop {
+                left: 0,
+                top: 0,
+                width: 4793,
+                height: 1600
+            }
+        );
+        // The rotated output is named by its logical rectangle alone: the
+        // centre of DP-3 is the centre of 1000x1600, not of X's 1600x2560.
+        let logical = screens[0].logical.unwrap();
+        assert_eq!(point_in(logical, 0.5, 0.5), (500, 800));
+        assert_eq!(point_in(logical, 1.0, 1.0), (999, 1599));
+    }
+
+    #[test]
+    fn one_unpaired_screen_falls_back_for_all() {
+        let layout = scaled();
+        let screens = [
+            screen(1, (0, 0, 1600, 2560), layout.output("DP-3")),
+            screen(2, (1000, 0, 5120, 2160), None),
+        ];
+        let error = compositor_bounds(&screens, Some(&layout)).unwrap_err();
+        assert!(error.contains("屏幕 2"), "{error}");
+        assert!(compositor_bounds(&screens[..1], None).is_err());
+        assert!(compositor_bounds(&[], Some(&layout)).is_err());
+    }
+
+    #[test]
+    fn a_screen_outside_the_layout_is_refused() {
+        let layout = scaled();
+        let stray = output(Some("HDMI-1"), 5000, 0, 1920, 1080);
+        let screens = [
+            screen(1, (0, 0, 1600, 2560), layout.output("DP-3")),
+            screen(2, (5000, 0, 1920, 1080), Some(&stray)),
+        ];
+        assert!(compositor_bounds(&screens, Some(&layout)).is_err());
+    }
+
+    #[test]
+    fn unnamed_outputs_and_negative_origins_widen_the_bounds() {
+        let layout = CompositorLayout {
+            outputs: vec![
+                output(Some("eDP-1"), 0, 0, 1280, 800),
+                output(None, -1920, -200, 1920, 1080),
+            ],
+        };
+        let screens = [screen(1, (0, 0, 2560, 1600), layout.output("eDP-1"))];
+        assert_eq!(
+            compositor_bounds(&screens, Some(&layout)).unwrap(),
+            native::Desktop {
+                left: -1920,
+                top: -200,
+                width: 3200,
+                height: 1080
+            }
+        );
     }
 }

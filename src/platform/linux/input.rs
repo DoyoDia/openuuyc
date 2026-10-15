@@ -12,7 +12,10 @@
 //! write access to `/dev/uinput`, granted by the udev rule the packages
 //! ship), and text through `zwp_virtual_keyboard_v1`. X11 still reads the key
 //! map, the pointer and the lock keys. Xorg sessions keep XTest alone, which
-//! needs no setup and positions the pointer absolutely.
+//! needs no setup and positions the pointer absolutely. An absolute position
+//! in a Wayland session goes to a second, absolute uinput pointer that the
+//! compositor resolves in its own layout (xdg-output); without that layout it
+//! becomes a relative move from the current pointer position.
 use anyhow::{Context, Result, bail, ensure};
 use std::time::Duration;
 use x11rb::connection::{Connection, RequestConnection as _};
@@ -53,8 +56,9 @@ impl Lock {
 /// 原生客户端收不到；Wayland 会话有 `/dev/uinput` 时改用它注入。X11 仍保留
 /// 用于读取键位表、指针位置与锁定键状态。
 ///
-/// 绝对定位另有一台带 `ABS_X`/`ABS_Y` 的设备，范围就是合成器自己布局的逻辑
-/// 尺寸：位置由合成器解算，不再经过 X，也就没有 XWayland 那套尺寸与缩放。
+/// 绝对定位另有一台带 `ABS_X`/`ABS_Y` 的设备（Sunshine 的做法），轴范围固定，
+/// 由合成器按它自己全局布局的外接矩形解算：不经过 X，也就没有 XWayland 那套
+/// 尺寸与缩放。
 mod uinput {
     use anyhow::{Context, Result, ensure};
     use std::fs::{File, OpenOptions};
@@ -75,6 +79,9 @@ mod uinput {
     const SYN_REPORT: u16 = 0x00;
     /// 绝对轴只受一根指针控制，而不是某一块屏上的坐标。
     const INPUT_PROP_POINTER: u32 = 0;
+    /// 绝对轴的最大值，与 Sunshine 一样固定，不随布局变：布局变了只改换算，
+    /// 不用换设备（换设备又要等合成器重新接手）。
+    pub(crate) const AXIS_MAX: i32 = 65535;
 
     const BTN_LEFT: u16 = 0x110;
     const BTN_RIGHT: u16 = 0x111;
@@ -231,10 +238,9 @@ mod uinput {
             })
         }
 
-        /// 绝对指针：`ABS_X`/`ABS_Y` 的范围就是合成器自己那套布局的逻辑尺寸，
-        /// 它拿这个范围把轴上的值解算成全局位置。
-        pub(crate) fn open_absolute(desktop: super::Desktop) -> Result<Self> {
-            let (width, height) = (desktop.width as i32 - 1, desktop.height as i32 - 1);
+        /// 绝对指针：`ABS_X`/`ABS_Y` 的范围固定为 `0..=AXIS_MAX`，合成器把它按
+        /// 比例映射到自己全部输出的外接矩形上。
+        pub(crate) fn open_absolute() -> Result<Self> {
             Self::create("OpenUUYC virtual absolute pointer", |fd| {
                 // 按钮也要声明：libinput 靠它认出这是一只鼠标，否则一条只有绝对
                 // 轴的设备会被归到触摸屏之类里去。
@@ -243,8 +249,8 @@ mod uinput {
                     set(fd, UI_SET_KEYBIT, code.into())?;
                 }
                 set(fd, UI_SET_EVBIT, EV_ABS.into())?;
-                set_abs(fd, ABS_X, width)?;
-                set_abs(fd, ABS_Y, height)?;
+                set_abs(fd, ABS_X, AXIS_MAX)?;
+                set_abs(fd, ABS_Y, AXIS_MAX)?;
                 // 指针而不是“直接设备”：INPUT_PROP_DIRECT 是在说坐标只落在
                 // 一块屏上，而这里描述的是整个桌面。
                 set(fd, UI_SET_PROPBIT, INPUT_PROP_POINTER.into())
@@ -291,7 +297,7 @@ mod uinput {
             self.sync()
         }
 
-        /// 绝对位置，取的是设备轴上的值（桌面左上角为 0）。
+        /// 绝对位置，取的是设备轴上的值（`0..=AXIS_MAX`）。
         pub(crate) fn move_absolute(&self, x: i32, y: i32) -> Result<()> {
             self.emit(EV_ABS, ABS_X, x)?;
             self.emit(EV_ABS, ABS_Y, y)?;
@@ -615,8 +621,8 @@ mod virtual_keyboard {
     }
 }
 
-/// 绝对坐标换算所在的桌面：左上角加尺寸。
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// 绝对指针覆盖的区域：合成器全局布局的外接矩形，左上角加尺寸。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Desktop {
     pub left: i32,
     pub top: i32,
@@ -624,28 +630,63 @@ pub(crate) struct Desktop {
     pub height: u32,
 }
 
-/// 合成器自己布局的桌面边界。
-///
-/// 问不到合成器（X11 会话，或是不支持 xdg-output 的合成器）时返回 `None`，
-/// 绝对定位就还是 X 的矩形加 hyprctl 那条路。
-fn compositor_desktop() -> Option<Desktop> {
-    let layout = super::display::compositor_layout()?;
-    let layout = &layout.outputs;
-    let left = layout.iter().map(|output| output.left).min()?;
-    let top = layout.iter().map(|output| output.top).min()?;
-    let right = layout
+/// 合成器全局布局的外接矩形，包括没有名字的输出：合成器把绝对指针映射到
+/// 它全部输出的外接矩形上（wlroots 的 output layout、Hyprland、niri、KWin 的
+/// 工作区、Mutter 的 stage），少算一块屏落点就整体偏。
+pub(crate) fn layout_bounds(layout: &crate::platform::CompositorLayout) -> Option<Desktop> {
+    let mut outputs = layout
+        .outputs
         .iter()
-        .map(|output| output.left + output.width as i32)
-        .max()?;
-    let bottom = layout
-        .iter()
-        .map(|output| output.top + output.height as i32)
-        .max()?;
-    (right > left && bottom > top).then(|| Desktop {
-        left,
-        top,
-        width: (right - left) as u32,
-        height: (bottom - top) as u32,
+        .filter(|o| o.width > 0 && o.height > 0);
+    let first = outputs.next()?;
+    let span = |o: &crate::platform::CompositorOutput| {
+        (
+            i64::from(o.left),
+            i64::from(o.top),
+            i64::from(o.left) + i64::from(o.width),
+            i64::from(o.top) + i64::from(o.height),
+        )
+    };
+    let (mut left, mut top, mut right, mut bottom) = span(first);
+    for output in outputs {
+        let (l, t, r, b) = span(output);
+        left = left.min(l);
+        top = top.min(t);
+        right = right.max(r);
+        bottom = bottom.max(b);
+    }
+    Some(Desktop {
+        left: i32::try_from(left).ok()?,
+        top: i32::try_from(top).ok()?,
+        width: u32::try_from(right - left).ok()?,
+        height: u32::try_from(bottom - top).ok()?,
+    })
+}
+
+/// 合成器把一个轴值落到像素 `origin + floor(value × extent / (AXIS_MAX + 1))`
+/// 上（libinput 按 `max - min + 1` 换算）。取像素中心对应的值，取整之后正好
+/// 落回这个像素。超过 `AXIS_MAX + 1` 像素宽的布局会有相邻像素共用一个值。
+fn axis_value(position: i32, origin: i32, extent: u32) -> i32 {
+    if extent == 0 {
+        return 0;
+    }
+    let range = i64::from(uinput::AXIS_MAX) + 1;
+    let extent = i64::from(extent);
+    let offset = (i64::from(position) - i64::from(origin)).clamp(0, extent - 1);
+    ((2 * offset + 1) * range / (2 * extent)).clamp(0, i64::from(uinput::AXIS_MAX)) as i32
+}
+
+/// 内核丢弃与设备当前值相同的绝对坐标，所以要重写同一个值时先在单独一帧里
+/// 挪开一个单位（不到一像素）。在轴的最大值处往回挪，不能出界。只有两条轴
+/// 都相同才需要：只丢一条轴时，合成器沿用设备自己的那个值，正是目标值。
+fn nudge(last: (i32, i32), value: (i32, i32)) -> Option<(i32, i32)> {
+    (last == value).then(|| {
+        let x = if value.0 >= uinput::AXIS_MAX {
+            value.0 - 1
+        } else {
+            value.0 + 1
+        };
+        (x, value.1)
     })
 }
 
@@ -656,79 +697,79 @@ const FRESH_FOR: Duration = Duration::from_millis(1500);
 /// 上面那个窗口期里补写的间隔。
 const REPEAT_EVERY: Duration = Duration::from_millis(250);
 
-/// 一个还没被合成器接手的位置。
-///
-/// 补写不能写同一个值：内核会丢掉与设备当前值相同的绝对坐标，而这正是要补的
-/// 那个值。所以沿 x 偏一个单位写（桌面尺寸量级上的一格，肉眼看不见），窗口
-/// 结束时再把原值写一次。
+/// 窗口期里还要补写的位置。
 struct Repeat {
     until: std::time::Instant,
-    at: std::time::Instant,
-    position: (i32, i32),
-    offset: i32,
+    next: std::time::Instant,
+    value: (i32, i32),
 }
 
-/// 由合成器解算的绝对指针：设备、它轴范围覆盖的那个桌面，以及合成器接手它
-/// 之前要补写的位置。
+/// 由合成器解算的绝对指针。轴范围固定（与 Sunshine 一样），按布局外接矩形
+/// 换算，所以布局变了也不用换设备。
 struct Absolute {
     device: uinput::Device,
-    desktop: Desktop,
     made: std::time::Instant,
+    /// 设备轴上的当前值（内核里的那份），新建时为 0。
+    last: (i32, i32),
     repeat: Option<Repeat>,
 }
 
 impl Absolute {
-    /// 按合成器自己的布局建一台绝对指针。轴范围是布局的逻辑尺寸：合成器
-    /// 就是拿它除的。
-    fn create(desktop: Desktop) -> Result<Self> {
+    fn create() -> Result<Self> {
         Ok(Self {
-            device: uinput::Device::open_absolute(desktop)?,
-            desktop,
+            device: uinput::Device::open_absolute()?,
             made: std::time::Instant::now(),
+            last: (0, 0),
             repeat: None,
         })
     }
 
-    /// 把引擎算出的（合成器空间里的）位置写进设备轴。
-    fn write(&mut self, x: i32, y: i32) -> Result<()> {
-        let local_x = (x - self.desktop.left).clamp(0, self.desktop.width as i32 - 1);
-        let local_y = (y - self.desktop.top).clamp(0, self.desktop.height as i32 - 1);
-        self.device.move_absolute(local_x, local_y)
-    }
-
-    /// 写一次，并在设备还新的时候开始补写。
-    fn aim(&mut self, x: i32, y: i32) -> Result<()> {
-        self.write(x, y)?;
-        if self.made.elapsed() < FRESH_FOR {
-            self.repeat = Some(Repeat {
-                until: self.made + FRESH_FOR,
-                at: std::time::Instant::now(),
-                position: (x, y),
-                offset: 0,
-            });
+    /// 写入一对轴值。与当前值相同时内核会把它整帧丢掉，而光标可能已经被别的
+    /// 设备（相对设备、本机鼠标、程序自己移动指针）挪走了，所以先在单独一帧里
+    /// 挪开一个单位，再写目标值。
+    fn emit(&mut self, value: (i32, i32)) -> Result<()> {
+        if let Some((x, y)) = nudge(self.last, value) {
+            self.device.move_absolute(x, y)?;
         }
+        self.device.move_absolute(value.0, value.1)?;
+        self.last = value;
         Ok(())
     }
 
-    /// 补写：见 `Repeat`。
+    /// 把合成器空间里的一点写进设备，设备还新的时候安排补写。
+    fn aim(&mut self, x: i32, y: i32, bounds: Desktop) -> Result<()> {
+        let value = (
+            axis_value(x, bounds.left, bounds.width),
+            axis_value(y, bounds.top, bounds.height),
+        );
+        self.emit(value)?;
+        let now = std::time::Instant::now();
+        let until = self.made + FRESH_FOR;
+        self.repeat = (now < until).then(|| Repeat {
+            until,
+            next: now + REPEAT_EVERY,
+            value,
+        });
+        Ok(())
+    }
+
+    /// 窗口期里按间隔补写。补写的值与当前值相同，`emit` 会先挪开一个单位，
+    /// 每次补写都以目标值结束，窗口结束时不必再写。
     fn flush(&mut self) -> Result<()> {
         let Some(repeat) = &mut self.repeat else {
             return Ok(());
         };
         let now = std::time::Instant::now();
         if now >= repeat.until {
-            let (x, y) = repeat.position;
             self.repeat = None;
-            return self.write(x, y);
-        }
-        if now.duration_since(repeat.at) < REPEAT_EVERY {
             return Ok(());
         }
-        repeat.at = now;
-        repeat.offset ^= 1;
-        let (x, y) = repeat.position;
-        let offset = repeat.offset;
-        self.write(x + offset, y)
+        if now < repeat.next {
+            return Ok(());
+        }
+        repeat.next = now + REPEAT_EVERY;
+        let value = repeat.value;
+        self.emit(value)
     }
 }
 
@@ -769,7 +810,7 @@ impl Injector {
         } else {
             match uinput::Device::open() {
                 Ok(device) => {
-                    tracing::info!("启用 uinput 输入注入（EV_KEY + EV_REL，无 ABS 轴）");
+                    tracing::info!("启用 uinput 输入注入（键盘、按键与相对位移）");
                     Some(device)
                 }
                 Err(error) => {
@@ -777,6 +818,22 @@ impl Injector {
                     None
                 }
             }
+        };
+        // 绝对定位另建一台设备，越早建越好：合成器接手它要几百毫秒。轴范围
+        // 固定，用不用它由引擎按合成器布局决定。XTest 由 X 自己解算，用不着。
+        let absolute = if uinput.is_some() {
+            match Absolute::create() {
+                Ok(absolute) => {
+                    tracing::info!("启用 uinput 虚拟绝对指针（按合成器布局定位）");
+                    Some(absolute)
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "虚拟绝对指针不可用，绝对定位改用相对移动");
+                    None
+                }
+            }
+        } else {
+            None
         };
         let screen_maps = if uinput.is_some() && hyprland() {
             let maps = screen_rect_maps();
@@ -803,57 +860,40 @@ impl Injector {
         } else {
             None
         };
-        let mut injector = Self {
+        Ok(Self {
             connection,
             root,
             min_keycode,
             max_keycode,
             uinput,
-            absolute: None,
+            absolute,
             screen_maps,
             virtual_keyboard,
-        };
-        // 合成器接手一台刚建的 uinput 设备要几百毫秒，这段时间里写进去的绝对
-        // 坐标谁都收不到，所以趁早把它建出来，先让它被打开。XTest 一侧由 X
-        // 自己解算，用不着这台设备。
-        if injector.uinput.is_some()
-            && let Err(error) = injector.prime()
-        {
-            tracing::warn!(%error, "虚拟绝对鼠标不可用，绝对定位回退到相对移动");
-        }
-        Ok(injector)
+        })
     }
 
-    /// 提前按合成器自己的布局把绝对指针建出来：轴范围在创建时固定，必须是
-    /// 合成器那一套逻辑尺寸——XWayland 报的矩形是另一种数（每个输出的位置
-    /// 是合成器的逻辑位置，尺寸却是它自己的像素），带缩放的屏上换算必然偏。
-    /// 问不到合成器布局时不建，绝对定位留给 hyprctl 那条路。
-    fn prime(&mut self) -> Result<()> {
-        let Some(desktop) = compositor_desktop() else {
-            return Ok(());
-        };
-        self.absolute = Some(Absolute::create(desktop)?);
-        Ok(())
-    }
-
-    /// 引擎报来桌面尺寸时调用。轴向的范围创建时就定死了，桌面变了就得换一台。
-    pub fn set_geometry(&mut self, desktop: Desktop) -> Result<()> {
-        // 没有绝对设备说明这个会话问不到合成器布局，引擎给的也就还是 X 的
-        // 矩形，拿它建出来的轴范围不是合成器要的那套数。
-        let Some(absolute) = &self.absolute else {
-            return Ok(());
-        };
-        if absolute.desktop == desktop {
-            return Ok(());
-        }
-        self.absolute = Some(Absolute::create(desktop)?);
-        Ok(())
-    }
-
-    /// 绝对坐标是否由合成器按自己的全局布局解算：虚拟设备是，XTest 不是
-    /// （后者由 X 在它自己的矩形里解算）。
-    pub fn aims_in_compositor_layout(&self) -> bool {
+    /// 有没有虚拟绝对指针。有它，引擎才可能按合成器布局定位。
+    pub fn has_absolute_pointer(&self) -> bool {
         self.absolute.is_some()
+    }
+
+    /// 移到合成器全局空间里的一点，由合成器按 `bounds`（它全部输出的外接
+    /// 矩形）解算。设备写入失败就不再用它，之后的绝对定位回到相对移动。
+    pub fn aim(&mut self, x: i32, y: i32, bounds: Desktop) -> Result<()> {
+        let absolute = self.absolute.as_mut().context("虚拟绝对指针不可用")?;
+        let result = absolute.aim(x, y, bounds);
+        if let Err(error) = &result {
+            tracing::warn!(%error, "虚拟绝对指针写入失败，停用并改用相对移动");
+            self.absolute = None;
+        }
+        result
+    }
+
+    /// 放弃还没补写完的位置（输入被收回或释放时，不再替对端移动指针）。
+    pub fn forget_aim(&mut self) {
+        if let Some(absolute) = &mut self.absolute {
+            absolute.repeat = None;
+        }
     }
 
     /// 当前焦点窗口是否跑在 XWayland 里。
@@ -921,13 +961,9 @@ impl Injector {
         )
     }
 
-    /// Move to a root-window position.
-    pub fn move_to(&mut self, x: i32, y: i32) -> Result<()> {
-        // 坐标已经是合成器布局里的位置（引擎按 `Screen::logical` 算的），
-        // 直接写进设备，由合成器解算。
-        if let Some(absolute) = &mut self.absolute {
-            return absolute.aim(x, y);
-        }
+    /// Move to a root-window position. Positions in the compositor's own
+    /// layout go through [`Self::aim`] instead.
+    pub fn move_to(&self, x: i32, y: i32) -> Result<()> {
         if let Some(device) = &self.uinput {
             // 设备不声明 ABS 轴（否则会被 libinput 误分类），所以按当前
             // 指针位置换算成相对位移。位置以合成器为准：每次重新读取，
@@ -1195,8 +1231,12 @@ impl Injector {
 
     pub fn flush(&mut self) -> Result<()> {
         // 合成器刚接手的设备上，位置可能要写上好几遍才有人收到。
-        if let Some(absolute) = &mut self.absolute {
-            absolute.flush()?;
+        if let Some(absolute) = &mut self.absolute
+            && let Err(error) = absolute.flush()
+        {
+            tracing::warn!(%error, "虚拟绝对指针写入失败，停用并改用相对移动");
+            self.absolute = None;
+            return Err(error);
         }
         self.connection.flush()?;
         Ok(())
@@ -1392,6 +1432,78 @@ mod tests {
         assert_eq!(evdev(0x70), Some(59));
         assert_eq!(evdev(0x79), Some(68));
         assert_eq!(evdev(0x7c), Some(183));
+    }
+}
+
+#[cfg(test)]
+mod absolute_tests {
+    use super::{Desktop, axis_value, layout_bounds, nudge, uinput::AXIS_MAX};
+    use crate::platform::{CompositorLayout, CompositorOutput};
+
+    /// What libinput hands the compositor (`value × extent / (max − min + 1)`)
+    /// and the pixel that position falls on.
+    fn landed(value: i32, origin: i32, extent: u32) -> i32 {
+        let position = f64::from(value) * f64::from(extent) / (f64::from(AXIS_MAX) + 1.0);
+        origin + position.floor() as i32
+    }
+
+    #[test]
+    fn every_pixel_maps_back_onto_itself() {
+        for (origin, extent) in [(0, 1), (0, 1000), (-1920, 4793), (1000, 3793), (0, 65536)] {
+            for position in origin..origin + extent as i32 {
+                let value = axis_value(position, origin, extent);
+                assert!((0..=AXIS_MAX).contains(&value));
+                assert_eq!(landed(value, origin, extent), position, "{origin} {extent}");
+            }
+        }
+    }
+
+    #[test]
+    fn positions_outside_the_bounds_stay_on_its_edge() {
+        assert_eq!(
+            axis_value(-5000, -1920, 4793),
+            axis_value(-1920, -1920, 4793)
+        );
+        assert_eq!(axis_value(9000, -1920, 4793), axis_value(2872, -1920, 4793));
+        assert_eq!(axis_value(10, 0, 0), 0);
+    }
+
+    #[test]
+    fn a_repeated_value_is_nudged_within_the_axis() {
+        assert_eq!(nudge((10, 20), (11, 20)), None);
+        assert_eq!(nudge((10, 20), (10, 21)), None);
+        assert_eq!(nudge((10, 20), (10, 20)), Some((11, 20)));
+        assert_eq!(nudge((0, 0), (0, 0)), Some((1, 0)));
+        assert_eq!(nudge((AXIS_MAX, 5), (AXIS_MAX, 5)), Some((AXIS_MAX - 1, 5)));
+    }
+
+    #[test]
+    fn bounds_cover_every_output_named_or_not() {
+        let output = |name: Option<&str>, left, top, width, height| CompositorOutput {
+            name: name.map(Into::into),
+            left,
+            top,
+            width,
+            height,
+        };
+        let layout = CompositorLayout {
+            outputs: vec![
+                output(Some("DP-1"), 0, 0, 2560, 1440),
+                output(None, -1080, -480, 1080, 1920),
+                output(Some("HDMI-A-1"), 2560, 200, 1280, 1024),
+                output(Some("broken"), 9000, 9000, 0, 0),
+            ],
+        };
+        assert_eq!(
+            layout_bounds(&layout),
+            Some(Desktop {
+                left: -1080,
+                top: -480,
+                width: 4920,
+                height: 1920
+            })
+        );
+        assert_eq!(layout_bounds(&CompositorLayout::default()), None);
     }
 }
 
