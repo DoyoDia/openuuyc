@@ -69,7 +69,7 @@ pub fn run(options: GuiOptions) -> Result<()> {
     let viewport = egui::ViewportBuilder::default()
         .with_visible(!options.background)
         .with_title(format!("{} · 控制中心", crate::APP_NAME))
-        .with_icon(crate::ui::branding::icon())
+        .with_icon(crate::ui::branding::icon(false))
         .with_inner_size([1180.0, 760.0])
         .with_min_inner_size([1024.0, 720.0]);
     crate::ui::run(

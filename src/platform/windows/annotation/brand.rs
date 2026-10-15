@@ -12,7 +12,7 @@ pub(super) struct Brand {
 }
 impl Brand {
     pub fn new(screen: &Screen, scale: f32) -> Result<Self> {
-        let icon = crate::ui::branding::icon();
+        let icon = crate::ui::branding::icon(false);
         let mut pixels = Vec::with_capacity(icon.rgba.len());
         for c in icon.rgba.chunks_exact(4) {
             let a = u16::from(c[3]);

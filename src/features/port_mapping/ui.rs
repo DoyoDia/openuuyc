@@ -17,7 +17,7 @@ pub(crate) fn open(
     let key = format!("ports:{}:{}", client.device_id(), device.device_id);
     let viewport = egui::ViewportBuilder::default()
         .with_title(format!("OpenUUYC · {} · 端口转发", device.alias))
-        .with_icon(crate::ui::branding::icon())
+        .with_icon(crate::ui::branding::icon(false))
         .with_inner_size(theme::MAPPING_WINDOW_SIZE)
         .with_min_inner_size(theme::MAPPING_WINDOW_MIN);
     window_manager::send(window_manager::Request::Open {

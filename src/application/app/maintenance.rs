@@ -204,7 +204,7 @@ fn run(uninstall: bool, launch_arguments: Vec<std::ffi::OsString>) -> Result<()>
                 } else {
                     "更新 OpenUUYC"
                 })
-                .with_icon(crate::ui::branding::icon())
+                .with_icon(crate::ui::branding::icon(false))
                 .with_inner_size(crate::ui::theme::MAINTENANCE_WINDOW_SIZE)
                 .with_resizable(false),
             centered: true,
