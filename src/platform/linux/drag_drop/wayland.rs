@@ -120,6 +120,9 @@ struct State {
     entered: bool,
     /// 文件列表已经问到（`paths` 刚拿到，还没被取走）。
     captured: bool,
+    /// 接住的是个没有文件列表的东西（拖的是文字、网页里的图片之类），已经可以
+    /// 断定拿不到路径，不必再等。
+    refused: bool,
     /// 原来那次拖动收场了：`drop`（松开在我们这块上），或者 `leave`（拖着拖着
     /// 离开了我们这块）。这两条是 Wayland 拖放里唯一能看到的「结束」。
     ended: bool,
@@ -153,6 +156,15 @@ fn logical_point(point: Position, size: (u32, u32), logical: (i32, i32)) -> (i32
 /// 所以照采集那边的三段式来：按名字 → 只有一块屏就用它 → 都不行就按物理尺寸认
 /// （尺寸按无序对比较，转过 90 度的屏宽高是换过来的）→ 还不行就报错，并把合成器
 /// 有的输出列出来。
+fn logical_size(state: &State, index: usize) -> (i32, i32) {
+    state
+        .logical
+        .get(index)
+        .copied()
+        .flatten()
+        .map_or((0, 0), |(_, size)| size)
+}
+
 fn pick(state: &State, device: &str, size: (u32, u32)) -> Result<usize> {
     if let Some(index) = state
         .outputs
@@ -175,7 +187,14 @@ fn pick(state: &State, device: &str, size: (u32, u32)) -> Result<usize> {
         .outputs
         .iter()
         .enumerate()
-        .filter(|(_, output)| output.physical != (0, 0) && side(output.physical) == wanted)
+        .filter(|(index, output)| {
+            // 两套单位都比一遍：`device` 来自 XWayland 的 RandR，有缩放时报的多半
+            // 是逻辑尺寸，而 `wl_output.mode` 是物理像素——只比后者的话，这条退路
+            // 恰好死在最需要它的多屏缩放场景里。
+            [output.physical, logical_size(state, *index)]
+                .into_iter()
+                .any(|size| size != (0, 0) && side(size) == wanted)
+        })
         .map(|(index, _)| index)
         .collect();
     if let [index] = matched[..] {
@@ -218,8 +237,9 @@ fn run(
         .roundtrip(&mut state)
         .context("读取 Wayland 输出描述失败")?;
 
-    let index = pick(&state, device, size)?;
-    let target = state.outputs[index].proxy.clone();
+    // 先确认必需的全局对象，再认屏：两边顺序反过来的话，GNOME 这类缺
+    // wlr-layer-shell 的合成器上报出来的会是「没有名为 XWAYLAND0 的输出」，把
+    // 真正的原因盖掉，而主控要看到的正是「这个合成器不提供 wlr-layer-shell」。
     let compositor = state
         .compositor
         .clone()
@@ -249,20 +269,35 @@ fn run(
         .map(|output| xdg.get_xdg_output(&output.proxy, &handle, ()))
         .collect();
     state.logical = vec![None; state.outputs.len()];
-    // 只等目标屏：别的屏的逻辑尺寸跟这块摆哪儿没有关系。
+    // 全都等到齐，不是只等目标屏：认屏的退路要在两套尺寸里比，而比之前得先知道
+    // 每块屏的逻辑尺寸（名字对不上时才用得上它）。正常一轮 roundtrip 就到，
+    // `SETUP` 只是兜底。
     let known = |state: &State| {
-        state.logical[index].is_some_and(|(_, (width, height))| width > 0 && height > 0)
+        state
+            .logical
+            .iter()
+            .all(|entry| entry.is_some_and(|(_, (width, height))| width > 0 && height > 0))
     };
     let deadline = Instant::now() + SETUP;
     while !known(&state) && Instant::now() < deadline {
         dispatch(&mut queue, &mut state, &connection)?;
         wait(&mut queue, &mut state, &connection, POLL)?;
     }
+
+    let index = pick(&state, device, size)?;
+    let target = state.outputs[index].proxy.clone();
     let (_, (logical_width, logical_height)) = state.logical[index]
         .filter(|(_, (width, height))| *width > 0 && *height > 0)
         .context("合成器没有给出这块屏的逻辑尺寸")?;
 
     let local = logical_point(point, size, (logical_width, logical_height));
+
+    // data device 必须在这块 surface 上屏**之前**建好。合成器按请求顺序处理：处理
+    // 下面那次 commit 时 surface 一上屏，它就重新判定指针底下是谁、把这次拖放交给
+    // 我们，而 `data_offer` 与 `enter` 是发给我们这个客户端**当时已有的** data
+    // device 的。上屏之后才建的 data device 不会补发，此后指针不动也不会重新判定，
+    // 整条路就卡在 `Unavailable`（sway 1.7 上实测如此）。
+    state.device = Some(manager.get_data_device(&seat, &handle, ()));
 
     let surface = compositor.create_surface(&handle, ());
     let shell = layer.get_layer_surface(
@@ -306,9 +341,6 @@ fn run(
     shell.ack_configure(serial);
     surface.commit();
 
-    let data = manager.get_data_device(&seat, &handle, ());
-    state.device = Some(data);
-
     // 摆好了就等合成器把这次拖放交过来。这一步就是全部：不必再推指针，指针底下
     // 换了 surface，合成器会重新判定一次（niri 与 wlroots 系都如此，PR 里有实测）。
     // 等不到就当这条路在这台合成器上走不通，和 X11 那条一样报 `Unavailable` 收工
@@ -324,7 +356,7 @@ fn run(
         wait(&mut queue, &mut state, &connection, POLL)?;
     }
     if !state.entered {
-        tracing::debug!(device, "合成器没有把这次拖放交给摆出来的 surface");
+        tracing::info!(device, "合成器没有把这次拖放交给摆出来的 surface");
         shell.destroy();
         surface.destroy();
         notify(Event::Unavailable);
@@ -333,6 +365,7 @@ fn run(
 
     let deadline = Instant::now() + LIMIT;
     while state.paths.is_none()
+        && !state.refused
         && !state.closed
         && !stop.load(Ordering::Acquire)
         && allowed()
@@ -359,6 +392,11 @@ fn run(
     let Some(paths) = state.paths.take() else {
         shell.destroy();
         surface.destroy();
+        // 接住了却拿不到路径，就把原因说出来：不说的话主控要等满 3 秒看门狗，
+        // 界面上一句「取消了」，用户根本不知道是拖的东西不对。
+        if state.refused {
+            notify(Event::Failed("拖动的不是文件".to_owned()));
+        }
         return Ok(());
     };
     tracing::info!(files = paths.len(), "Wayland 拖放接住了");
@@ -715,6 +753,14 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for State {
             wl_data_device::Event::Enter { .. } => {
                 state.entered = true;
                 request(state);
+                // offer 与它的类型清单一定在 `enter` 之前到齐（协议如此），所以这
+                // 一刻就能断定：有 offer、却没一个认得出的类型，那拖的不是文件。
+                state.refused = state.requested.is_none()
+                    && state.offer.is_some()
+                    && !state
+                        .mimes
+                        .iter()
+                        .any(|mime| MIMES.contains(&mime.as_str()));
             }
             // 拖起来的那次松开不会以 `wl_pointer.button` 的形式送到我们手上——
             // 隐式抓取把它吃掉了，落点是谁就以 `drop` 告诉谁。
