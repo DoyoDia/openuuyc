@@ -373,6 +373,24 @@ fn pick(outputs: &[Output], screen: &Screen) -> Result<usize> {
     )
 }
 
+/// Whether this compositor serves the protocol at all. One connection and one
+/// registry round trip: no frame is asked for, so nobody is asked for
+/// anything. The startup probe uses this to tell a compositor that will copy
+/// from one that will fall through to the portal.
+pub(crate) fn available() -> bool {
+    let Ok(connection) = Connection::connect_to_env() else {
+        return false;
+    };
+    let mut queue = connection.new_event_queue::<State>();
+    let handle = queue.handle();
+    connection.display().get_registry(&handle, ());
+    let mut state = State {
+        connection: Some(connection),
+        ..Default::default()
+    };
+    queue.roundtrip(&mut state).is_ok() && state.manager.is_some()
+}
+
 impl Dispatch<wl_registry::WlRegistry, ()> for State {
     fn event(
         state: &mut Self,

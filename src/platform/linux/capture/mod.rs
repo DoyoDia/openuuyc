@@ -213,10 +213,28 @@ fn candidates() -> Result<Vec<Kind>> {
     })
 }
 
+/// The candidates that can really open here, in order. A `Wlr` entry is
+/// dropped when the compositor does not serve the protocol, so whatever is
+/// behind it — on Mutter and KWin, the portal — is seen for what it is.
+fn usable(kinds: &[Kind], wlr_available: bool) -> Vec<Kind> {
+    kinds
+        .iter()
+        .copied()
+        .filter(|kind| *kind != Kind::Wlr || wlr_available)
+        .collect()
+}
+
 /// Whether opening capture now would ask the local user to share the
-/// screen: the portal comes first and has no remembered grant yet.
+/// screen: the portal comes first and has no remembered grant yet. A `Wlr`
+/// that cannot open leaves the portal first, so the question has to be asked
+/// of the list the session would really use.
 pub(crate) fn needs_consent() -> bool {
-    candidates().is_ok_and(|kinds| consent_needed(&kinds, portal::remembered()))
+    candidates().is_ok_and(|kinds| {
+        // Only a `Wlr` head can hide the portal behind it, and the probe costs
+        // a connection, so it is skipped for every other order.
+        let wlr = kinds.first() == Some(&Kind::Wlr) && wlr_screencopy::available();
+        consent_needed(&usable(&kinds, wlr), portal::remembered())
+    })
 }
 
 fn consent_needed(kinds: &[Kind], remembered: bool) -> bool {
@@ -568,7 +586,7 @@ fn scale(source: &[u8], from: (u32, u32), to: (u32, u32)) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Kind, consent_needed, scale};
+    use super::{Kind, consent_needed, scale, usable};
 
     #[test]
     fn only_an_unremembered_portal_asks_the_user() {
@@ -577,6 +595,31 @@ mod tests {
         // X11 sessions reach the portal only after NvFBC and MIT-SHM fail.
         assert!(!consent_needed(
             &[Kind::NvFbc, Kind::X11, Kind::Portal],
+            false
+        ));
+    }
+
+    #[test]
+    fn a_wlr_that_cannot_open_leaves_the_portal_in_front() {
+        // Neither Mutter nor KWin serves `zwlr_screencopy_manager_v1`: the
+        // startup probe must not fall through to the portal and pop its
+        // dialog, which is what #1's guard exists to prevent.
+        assert!(consent_needed(
+            &usable(&[Kind::Wlr, Kind::Portal], false),
+            false
+        ));
+        assert!(!consent_needed(
+            &usable(&[Kind::Wlr, Kind::Portal], true),
+            false
+        ));
+        // A grant that is already remembered stays quiet either way.
+        assert!(!consent_needed(
+            &usable(&[Kind::Wlr, Kind::Portal], false),
+            true
+        ));
+        // An X11 order has no wlr entry to drop.
+        assert!(!consent_needed(
+            &usable(&[Kind::NvFbc, Kind::X11, Kind::Portal], false),
             false
         ));
     }
