@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 use tracing_appender::non_blocking::{ErrorCounter, WorkerGuard};
-use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 mod files;
 pub use files::{MAX_FILE_MIB, MAX_TOTAL_MIB, RETENTION_DAYS};
 
@@ -209,9 +209,36 @@ pub fn apply(mut settings: Settings) -> Result<()> {
     state.error = None;
     Ok(())
 }
+/// systemd 给服务的标准错误接上 journal 时会设 `JOURNAL_STREAM=设备号:inode`，两个
+/// 数都是十进制。这个变量会被子进程继承，桌面自己拉起的程序也可能带着它（niri 的
+/// 会话里就有），所以光看它在不在会给没接 journal 的进程也挂一层 stderr，要比一比
+/// 自己标准错误的 `dev:ino`。
+#[cfg(target_os = "linux")]
+fn in_journal() -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Some(value) = std::env::var_os("JOURNAL_STREAM") else {
+        return false;
+    };
+    let Ok(stderr) = std::fs::metadata("/proc/self/fd/2") else {
+        return false;
+    };
+    value
+        .to_str()
+        .is_some_and(|value| value == format!("{}:{}", stderr.dev(), stderr.ino()))
+}
+
+/// journal 是 Linux 的 systemd 才有的东西。
+#[cfg(not(target_os = "linux"))]
+fn in_journal() -> bool {
+    false
+}
+
 /// All viewer children belong to this application launch.
 pub fn configure_child(command: &mut std::process::Command) {
     if let Some(r) = RUNTIME.get() {
+        // 继承下去的 `JOURNAL_STREAM` 是父进程的流，子进程的标准错误接到哪儿由父进程
+        // 决定，留着这个变量只会让子进程以为自己也在 journal 里。
+        command.env_remove("JOURNAL_STREAM");
         command.env("OPENUUYC_LOG_SESSION", &r.session);
         command.env("OPENUUYC_LOG_STEM", &r.stem);
         let state = r.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -314,16 +341,18 @@ pub fn init(level: Option<&str>, path: Option<&Path>) -> Result<LoggingGuard> {
         .thread_name("log-writer")
         .finish(sink);
     let dropped = writer.error_counter();
-    // 被 systemd 起来时输出接在 journal 上，systemd 会设这个变量。日志平时只落
-    // 文件，这里再挂一层 stderr，`journalctl --user -u openuuyc` 才有内容。
-    let journal = std::env::var_os("JOURNAL_STREAM").map(|_| {
+    // 被 systemd 起来时标准错误接在 journal 上，日志平时只落文件，这时再挂一层
+    // stderr，`journalctl --user -u openuuyc` 才有内容。
+    let journal = in_journal().then(|| {
         tracing_subscriber::fmt::layer()
             .with_writer(std::io::stderr)
             .with_ansi(false)
-            .with_filter(filter.clone())
     });
+    // 过滤器挂在订阅者上而不是某一层上：两层（文件与 stderr）用同一份，改设置后
+    // 两层一起跟随。
     let (filter_layer, filter) = tracing_subscriber::reload::Layer::new(filter);
     tracing_subscriber::registry()
+        .with(filter_layer)
         .with(
             tracing_subscriber::fmt::layer()
                 .with_writer(writer)
@@ -333,8 +362,7 @@ pub fn init(level: Option<&str>, path: Option<&Path>) -> Result<LoggingGuard> {
                         .with_target(true)
                         .with_thread_ids(true),
                     session.clone(),
-                ))
-                .with_filter(filter_layer),
+                )),
         )
         .with(journal)
         .try_init()
