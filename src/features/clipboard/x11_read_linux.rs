@@ -159,9 +159,9 @@ fn fetch(
     let Some(property) = convert(connection, window, atoms, target)? else {
         return Ok(None);
     };
-    // 一开始必须删掉：INCR 期间每次 PropertyNotify 都要能看出「又有新的一段」。
+    // 先只看类型。
     let reply = connection
-        .get_property(true, window, property, AtomEnum::ANY, 0, 0)?
+        .get_property(false, window, property, AtomEnum::ANY, 0, 0)?
         .reply()
         .context("读取剪贴板属性失败")?;
     if reply.type_ != atoms.incr {
@@ -178,6 +178,13 @@ fn fetch(
     // 传输的总时限。一整块几十 MB 传上几秒是正常的，按整次计时会在中途超时，
     // 而这里的超时是直接放弃：上层拿到的是一份空快照，用户看到的是「复制了但
     // 什么都没过来」，连截断都不是。总量另有 `MAX` 管着。
+    //
+    // 传输从我们删掉 `INCR` 那个记号开始，对端看到删除才写第一段。删除要单独发：
+    // `GetProperty` 只在一次读完整个属性时才顺手删掉它，上面那次只读了零个字节。
+    connection
+        .delete_property(window, property)?
+        .check()
+        .context("开始分段读取剪贴板失败")?;
     let mut data = Vec::new();
     let mut deadline = Instant::now() + WAIT;
     loop {
