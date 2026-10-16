@@ -21,6 +21,7 @@
 use crate::platform::{CompositorLayout, CompositorOutput, Rotation};
 use anyhow::{Context, Result, bail};
 use std::os::fd::AsRawFd;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 use wayland_client::protocol::{wl_callback, wl_output, wl_registry};
@@ -40,6 +41,10 @@ const RETRY_MAX: Duration = Duration::from_secs(60);
 const WAIT_POLL: Duration = Duration::from_millis(100);
 
 static SNAPSHOT: RwLock<Option<Arc<CompositorLayout>>> = RwLock::new(None);
+/// Set when the watcher's latest attempt failed, cleared when it next publishes
+/// a layout: [`layout_soon`] does not wait on a compositor that has already
+/// said it cannot describe one.
+static UNAVAILABLE: AtomicBool = AtomicBool::new(false);
 
 /// The latest layout the compositor described, without waiting for it.
 ///
@@ -56,7 +61,9 @@ pub(crate) fn layout() -> Option<Arc<CompositorLayout>> {
 ///
 /// A caller that cannot go on without the layout, and is not in anyone's hot
 /// path, asks this way; the wait is bounded so a compositor that never answers
-/// costs it one pause rather than hanging. Without a Wayland session there is
+/// costs one pause rather than hanging. Once the watcher has failed, later
+/// calls return at once until it describes the layout again, so that pause is
+/// paid by the process, not by every call. Without a Wayland session there is
 /// nothing to wait for at all.
 pub(crate) fn layout_soon() -> Option<Arc<CompositorLayout>> {
     if !watching() {
@@ -66,6 +73,9 @@ pub(crate) fn layout_soon() -> Option<Arc<CompositorLayout>> {
     loop {
         if let Some(layout) = layout() {
             return Some(layout);
+        }
+        if UNAVAILABLE.load(Ordering::Acquire) {
+            return None;
         }
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
@@ -92,6 +102,9 @@ fn watching() -> bool {
 
 fn publish(layout: Option<CompositorLayout>) {
     let mut snapshot = SNAPSHOT.write().unwrap_or_else(|e| e.into_inner());
+    if layout.is_some() {
+        UNAVAILABLE.store(false, Ordering::Release);
+    }
     if snapshot.as_deref() != layout.as_ref() {
         tracing::info!(?layout, "合成器输出布局");
         *snapshot = layout.map(Arc::new);
@@ -108,6 +121,7 @@ fn watch() {
             Ok(never) => match never {},
         };
         publish(None);
+        UNAVAILABLE.store(true, Ordering::Release);
         if described {
             pause = RETRY_FIRST;
         }
