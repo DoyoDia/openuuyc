@@ -44,6 +44,11 @@ pub(crate) struct Engine {
     /// Why absolute positions last went where they did, so a change is
     /// logged once rather than on every event.
     aim_space: Option<Result<(), String>>,
+    /// The pointer was last placed through the absolute device, so the
+    /// device's axis values are where the pointer is. After a relative move
+    /// (or an absolute position that fell back to one) they are stale, and
+    /// writing them again would throw the pointer back there.
+    aimed: bool,
 }
 
 impl Engine {
@@ -80,6 +85,7 @@ impl Engine {
             foreground: None,
             mouse_policy: Default::default(),
             aim_space: None,
+            aimed: false,
         })
     }
     pub fn backend(&self) -> &'static str {
@@ -93,7 +99,15 @@ impl Engine {
     /// 请合成器重新判定一次指针底下是谁：把指针在原地重报一次。Wayland 的拖放接取
     /// 面摆在指针底下，而合成器只在指针真的动过之后才重判（见
     /// `platform::linux::input::realign_pointer`）。
+    ///
+    /// 只在指针最后一次是经绝对设备摆的位置时才重报：设备轴上的值只在那时与指针
+    /// 一致，相对移动之后再写它，指针会被甩回旧位置。被控本机的人在最后一次注入
+    /// 之后自己动过鼠标，轴上的值同样会过期，这里看不出来；拖出时被控端一般没人
+    /// 碰鼠标，所以不另做处理。
     pub fn realign_pointer(&mut self) -> Result<bool> {
+        if !self.aimed {
+            return Ok(false);
+        }
         self.injector.realign()
     }
     pub fn configure(&mut self, configuration: super::config::Configuration) -> Result<()> {
@@ -219,8 +233,11 @@ impl Engine {
             && let Some(logical) = logical
         {
             let (px, py) = point_in(logical, x, y);
-            return self.injector.aim(px, py, bounds);
+            let result = self.injector.aim(px, py, bounds);
+            self.aimed = result.is_ok();
+            return result;
         }
+        self.aimed = false;
         let (px, py) = point_in(rect?, x, y);
         self.injector.move_to(px, py)
     }
@@ -349,6 +366,7 @@ impl Engine {
                 self.button(button, false)?;
             }
             Event::Relative { x, y } => {
+                self.aimed = false;
                 ensure!(
                     x.unsigned_abs() <= 1_000_000 && y.unsigned_abs() <= 1_000_000,
                     "相对位移过大"
@@ -356,6 +374,7 @@ impl Engine {
                 self.injector.move_by(x, y)?;
             }
             Event::RelativeScaled { screen, x, y } => {
+                self.aimed = false;
                 let s = self.geometry.screen(screen)?;
                 self.injector.move_by(
                     (f64::from(s.width) * x).round() as i32,
@@ -417,6 +436,7 @@ impl Engine {
         self.interruptible = false;
         self.backspace = false;
         self.injector.forget_aim();
+        self.aimed = false;
         let flushed = self.injector.flush();
         match failure {
             Some(e) => Err(e),

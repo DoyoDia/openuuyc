@@ -436,7 +436,7 @@ fn run(
             match engine.realign_pointer() {
                 Ok(true) => tracing::debug!("指针在原地重报了一次"),
                 Ok(false) => {
-                    tracing::debug!("没有可用的绝对指针，接取面只能等合成器自己重判")
+                    tracing::debug!("指针不是经绝对指针摆的位置，接取面只能等合成器自己重判")
                 }
                 Err(error) => tracing::debug!(%error, "指针原地重报失败"),
             }
