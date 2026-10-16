@@ -34,7 +34,8 @@ XFCE、MATE、Cinnamon 等桌面上它改写 ~/.config/autostart/openuuyc.deskto
 
     sudo systemctl enable --now openuuyc-vkms.socket
 
-还需要内核带 VKMS 模块（CONFIG_DRM_VKMS）；没开的话诊断页里会说明。
+还需要 Linux 6.19 或更新的内核带 CONFIG_DRM_VKMS，而且当前合成器能把新输出接进
+桌面布局（目前只有 niri）；条件不满足时诊断页里会写明是哪一条不满足。
 EOF
 }
 
