@@ -74,6 +74,19 @@ impl Content {
         }
     }
 
+    /// 回应 `target` 时属性的类型。
+    ///
+    /// 按 ICCCM，`TEXT` 是「由持有者挑一种编码」，回应里写的是挑中的那种：文本给的是
+    /// Latin-1（见 `payload`），也就是 `STRING`；文件那份的路径文本是 UTF-8。其余类型
+    /// 问什么就是什么。
+    fn kind(&self, target: &'static str) -> &'static str {
+        match (self, target) {
+            (Self::Text(_), "TEXT") => "STRING",
+            (Self::Files(_), "TEXT") => "UTF8_STRING",
+            _ => target,
+        }
+    }
+
     /// 某个类型上要给的字节。
     fn payload(&self, target: &str) -> Vec<u8> {
         match self {
@@ -463,8 +476,15 @@ fn reply(
             )?
             .check()?;
     } else if let Some(index) = atoms.data.iter().position(|atom| *atom == request.target) {
-        let data = content.payload(content.targets()[index]);
-        let kind = request.target;
+        let target = content.targets()[index];
+        let data = content.payload(target);
+        // 两份清单里都有 `STRING` 和 `UTF8_STRING`，找不到只会是清单改坏了，那就照旧
+        // 写被问的类型。
+        let kind = content
+            .targets()
+            .iter()
+            .position(|name| *name == content.kind(target))
+            .map_or(request.target, |kind| atoms.data[kind]);
         if data.len() <= chunk {
             connection
                 .change_property8(PropMode::REPLACE, requestor, property, kind, &data)?
@@ -586,6 +606,10 @@ mod tests {
             [0x63, 0x61, 0x66, 0xe9, 0x20, b'?', b'?']
         );
         assert_eq!(content.payload("TEXT"), content.payload("STRING"));
+        // `TEXT` 的回应要写实际的编码，Latin-1 就是 `STRING`。
+        assert_eq!(content.kind("TEXT"), "STRING");
+        assert_eq!(content.kind("UTF8_STRING"), "UTF8_STRING");
+        assert_eq!(content.kind("STRING"), "STRING");
     }
 
     /// 文件那份还是老样子：`text/uri-list` 是 file URI，其余类型给路径文本。
@@ -601,5 +625,8 @@ mod tests {
             String::from_utf8(content.payload("UTF8_STRING")).unwrap(),
             "/tmp/a b.txt"
         );
+        // 路径文本是 UTF-8，`TEXT` 就照实说。
+        assert_eq!(content.payload("TEXT"), content.payload("UTF8_STRING"));
+        assert_eq!(content.kind("TEXT"), "UTF8_STRING");
     }
 }
