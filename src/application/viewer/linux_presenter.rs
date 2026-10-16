@@ -462,13 +462,16 @@ impl ConnectingWindowsRunner {
             } else if let Stage::Playing(player) = stage {
                 let relative = player.input().relative_mode();
                 let menu_open = player.stream_control_ui.open;
+                // 切屏、切设备期间浮动栏不收起，等待态一直看得见（Windows 传的是
+                // `screen_tabs.is_pending()`，同一个判断）。
+                let pending = player.is_pending();
                 // 全屏那根浮动条和平时是同一根（Windows 也是），所以设备切换菜单
                 // 在这儿一样能点。
                 let switcher = player.device_switch();
                 close_requested |=
                     shell
                         .fullscreen_chrome
-                        .show(&ctx, relative, menu_open, false, |ui| {
+                        .show(&ctx, relative, menu_open, pending, |ui| {
                             let bar = ui.available_rect_before_wrap();
                             let close = match switcher.as_ref() {
                                 Some(switcher) => {
@@ -984,6 +987,7 @@ impl Player {
             && window.is_minimized() != Some(true)
             && !control.drag_drop().interactive()
             && !self.stream_control_ui.open
+            && !self.is_pending()
             && !ctx.any_popup_open()
             && !ctx.text_edit_focused()
             && let Err(error) = control.restore_input_control()
@@ -2094,13 +2098,18 @@ impl Player {
         }
     }
 
-    fn local_ui_owns_input(&self, context: &egui::Context) -> bool {
-        // 切屏与设备切换期间不转发输入：两边都在换轨道，键鼠很容易落到别处。
-        self.stream_control_ui.open
-            || self.pending.is_some()
+    /// 正在切屏或切设备，和 Windows `ScreenTabBar::is_pending` 同一个判断。
+    fn is_pending(&self) -> bool {
+        self.pending.is_some()
             || self
                 .device_switch()
                 .is_some_and(|switcher| switcher.is_switching())
+    }
+
+    fn local_ui_owns_input(&self, context: &egui::Context) -> bool {
+        // 切屏与设备切换期间不转发输入：两边都在换轨道，键鼠很容易落到别处。
+        self.stream_control_ui.open
+            || self.is_pending()
             || context.any_popup_open()
             || context.text_edit_focused()
             || context.memory(|memory| memory.top_modal_layer().is_some())
