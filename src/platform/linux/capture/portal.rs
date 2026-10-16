@@ -20,7 +20,7 @@ use super::Picture;
 use super::Screen;
 use super::pipewire::Stream;
 use crate::platform::CompositorLayout;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use ashpd::desktop::PersistMode;
 use ashpd::desktop::screencast::{
     CursorMode, OpenPipeWireRemoteOptions, Screencast, SelectSourcesOptions, SourceType,
@@ -168,9 +168,54 @@ impl Session {
         // monitor's (see `pick`). Outside a Wayland session this returns at
         // once, and inside one only the process's first ask waits a round trip.
         let layout = crate::platform::display::compositor_layout_soon();
-        let index = pick(&self.sources, screen, layout.as_deref())
-            .context("所选显示器不在本机授权共享的屏幕中")?;
-        Ok(&self.sources[index])
+        if let Some(index) = pick(&self.sources, screen, layout.as_deref()) {
+            return Ok(&self.sources[index]);
+        }
+        // Everything a report needs to tell which side had it wrong.
+        tracing::warn!(
+            screen = %screen.device_name,
+            left = screen.left,
+            top = screen.top,
+            width = screen.width,
+            height = screen.height,
+            sources = ?self.sources,
+            layout = layout.is_some(),
+            layout_output = ?layout.as_deref().and_then(|layout| layout.output(&screen.device_name)),
+            "门户共享的屏幕里找不到所选显示器"
+        );
+        Err(anyhow!(unmatched(
+            &self.sources,
+            screen,
+            layout.as_deref(),
+            super::wayland_session(),
+        )))
+    }
+}
+
+/// Why `pick` found no stream for `screen`, in words the user can act on.
+///
+/// On a scaled desktop a miss is rarely a monitor left out of the grant, and
+/// telling the user so would send them to revoke and grant it again for
+/// nothing; what was missing is the layout to pair by, or the name to look up.
+fn unmatched(
+    sources: &[Source],
+    screen: &Screen,
+    layout: Option<&CompositorLayout>,
+    wayland: bool,
+) -> String {
+    if sources.len() > 1 && sources.iter().all(|s| s.position.is_none()) {
+        return "门户没有给出共享屏幕的位置，无法区分共享的多块屏".to_owned();
+    }
+    match layout {
+        None if wayland => "读不到合成器的输出布局（需要 Wayland 会话和 xdg-output），\
+             缩放的桌面上无法确认门户共享的是哪块屏"
+            .to_owned(),
+        Some(layout) if layout.output(&screen.device_name).is_none() => format!(
+            "合成器布局里没有名为 {} 的输出（XWayland 23.1 之前输出名不是连接器名），\
+             缩放的桌面上无法确认门户共享的是哪块屏",
+            screen.device_name
+        ),
+        _ => "所选显示器不在本机授权共享的屏幕中".to_owned(),
     }
 }
 
@@ -281,7 +326,7 @@ impl Grab {
 
 #[cfg(test)]
 mod tests {
-    use super::{Source, pick};
+    use super::{Source, pick, unmatched};
     use crate::media::capture::Screen;
     use crate::platform::{CompositorLayout, CompositorOutput, Rotation};
 
@@ -495,5 +540,41 @@ mod tests {
             },
         ];
         assert_eq!(pick(&two, &wanted, None), None);
+    }
+
+    /// Each way of missing is told apart, so the user is not sent to grant a
+    /// monitor again when the grant was never the problem.
+    #[test]
+    fn a_miss_says_what_was_missing() {
+        let sources = [stream(0, 0, 1920, 1080)];
+        let wanted = screen("DP-2", 3840, 0, 3840, 2160);
+        assert!(unmatched(&sources, &wanted, None, true).contains("读不到合成器的输出布局"));
+        let other = layout(vec![output("DP-1", 0, 0, 1920, 1080)]);
+        let named = unmatched(&sources, &wanted, Some(&other), true);
+        assert!(named.contains("没有名为 DP-2 的输出"), "{named}");
+        // An X11 session has no layout to read, and the display server's
+        // rectangle is the portal's: a miss there is a monitor not shared.
+        assert_eq!(
+            unmatched(&sources, &wanted, None, false),
+            "所选显示器不在本机授权共享的屏幕中"
+        );
+        let knows = layout(vec![output("DP-2", 1920, 0, 1920, 1080)]);
+        assert_eq!(
+            unmatched(&sources, &wanted, Some(&knows), true),
+            "所选显示器不在本机授权共享的屏幕中"
+        );
+        let blind = [
+            Source {
+                node: 0,
+                position: None,
+                size: None,
+            },
+            Source {
+                node: 1,
+                position: None,
+                size: None,
+            },
+        ];
+        assert!(unmatched(&blind, &wanted, Some(&knows), true).contains("没有给出共享屏幕的位置"));
     }
 }
