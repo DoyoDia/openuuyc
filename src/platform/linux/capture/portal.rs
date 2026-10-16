@@ -163,17 +163,13 @@ impl Session {
 
     /// The shared monitor that is `screen`.
     fn source(&self, screen: &Screen) -> Result<&Source> {
-        // A desktop at scale 1 describes a monitor with the same rectangle in
-        // both spaces, so the display server's own answer is tried first and
-        // most sessions never ask the compositor anything.
-        let index = match pick(&self.sources, screen, None) {
-            Some(index) => index,
-            None => {
-                let layout = crate::platform::display::compositor_layout_soon();
-                pick(&self.sources, screen, layout.as_deref())
-                    .context("所选显示器不在本机授权共享的屏幕中")?
-            }
-        };
+        // Asked every time, not only when the display server's rectangle
+        // misses: on a desktop with mixed scales that rectangle can be another
+        // monitor's (see `pick`). Outside a Wayland session this returns at
+        // once, and inside one only the process's first ask waits a round trip.
+        let layout = crate::platform::display::compositor_layout_soon();
+        let index = pick(&self.sources, screen, layout.as_deref())
+            .context("所选显示器不在本机授权共享的屏幕中")?;
         Ok(&self.sources[index])
     }
 }
@@ -187,25 +183,22 @@ impl Session {
 /// scales both the position and the size by the display's scale, while
 /// xwayland-satellite keeps the logical position and sizes the output in its
 /// own pixels. So the compositor's own layout — the space the portal describes
-/// the monitor in — is what a scaled desktop is paired by, through the name the
-/// output is known by (`DP-1`, which RandR also reports as the monitor name).
+/// the monitor in — is what a monitor is paired by whenever it can be, through
+/// the name the output is known by (`DP-1`, which RandR also reports as the
+/// monitor name). The display server's rectangle is used only where there is
+/// no layout that names the monitor.
 ///
 /// Nothing here guesses: a monitor the layout cannot name, or a stream whose
 /// rectangle is not the layout's, leaves the screen unmatched, and the caller
 /// reports that rather than capturing a monitor nobody asked for.
 fn pick(sources: &[Source], screen: &Screen, layout: Option<&CompositorLayout>) -> Option<usize> {
-    let rectangle = (
-        (screen.left, screen.top),
-        (screen.width as i32, screen.height as i32),
-    );
-    if let Some(index) = sources
-        .iter()
-        .position(|s| s.position == Some(rectangle.0) && s.size == Some(rectangle.1))
-    {
-        return Some(index);
-    }
-    if let Some(output) = layout.and_then(|layout| layout.output(&screen.device_name))
-        && let Some(index) = sources.iter().position(|s| {
+    // A layout that names the monitor is the only thing it is paired by. The
+    // display server's rectangle lives in another space on a scaled desktop and
+    // can be exactly another monitor's portal rectangle: XWayland on Mutter
+    // scales a whole desktop of 200% and 100% monitors by 2, so the second of
+    // two 200% monitors sits where the portal puts a 100% third one.
+    if let Some(output) = layout.and_then(|layout| layout.output(&screen.device_name)) {
+        if let Some(index) = sources.iter().position(|s| {
             s.position == Some((output.left, output.top))
                 // A toolkit that rounds a fractional layout size on its way to
                 // XWayland (KWin) is off by a unit; a position is never rounded.
@@ -213,9 +206,22 @@ fn pick(sources: &[Source], screen: &Screen, layout: Option<&CompositorLayout>) 
                     (i64::from(width) - i64::from(output.width)).abs() <= 1
                         && (i64::from(height) - i64::from(output.height)).abs() <= 1
                 })
-        })
-    {
-        return Some(index);
+        }) {
+            return Some(index);
+        }
+    } else {
+        // No layout to ask (an X11 session) or none that knows the name: the
+        // two spaces agree only at scale 1, and that is all this can pair.
+        let rectangle = (
+            (screen.left, screen.top),
+            (screen.width as i32, screen.height as i32),
+        );
+        if let Some(index) = sources
+            .iter()
+            .position(|s| s.position == Some(rectangle.0) && s.size == Some(rectangle.1))
+        {
+            return Some(index);
+        }
     }
     match sources {
         // A single shared monitor without geometry can only be this one.
@@ -319,6 +325,37 @@ mod tests {
 
     fn layout(outputs: Vec<CompositorOutput>) -> CompositorLayout {
         CompositorLayout { outputs }
+    }
+
+    /// GNOME 50 with three 4K monitors side by side, the first two at 200% and
+    /// the third at 100%: XWayland scales the whole desktop by 2, so the second
+    /// monitor's RandR rectangle is exactly the third one's portal rectangle.
+    /// The layout names every monitor, and each must find its own stream.
+    #[test]
+    fn mixed_scales_pair_by_the_layout_even_where_a_rectangle_collides() {
+        let sources = [
+            stream(0, 0, 1920, 1080),
+            stream(1920, 0, 1920, 1080),
+            stream(3840, 0, 3840, 2160),
+        ];
+        let layout = layout(vec![
+            output("DP-1", 0, 0, 1920, 1080),
+            output("DP-2", 1920, 0, 1920, 1080),
+            output("DP-3", 3840, 0, 3840, 2160),
+        ]);
+        let screens = [
+            screen("DP-1", 0, 0, 3840, 2160),
+            screen("DP-2", 3840, 0, 3840, 2160),
+            screen("DP-3", 7680, 0, 7680, 4320),
+        ];
+        for (index, wanted) in screens.iter().enumerate() {
+            assert_eq!(
+                pick(&sources, wanted, Some(&layout)),
+                Some(index),
+                "{}",
+                wanted.device_name
+            );
+        }
     }
 
     /// A desktop at scale 1 is described with one rectangle by both sides.
