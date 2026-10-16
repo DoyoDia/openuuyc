@@ -61,14 +61,8 @@ impl Client {
     }
 
     pub fn create(&mut self, width: u32, height: u32, hz: u32) -> Result<String> {
-        let reply = self.call(&Request::Create {
-            width,
-            height,
-            hz,
-        })?;
-        reply
-            .connector
-            .context("辅助程序没有报出连接器名")
+        let reply = self.call(&Request::Create { width, height, hz })?;
+        reply.connector.context("辅助程序没有报出连接器名")
     }
 
     pub fn destroy(&mut self, connector: &str) -> Result<()> {

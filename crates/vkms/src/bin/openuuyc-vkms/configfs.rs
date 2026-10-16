@@ -140,7 +140,10 @@ impl Instance {
             };
             // 报给客户端的是 DRM 连接器名（`Virtual-5`），不是 sysfs 目录名
             // （`card5-Virtual-5`）：合成器只认前者。
-            names.push((index.parse().context("连接器编号不是数字")?, rest.to_owned()));
+            names.push((
+                index.parse().context("连接器编号不是数字")?,
+                rest.to_owned(),
+            ));
         }
         names.sort();
         Ok(names.into_iter().map(|(_, name)| name).collect())
@@ -192,7 +195,9 @@ fn instance_dir() -> PathBuf {
     Path::new(ROOT).join(INSTANCE)
 }
 fn connector_slot(slot: usize) -> PathBuf {
-    instance_dir().join("connectors").join(format!("conn{slot}"))
+    instance_dir()
+        .join("connectors")
+        .join(format!("conn{slot}"))
 }
 
 /// 让内核加载 vkms。已经加载过就什么都不做——参数是加载那一刻定的，改不了。
@@ -234,7 +239,10 @@ fn build(instance: &Path) -> Result<()> {
                 .with_context(|| format!("无法创建 {}", directory.display()))?;
         }
         // 管线要连起来才成一条：平面和编码器都能用这个 CRTC，连接器能用这个编码器。
-        symlink(&crtc, &plane.join("possible_crtcs").join(format!("crtc{slot}")))?;
+        symlink(
+            &crtc,
+            &plane.join("possible_crtcs").join(format!("crtc{slot}")),
+        )?;
         symlink(
             &crtc,
             &encoder.join("possible_crtcs").join(format!("crtc{slot}")),
@@ -294,9 +302,7 @@ fn wait_for_card(deadline: Duration) -> Result<String> {
                     continue;
                 }
                 let device = entry.path().join("device");
-                if std::fs::read_link(&device)
-                    .is_ok_and(|target| target.ends_with(INSTANCE))
-                {
+                if std::fs::read_link(&device).is_ok_and(|target| target.ends_with(INSTANCE)) {
                     return Ok(name);
                 }
             }
@@ -310,7 +316,10 @@ fn wait_for_card(deadline: Duration) -> Result<String> {
 }
 
 fn set_status(slot: usize, status: Status) -> Result<()> {
-    write_attr(&connector_slot(slot).join("status"), &(status as u8).to_string())
+    write_attr(
+        &connector_slot(slot).join("status"),
+        &(status as u8).to_string(),
+    )
 }
 
 /// 写 configfs 属性。一次 write 必须把整份内容带过去：内核是按这一次调用来解析的，
@@ -323,13 +332,17 @@ fn write_attr(path: &Path, value: &str) -> Result<()> {
     let written = file
         .write(value.as_bytes())
         .with_context(|| format!("写入 {} 失败", path.display()))?;
-    ensure!(written == value.len(), "{} 只写进去了一部分", path.display());
+    ensure!(
+        written == value.len(),
+        "{} 只写进去了一部分",
+        path.display()
+    );
     Ok(())
 }
 
 fn read_trim(path: &Path) -> Result<String> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("无法读取 {}", path.display()))?;
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("无法读取 {}", path.display()))?;
     Ok(text.trim().to_owned())
 }
 
@@ -342,11 +355,10 @@ fn symlink(target: &Path, link: &Path) -> Result<()> {
 }
 
 fn remove_ignore_missing(path: &Path) -> Result<()> {
-    match std::fs::remove_file(path)
-        .or_else(|error| match error.kind() {
-            std::io::ErrorKind::IsADirectory => std::fs::remove_dir(path),
-            _ => Err(error),
-        }) {
+    match std::fs::remove_file(path).or_else(|error| match error.kind() {
+        std::io::ErrorKind::IsADirectory => std::fs::remove_dir(path),
+        _ => Err(error),
+    }) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         other => other.with_context(|| format!("无法删除 {}", path.display())),
     }

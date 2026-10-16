@@ -10,7 +10,7 @@ mod configfs;
 mod peer;
 
 use anyhow::{Context, Result, ensure};
-use openuuyc_vkms::protocol::{Reply, Request, MAX_DIMENSION, MAX_HZ, MIN_DIMENSION};
+use openuuyc_vkms::protocol::{MAX_DIMENSION, MAX_HZ, MIN_DIMENSION, Reply, Request};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
@@ -203,14 +203,12 @@ fn serve(shared: &Shared, id: u64, stream: UnixStream) {
             Ok(request) => match &refusal {
                 Some(error) => Reply::failed(format!("{error:#}")),
                 None => match request {
-                    Request::Create {
-                        width,
-                        height,
-                        hz,
-                    } => match shared.create(id, width, height, hz) {
-                        Ok(connector) => Reply::connector(connector),
-                        Err(error) => Reply::failed(error),
-                    },
+                    Request::Create { width, height, hz } => {
+                        match shared.create(id, width, height, hz) {
+                            Ok(connector) => Reply::connector(connector),
+                            Err(error) => Reply::failed(error),
+                        }
+                    }
                     Request::Destroy { connector } => match shared.destroy(id, &connector) {
                         Ok(()) => Reply::done(),
                         Err(error) => Reply::failed(error),
@@ -242,7 +240,10 @@ fn serve(shared: &Shared, id: u64, stream: UnixStream) {
 
 fn validate(width: u32, height: u32, hz: u32) -> Result<()> {
     let size = MIN_DIMENSION..=MAX_DIMENSION;
-    ensure!(size.contains(&width) && size.contains(&height), "无效的虚拟显示器尺寸");
+    ensure!(
+        size.contains(&width) && size.contains(&height),
+        "无效的虚拟显示器尺寸"
+    );
     ensure!((1..=MAX_HZ).contains(&hz), "无效的虚拟显示器刷新率");
     Ok(())
 }
@@ -286,16 +287,20 @@ fn listen(path: &str) -> Result<UnixListener> {
         }
         _ => {}
     }
-    let listener = UnixListener::bind(path)
-        .with_context(|| format!("无法监听 {}", path.display()))?;
+    let listener =
+        UnixListener::bind(path).with_context(|| format!("无法监听 {}", path.display()))?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(SOCKET_MODE))
         .context("无法设置套接字权限")?;
     Ok(listener)
 }
 
 fn activated() -> bool {
-    let pid = std::env::var("LISTEN_PID").ok().and_then(|v| v.parse::<u32>().ok());
-    let fds = std::env::var("LISTEN_FDS").ok().and_then(|v| v.parse::<u32>().ok());
+    let pid = std::env::var("LISTEN_PID")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok());
+    let fds = std::env::var("LISTEN_FDS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok());
     pid == Some(std::process::id()) && fds.unwrap_or(0) >= 1
 }
 
