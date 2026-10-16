@@ -195,7 +195,7 @@ pub(super) fn local_path(value: &str) -> Result<PathBuf> {
             && bytes[0].is_ascii_alphabetic()
             && bytes[1] == b':'
             && matches!(bytes[2], b'/' | b'\\'),
-        "仅支持本地磁盘的绝对路径"
+        "仅支持本地磁盘的绝对路径：{text}"
     );
     let mut result = PathBuf::from(format!("{}:\\", bytes[0] as char));
     let tail = text[3..].trim_end_matches(['\\', '/']);
