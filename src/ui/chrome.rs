@@ -151,15 +151,13 @@ fn window_title_bar_impl(
             .enabled_buttons()
             .contains(winit::window::WindowButtons::MAXIMIZE),
     );
-    let drag = ui.interact(
-        caption_rect,
-        ui.id().with("window-title-drag"),
-        egui::Sense::click_and_drag(),
-    );
-    if let Some(state) = move_state {
-        update_nonmodal_window_move(ui.ctx(), window, &drag, state);
-    } else if handle_title_drag(window, &drag) {
-        let _ = window.drag_window();
+    // 调用方自己画标题那一格时（播放器的设备切换按钮），拖动区和 Windows 的
+    // `player-title-drag` 一样从那一格右边开始，免得按住设备按钮一拖就拖动了窗口；
+    // 那一格要先画出来才知道有多宽，所以拖动区放到后面登记（两者不重叠，先后无所谓）。
+    let mut move_state = move_state;
+    let has_identity = identity.is_some();
+    if !has_identity {
+        title_drag(ui, window, caption_rect, move_state.take());
     }
     let brand_rect = if alert.is_some() {
         egui::Rect::from_min_max(
@@ -197,7 +195,19 @@ fn window_title_bar_impl(
     caption.set_clip_rect(brand_rect);
     paint_brand_logo(&mut caption);
     match identity {
-        Some(draw) => draw(&mut caption),
+        Some(draw) => {
+            draw(&mut caption);
+            let start = caption
+                .min_rect()
+                .right()
+                .clamp(caption_rect.left(), caption_rect.right());
+            title_drag(
+                ui,
+                window,
+                egui::Rect::from_min_max(egui::pos2(start, caption_rect.top()), caption_rect.max),
+                move_state.take(),
+            );
+        }
         None => {
             caption.add(
                 egui::Label::new(
@@ -229,6 +239,25 @@ fn window_title_bar_impl(
     let close = window_buttons_impl(&mut controls, window, tooltips);
     ui.allocate_rect(rect, egui::Sense::hover());
     close
+}
+
+/// 标题栏上能拖动窗口的那一片。
+fn title_drag(
+    ui: &mut egui::Ui,
+    window: &Window,
+    area: egui::Rect,
+    move_state: Option<&mut WindowMoveState>,
+) {
+    let drag = ui.interact(
+        area,
+        ui.id().with("window-title-drag"),
+        egui::Sense::click_and_drag(),
+    );
+    if let Some(state) = move_state {
+        update_nonmodal_window_move(ui.ctx(), window, &drag, state);
+    } else if handle_title_drag(window, &drag) {
+        let _ = window.drag_window();
+    }
 }
 
 pub(crate) fn paint_title_alert(ui: &egui::Ui, alert: &TitleBarAlert, rect: egui::Rect) {
