@@ -387,8 +387,11 @@ mod uinput {
     /// 触摸屏的那条路径不读这个轴，公开接口里也没有触摸屏的接触面积，所以合成器和
     /// 应用拿不到它。
     ///
-    /// 设备坐标是「面板自己」的坐标：合成器读它的时候会套上输出当前的旋转和缩放
-    /// （`panel` 就是这件事的逆），所以屏幕大小和缩放都不进这里。
+    /// 设备坐标是「面板自己」的比例坐标，合成器把它铺到映射给它的那块输出（或者
+    /// 整块布局）上，所以屏幕大小和缩放都不进这里。铺的时候套不套输出的旋转各家
+    /// 不同：niri 和 KWin 总是套，mutter、wlroots 和 Hyprland 只在用户配了映射或
+    /// 变换时才套。所以转过的屏引擎一律不交给它（见 engine 里的 `route_for`）；
+    /// `panel` 是「总是套旋转」那一类合成器的逆，留给以后按合成器逐个放开。
     ///
     /// 只在 Wayland 会话下建（`Injector::open` 里跟着 uinput 设备走）。Xorg 的
     /// libinput 驱动会把一块没有映射的触摸屏铺满整个 X screen，也就是横跨所有
@@ -614,12 +617,14 @@ mod uinput {
     /// A position on the screen as a fraction of it, to the same position as a
     /// fraction of the touchscreen's own, untransformed panel.
     ///
-    /// The compositor does the opposite: it reads a touch as a fraction of the
-    /// panel and applies the output's transform to it, in the output's
-    /// rectangle (smithay's `transform_point_in`, which is what a compositor
-    /// scales a touch device's axes with). Undoing that is this inverse, in
-    /// normalized coordinates: both spaces are the unit square, so the axis
-    /// lengths, the output's scale and its physical size never enter.
+    /// A compositor that turns touches with the output does the opposite: it
+    /// reads a touch as a fraction of the panel and applies the output's
+    /// transform to it, in the output's rectangle (smithay's
+    /// `transform_point_in`, which niri scales a touch device's axes with;
+    /// KWin's `devicePointToGlobalPosition` turns the same way but ignores the
+    /// flips). Undoing that is this inverse, in normalized coordinates: both
+    /// spaces are the unit square, so the axis lengths, the output's scale and
+    /// its physical size never enter.
     fn panel(rotation: Rotation, x: f32, y: f32) -> (f32, f32) {
         match rotation {
             Rotation::Normal => (x, y),
@@ -679,7 +684,7 @@ mod uinput {
             assert!(contacts.used.iter().all(|used| !used));
         }
 
-        /// 合成器把设备的坐标按输出的旋转解释，所以转过的屏上两条轴要换过来报。
+        /// 会按输出旋转解释设备坐标的合成器（niri、KWin）上，转过的屏两条轴要换过来报。
         #[test]
         fn a_rotated_output_moves_the_axes_the_panel_reports() {
             let mut contacts = Contacts::default();

@@ -70,9 +70,13 @@ enum Route {
 /// 差——模拟走绝对指针，落点总是对的。所以三件事都得成立：
 ///
 /// - 合成器布局拿得到（Wayland 会话），而且里面恰好一块输出；
-/// - 主控这边也恰好一块屏（`geometry.screens` 就是主控看的东西）；
-/// - 这块屏没被转过：坐标要按输出旋转反算，而只有 smithay 系（niri）会按输出旋转
-///   解释触摸屏坐标，Hyprland 与 mutter 不会，反算反而落错地方。
+/// - 被控端也恰好一块屏（`geometry.screens` 是被控端全部的屏幕，不只是主控正在
+///   看的那块）；
+/// - 合成器里这块输出没被转过：转过的屏上触摸屏坐标转不转，取决于合成器和用户的
+///   配置。niri 和 KWin 总是按输出旋转；mutter 只在把触摸屏映射到某块屏时转，不
+///   映射时铺满整个舞台、不转；wlroots（sway）只在配了 `map_to_output` 时转；
+///   Hyprland 只在配了 `input:touchdevice:transform` 时转。这边看不出是哪一种，
+///   反算错了就落错地方。
 ///
 /// 以后某个合成器的映射能确切知道了（按合成器逐个放开、或者读 niri 的
 /// `map-to-output`），再改这里。
@@ -84,7 +88,7 @@ fn route_for(layout: Option<&CompositorLayout>, screens: &[Screen]) -> Result<Ro
         return Err(format!("合成器有 {} 块屏", layout.outputs.len()));
     };
     let [screen] = screens else {
-        return Err(format!("主控这边有 {} 块屏", screens.len()));
+        return Err(format!("被控端有 {} 块屏", screens.len()));
     };
     // 旋转看合成器里这块输出自己的，不看 `screen`：屏幕和输出是按名字配对的，
     // XWayland 起的名字和 `wl_output` 的对不上时，屏幕那边就只剩默认的不旋转。
@@ -697,7 +701,7 @@ mod tests {
 
         let mut two = one.clone();
         two.push(screen(1, (0, 0, 1920, 1080), single.outputs.first()));
-        assert!(route_for(Some(&single), &two).is_err(), "主控这边两块屏");
+        assert!(route_for(Some(&single), &two).is_err(), "被控端两块屏");
 
         let mut turned = single.clone();
         turned.outputs[0].rotation = Rotation::Rotate90;
