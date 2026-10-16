@@ -729,17 +729,17 @@ impl ApplicationHandler<UiEvent> for ConnectingWindowsRunner {
             if let Some(window) = self.window.clone() {
                 player.refresh_catalog(&window);
             }
-            match player.poll() {
-                Ok(true) => self.schedule_now(),
-                // Nothing decoded: egui asks for the repaints it needs and the
-                // wake bridge covers the next frame, so the loop can sleep.
-                // Repainting the whole UI at the display rate instead would
-                // leave an arriving frame waiting for the pass in progress.
-                Ok(false) => {}
-                Err(error) => {
-                    self.fail(event_loop, &error);
-                    return;
-                }
+            if player.connection_ended() {
+                // 和 Windows 一样干净地退出：结束的原因由 controller 那边报。
+                self.exit(event_loop);
+                return;
+            }
+            // Nothing decoded: egui asks for the repaints it needs and the
+            // wake bridge covers the next frame, so the loop can sleep.
+            // Repainting the whole UI at the display rate instead would
+            // leave an arriving frame waiting for the pass in progress.
+            if player.poll() {
+                self.schedule_now();
             }
         }
         match self.next_repaint {
@@ -796,8 +796,10 @@ struct Player {
     session: Arc<NativeViewerSession>,
     /// 连接开始时的那条会话。带着「连接结束」句柄的是它
     /// （`session/controller/viewing.rs` 的 `present_video`），切到别的屏之后也得靠它
-    /// 发现连接没了。
+    /// 的 shutdown 标志发现连接没了（见 [`Player::connection_ended`]）。
     initial: Arc<NativeViewerSession>,
+    /// 正在显示的那块屏的解码器已经报过致命错误：弹一次窗就够了，换屏时复位。
+    session_failed: bool,
     /// 这个连接上所有能看的屏，以及每块屏各自的解码器。多窗口时共用同一份。
     screens: super::screens::ScreenPlayback,
     /// 顶栏 tab 用的屏目录：对端报的屏，加上拓扑里还没落定的那几块。
@@ -898,6 +900,7 @@ impl Player {
             _shortcuts: crate::application::viewer_shortcuts::Watcher::new()?,
             session,
             initial,
+            session_failed: false,
             screens,
             catalog,
             next_refresh: Instant::now(),
@@ -1057,6 +1060,7 @@ impl Player {
             self.wake = FrameWakeBridge::install(&session, self.proxy.clone(), self.window_id)?;
         }
         self.session = session;
+        self.session_failed = false;
         self.pending = None;
         self.current = None;
         self.video_size = None;
@@ -1237,13 +1241,37 @@ impl Player {
         }
     }
 
+    /// 连接结束了：和 Windows `ScreenWindows::update` 一样，只看连接开始时那条会话的
+    /// shutdown 标志。连接结束时 controller 关的是它（`present_video` 交出去的
+    /// close 句柄），切到别的屏之后也一样；它的解码器在后台出错不算连接结束。
+    fn connection_ended(&self) -> bool {
+        self.initial
+            .shutdown
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// True when a decoded frame is waiting to go up.
-    fn poll(&mut self) -> Result<bool> {
+    ///
+    /// 正在显示的那块屏的解码器停了（硬解初始化失败、回退失败等写进 `fatal_error`
+    /// 的错误），窗口不再有新帧：和 Windows 播放器每帧查 `fatal_error` 一样弹出
+    /// 「显示器操作失败」，但不关窗口，用户还能切到别的屏。
+    fn poll(&mut self) -> bool {
         self.confirm_neutral();
-        // 连接还在不在，问的是连接开始时那条会话：切到别的屏之后只有它带着
-        // 「会话结束」的句柄，别的屏的解码线程要等窗口关掉才停。
-        self.initial.ensure_running()?;
-        Ok(mutex_lock(&self.session.frame_queue).is_some())
+        let failure = if self.session_failed {
+            None
+        } else {
+            mutex_lock(&self.session.fatal_error).clone()
+        };
+        if let Some(error) = failure {
+            self.session_failed = true;
+            tracing::error!(
+                screen_id = self.session.screen_id(),
+                %error,
+                "displayed screen decoder stopped"
+            );
+            self.report("显示器操作失败", error);
+        }
+        mutex_lock(&self.session.frame_queue).is_some()
     }
 
     /// Take the newest decoded frame; the decoder already replaced any the
