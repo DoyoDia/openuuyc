@@ -1,60 +1,24 @@
-//! Verify the GPU scaler's colours and the native-size exactness.
+//! Verify the GPU scaler plane by plane against a CPU reference.
 //!
-//! The converter now writes the requested output geometry directly. Two things
-//! must hold: at equal sizes the pass must stay a bit-exact `texelFetch` (the
-//! baseline behaviour), and when scaling it must still produce BT.601
-//! limited-range values without a channel swap or a flipped axis.
+//! The converter writes the requested output geometry directly. Two things
+//! must hold, both with and without an odd crop origin:
+//!
+//! - at equal sizes the pass stays the exact `texelFetch` it was: every Y and
+//!   UV byte is less than one level from the BT.601 limited-range value
+//!   computed here from the source texels, that is, it differs from the exact
+//!   value only by the final rounding. Drivers do not all round that last step
+//!   to nearest (NVIDIA's GLES sends a few percent of the bytes within 0.08 of
+//!   a tie the other way), so the probe counts those bytes without failing;
+//! - when scaling, every byte stays within `SCALED_TOLERANCE` of a bilinear
+//!   reference sampled at the same pixel centres the CPU `scale` used, and a
+//!   copy of that reference moved by half a source pixel must fail the same
+//!   test, so a sampling grid that is off by half a pixel cannot pass.
+//!
+//! The source is three sinusoids, one per channel along x, y and the diagonal,
+//! so a channel swap, a flipped axis or a shifted grid all change many bytes.
 #![allow(dead_code)]
-use std::os::fd::AsRawFd;
+use std::{os::fd::AsRawFd, rc::Rc, sync::Arc};
 
-mod media {
-    pub mod encoding {
-        #[derive(Clone, Copy, Debug, PartialEq)]
-        pub enum Codec {
-            H264,
-        }
-        #[derive(Clone, Copy, Debug)]
-        pub struct Format {
-            pub codec: Codec,
-            pub chroma: u8,
-            pub depth: u8,
-        }
-        impl Format {
-            pub const AVC: Self = Self {
-                codec: Codec::H264,
-                chroma: 1,
-                depth: 8,
-            };
-            pub fn valid(self) -> bool {
-                true
-            }
-        }
-        #[derive(Clone, Copy)]
-        pub struct Rate {
-            pub target: u32,
-            pub peak: u32,
-            pub fps: u32,
-            pub quality: i32,
-        }
-        pub struct Encoded {
-            pub data: Vec<u8>,
-            pub keyframe: bool,
-            pub timestamp_100ns: i64,
-            pub is_new: bool,
-            pub timing: Option<()>,
-            pub format: Format,
-            pub color: (),
-        }
-        pub enum Color {
-            Sdr,
-        }
-        impl Color {
-            pub fn space(self, _: Option<()>) {}
-        }
-    }
-}
-#[path = "../../../../../src/platform/linux/vaapi_encoder.rs"]
-mod encoder;
 #[path = "../../../../../src/platform/linux/gpu_convert.rs"]
 mod gpu_convert;
 /// The probe does no CUDA work beside VA-API, so there is no `cuInit` to
@@ -63,56 +27,191 @@ mod cuda {
     pub fn initialize_before_va() {}
 }
 
-const COLORS: [[u8; 3]; 8] = [
-    [0, 0, 0],
-    [255, 255, 255],
-    [0, 0, 255],
-    [0, 255, 0],
-    [255, 0, 0],
-    [255, 255, 0],
-    [255, 0, 255],
-    [0, 255, 255],
-];
-const EXPECT: [[u8; 3]; 8] = [
-    [16, 128, 128],
-    [235, 128, 128],
-    [81, 90, 240],
-    [145, 54, 34],
-    [41, 240, 110],
-    [170, 166, 16],
-    [106, 202, 222],
-    [210, 16, 146],
-];
+/// Largest difference a scaled byte may have from the reference. The GPU
+/// interpolates with a few bits of sub-texel precision; on this pattern that
+/// moves a byte by under one level (0.74 at most on NVIDIA's GLES), while a
+/// grid off by a quarter of a source pixel moves the worst byte by fifteen
+/// and half a pixel by thirty.
+const SCALED_TOLERANCE: f64 = 2.0;
 
-/// Sample the middle of each colour bar through the encoder's own import.
-fn sample(
-    nv: &std::sync::Arc<gpu_convert::OwnedNv12>,
-    display: &std::rc::Rc<cros_libva::Display>,
-    (w, h): (u32, u32),
-) -> anyhow::Result<Vec<[u8; 3]>> {
+/// One BGRA pixel per source position.
+fn pattern(w: u32, h: u32) -> Vec<u8> {
+    let wave = |v: f64, period: f64| {
+        (127.5 + 127.0 * (v * std::f64::consts::TAU / period).sin()).round() as u8
+    };
+    let mut out = vec![0u8; w as usize * h as usize * 4];
+    for y in 0..h {
+        for x in 0..w {
+            let i = ((y * w + x) * 4) as usize;
+            let (fx, fy) = (f64::from(x), f64::from(y));
+            out[i..i + 4].copy_from_slice(&[
+                wave(fx + 2.0 * fy, 29.0),
+                wave(fy, 11.0),
+                wave(fx, 13.0),
+                255,
+            ]);
+        }
+    }
+    out
+}
+
+/// Normalised RGB of one source pixel, clamped to the image as the GPU's
+/// `CLAMP_TO_EDGE` does.
+fn texel(source: &[u8], (w, h): (u32, u32), x: i64, y: i64) -> [f64; 3] {
+    let x = x.clamp(0, i64::from(w) - 1) as usize;
+    let y = y.clamp(0, i64::from(h) - 1) as usize;
+    let i = (y * w as usize + x) * 4;
+    [
+        f64::from(source[i + 2]) / 255.0,
+        f64::from(source[i + 1]) / 255.0,
+        f64::from(source[i]) / 255.0,
+    ]
+}
+
+/// Bilinear sample at a source position measured in texels, texel centres at
+/// integer positions.
+fn bilinear(source: &[u8], size: (u32, u32), x: f64, y: f64) -> [f64; 3] {
+    let (x0, y0) = (x.floor(), y.floor());
+    let (fx, fy) = (x - x0, y - y0);
+    let (x0, y0) = (x0 as i64, y0 as i64);
+    let mut c = [0.0; 3];
+    for (dx, dy, weight) in [
+        (0, 0, (1.0 - fx) * (1.0 - fy)),
+        (1, 0, fx * (1.0 - fy)),
+        (0, 1, (1.0 - fx) * fy),
+        (1, 1, fx * fy),
+    ] {
+        let t = texel(source, size, x0 + dx, y0 + dy);
+        for k in 0..3 {
+            c[k] += t[k] * weight;
+        }
+    }
+    c
+}
+
+fn luma(c: [f64; 3]) -> f64 {
+    16.0 + 65.481 * c[0] + 128.553 * c[1] + 24.966 * c[2]
+}
+
+fn chroma(c: [f64; 3]) -> [f64; 2] {
+    [
+        128.0 - 37.797 * c[0] - 74.203 * c[1] + 112.0 * c[2],
+        128.0 + 112.0 * c[0] - 93.786 * c[1] - 18.214 * c[2],
+    ]
+}
+
+/// Expected Y and interleaved UV planes, unrounded. `shift` moves the
+/// sampling grid by that many source pixels on both axes; zero is correct.
+fn expected(
+    source: &[u8],
+    size: (u32, u32),
+    (cx, cy, cw, ch): (u32, u32, u32, u32),
+    (tw, th): (u32, u32),
+    shift: f64,
+) -> (Vec<f64>, Vec<f64>) {
+    let native = (cw, ch) == (tw, th) && shift == 0.0;
+    let (sx, sy) = (f64::from(cw) / f64::from(tw), f64::from(ch) / f64::from(th));
+    // The colour behind output pixel (x, y): the texel itself at equal sizes,
+    // otherwise the bilinear sample at that pixel's centre in the crop.
+    let at = |x: u32, y: u32| {
+        if native {
+            texel(source, size, i64::from(cx + x), i64::from(cy + y))
+        } else {
+            bilinear(
+                source,
+                size,
+                f64::from(cx) + (f64::from(x) + 0.5) * sx - 0.5 + shift,
+                f64::from(cy) + (f64::from(y) + 0.5) * sy - 0.5 + shift,
+            )
+        }
+    };
+    let mut y_plane = Vec::with_capacity(tw as usize * th as usize);
+    for y in 0..th {
+        for x in 0..tw {
+            y_plane.push(luma(at(x, y)));
+        }
+    }
+    // Chroma averages the colours behind the 2x2 block of output pixels.
+    let mut uv_plane = Vec::with_capacity(tw as usize * th as usize / 2);
+    for y in (0..th).step_by(2) {
+        for x in (0..tw).step_by(2) {
+            let mut c = [0.0; 3];
+            for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                let v = at(x + dx, y + dy);
+                for k in 0..3 {
+                    c[k] += v[k] * 0.25;
+                }
+            }
+            uv_plane.extend(chroma(c));
+        }
+    }
+    (y_plane, uv_plane)
+}
+
+/// How far one plane is from its reference.
+#[derive(Default)]
+struct Error {
+    /// Bytes other than the reference rounded to nearest.
+    not_nearest: usize,
+    /// Largest absolute difference from the unrounded reference.
+    max: f64,
+    /// PSNR in dB against the rounded reference, infinite when identical.
+    psnr: f64,
+}
+
+fn compare(got: &[u8], want: &[f64]) -> Error {
+    let mut error = Error::default();
+    let mut squared = 0.0;
+    for (&g, &w) in got.iter().zip(want) {
+        let w = w.clamp(0.0, 255.0);
+        let g = f64::from(g);
+        let rounded = w.round();
+        error.not_nearest += usize::from(g != rounded);
+        error.max = error.max.max((g - w).abs());
+        squared += (g - rounded).powi(2);
+    }
+    let mse = squared / want.len() as f64;
+    error.psnr = 10.0 * (255.0f64.powi(2) / mse).log10();
+    error
+}
+
+/// Read both planes back, tightly packed, through the encoder's own import.
+fn planes(
+    nv: &Arc<gpu_convert::OwnedNv12>,
+    display: &Rc<cros_libva::Display>,
+) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+    let (w, h) = nv.size();
     let imported = nv.import(display)?;
     let image = cros_libva::Image::derive_from(&imported, (w, h))?;
     let p = image.image();
     let b = image.as_ref();
-    let mut out = Vec::new();
-    for bar in 0..8usize {
-        let x = (bar as u32 * w / 8 + w / 16) & !1;
-        let y = (h / 2) & !1;
-        out.push([
-            b[p.offsets[0] as usize + (y * p.pitches[0] + x) as usize],
-            b[p.offsets[1] as usize + ((y / 2) * p.pitches[1] + x) as usize],
-            b[p.offsets[1] as usize + ((y / 2) * p.pitches[1] + x + 1) as usize],
-        ]);
+    let (w, h) = (w as usize, h as usize);
+    let mut y = Vec::with_capacity(w * h);
+    for row in 0..h {
+        let start = p.offsets[0] as usize + row * p.pitches[0] as usize;
+        y.extend_from_slice(&b[start..start + w]);
     }
-    Ok(out)
+    let mut uv = Vec::with_capacity(w * h / 2);
+    for row in 0..h / 2 {
+        let start = p.offsets[1] as usize + row * p.pitches[1] as usize;
+        uv.extend_from_slice(&b[start..start + w]);
+    }
+    Ok((y, uv))
 }
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<_> = std::env::args().collect();
     let w: u32 = args.get(1).map_or(Ok(2880), |s| s.parse())?;
     let h: u32 = args.get(2).map_or(Ok(1800), |s| s.parse())?;
-    let tw: u32 = args.get(3).map_or(Ok(1280), |s| s.parse())?;
-    let th: u32 = args.get(4).map_or(Ok(720), |s| s.parse())?;
+    // 2880x1800 at the 1080p quality: the geometry `fit_size` really produces.
+    let tw: u32 = args.get(3).map_or(Ok(1728), |s| s.parse())?;
+    let th: u32 = args.get(4).map_or(Ok(1080), |s| s.parse())?;
+    // An odd crop origin, the way a portal's crop metadata can place it.
+    let crop = (7, 5, w.saturating_sub(16), h.saturating_sub(12));
+    anyhow::ensure!(
+        [w, h, tw, th].iter().all(|n| n % 2 == 0) && tw <= crop.2 && th <= crop.3 && tw >= 2,
+        "sizes must be even and the target no larger than the source minus 16x12"
+    );
 
     let display = cros_libva::Display::open_drm_display("/dev/dri/renderD128")?;
     let source = display
@@ -135,71 +234,91 @@ fn main() -> anyhow::Result<()> {
         fourcc: u32::from_le_bytes(*b"AR24"),
         modifier: desc.objects[0].drm_format_modifier,
     };
-    // Vertical colour bars, so a horizontal flip or a channel swap is visible.
+    let pixels = pattern(w, h);
     {
         let mut image = cros_libva::Image::derive_from(&source, (w, h))?;
         let p = *image.image();
         for y in 0..h as usize {
             let row = p.offsets[0] as usize + y * p.pitches[0] as usize;
-            for x in 0..w as usize {
-                let c = COLORS[x * 8 / w as usize];
-                image.as_mut()[row + x * 4..row + x * 4 + 4]
-                    .copy_from_slice(&[c[0], c[1], c[2], 255]);
-            }
+            image.as_mut()[row..row + w as usize * 4]
+                .copy_from_slice(&pixels[y * w as usize * 4..(y + 1) * w as usize * 4]);
         }
     }
     let gpu = gpu_convert::Converter::new(display.clone())?;
     let enc_display = cros_libva::Display::open_drm_display("/dev/dri/renderD128")?;
 
-    // Native pass must be exact (texelFetch), the same as before scaling existed.
-    let native = gpu.convert(&rgb, (0, 0, w, h), (w, h))?;
-    let native_samples = sample(&native, &enc_display, (w, h))?;
-    let mut native_bad = 0;
-    for (bar, got) in native_samples.iter().enumerate() {
-        for c in 0..3 {
-            if (i32::from(got[c]) - i32::from(EXPECT[bar][c])).abs() > 1 {
-                native_bad += 1;
-            }
-        }
-    }
-    println!("native  {w}x{h} samples={native_samples:?} mismatches={native_bad}");
+    let mut failed = false;
+    for (label, crop) in [("full", (0, 0, w, h)), ("crop", crop)] {
+        // Equal sizes: the exact texelFetch pass, every byte one of the two
+        // integers next to the exact value.
+        let native = (crop.2, crop.3);
+        let (y, uv) = planes(&gpu.convert(&rgb, crop, native)?, &enc_display)?;
+        let (want_y, want_uv) = expected(&pixels, (w, h), crop, native, 0.0);
+        let (ey, euv) = (compare(&y, &want_y), compare(&uv, &want_uv));
+        let ok = ey.max < 1.0 && euv.max < 1.0;
+        failed |= !ok;
+        println!(
+            "native {label} {crop:?}->{native:?}: Y max={:.3} not-nearest={}, UV max={:.3} not-nearest={} {}",
+            ey.max,
+            ey.not_nearest,
+            euv.max,
+            euv.not_nearest,
+            if ok { "ok" } else { "FAIL" }
+        );
 
-    // Scaled pass must keep the same colours and orientation.
-    let scaled = gpu.convert(&rgb, (0, 0, w, h), (tw, th))?;
-    let scaled_samples = sample(&scaled, &enc_display, (tw, th))?;
-    let mut scaled_bad = 0;
-    for (bar, got) in scaled_samples.iter().enumerate() {
-        for c in 0..3 {
-            if (i32::from(got[c]) - i32::from(EXPECT[bar][c])).abs() > 2 {
-                scaled_bad += 1;
+        // Scaled: close to the reference everywhere, and far from a grid that
+        // is half a source pixel off.
+        let scaled = gpu.convert(&rgb, crop, (tw, th))?;
+        let (y, uv) = planes(&scaled, &enc_display)?;
+        let (want_y, want_uv) = expected(&pixels, (w, h), crop, (tw, th), 0.0);
+        let (ey, euv) = (compare(&y, &want_y), compare(&uv, &want_uv));
+        let ok = ey.max <= SCALED_TOLERANCE && euv.max <= SCALED_TOLERANCE;
+        failed |= !ok;
+        println!(
+            "scaled {label} {crop:?}->({tw}, {th}): Y psnr={:.2} max={:.2}, UV psnr={:.2} max={:.2} {}",
+            ey.psnr,
+            ey.max,
+            euv.psnr,
+            euv.max,
+            if ok { "ok" } else { "FAIL" }
+        );
+        let (off_y, off_uv) = expected(&pixels, (w, h), crop, (tw, th), 0.5);
+        let (sy, suv) = (compare(&y, &off_y), compare(&uv, &off_uv));
+        let caught = sy.max > SCALED_TOLERANCE && suv.max > SCALED_TOLERANCE;
+        failed |= !caught;
+        println!(
+            "         vs a grid half a pixel off: Y psnr={:.2} max={:.2}, UV psnr={:.2} max={:.2} {}",
+            sy.psnr,
+            sy.max,
+            suv.psnr,
+            suv.max,
+            if caught {
+                "rejected"
+            } else {
+                "FAIL: the test cannot see the shift"
             }
-        }
-    }
-    println!("scaled  {w}x{h}->{tw}x{th} samples={scaled_samples:?} mismatches={scaled_bad}");
+        );
 
-    // A repeated scaled conversion must not drift or flip.
-    let mut repeats_bad = 0;
-    for _ in 0..8 {
-        let nv = gpu.convert(&rgb, (0, 0, w, h), (tw, th))?;
-        let got = sample(&nv, &enc_display, (tw, th))?;
-        for (bar, g) in got.iter().enumerate() {
-            for c in 0..3 {
-                if (i32::from(g[c]) - i32::from(scaled_samples[bar][c])).abs() > 1 {
-                    repeats_bad += 1;
-                }
-            }
+        // Repeating the conversion must give the same bytes.
+        let mut drift = 0;
+        for _ in 0..4 {
+            let (again_y, again_uv) = planes(&gpu.convert(&rgb, crop, (tw, th))?, &enc_display)?;
+            drift += usize::from(again_y != y || again_uv != uv);
         }
+        failed |= drift != 0;
+        println!(
+            "repeat {label}: {drift} of 4 differ {}",
+            if drift == 0 { "ok" } else { "FAIL" }
+        );
     }
-    println!("repeat  mismatches={repeats_bad}");
-
-    let total = native_bad + scaled_bad + repeats_bad;
     println!(
         "{}",
-        if total == 0 {
-            "PASS: native exact, scaled colours and orientation preserved"
-        } else {
+        if failed {
             "FAIL"
+        } else {
+            "PASS: native exact up to rounding, scaled within tolerance on the pixel-centre grid"
         }
     );
+    anyhow::ensure!(!failed, "scale probe failed");
     Ok(())
 }

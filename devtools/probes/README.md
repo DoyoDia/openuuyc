@@ -82,9 +82,13 @@ interaction with the encoder. All of them link the production
   two threads, to catch leaks or lifetime races in the EGL/GL/VA objects.
 - `cycle` — creates and drops `Converter` repeatedly, sequentially and on two
   concurrent threads, to exercise the `eglTerminate`/`gbm_device_destroy` path.
-- `scale` — verifies the GPU scaler. Confirms the equal-size pass stays an
-  exact `texelFetch` and that a scaled pass keeps BT.601 limited-range colours
-  and bar orientation across repeated conversions.
+- `scale` — verifies the GPU scaler plane by plane, on the whole frame and on
+  an odd crop origin. At equal sizes every Y and UV byte must be within the
+  final rounding of the BT.601 limited-range value of its source texels (the
+  exact `texelFetch` pass); when scaling, every byte must stay within 2 of a
+  bilinear reference sampled at the pixel centres the CPU `scale` uses, and the
+  same reference moved by half a source pixel must fail that bound, so a
+  shifted sampling grid cannot pass. Repeated conversions must be identical.
 - `mismatch` — measures the cost of a controller quality whose output geometry
   differs from the source, comparing the native pass with the scaled one. This
   is the regression the scaler fixed: reading the NV12 back to the CPU and
@@ -94,6 +98,7 @@ interaction with the encoder. All of them link the production
 ```sh
 cargo run --release --manifest-path devtools/probes/gpu-conversion/Cargo.toml --bin overlap -- 2880 1800 128
 cargo run --release --manifest-path devtools/probes/gpu-conversion/Cargo.toml --bin churn -- 2880 1800 1500 2
+cargo run --release --manifest-path devtools/probes/gpu-conversion/Cargo.toml --bin scale -- 2880 1800 1728 1080
 ```
 
 Measured on Haswell at idle (load < 2), 2880x1800: pipelined CPU 40-41 fps vs
