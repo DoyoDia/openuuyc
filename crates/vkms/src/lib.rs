@@ -9,5 +9,5 @@
 pub mod client;
 pub mod protocol;
 
-pub use client::{Client, SOCKET, installed, probe};
-pub use protocol::{Reply, Request, Status};
+pub use client::{Client, Disconnected, SOCKET, installed, probe};
+pub use protocol::{Reply, Request, Status, Unsupported};

@@ -3,7 +3,7 @@
 //! 连接本身就是租约：辅助程序把这条连接要到的连接器记在自己名下，读到 EOF 就全部
 //! 断开。所以主程序不需要（也没法）做额外的清理工作，进程死掉也不会留下悬空的虚拟屏。
 use crate::protocol::{Reply, Request, Status};
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
@@ -22,6 +22,20 @@ pub const HELPER_SOCKET_UNITS: [&str; 2] = [
 
 /// 单次往返的等待上限。辅助程序建屏时要等内核把连接器报出来，但也就几百毫秒。
 const TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 这条连接已经不能用了：辅助程序没在跑、它空闲超时把我们踢了、或者它重启了。
+///
+/// 单独一个类型是为了让主程序能把它和「辅助程序拒绝了这次请求」分开：前者丢掉
+/// 缓存的连接重来一次就好，后者重试多少次都是一样的结果。
+#[derive(Debug)]
+pub struct Disconnected(String);
+
+impl std::fmt::Display for Disconnected {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+impl std::error::Error for Disconnected {}
 
 /// 辅助程序装没装。装没装看文件，能不能用要真的连一次（见 [`probe`]）。
 pub fn installed() -> bool {
@@ -49,8 +63,10 @@ impl Client {
     }
 
     pub fn connect_to(path: &str) -> Result<Self> {
-        let stream = UnixStream::connect(path).with_context(|| {
-            format!("无法连接虚拟显示器辅助程序（{path}），它可能没有安装或没有运行")
+        let stream = UnixStream::connect(path).map_err(|error| {
+            Disconnected(format!(
+                "无法连接虚拟显示器辅助程序（{path}）：{error}；它可能没有安装或没有运行"
+            ))
         })?;
         stream.set_read_timeout(Some(TIMEOUT))?;
         stream.set_write_timeout(Some(TIMEOUT))?;
@@ -80,20 +96,28 @@ impl Client {
     fn call(&mut self, request: &Request) -> Result<Reply> {
         let mut line = serde_json::to_vec(request)?;
         line.push(b'\n');
-        self.writer
-            .write_all(&line)
-            .context("向辅助程序发送请求失败")?;
-        self.writer.flush()?;
+        self.writer.write_all(&line).map_err(send_failed)?;
+        self.writer.flush().map_err(send_failed)?;
         let mut answer = String::new();
-        let read = self
-            .reader
-            .read_line(&mut answer)
-            .context("读取辅助程序的应答失败")?;
-        ensure!(read > 0, "辅助程序没有应答就断开了连接");
+        let read = match self.reader.read_line(&mut answer) {
+            // 空闲的连接会被辅助程序收掉（见 openuuyc-vkms 的 IDLE_TIMEOUT），
+            // 所以读失败也要算成「这条连接没了」，而不是一次业务失败。
+            Ok(read) => read,
+            Err(error) => {
+                return Err(Disconnected(format!("读取辅助程序的应答失败：{error}")).into());
+            }
+        };
+        if read == 0 {
+            return Err(Disconnected("辅助程序没有应答就断开了连接".into()).into());
+        }
         let reply: Reply = serde_json::from_str(&answer)
             .with_context(|| format!("辅助程序的应答无法解析：{}", answer.trim()))?;
         reply.into_result()
     }
+}
+
+fn send_failed(error: std::io::Error) -> anyhow::Error {
+    Disconnected(format!("向辅助程序发送请求失败：{error}")).into()
 }
 
 #[cfg(test)]
@@ -103,8 +127,26 @@ mod tests {
     #[test]
     fn a_refusal_becomes_an_error_with_the_helpers_own_words() {
         let reply = Reply::failed("没有空闲的虚拟显示器");
-        let error = reply.into_result().unwrap_err().to_string();
-        assert!(error.contains("没有空闲的虚拟显示器"));
+        let error = reply.into_result().unwrap_err();
+        assert!(error.to_string().contains("没有空闲的虚拟显示器"));
+        assert!(
+            error
+                .downcast_ref::<crate::protocol::Unsupported>()
+                .is_none()
+        );
+    }
+
+    /// 「这台机器做不了」要能和普通拒绝区分开，诊断页才说得出「内核不支持」。
+    #[test]
+    fn an_unsupported_reply_is_marked_as_such() {
+        let reply = Reply::unsupported("本机内核 6.8 的 VKMS 不支持 configfs");
+        let error = reply.into_result().unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<crate::protocol::Unsupported>()
+                .is_some()
+        );
+        assert!(error.to_string().contains("不支持 configfs"));
     }
 
     #[test]
