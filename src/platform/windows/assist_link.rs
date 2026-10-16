@@ -1,85 +1,195 @@
-//! `uuremote://` 协议注册：让系统把协助邀请链接交给本程序。
-//!
-//! 官方客户端把这条协议登记在 HKLM（安装时要管理员），而 `HKCU\Software\Classes`
-//! 对当前用户优先。我们只动 HKCU：不用提权，也不碰官方客户端写下的那一份，
-//! 卸载时只删带自己归属标记的键。
-//!
-//! 注册与否由用户在安装对话框里决定（见组件管理），这里只负责把决定落到注册表，
-//! 并在程序搬家或更新后把命令改回当前路径。
-use super::registry::{key, read, set, wide};
-use anyhow::Result;
+//! User-selected UU invite activation. Preserve a prior HKCU registration and
+//! only retarget/remove a registration whose command still belongs to us.
+use super::registry::{Key, key, read, set, wide};
+use anyhow::{Context, Result, ensure};
 use std::path::Path;
 use windows::{
-    Win32::{System::Registry::*, UI::Shell::*},
+    Win32::{Foundation::*, System::Registry::*, UI::Shell::*},
     core::PCWSTR,
 };
 
 const SCHEME: &str = r"Software\Classes\uuremote";
+const BACKUP: &str = r"Software\OpenUUYC\AssistLinkBackup.v1";
 const OWNER: &str = "OpenUUYC.AssistLink.v1";
 
 fn command(image: &Path) -> String {
     format!("\"{}\" \"%1\"", image.display())
 }
-
 fn stored_command() -> Option<String> {
     read(&format!(r"{SCHEME}\shell\open\command"), "")
         .ok()
         .flatten()
 }
-
-/// 这条协议是不是我们登记的。官方客户端写在 HKLM，看不到这个标记。
-pub(crate) fn owned() -> bool {
-    read(SCHEME, "OpenUUYCOwner").ok().flatten().as_deref() == Some(OWNER)
+fn open_read(path: &str) -> Result<Option<Key>> {
+    let mut handle = HKEY::default();
+    let result = unsafe {
+        RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR(wide(path).as_ptr()),
+            None,
+            KEY_READ,
+            &mut handle,
+        )
+    };
+    if result == ERROR_FILE_NOT_FOUND || result == ERROR_PATH_NOT_FOUND {
+        return Ok(None);
+    }
+    result.ok()?;
+    Ok(Some(Key(handle)))
 }
-
-/// 登记本程序，或者把已有的登记改指过来。用户已经在界面上确认过要接管，
-/// 所以这里直接覆盖 HKCU 里同名的那一项。
-pub(crate) fn enable() -> Result<()> {
-    let image = dunce::canonicalize(std::env::current_exe()?)?;
-    let root = key(SCHEME)?;
-    set(root.0, "", "URL:OpenUUYC remote assistance")?;
-    set(root.0, "URL Protocol", "")?;
-    set(root.0, "OpenUUYCOwner", OWNER)?;
-    let open = key(&format!(r"{SCHEME}\shell\open\command"))?;
-    set(open.0, "", &command(&image))?;
+fn delete_tree(path: &str) -> Result<()> {
+    let result = unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, PCWSTR(wide(path).as_ptr())) };
+    if result == ERROR_FILE_NOT_FOUND || result == ERROR_PATH_NOT_FOUND {
+        return Ok(());
+    }
+    result
+        .ok()
+        .with_context(|| format!("删除协议登记失败：{path}"))?;
+    Ok(())
+}
+fn copy_tree(from: &str, to: &str) -> Result<bool> {
+    let Some(source) = open_read(from)? else {
+        return Ok(false);
+    };
+    // RegCopyTree also copies security descriptors; ordinary KEY_WRITE is
+    // insufficient for this destination handle. Do not broaden shared helpers.
+    let mut handle = HKEY::default();
+    unsafe {
+        RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR(wide(to).as_ptr()),
+            None,
+            None,
+            REG_OPTION_NON_VOLATILE,
+            KEY_ALL_ACCESS,
+            None,
+            &mut handle,
+            None,
+        )
+        .ok()
+        .context("创建协议备份/恢复目标失败")?;
+    }
+    let target = Key(handle);
+    unsafe {
+        RegCopyTreeW(source.0, None, target.0)
+            .ok()
+            .context("复制协助链接登记失败")?;
+    }
+    Ok(true)
+}
+fn changed() {
     unsafe {
         SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST | SHCNF_FLUSH, None, None);
     }
-    tracing::info!(image = %image.display(), "已接管 uuremote:// 协助链接");
-    Ok(())
 }
 
-/// 取消接管。只在登记确实是我们写的（归属标记还在）时才删，免得删掉别人
-/// 后来写进去的同一项。
+pub(crate) fn owned() -> bool {
+    read(SCHEME, "OpenUUYCOwner").ok().flatten().as_deref() == Some(OWNER)
+        && read(&format!(r"{SCHEME}\shell\open\command"), "DelegateExecute")
+            .is_ok_and(|v| v.is_none())
+        && stored_command()
+            .zip(read(SCHEME, "OpenUUYCCommand").ok().flatten())
+            .is_some_and(|(actual, ours)| actual.eq_ignore_ascii_case(&ours))
+}
+fn backup_previous() -> Result<()> {
+    if open_read(BACKUP)?.is_some() {
+        ensure!(
+            read(BACKUP, "Owner")?.as_deref() == Some(OWNER),
+            "协助链接备份不属于本程序"
+        );
+        delete_tree(BACKUP)?;
+    }
+    let backup = key(BACKUP)?;
+    set(backup.0, "Owner", OWNER)?;
+    let previous = copy_tree(SCHEME, &format!(r"{BACKUP}\Previous"))?;
+    set(backup.0, "HadPrevious", if previous { "1" } else { "0" })
+}
+fn restore_previous() -> Result<()> {
+    ensure!(
+        read(BACKUP, "Owner")?.as_deref() == Some(OWNER),
+        "协助链接原登记备份不可用，未删除当前登记"
+    );
+    let previous = read(BACKUP, "HadPrevious")?.context("协助链接备份不完整")?;
+    ensure!(
+        matches!(previous.as_str(), "0" | "1"),
+        "协助链接备份状态无效"
+    );
+    if previous == "1" {
+        ensure!(
+            open_read(&format!(r"{BACKUP}\Previous"))?.is_some(),
+            "原协议登记备份缺失"
+        );
+    }
+    delete_tree(SCHEME)?;
+    if previous == "1" {
+        ensure!(
+            copy_tree(&format!(r"{BACKUP}\Previous"), SCHEME)?,
+            "恢复原协议登记失败"
+        );
+    }
+    delete_tree(BACKUP)?;
+    changed();
+    Ok(())
+}
+fn write_registration(image: &Path) -> Result<()> {
+    let wanted = command(image);
+    let root = key(SCHEME)?;
+    set(root.0, "", "URL:OpenUUYC remote assistance")?;
+    set(root.0, "URL Protocol", "")?;
+    let open = key(&format!(r"{SCHEME}\shell\open\command"))?;
+    set(open.0, "", &wanted)?;
+    set(root.0, "OpenUUYCCommand", &wanted)?;
+    set(root.0, "OpenUUYCOwner", OWNER)?;
+    changed();
+    Ok(())
+}
+fn enable_image(image: &Path) -> Result<()> {
+    let was_owned = owned();
+    let previous_command = stored_command();
+    if !was_owned {
+        backup_previous()?;
+        // A previous handler may use DelegateExecute or other verbs. The
+        // whole original tree is preserved above before replacing it.
+        delete_tree(SCHEME)?;
+    }
+    if let Err(error) = write_registration(image) {
+        if !was_owned {
+            let current = stored_command();
+            if current.is_none()
+                || current == previous_command
+                || current.as_deref() == Some(command(image).as_str())
+            {
+                restore_previous().context("协议登记失败且恢复原登记失败")?;
+            }
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+pub(crate) fn enable() -> Result<()> {
+    // This option is applied after successful installation, to the stable image.
+    let image = dunce::canonicalize(super::components::application::image()?)?;
+    enable_image(&image)
+}
 pub(crate) fn disable() -> Result<()> {
     if !owned() {
         return Ok(());
     }
-    unsafe {
-        RegDeleteTreeW(HKEY_CURRENT_USER, PCWSTR(wide(SCHEME).as_ptr())).ok()?;
-        SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST | SHCNF_FLUSH, None, None);
-    }
-    tracing::info!("已交回 uuremote:// 协助链接");
-    Ok(())
+    restore_previous()
 }
-
-/// 程序搬家或更新之后，把命令改回当前这份程序。没登记过就什么都不做——
-/// 不能因为本程序启动一次就把用户留给别的程序的协议抢过来。
+fn retarget_image(image: &Path) -> Result<()> {
+    if !owned() || stored_command().as_deref() == Some(command(image).as_str()) {
+        return Ok(());
+    }
+    write_registration(image)
+}
 pub(crate) fn retarget() -> Result<()> {
     if !owned() {
         return Ok(());
     }
-    let image = dunce::canonicalize(std::env::current_exe()?)?;
-    let wanted = command(&image);
-    if stored_command().is_some_and(|value| value == wanted) {
-        return Ok(());
-    }
-    let open = key(&format!(r"{SCHEME}\shell\open\command"))?;
-    set(open.0, "", &wanted)?;
-    Ok(())
+    let image = dunce::canonicalize(super::components::application::image()?)?;
+    retarget_image(&image)
 }
-
-/// 控制中心每次起来都校正一次路径；失败不打断启动。
 pub(crate) fn retarget_on_start() {
     if let Err(error) = retarget() {
         tracing::warn!(error = %format!("{error:#}"), "校正协助链接的注册失败");

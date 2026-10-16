@@ -103,8 +103,13 @@ impl Manager {
                         Ok(reboot) => {
                             self.reboot |= reboot;
                             self.completed = true;
-                            self.handoff =
-                                kind == Kind::Suite && operation == Operation::Install && !reboot;
+                            if kind == Kind::Suite && operation == Operation::Install {
+                                self.apply_link_takeover();
+                            }
+                            self.handoff = kind == Kind::Suite
+                                && operation == Operation::Install
+                                && !reboot
+                                && self.error.is_none();
                         }
                         Err(error) => self.error = Some(error),
                     }
@@ -160,6 +165,20 @@ impl Manager {
     pub(super) fn management(&mut self, ui: &mut egui::Ui, active: bool) {
         self.poll();
         section(ui, "服务管理");
+        if self.status.as_ref().is_some_and(|s| s.installed) {
+            let mut takeover = self.link_takeover();
+            if ui
+                .add_enabled(
+                    self.pending.is_none(),
+                    egui::Checkbox::new(&mut takeover, "用 OpenUUYC 打开 UU 远程协助邀请链接"),
+                )
+                .changed()
+            {
+                self.takeover_links = Some(takeover);
+                self.error = None;
+                self.apply_link_takeover();
+            }
+        }
         let label = self
             .status
             .as_ref()
@@ -352,9 +371,6 @@ impl Manager {
             });
             if accepted {
                 self.confirm = None;
-                if operation == Operation::Install {
-                    self.apply_link_takeover();
-                }
                 self.work(Some(operation), ctx.clone());
             } else if dismiss || result.should_close() {
                 self.confirm = None;

@@ -201,7 +201,12 @@ fn main() -> Result<()> {
         let activation = match (link.as_deref(), &command) {
             // 链接是用户点出来的，哪怕这次是后台启动也得把窗口叫出来。
             (Some(uri), _) => app::instance::Activation::Link(uri),
-            (None, Commands::Gui { background: true, .. }) => app::instance::Activation::Quiet,
+            (
+                None,
+                Commands::Gui {
+                    background: true, ..
+                },
+            ) => app::instance::Activation::Quiet,
             (None, _) => app::instance::Activation::Show,
         };
         match app::instance::acquire(activation)? {
@@ -384,9 +389,30 @@ fn main() -> Result<()> {
 /// 要优先当子命令，否则 `OpenUUYC gui` 会被读成一条链接。
 fn parse_cli() -> std::result::Result<Cli, clap::Error> {
     use clap::{CommandFactory, FromArgMatches};
+    let args: Vec<_> = std::env::args_os().collect();
+    let has_link = args.iter().skip(1).any(|a| {
+        a.to_string_lossy()
+            .to_ascii_lowercase()
+            .starts_with("uuremote:")
+    });
+    // An OS protocol activation is a single argument, never a second command.
+    // Clap diagnostics must not echo an invite or its verification code.
+    if has_link && args.len() != 2 {
+        return Err(clap::Error::raw(
+            clap::error::ErrorKind::InvalidValue,
+            "协助链接启动参数无效",
+        ));
+    }
     let matches = Cli::command()
         .subcommand_precedence_over_arg(true)
-        .try_get_matches()?;
+        .try_get_matches_from(args)
+        .map_err(|error| {
+            if has_link {
+                clap::Error::raw(clap::error::ErrorKind::InvalidValue, "协助链接启动参数无效")
+            } else {
+                error
+            }
+        })?;
     Cli::from_arg_matches(&matches)
 }
 

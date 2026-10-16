@@ -322,23 +322,26 @@ fn running_image(expected: &std::path::Path, migrating: bool) -> Result<Option<R
 /// 协助链接是用户点出来的，控制中心可能正好在启动，所以比通知多等几轮；
 /// 错过就再也没有第二次机会了。
 pub(crate) fn deliver_uri(uri: &str) -> Result<()> {
-    let mut last = anyhow::anyhow!("控制中心暂时不可用");
-    for attempt in 0..DELIVER_ATTEMPTS {
-        match deliver_uri_once(uri) {
-            Ok(()) => return Ok(()),
-            Err(error) => last = error,
+    use windows::Win32::{System::DataExchange::COPYDATASTRUCT, UI::WindowsAndMessaging::*};
+    anyhow::ensure!(uri.len() <= MAX_ACTIVATION, "链接参数过长");
+    let assistance = uri
+        .get(..9)
+        .is_some_and(|s| s.eq_ignore_ascii_case("uuremote:"));
+    let image = std::env::current_exe()?;
+    let attempts = if assistance { DELIVER_ATTEMPTS } else { 1 };
+    let mut running = None;
+    for attempt in 0..attempts {
+        running = running_image(&image, false)?;
+        if running.is_some() {
+            break;
         }
-        if attempt + 1 < DELIVER_ATTEMPTS {
+        if attempt + 1 < attempts {
             std::thread::sleep(DELIVER_INTERVAL);
         }
     }
-    Err(last)
-}
-fn deliver_uri_once(uri: &str) -> Result<()> {
-    use windows::Win32::{System::DataExchange::COPYDATASTRUCT, UI::WindowsAndMessaging::*};
-    anyhow::ensure!(uri.len() <= MAX_ACTIVATION, "链接参数过长");
-    let running =
-        running_image(&std::env::current_exe()?, false)?.context("请求已过期或控制中心已退出")?;
+    let running = running.context("请求已过期或控制中心已退出")?;
+    // Retry only discovery. Once WM_COPYDATA is sent, a timeout has an unknown
+    // delivery result and must not replay notifications or connection requests.
     // Protocol activation carries the user's foreground grant to the existing UI.
     let mut pid = 0;
     unsafe {

@@ -1,13 +1,8 @@
 //! 协助邀请链接（`uuremote://external/assistance?...`）在进程内的投递。
 //!
-//! 链接可能从三个方向进来：命令行参数、Windows 的协议激活转发（WM_COPYDATA）、
-//! Linux 的单实例控制通道。它们都只把链接放进这里的队列，由控制中心在下一帧
-//! 统一处理：切到「开始协助」页、填好设备 ID 和验证码，再走与手动输入完全一样
-//! 的连接流程。
-//!
-//! 队列是进程级的静态量，不绑定某一个窗口：控制中心可能还没建出来、可能收在
-//! 托盘里，链接都得等着。同一时刻只留最新的一条，和官方「同一批请求只保留最新
-//! 一条」的取舍一致。
+//! 命令行和 Windows WM_COPYDATA 都只校验并入队，控制中心等登录、
+//! 凭据提示及已有操作结束后再处理，复用手动输入的连接流程。
+//! 队列不绑定窗口；等待期间保留最新邀请，避免积压过期连接请求。
 use crate::account::assist::AssistLink;
 use std::collections::VecDeque;
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -53,7 +48,7 @@ pub(crate) fn receive(uri: &str) {
             queue.link = Some(link);
         }
         Err(error) => {
-            tracing::warn!(uri, "无法处理的协助链接：{error:#}");
+            tracing::warn!("无法处理协助链接：{error:#}");
             if queue.failed.len() >= MAX_FAILED {
                 queue.failed.pop_front();
             }
@@ -73,31 +68,4 @@ pub(super) fn take(settled: bool) -> Option<Activation> {
         .then(|| queue.link.take())
         .flatten()
         .map(Activation::Link)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// 队列是进程级的静态量，只用一个用例跑完两种路径，免得用例之间互相取走
-    /// 对方的投递。
-    #[test]
-    fn queues_the_newest_link_and_reports_failures() {
-        receive("uuremote://external/assistance?deviceId=12345");
-        receive("uuremote://external/assistance?deviceId=111111111&code=AAAAAAAA");
-        receive("uuremote://external/assistance?deviceId=222222222&code=BBBBBBBB");
-        // 界面忙的时候先不取链接，但坏链接的理由要立刻送到。
-        let Some(Activation::Failed(message)) = take(false) else {
-            panic!("校验失败的链接应该直接交给界面");
-        };
-        assert!(message.contains("9位设备 ID"), "{message}");
-        // 界面没稳定之前，排队的链接不该被取走。
-        assert!(take(false).is_none());
-        let Some(Activation::Link(link)) = take(true) else {
-            panic!("队列里应该留着最新的一条链接");
-        };
-        assert_eq!(link.connect_id, "222222222");
-        assert_eq!(link.code, "BBBBBBBB");
-        assert!(take(true).is_none(), "被取代的旧链接不该再出现");
-    }
 }

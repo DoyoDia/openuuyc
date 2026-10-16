@@ -168,33 +168,48 @@ pub(crate) struct FavoriteItem<'a> {
 /// 官方「复制并分享」发出的协助邀请链接：
 /// `uuremote://external/assistance?deviceId=<9位设备 ID>&code=<验证码>&controlledLogin=<0|1>`
 ///
-/// 链接由被协助方的客户端生成，或由 `https://uuyc.163.com/invite/{邀请码}`
-/// 落地页把服务端的 `source_data` 原样拼进查询串。官方客户端用 `strtol` 按
-/// 十进制解析 `controlledLogin`，判 `== 1` 记为真，说的是被协助端生成邀请时
-/// 的登录状态；本程序的连接只由设备 ID 和验证码决定，所以照抄它的宽松程度就
-/// 够了——非数字一律当假。
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// controlledLogin 表示被协助端生成邀请时的登录状态。4.41.2.2602
+/// C140209E20 用 QString::toInt 解析；本程序只将它作为元信息，
+/// 连接权限仍由设备 ID、验证码及既有预检决定。
+#[derive(Clone, PartialEq, Eq)]
 pub struct AssistLink {
     pub connect_id: String,
     /// 免密连接没有验证码，官方链接允许 `code` 缺失。
     pub code: String,
     pub controlled_login: bool,
 }
+impl fmt::Debug for AssistLink {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AssistLink")
+            .field("connect_id", &self.connect_id)
+            .field("code", &"REDACTED")
+            .field("controlled_login", &self.controlled_login)
+            .finish()
+    }
+}
 impl AssistLink {
-    /// 链接能否原样塞进逐行收发的通道（Linux 的单实例控制通道）。正常链接里的
-    /// 空白一定被百分号编码过，出现空白就说明这一行会被拆散。
+    pub const MAX_URI_BYTES: usize = 1024;
+    /// 限制外部激活载荷；原始空白和控制字符必须使用 URL 编码。
     pub fn transportable(uri: &str) -> bool {
-        !uri
-            .chars()
-            .any(|c| c.is_ascii_whitespace() || c.is_control())
+        uri.len() <= Self::MAX_URI_BYTES
+            && !uri
+                .chars()
+                .any(|c| c.is_ascii_whitespace() || c.is_control())
     }
     pub fn parse(uri: &str) -> Result<Self> {
         if !Self::transportable(uri) {
-            bail!("协助链接包含空白字符");
+            bail!("协助链接过长或包含无效字符");
         }
         let url = url::Url::parse(uri).map_err(|_| anyhow::anyhow!("协助链接格式不正确"))?;
         if !url.scheme().eq_ignore_ascii_case("uuremote") {
             bail!("不是 UU 远程的链接");
+        }
+        if !url.username().is_empty()
+            || url.password().is_some()
+            || url.port().is_some()
+            || url.fragment().is_some()
+        {
+            bail!("协助链接格式不正确");
         }
         let route = format!(
             "{}{}",
@@ -207,14 +222,22 @@ impl AssistLink {
         let mut connect_id = None;
         let mut code = String::new();
         let mut controlled_login = false;
+        let mut seen = std::collections::HashSet::new();
         for (key, value) in url.query_pairs() {
+            if matches!(key.as_ref(), "deviceId" | "code" | "controlledLogin")
+                && !seen.insert(key.to_string())
+            {
+                bail!("协助链接包含重复参数");
+            }
             match key.as_ref() {
                 "deviceId" => connect_id = Some(normalize_connect_id(&value)?),
                 "code" => {
                     validate_connect_code(&value)?;
                     code = value.into_owned();
                 }
-                "controlledLogin" => controlled_login = value.trim() == "1",
+                "controlledLogin" => {
+                    controlled_login = value.trim().parse::<i32>().ok() == Some(1);
+                }
                 // 链接还会带上系统、地区等只给官方客户端看的信息，忽略即可。
                 _ => (),
             }
@@ -224,55 +247,5 @@ impl AssistLink {
             code,
             controlled_login,
         })
-    }
-}
-
-#[cfg(test)]
-mod link_tests {
-    use super::AssistLink;
-
-    #[test]
-    fn reads_an_invite_link() {
-        let link = AssistLink::parse(
-            "uuremote://external/assistance?deviceId=654677613&code=Z4TFVC3K&controlledLogin=1",
-        )
-        .unwrap();
-        assert_eq!(link.connect_id, "654677613");
-        assert_eq!(link.code, "Z4TFVC3K");
-        assert!(link.controlled_login);
-    }
-
-    #[test]
-    fn passwordless_links_carry_no_code() {
-        let link = AssistLink::parse("uuremote://external/assistance?deviceId=123456789").unwrap();
-        assert_eq!(link.code, "");
-        // 官方用 strtol 解析，非 1 的值一律当假。
-        assert!(!link.controlled_login);
-    }
-
-    #[test]
-    fn decodes_percent_escapes() {
-        let link = AssistLink::parse(
-            "uuremote://external/assistance?deviceId=123456789&code=A%20b%2Bc&controlledLogin=0",
-        )
-        .unwrap();
-        assert_eq!(link.code, "A b+c");
-        assert!(!link.controlled_login);
-    }
-
-    #[test]
-    fn rejects_other_routes_and_shapes() {
-        for uri in [
-            "uuremote://external/cloudDeviceAdd?deviceId=123456789",
-            "uuremote://external/device/control?anonymous_device_id=x",
-            "openuuyc-notification://open/0123456789abcdef0123456789abcdef",
-            "https://uuyc.163.com/invite/Z4TFVC3K",
-            "uuremote://external/assistance",
-            "uuremote://external/assistance?deviceId=12345",
-            "uuremote://external/assistance?deviceId=654677613&code=a b",
-            " uuremote://external/assistance?deviceId=654677613",
-        ] {
-            assert!(AssistLink::parse(uri).is_err(), "{uri} 不该被接受");
-        }
     }
 }

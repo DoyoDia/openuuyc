@@ -8,7 +8,8 @@ impl DeviceCenterApp {
     /// 填好设备 ID 和验证码，然后走与手动输入完全一样的连接流程。界面还在登录、
     /// 登出或别的写操作时先排队；未登录就只填内容，不代替用户按下连接。
     pub(in crate::application::app) fn tick_assist_link(&mut self) {
-        let settled = !self.assist.busy
+        let settled = self.assist.password_prompt.is_none()
+            && !self.assist.busy
             && !self.logout_pending
             && !self.login_running
             && !self.login_restoring

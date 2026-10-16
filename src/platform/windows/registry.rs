@@ -4,10 +4,7 @@
 //! 记下自己的归属标记，卸载时只删自己写下的那一棵树。
 use anyhow::{Context, Result};
 use windows::{
-    Win32::{
-        Foundation::*,
-        System::Registry::*,
-    },
+    Win32::{Foundation::*, System::Registry::*},
     core::PCWSTR,
 };
 
