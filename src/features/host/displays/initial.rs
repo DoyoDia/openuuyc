@@ -153,6 +153,15 @@ impl State {
         }
         if options.force_virtual || self.preferences.default_virtual {
             validate_modes(&[virtual_size])?;
+            // 「只用虚拟屏启动」在 Linux 上还没做：它要的是本机屏幕不再显示操作内容，
+            // 做不到就照常把物理屏留着等于骗人。主控这次明确要，就带着原因失败；
+            // 本机存下来的偏好只降级处理——那可能是从 Windows 带过来的偏好文件，
+            // 为它把连接挡死会让这台机器再也连不上。
+            #[cfg(not(windows))]
+            ensure!(
+                !options.force_virtual,
+                "Linux 被控端还不支持「只用虚拟屏启动」：物理显示器没法下线，请改用普通连接"
+            );
             let result = self.create(
                 Virtual {
                     guid: uuid::Uuid::new_v4().to_string(),
@@ -183,9 +192,8 @@ impl State {
         self.restoring = true;
         let restore = (|| -> Result<()> {
             for mut spec in saved {
-                validate_modes(&[(spec.width, spec.height)])?;
                 spec.identity = None;
-                self.create(spec, lease, false)?;
+                self.restore_virtual(spec, lease)?;
             }
             // Physical modes belong to the current desktop owner. Previous
             // connections may remember virtual resources, but must not replay

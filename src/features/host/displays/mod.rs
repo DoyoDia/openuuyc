@@ -1089,6 +1089,36 @@ impl State {
             .context("虚拟显示器辅助程序不可用")?)
     }
 
+    /// 重建上次连接时保存下来的虚拟屏。
+    ///
+    /// Linux 上重建失败只是少一块屏。这块屏可能依赖辅助程序、内核模块或者当时那个
+    /// 合成器，任何一个变了都会建不出来——在 niri 里加过屏、下次从 GNOME 登录，或者
+    /// 辅助程序的服务被停了，都会走到这里。为它把整次连接废掉的话，这台机器就再也
+    /// 连不上了，直到用户自己去删偏好文件。所以记一条警告、跳过，退回物理屏继续连。
+    #[cfg(not(windows))]
+    fn restore_virtual(&mut self, spec: Virtual, lease: &Lease) -> Result<()> {
+        let guid = spec.guid.clone();
+        let result = validate_modes(&[(spec.width, spec.height)])
+            .and_then(|()| self.create(spec, lease, false))
+            .map(|_| ());
+        if let Err(error) = result {
+            tracing::warn!(
+                error = %format!("{error:#}"),
+                guid,
+                "重建保存的虚拟屏失败，跳过它继续连接"
+            );
+        }
+        Ok(())
+    }
+
+    /// Windows 上虚拟屏驱动是装好的，建不出来说明环境真的坏了，照旧报错。
+    #[cfg(windows)]
+    fn restore_virtual(&mut self, spec: Virtual, lease: &Lease) -> Result<()> {
+        validate_modes(&[(spec.width, spec.height)])?;
+        self.create(spec, lease, false)?;
+        Ok(())
+    }
+
     /// 走合成器的那条虚拟屏创建路径。
     ///
     /// 和 [`Self::create`] 的区别不只是实现：这里没有基线拓扑要记、没有布局要算，
