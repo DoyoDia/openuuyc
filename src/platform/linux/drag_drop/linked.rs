@@ -958,7 +958,19 @@ mod tests {
             .write_all(b"# a comment is not a path\nfile:///tmp/b c.txt\n")
             .unwrap();
         drop(write);
-        assert!(listing.drain(), "写端关了才算读完");
+        // 写端可能在别处被短暂继承一份：这个进程里的测试会 fork 子进程（被控端
+        // agent、门户那一类），从 fork 到 exec 之间的那一小段里，子进程也拿着
+        // 这份写端，EOF 于是会迟一点才到。`O_CLOEXEC` 已经把 exec 之后的窗口
+        // 关掉了，剩下的这一小段只能等——别把别人的窗口期当成我们的 bug。
+        let mut done = false;
+        for _ in 0..50 {
+            if listing.drain() {
+                done = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(done, "写端关了才算读完");
         assert_eq!(
             listing.paths(),
             vec![PathBuf::from("/tmp/a.txt"), PathBuf::from("/tmp/b c.txt")]
