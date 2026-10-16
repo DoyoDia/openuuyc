@@ -213,15 +213,6 @@ impl ScreenPlayback {
         (task, receive)
     }
 
-    /// 某块屏现在的解码器。窗口按自己选中的屏从这份共享登记里取，多窗口因此
-    /// 不会各开一份。
-    pub(crate) fn decoder(&self, screen_id: i32) -> Option<Arc<NativeViewerSession>> {
-        super::mutex_lock(&self.decoders)
-            .values()
-            .find(|session| session.screen_id() == screen_id)
-            .cloned()
-    }
-
     pub(crate) fn register(&self, session: Arc<NativeViewerSession>) {
         let mut decoders = super::mutex_lock(&self.decoders);
         if self.tasks.shutdown.is_cancelled() {
