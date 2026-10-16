@@ -281,6 +281,10 @@ pub(super) fn operation(
                     .collect();
                 let mut entries = super::super::service::local_list(&path)?;
                 Store::hide_temporary(&mut entries, &temporary);
+                // 对端（官方主控）要求拿到手的路径带反斜杠，见 `storage::wire_path`。
+                for entry in &mut entries {
+                    entry.full_path = storage::wire_path(&entry.full_path);
+                }
                 let (entries, dir_data) = if capabilities.compressed {
                     (Vec::new(), storage::compress(&DirectoryData { entries })?)
                 } else {
@@ -349,10 +353,9 @@ pub(super) fn operation(
                 }
                 Res::OperationResult(FileOperationResult {
                     file_error: 1,
-                    path: made
-                        .context("无法分配文件夹名称")?
-                        .to_string_lossy()
-                        .into_owned(),
+                    path: storage::wire_path(
+                        &made.context("无法分配文件夹名称")?.to_string_lossy(),
+                    ),
                     err_msg: String::new(),
                 })
             }
@@ -370,7 +373,7 @@ pub(super) fn operation(
                 std::fs::rename(&from, &to)?;
                 Res::OperationResult(FileOperationResult {
                     file_error: 1,
-                    path: to.to_string_lossy().into_owned(),
+                    path: storage::wire_path(&to.to_string_lossy()),
                     err_msg: String::new(),
                 })
             }

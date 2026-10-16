@@ -220,15 +220,31 @@ pub(super) fn local_path(value: &str) -> Result<PathBuf> {
     }
     Ok(result)
 }
+/// 回给对端的路径形状：分隔符一律用反斜杠。
+///
+/// 官方主控把它手里的路径原样回给我们（实测：它把我们给的 `full_path` 一字不差地放进
+/// 了 `send_request`），但它拼路径时按反斜杠拆 parent/name，整条路径里没有反斜杠就判
+/// `invalid_path`、把下载请求的源路径整个丢掉——我们收到的就是空 path。它随后浏览的
+/// 也正是我们给的那个字符串，所以对外一律用反斜杠，回来时由 [`local_path`] 换回 POSIX。
+/// Windows 侧的路径本来就是反斜杠，这里等于原样。
+pub(super) fn wire_path(value: &str) -> String {
+    value.replace('/', "\\")
+}
+
 #[cfg(not(windows))]
 pub(super) fn local_path(value: &str) -> Result<PathBuf> {
-    let path = if value == ":/Default" {
-        known_folder(KnownFolder::Downloads).context("用户下载目录不可用")?
+    let text = if value == ":/Default" {
+        known_folder(KnownFolder::Downloads)
+            .context("用户下载目录不可用")?
+            .to_string_lossy()
+            .into_owned()
     } else {
-        PathBuf::from(value)
+        // 对端按 `wire_path` 的形状回话：反斜杠是分隔符，先换回 POSIX 再校验。
+        value.replace('\\', "/")
     };
-    let text = path.to_str().context("文件路径无效")?;
-    ensure!(text.starts_with('/'), "仅支持本地磁盘的绝对路径");
+    // 把收到的值带上：这条曾经只报「仅支持本地磁盘的绝对路径」，而对面（官方主控）
+    // 到底发了什么形式完全看不出来，排查时只能干瞪眼。
+    ensure!(text.starts_with('/'), "仅支持本地磁盘的绝对路径：{text}");
     let mut result = PathBuf::from("/");
     let tail = text.trim_matches('/');
     if !tail.is_empty() {
@@ -610,5 +626,14 @@ mod tests {
         assert!(local_path("relative/path").is_err());
         assert!(local_path("C:\\Users").is_err());
         assert!(local_path("/tmp/../etc").is_err());
+        // 对外的路径是反斜杠形状（官方主控按反斜杠拆 parent/name，没有就丢弃整条
+        // 下载请求的源路径），回来时换回 POSIX。
+        assert_eq!(wire_path("/home/clansty/Downloads"), "\\home\\clansty\\Downloads");
+        assert_eq!(wire_path("/"), "\\");
+        assert_eq!(
+            local_path("\\home\\clansty\\Downloads").unwrap(),
+            PathBuf::from("/home/clansty/Downloads")
+        );
+        assert_eq!(local_path("\\").unwrap(), PathBuf::from("/"));
     }
 }
