@@ -80,17 +80,19 @@ fn route_for(layout: Option<&CompositorLayout>, screens: &[Screen]) -> Result<Ro
     let Some(layout) = layout else {
         return Err("读不到合成器的输出布局".into());
     };
-    if layout.outputs.len() != 1 {
+    let [output] = layout.outputs.as_slice() else {
         return Err(format!("合成器有 {} 块屏", layout.outputs.len()));
-    }
+    };
     let [screen] = screens else {
         return Err(format!("主控这边有 {} 块屏", screens.len()));
     };
-    if screen.rotation != Rotation::Normal {
-        return Err(format!("屏幕转过 {:?}", screen.rotation));
+    // 旋转看合成器里这块输出自己的，不看 `screen`：屏幕和输出是按名字配对的，
+    // XWayland 起的名字和 `wl_output` 的对不上时，屏幕那边就只剩默认的不旋转。
+    if output.rotation != Rotation::Normal {
+        return Err(format!("屏幕转过 {:?}", output.rotation));
     }
     Ok(Route::Touchscreen {
-        rotation: screen.rotation,
+        rotation: output.rotation,
         width: f64::from(screen.width).max(1.0),
     })
 }
@@ -647,7 +649,6 @@ mod tests {
                 right: o.left + o.width as i32,
                 bottom: o.top + o.height as i32,
             }),
-            rotation: logical.map_or_else(Default::default, |o| o.rotation),
         }
     }
 
@@ -692,9 +693,23 @@ mod tests {
         two.push(screen(1, (0, 0, 1920, 1080), single.outputs.first()));
         assert!(route_for(Some(&single), &two).is_err(), "主控这边两块屏");
 
-        let mut turned = one.clone();
-        turned[0].rotation = Rotation::Rotate90;
-        assert!(route_for(Some(&single), &turned).is_err(), "屏幕转过 90 度");
+        let mut turned = single.clone();
+        turned.outputs[0].rotation = Rotation::Rotate90;
+        assert!(route_for(Some(&turned), &one).is_err(), "屏幕转过 90 度");
+    }
+
+    /// 旋转只看合成器那块输出：屏幕的名字和 `wl_output` 的没配上时，屏幕这边看不出
+    /// 输出转过，也照样退回模拟。
+    #[test]
+    fn a_rotated_output_falls_back_even_when_the_screen_is_unpaired() {
+        let mut layout = CompositorLayout {
+            outputs: vec![output(Some("DP-1"), 0, 0, 1080, 1920)],
+        };
+        layout.outputs[0].rotation = Rotation::Rotate90;
+        let unpaired = vec![screen(0, (0, 0, 1080, 1920), None)];
+        assert!(unpaired[0].logical.is_none());
+        let error = route_for(Some(&layout), &unpaired).unwrap_err();
+        assert!(error.contains("Rotate90"), "{error}");
     }
 
     #[test]

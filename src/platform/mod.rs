@@ -1,6 +1,5 @@
 //! Native OS/driver implementations. Product policy belongs to sessions/features.
 //! Select the real backend here; no placeholder implementations for future OSes.
-use serde::{Deserialize, Serialize};
 #[cfg(windows)]
 pub(crate) mod windows;
 #[cfg(windows)]
@@ -33,10 +32,15 @@ pub(crate) struct CompositorOutput {
 }
 
 /// How far the compositor has turned the panel, as `wl_output.transform`
-/// states it. Only the touch path needs it: a touchscreen reports its own
-/// panel's coordinates and the compositor rotates them into the screen, while
-/// every other device names a position that is already a screen position.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// states it. Only the touch path needs it: a touchscreen reports a position
+/// on its own panel, which some compositors turn with the output and others
+/// do not, while every other device names a position that is already a screen
+/// position.
+///
+/// Only the Wayland layout reader builds one; Windows has no compositor
+/// layout, so there the variants are never constructed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(windows, allow(dead_code))]
 pub(crate) enum Rotation {
     #[default]
     Normal,

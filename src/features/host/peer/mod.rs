@@ -453,17 +453,16 @@ impl Peer {
                     let layout = crate::platform::display::compositor_layout();
                     lock(&input_reports.catalog)
                         .iter()
-                        .map(|s| {
-                            let output = layout
+                        .map(|s| super::input::Screen {
+                            id: s.screen.id,
+                            left: s.screen.left,
+                            top: s.screen.top,
+                            width: s.screen.width,
+                            height: s.screen.height,
+                            logical: layout
                                 .as_ref()
-                                .and_then(|layout| layout.output(&s.screen.device_name));
-                            super::input::Screen {
-                                id: s.screen.id,
-                                left: s.screen.left,
-                                top: s.screen.top,
-                                width: s.screen.width,
-                                height: s.screen.height,
-                                logical: output.and_then(|output| {
+                                .and_then(|layout| layout.output(&s.screen.device_name))
+                                .and_then(|output| {
                                     Some(super::input::Rect {
                                         left: output.left,
                                         top: output.top,
@@ -475,9 +474,6 @@ impl Peer {
                                             .checked_add(i32::try_from(output.height).ok()?)?,
                                     })
                                 }),
-                                rotation: output
-                                    .map_or_else(Default::default, |output| output.rotation),
-                            }
                         })
                         .collect()
                 },
