@@ -824,9 +824,7 @@ impl Inner {
                             p.waiter.finish(Err("无效的剪贴板文件列表".into()));
                             break;
                         }
-                        // 线上的时间戳两套量纲（见 `protocol::wire_filetime`），进来就
-                        // 统一成 ticks：拖放导入、写回本地剪贴板这些消费者就不必各自判
-                        // 一次。
+                        // Normalize wire Unix seconds once for native OLE and drag consumers.
                         items.extend(s.file_descs.into_iter().map(|mut f| {
                             f.last_write_time = wire_filetime(f.last_write_time);
                             f

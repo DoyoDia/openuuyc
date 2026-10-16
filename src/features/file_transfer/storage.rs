@@ -97,53 +97,6 @@ pub(super) fn modified(m: &std::fs::Metadata) -> u64 {
         .and_then(|v| v.duration_since(UNIX_EPOCH).ok())
         .map_or(0, |v| v.as_secs())
 }
-
-/// The transfer manifest carries modified times as 100 ns ticks since 1601
-/// (the Windows FILETIME scale): the official host writes the value it receives
-/// straight into the target file's FILETIME, so a push manifest has to use that
-/// scale. Unix seconds land in 1601 instead, which is what leaves the received
-/// file with an empty "date modified" in Explorer. Directory listings
-/// (`FileEntry.modified_time`) are a different field and stay Unix seconds.
-const FILETIME_EPOCH_TICKS: u64 = 116_444_736_000_000_000;
-const TICKS_PER_SECOND: u64 = 10_000_000;
-/// Wire timestamps below this can only be Unix seconds: any time after 1970 is
-/// at least `FILETIME_EPOCH_TICKS` on the ticks scale.
-const SECONDS_CEILING: u64 = 1_000_000_000_000;
-/// The largest Unix second a file time can hold here, 9999-12-31; anything past
-/// it is a wrapped or corrupt value rather than a real time.
-const MAX_UNIX_SECONDS: u64 = 253_402_300_799;
-/// A manifest entry for a file whose modified time is `modified(&m)`. A zero
-/// (unknown) time stays zero, as the protocol expects.
-pub(super) fn wire_time(seconds: u64) -> u64 {
-    if seconds == 0 {
-        0
-    } else {
-        seconds * TICKS_PER_SECOND + FILETIME_EPOCH_TICKS
-    }
-}
-/// Undo [`wire_time`] for a value that arrived from a peer, as a local time. A
-/// download manifest from an official host, and any build of ours from before
-/// this scale, carries Unix seconds instead, so accept both: published values
-/// on the two scales are more than five orders of magnitude apart, and zero
-/// stays "unspecified". Wrapped pre-1970 times and anything past 9999 are
-/// unknown, never a bogus stamp.
-pub(super) fn local_time(value: u64) -> Option<std::time::SystemTime> {
-    if value == 0 || value > wire_time(MAX_UNIX_SECONDS) {
-        return None;
-    }
-    if value < SECONDS_CEILING {
-        return UNIX_EPOCH.checked_add(std::time::Duration::from_secs(value));
-    }
-    let ticks = value - FILETIME_EPOCH_TICKS;
-    let seconds = ticks / TICKS_PER_SECOND;
-    if seconds == 0 {
-        return None;
-    }
-    UNIX_EPOCH.checked_add(std::time::Duration::new(
-        seconds,
-        ((ticks % TICKS_PER_SECOND) * 100) as u32,
-    ))
-}
 fn not_link(p: &Path) -> Result<std::fs::Metadata> {
     let m = std::fs::symlink_metadata(p)?;
     ensure!(
@@ -296,12 +249,7 @@ pub(super) fn open_source(root: &Path, item: &FileInfo) -> Result<File> {
     check_handle(&f, root)?;
     let m = f.metadata()?;
     ensure!(
-        m.is_file()
-            && m.len() == item.size
-            // The manifest entry may be on either scale (a push manifest carries
-            // ticks, an older peer or a download manifest carries seconds); the
-            // file has to match it on whichever scale it used.
-            && (modified(&m) == item.modified_time || wire_time(modified(&m)) == item.modified_time),
+        m.is_file() && m.len() == item.size && modified(&m) == item.modified_time,
         "源文件已变化，不能继续原任务"
     );
     Ok(f)
@@ -442,7 +390,10 @@ pub(super) async fn finish(
     );
     v.file.sync_all().await?;
     let file = v.file.into_std().await;
-    if let Some(time) = local_time(v.partial.info.modified_time) {
+    if v.partial.info.modified_time != 0
+        && let Some(time) =
+            UNIX_EPOCH.checked_add(std::time::Duration::from_secs(v.partial.info.modified_time))
+    {
         file.set_modified(time)?;
     }
     drop(file);
@@ -554,49 +505,5 @@ impl Store {
             let _ = std::fs::remove_file(temp);
         }
         result
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::Duration;
-
-    /// A 2026 file time in Unix seconds: the value a client pushes, and the
-    /// value whose FILETIME the official host ends up with when the scale is
-    /// wrong (which is what the fix is about).
-    const SAMPLE: u64 = 1_791_980_189;
-
-    #[test]
-    fn push_manifests_carry_filetime_ticks() {
-        assert_eq!(
-            wire_time(SAMPLE),
-            SAMPLE * TICKS_PER_SECOND + FILETIME_EPOCH_TICKS
-        );
-        assert_eq!(wire_time(0), 0, "an unknown time stays unspecified");
-        assert_eq!(
-            local_time(wire_time(SAMPLE)).unwrap(),
-            UNIX_EPOCH + Duration::from_secs(SAMPLE)
-        );
-        // Ticks keep their 100 ns resolution on the way back.
-        assert_eq!(
-            local_time(wire_time(SAMPLE) + 5).unwrap(),
-            UNIX_EPOCH + Duration::from_secs(SAMPLE) + Duration::from_nanos(500)
-        );
-    }
-
-    #[test]
-    fn received_times_accept_either_scale() {
-        // Download manifests from official hosts, and manifests from builds of
-        // ours older than this one, carry Unix seconds.
-        assert_eq!(
-            local_time(SAMPLE).unwrap(),
-            UNIX_EPOCH + Duration::from_secs(SAMPLE)
-        );
-        assert_eq!(local_time(0), None, "a zero time is unspecified");
-        // A wrapped pre-1970 time is unknown, never a stamp in 1601 or in a
-        // year far past 9999.
-        assert_eq!(local_time(18_446_744_062_065_078_195), None);
-        assert_eq!(local_time(u64::MAX), None);
     }
 }

@@ -319,13 +319,8 @@ async fn upload(rpc: &mut Rpc, r: &mut Record, repo: &Repository) -> Result<()> 
     if !r.initialized {
         let source = PathBuf::from(&r.source);
         let stop = rpc.stop.clone();
-        let (root, folder, mut files) =
+        let (root, folder, files) =
             tokio::task::spawn_blocking(move || storage::scan(&source, &stop)).await??;
-        // A scan reports Unix seconds; the push manifest and every FileAsk that
-        // follows it carry the 1601-epoch ticks the peer writes into the file.
-        for f in &mut files {
-            f.modified_time = storage::wire_time(f.modified_time);
-        }
         r.local_root = Some(root);
         r.folder = folder;
         r.files = files;
