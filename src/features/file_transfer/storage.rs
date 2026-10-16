@@ -629,7 +629,10 @@ mod tests {
         assert!(local_path("/tmp/../etc").is_err());
         // 对外的路径是反斜杠形状（官方主控按反斜杠拆 parent/name，没有就丢弃整条
         // 下载请求的源路径），回来时换回 POSIX。
-        assert_eq!(wire_path("/home/clansty/Downloads"), "\\home\\clansty\\Downloads");
+        assert_eq!(
+            wire_path("/home/clansty/Downloads"),
+            "\\home\\clansty\\Downloads"
+        );
         assert_eq!(wire_path("/"), "\\");
         assert_eq!(
             local_path("\\home\\clansty\\Downloads").unwrap(),
