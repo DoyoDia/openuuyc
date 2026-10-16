@@ -1247,16 +1247,25 @@ fn write_text(state: &mut State, text: &str) -> Result<()> {
     // 个会话里 arboard 落在 Wayland 那一侧、而且另有一座 X11 孤岛」，也只有那时才需
     // 要（它落回 X11 时，上面那次 `set_text` 写的就是 X11）。
     state.offer = None;
-    if super::x11_read::wanted(state.wayland_clipboard) {
-        match super::x11_offer::Offer::publish_text(text.to_owned()) {
-            Ok(offer) => state.offer = Some(offer),
-            Err(error) => tracing::debug!(error = format!("{error:#}"), "接管 X11 剪贴板失败"),
-        }
-    }
     state.local = LocalSnapshot {
         text: Some(text.to_owned()),
         ..Default::default()
     };
+    // 写成的那一侧「上次看到的」当场就记成这一份，不能等下一轮把它读回来再记：读回
+    // 来之前用户可能已经复制了别的。那时 X11 那一侧读到的是我们自己挂的这份，和旧
+    // 记录一比像是「变了」，会把它当成本地复制发回去，顶掉对端随后收到的那份；
+    // Wayland 那一侧读到的是用户复制的东西，而它要是恰好和旧记录一样（同一份又复制
+    // 了一遍），就会被当成「没变」吞掉。
+    state.wayland = state.local.clone();
+    if super::x11_read::wanted(state.wayland_clipboard) {
+        match super::x11_offer::Offer::publish_text(text.to_owned()) {
+            Ok(offer) => {
+                state.offer = Some(offer);
+                state.x11 = state.local.clone();
+            }
+            Err(error) => tracing::debug!(error = format!("{error:#}"), "接管 X11 剪贴板失败"),
+        }
+    }
     state.remote = true;
     state.retire();
     state.mounted = None;
@@ -1275,14 +1284,22 @@ fn write_files(state: &mut State, paths: &[PathBuf]) -> Result<()> {
     // 只有 Wayland 那一侧真的写成了才会有 `LocalChanged` 来核销这一格（写次数数的
     // 就是那一侧），没写成时自己撤回，否则它会把用户下一次「同一份又复制了一遍」
     // 吞掉。
-    if !matches!(result, Ok(true)) {
+    if !result.as_ref().is_ok_and(|published| published.counted) {
         state.writes.not_written();
     }
-    result.context("写入系统剪贴板失败")?;
+    let published = result.context("写入系统剪贴板失败")?;
     state.local = LocalSnapshot {
         sources: paths.to_vec(),
         ..Default::default()
     };
+    // 和 `write_text` 一样，写成的那一侧当场记成这一份。没写成的那一侧不动：它上面
+    // 还是原来那份，记成这一份的话，下一轮读到原来那份就会被当成一次新复制发出去。
+    if published.arboard {
+        state.wayland = state.local.clone();
+    }
+    if published.x11 {
+        state.x11 = state.local.clone();
+    }
     state.remote = true;
     state.retire();
     Ok(())
@@ -1301,14 +1318,10 @@ fn write_files(state: &mut State, paths: &[PathBuf]) -> Result<()> {
 /// GNOME 的文件管理器只认 `x-special/gnome-copied-files`，多个名字只有 X11
 /// 的 offer 给得出。
 ///
-/// 返回值是「Wayland 那一侧写成了没有」：写次数数的就是那一侧，调用方要靠它决定
-/// 要不要撤回还没被核销的那一格（见 `write_files`）。
-fn publish_files(state: &mut State, paths: &[PathBuf]) -> Result<bool> {
+/// 返回值说哪几侧写成了，见 `Published`。
+fn publish_files(state: &mut State, paths: &[PathBuf]) -> Result<Published> {
     let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
-    let mut written = false;
-    // 以 arboard 真的落在 Wayland 上为准：合成器不给 data-control 时它会退回 X11，
-    // 那一笔写的其实也是 X11，写次数不会因此前进。
-    let mut on_wayland = false;
+    let mut published = Published::default();
     let mut failures = Vec::new();
     // 两侧都试，谁也不给谁让路：Wayland 那一侧写不上（合成器没有 data-control、
     // arboard 起不来）时 XWayland 那半个桌面照样粘得出来，反过来也一样。原先
@@ -1317,8 +1330,10 @@ fn publish_files(state: &mut State, paths: &[PathBuf]) -> Result<bool> {
     if wayland {
         match arboard_files(state, paths) {
             Ok(()) => {
-                written = true;
-                on_wayland = state.wayland_clipboard;
+                published.arboard = true;
+                // 以 arboard 真的落在 Wayland 上为准：合成器不给 data-control 时它会
+                // 退回 X11，那一笔写的其实也是 X11，写次数不会因此前进。
+                published.counted = state.wayland_clipboard;
             }
             Err(error) => {
                 tracing::debug!(error = format!("{error:#}"), "写入 Wayland 剪贴板失败");
@@ -1329,7 +1344,9 @@ fn publish_files(state: &mut State, paths: &[PathBuf]) -> Result<bool> {
     match super::x11_offer::Offer::publish_files(paths.to_vec()) {
         Ok(offer) => {
             state.offer = Some(offer);
-            written = true;
+            published.x11 = true;
+            // arboard 没落在 Wayland 上时它读的就是 X11，那一侧现在也是这一份。
+            published.arboard |= !state.wayland_clipboard;
         }
         Err(error) => {
             state.offer = None;
@@ -1339,14 +1356,30 @@ fn publish_files(state: &mut State, paths: &[PathBuf]) -> Result<bool> {
             // 的单格式。Wayland 会话里它写的是另一座孤岛，上面已经试过了。
             if !wayland {
                 match arboard_files(state, paths) {
-                    Ok(()) => written = true,
+                    Ok(()) => published.arboard = true,
                     Err(error) => failures.push(format!("{error:#}")),
                 }
             }
         }
     }
-    ensure!(written, "写入系统剪贴板失败：{}", failures.join("；"));
-    Ok(on_wayland)
+    ensure!(
+        published.arboard || published.x11,
+        "写入系统剪贴板失败：{}",
+        failures.join("；")
+    );
+    Ok(published)
+}
+
+/// `publish_files` 写成了哪几侧。
+#[derive(Clone, Copy, Default)]
+struct Published {
+    /// arboard 那一侧（`read_wayland` 读的那一侧）挂上了这一份。
+    arboard: bool,
+    /// X11 那一侧挂的是我们的 offer。
+    x11: bool,
+    /// Wayland 那一侧写成了，写次数会因此前进：调用方要靠它决定要不要撤回还没被
+    /// 核销的那一格（见 `write_files`）。
+    counted: bool,
 }
 
 /// 让 arboard 挂上这一批文件：Wayland 会话里它写 Wayland 那一侧，X11 会话里它
