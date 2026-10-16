@@ -149,10 +149,15 @@ pub(super) fn descriptor_bytes(
     bytes[..4].copy_from_slice(&(items.len() as u32).to_le_bytes());
     for (b, f) in bytes[4..].chunks_exact_mut(592).zip(items) {
         ensure!(safe_name(&f.file_name), unsafe_name);
-        // FD_ATTRIBUTES | FD_WRITESTIME | FD_FILESIZE | FD_PROGRESSUI
-        b[..4].copy_from_slice(&0x4064u32.to_le_bytes());
+        // FD_ATTRIBUTES | FD_WRITESTIME | FD_FILESIZE | FD_PROGRESSUI; an unknown
+        // time drops FD_WRITESTIME instead of claiming 1601.
+        let has_time = f.last_write_time != 0 && f.last_write_time <= i64::MAX as u64;
+        let flags = if has_time { 0x4064u32 } else { 0x4044u32 };
+        b[..4].copy_from_slice(&flags.to_le_bytes());
         b[36..40].copy_from_slice(&f.file_attributes.to_le_bytes());
-        b[56..64].copy_from_slice(&f.last_write_time.to_le_bytes());
+        if has_time {
+            b[56..64].copy_from_slice(&f.last_write_time.to_le_bytes());
+        }
         b[64..68].copy_from_slice(&((f.file_size >> 32) as u32).to_le_bytes());
         b[68..72].copy_from_slice(&(f.file_size as u32).to_le_bytes());
         for (out, c) in b[72..]

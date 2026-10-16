@@ -1322,7 +1322,11 @@ fn serve(s: &Arc<Inner>, epoch: u64, id: i64, kind: ClipboardRequestKind) -> Res
                             segments.push(std::mem::take(&mut current));
                             bytes = 0;
                         }
-                        current.push(item.desc.clone());
+                        // 线上发 Unix 秒（见 `wire_seconds`）：官方客户端按秒读，
+                        // 而我们内部、以及给 Windows 的 FILEDESCRIPTORW 里都是 ticks。
+                        let mut wire = item.desc.clone();
+                        wire.last_write_time = wire_seconds(wire.last_write_time);
+                        current.push(wire);
                         bytes += size;
                     }
                     if !current.is_empty() {
@@ -1441,7 +1445,11 @@ fn parse_descriptors(bytes: &[u8]) -> Result<Vec<ClipboardFileDescriptor>> {
         out.push(ClipboardFileDescriptor {
             file_name: name,
             file_attributes: u32at(36),
-            last_write_time: u32at(56) as u64 | ((u32at(60) as u64) << 32),
+            last_write_time: if u32at(0) & 0x20 != 0 {
+                u32at(56) as u64 | ((u32at(60) as u64) << 32)
+            } else {
+                0
+            },
             file_size: u32at(68) as u64 | ((u32at(64) as u64) << 32),
         });
     }

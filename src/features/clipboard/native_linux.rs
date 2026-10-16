@@ -1829,7 +1829,11 @@ fn serve(
                     segments.push(std::mem::take(&mut current));
                     bytes = 0;
                 }
-                current.push(item.desc.clone());
+                // 线上发 Unix 秒（见 `wire_seconds`），和 Windows 那边一致；
+                // FileGroupDescriptorW 的二进制块里仍是 ticks。
+                let mut wire = item.desc.clone();
+                wire.last_write_time = wire_seconds(wire.last_write_time);
+                current.push(wire);
                 bytes += size;
             }
             if !current.is_empty() {
