@@ -12,6 +12,8 @@ OpenUUYC 是用 Rust 编写的 UU 远程第三方 Windows 客户端，支持主�
 
 最新稳定版为 [v1.0.1](https://github.com/djkcyl/farwing/releases/tag/v1.0.1)。
 
+最新测试版为 [v1.0.2-beta.5](https://github.com/djkcyl/farwing/releases/tag/v1.0.2-beta.5)，包含协助邀请链接、被控托盘提示、观看窗口剪贴板开关，以及网络参数、单轨切屏和文件时间修正。
+
 接收测试版更新提醒：在“关于”中开启“允许测试版”（默认关闭）。
 
 **从 alpha.6 或更早版本升级需重新登录，设备 ID 会改变，旧设备条目需手动删除。**
