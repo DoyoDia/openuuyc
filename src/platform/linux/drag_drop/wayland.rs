@@ -168,9 +168,14 @@ fn logical_size(state: &State, index: usize) -> (i32, i32) {
 ///
 /// 名字对不上是常态：XWayland 那边给的可能压根不是合成器的输出名（老版本直接叫
 /// `XWAYLAND0`），而 `wl_output` 在 v4 之前根本不发名字（绑上去拿到的是空串）。
-/// 所以照采集那边的三段式来：按名字 → 只有一块屏就用它 → 都不行就按尺寸认，物理
-/// 与逻辑尺寸有一种对得上就算（尺寸按无序对比较，转过 90 度的屏宽高是换过来的）
-/// → 还不行就报错，并把合成器有的输出列出来。
+/// 所以照采集那边的三段式来：按名字 → 只有一块屏就用它 → 都不行就按尺寸认（尺寸
+/// 按无序对比较，转过 90 度的屏宽高是换过来的）→ 还不行就报错，并把合成器有的
+/// 输出列出来。
+///
+/// 按尺寸认时先比逻辑尺寸、再比物理尺寸：`size` 来自 XWayland 的 RandR，有缩放时
+/// 报的多半是逻辑尺寸，而 `wl_output.mode` 是物理像素——只比后者的话，这条退路恰
+/// 好死在最需要它的多屏缩放场景里。逻辑尺寸有好几块屏对得上就报错，不再去比物理
+/// 尺寸：那样只会挑中凑巧对上的另一块屏。
 fn pick(state: &State, device: &str, size: (u32, u32)) -> Result<usize> {
     if let Some(index) = state
         .outputs
@@ -189,37 +194,52 @@ fn pick(state: &State, device: &str, size: (u32, u32)) -> Result<usize> {
     }
     let side = |(width, height): (i32, i32)| (width.max(height), width.min(height));
     let wanted = side((size.0 as i32, size.1 as i32));
-    let matched: Vec<usize> = state
-        .outputs
-        .iter()
-        .enumerate()
-        .filter(|(index, output)| {
-            // 两套单位都比一遍：`device` 来自 XWayland 的 RandR，有缩放时报的多半
-            // 是逻辑尺寸，而 `wl_output.mode` 是物理像素——只比后者的话，这条退路
-            // 恰好死在最需要它的多屏缩放场景里。
-            [output.physical, logical_size(state, *index)]
-                .into_iter()
-                .any(|size| size != (0, 0) && side(size) == wanted)
-        })
-        .map(|(index, _)| index)
-        .collect();
-    if let [index] = matched[..] {
-        tracing::debug!(device, "输出名对不上，按尺寸认屏");
-        return Ok(index);
-    }
-    bail!(
-        "合成器里没有名为 {device} 的输出（它有：{}）",
-        state
-            .outputs
-            .iter()
-            .map(|output| if output.name.is_empty() {
-                format!("无名 {}x{}", output.physical.0, output.physical.1)
-            } else {
-                output.name.clone()
+    let matching = |size_of: &dyn Fn(usize) -> (i32, i32)| -> Vec<usize> {
+        (0..state.outputs.len())
+            .filter(|&index| {
+                let size = size_of(index);
+                size != (0, 0) && side(size) == wanted
             })
-            .collect::<Vec<_>>()
-            .join("、")
-    )
+            .collect()
+    };
+    let mut matched = matching(&|index| logical_size(state, index));
+    if matched.is_empty() {
+        matched = matching(&|index| state.outputs[index].physical);
+    }
+    let describe = |index: usize| {
+        let output = &state.outputs[index];
+        if output.name.is_empty() {
+            format!("无名 {}x{}", output.physical.0, output.physical.1)
+        } else {
+            output.name.clone()
+        }
+    };
+    match matched[..] {
+        [index] => {
+            tracing::debug!(device, "输出名对不上，按尺寸认屏");
+            Ok(index)
+        }
+        [] => bail!(
+            "合成器里没有名为 {device} 的输出，也没有 {}x{} 的屏（它有：{}）",
+            size.0,
+            size.1,
+            (0..state.outputs.len())
+                .map(describe)
+                .collect::<Vec<_>>()
+                .join("、")
+        ),
+        _ => bail!(
+            "合成器里没有名为 {device} 的输出，按尺寸 {}x{} 认又有好几块屏对得上（{}），\
+             分不出是哪一块",
+            size.0,
+            size.1,
+            matched
+                .iter()
+                .map(|&index| describe(index))
+                .collect::<Vec<_>>()
+                .join("、")
+        ),
+    }
 }
 
 fn run(
