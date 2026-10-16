@@ -16,6 +16,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const MODULE: &str = "vkms";
+/// 这个参数本身就是 configfs 接口的一部分，老内核不认它。
+const DEFAULT_DEV_PARAMETER: &str = "create_default_dev";
 const CONFIGFS: &str = "/sys/kernel/config";
 const ROOT: &str = "/sys/kernel/config/vkms";
 /// 实例目录名，同时也是 faux 设备名（`/sys/devices/faux/openuuyc`），靠它认出
@@ -54,6 +56,7 @@ impl Lease {
 impl Instance {
     /// 接管已有的实例，或者按当前形状造一个。返回时保证 `SLOTS` 路连接器全部断开。
     pub fn open() -> Result<Self> {
+        ensure_supported()?;
         load_module()?;
         let directory = instance_dir();
         if directory.exists() && !enabled(&directory)? {
@@ -205,10 +208,6 @@ fn load_module() -> Result<()> {
     if Path::new("/sys/module/vkms").exists() {
         return Ok(());
     }
-    ensure!(
-        Path::new("/sys/kernel/config").exists(),
-        "系统没有挂载 configfs（{CONFIGFS}），无法创建虚拟显示器"
-    );
     let output = std::process::Command::new("modprobe")
         .args([MODULE, "create_default_dev=N"])
         .output()
@@ -219,6 +218,59 @@ fn load_module() -> Result<()> {
         String::from_utf8_lossy(&output.stderr).trim()
     );
     Ok(())
+}
+
+/// 这个内核的 VKMS 有没有 configfs 接口。没有就不要碰它。
+///
+/// 连接器上的 `status`、`create_default_dev` 参数和 configfs 接口是同一组补丁
+/// （`drm/vkms: Add configfs support`）带进主线的，Linux 6.19 才有。老内核上
+/// `modprobe vkms create_default_dev=N` 只会打一行 `unknown parameter ... ignored`
+/// 然后把模块**照常加载**（`kernel/module/main.c` 的 `unknown_module_param_cb`），
+/// 于是用户桌面上平白多出一块一直连着的 `Virtual-1`，而 `/sys/kernel/config/vkms`
+/// 根本不存在、建屏必然失败。所以加载之前先问清楚，不支持就什么都别做。
+fn ensure_supported() -> Result<()> {
+    // 接口在就说明模块已经按支持 configfs 的版本加载好了。
+    if Path::new(ROOT).exists() {
+        return Ok(());
+    }
+    if Path::new("/sys/module/vkms").exists() {
+        bail!(
+            "本机加载的 VKMS 模块没有 configfs 接口（{ROOT} 不存在），虚拟屏需要 Linux 6.19 或更新的内核"
+        );
+    }
+    ensure!(
+        Path::new(CONFIGFS).exists(),
+        "系统没有挂载 configfs（{CONFIGFS}），无法创建虚拟显示器"
+    );
+    ensure!(
+        module_has_default_dev_parameter()?,
+        "本机内核 {} 的 VKMS 不支持 configfs，虚拟屏需要 Linux 6.19 或更新的内核",
+        kernel_release()
+    );
+    Ok(())
+}
+
+/// `modinfo -F parm vkms` 里有没有 `create_default_dev`。有它就是 6.19 之后的模块。
+fn module_has_default_dev_parameter() -> Result<bool> {
+    let output = std::process::Command::new("modinfo")
+        .args(["-F", "parm", MODULE])
+        .output()
+        .context("无法执行 modinfo（需要 kmod）")?;
+    ensure!(
+        output.status.success(),
+        "无法读取 {MODULE} 模块的信息：{}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .any(|line| line.trim().starts_with(DEFAULT_DEV_PARAMETER)))
+}
+
+/// 内核版本，只用来写进给用户看的原因里。
+fn kernel_release() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .map(|text| text.trim().to_owned())
+        .unwrap_or_else(|_| "未知版本".into())
 }
 
 fn enabled(instance: &Path) -> Result<bool> {
