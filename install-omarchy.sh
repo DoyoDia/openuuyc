@@ -141,6 +141,10 @@ say "安装程序文件"
     "$PREFIX/share/applications/openuuyc.desktop"
 "${SUDO[@]}" install -Dm644 assets/icon-256.png \
     "$PREFIX/share/icons/hicolor/256x256/apps/openuuyc.png"
+# 桌面条目里登记了 uuremote:// 协助链接；刷新 MIME 缓存，xdg-open 才找得到它。
+if command -v update-desktop-database >/dev/null; then
+    "${SUDO[@]}" update-desktop-database -q "$PREFIX/share/applications" || true
+fi
 
 say "安装登录自启单元"
 # 打包的那份单元把程序路径写死成 /usr/bin/OpenUUYC；这个脚本装到 $PREFIX，

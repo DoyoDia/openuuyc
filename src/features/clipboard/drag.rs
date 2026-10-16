@@ -263,7 +263,7 @@ pub(super) fn receive(
                             directory:f.file_attributes&0x10!=0,
                             info:crate::features::file_transfer::protocol::FileInfo {
                                 rel_path:f.file_name,size:f.file_size,
-                                modified_time:f.last_write_time.saturating_sub(116444736000000000)/10000000,
+                                modified_time:wire_seconds(f.last_write_time),
                             },
                         }).collect();
                         let runtime=tokio::runtime::Builder::new_current_thread().enable_all().build()?;

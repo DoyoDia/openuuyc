@@ -275,6 +275,44 @@ pub(in crate::application::viewer) fn player_title_bar(
     } else {
         "将所选麦克风发送到远端（设备可在高级设置中切换）"
     };
+
+    // 动作区是从右往左排的，先加的落在右边，所以这里的代码顺序和屏幕上的左右
+    // 顺序相反：剪贴板写在麦克风前头，显示出来才在麦克风右边。
+    // 剪贴板按设备记住开没开，顶栏只是让你不用钻进串流设置的高级页。
+    let clip = bar.stream_control.clipboard().snapshot();
+    let clip_hint = if !clip.enabled {
+        "同步剪贴板：把本机剪贴板发送到远端，并把远端剪贴板取回本机".to_owned()
+    } else if let Some(error) = clip.error.as_deref() {
+        error.to_owned()
+    } else if clip.active {
+        "剪贴板同步中，点击关闭".to_owned()
+    } else {
+        "剪贴板同步已开启，等待通道就绪，点击关闭".to_owned()
+    };
+    if actions
+        .add_enabled_ui(
+            clip.enabled
+                || (control.ready
+                    && control.mouse_mode != crate::features::remote_input::MouseMode::View),
+            |ui| title_icon_button(ui, TitleIcon::Clipboard, clip.enabled, &clip_hint),
+        )
+        .inner
+        .on_disabled_hover_text("请先连接并开启键鼠控制")
+        .clicked()
+    {
+        crate::ui::controls::clear_notice(actions.ctx(), "clipboard-request-error");
+        match bar.stream_control.set_clipboard_enabled(!clip.enabled) {
+            Ok(()) => crate::ui::controls::clear_notice(actions.ctx(), "clipboard-error"),
+            Err(error) => crate::ui::controls::notice(
+                actions.ctx(),
+                "clipboard-request-error",
+                "剪贴板同步",
+                crate::ui::controls::DialogIcon::Error,
+                error.to_string(),
+            ),
+        }
+    }
+
     if actions
         .add_enabled_ui(
             mic.enabled
