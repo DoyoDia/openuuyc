@@ -17,18 +17,26 @@ use anyhow::{Context as _, Result, bail};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
-use x11rb::connection::Connection;
+use std::time::{Duration, Instant};
+use x11rb::connection::{Connection, RequestConnection as _};
 use x11rb::protocol::Event;
 use x11rb::protocol::xproto::{
-    Atom, AtomEnum, ConnectionExt as _, CreateWindowAux, EventMask, PropMode,
-    SELECTION_NOTIFY_EVENT, SelectionNotifyEvent, SelectionRequestEvent, WindowClass,
+    Atom, AtomEnum, ChangeWindowAttributesAux, ConnectionExt as _, CreateWindowAux, EventMask,
+    PropMode, Property, SELECTION_NOTIFY_EVENT, SelectionNotifyEvent, SelectionRequestEvent,
+    Window, WindowClass,
 };
 use x11rb::wrapper::ConnectionExt as _;
 
 /// How long the owner thread waits for an event before looking at whether it
 /// has been asked to stop.
 const POLL: Duration = Duration::from_millis(50);
+
+/// 对方多久不来取下一段就放弃这次分段传输。每送出一段重新算起。
+const INCR_WAIT: Duration = Duration::from_secs(5);
+
+/// `ChangeProperty` 请求除数据以外的字节：24 字节的请求头，再加上 BIG-REQUESTS
+/// 把长度字段挪出来的 4 字节。
+const PROPERTY_HEADER: usize = 28;
 
 /// The targets a file copy offers, most specific first, which is the order
 /// `TARGETS` should list them in.
@@ -131,6 +139,7 @@ struct Atoms {
     clipboard: Atom,
     targets: Atom,
     timestamp: Atom,
+    incr: Atom,
     /// One per entry in the content's target list, in the same order.
     data: Vec<Atom>,
 }
@@ -189,6 +198,7 @@ impl Offer {
             clipboard: intern(&connection, "CLIPBOARD")?,
             targets: intern(&connection, "TARGETS")?,
             timestamp: intern(&connection, "TIMESTAMP")?,
+            incr: intern(&connection, "INCR")?,
             data: content
                 .targets()
                 .iter()
@@ -249,19 +259,65 @@ impl Drop for Offer {
     }
 }
 
+/// 一次分段传输（ICCCM 2.7.2 的 INCR）。
+///
+/// 数据大过 X 服务器单个请求的上限时，一次 `ChangeProperty` 写不下：先在对方的属性
+/// 上放一个 `INCR` 类型、值为总长度的记号，对方每删一次属性，就往里写下一段，最后
+/// 写一段空的表示完了。
+struct Transfer {
+    requestor: Window,
+    property: Atom,
+    /// 每一段属性的类型，也就是这份数据实际的类型。
+    kind: Atom,
+    data: Vec<u8>,
+    /// 已经写出去的字节数。
+    sent: usize,
+    /// 到这一刻对方还没来取下一段，就放弃。
+    deadline: Instant,
+}
+
 /// Answer selection requests until ownership is lost or the offer is retired.
 fn serve(
-    connection: &impl Connection,
+    connection: &x11rb::rust_connection::RustConnection,
     window: x11rb::protocol::xproto::Window,
     atoms: &Atoms,
     content: &Content,
     stop: &AtomicBool,
 ) {
+    // 一个请求能带多少字节由 X 服务器说了算（有 BIG-REQUESTS 时 Xorg 是 16 MB，没有
+    // 时只有 256 KB），远端发来的文本最大 32 MB，超过的只能分段交出去。
+    let chunk = connection
+        .maximum_request_bytes()
+        .saturating_sub(PROPERTY_HEADER);
+    let mut transfers: Vec<Transfer> = Vec::new();
+    // 选择区被别人拿走以后不再接新的请求，但已经开始的分段传输要送完：对方正等着
+    // 下一段，半路停下它就只能干等到自己超时（`xclip` 根本没有超时）。offer 被撤下
+    // （`Drop`）时不在此列：剪贴板线程正等着这里退出。
+    let mut owned = true;
     while !stop.load(Ordering::Acquire) {
+        let now = Instant::now();
+        let expired: Vec<Window> = transfers
+            .iter()
+            .filter(|transfer| transfer.deadline <= now)
+            .map(|transfer| transfer.requestor)
+            .collect();
+        if !expired.is_empty() {
+            tracing::debug!(
+                count = expired.len(),
+                "对方迟迟不取下一段，放弃剪贴板分段传输"
+            );
+            transfers.retain(|transfer| transfer.deadline > now);
+            for requestor in expired {
+                unwatch(connection, &transfers, requestor);
+            }
+        }
+        if !owned && transfers.is_empty() {
+            return;
+        }
         let event = match connection.poll_for_event() {
             Ok(Some(event)) => event,
             Ok(None) => {
-                std::thread::sleep(POLL);
+                wait(connection);
                 continue;
             }
             Err(error) => {
@@ -271,10 +327,34 @@ fn serve(
         };
         match event {
             // Something else took the clipboard, which retires this offer.
-            Event::SelectionClear(event) if event.owner == window => return,
-            Event::SelectionRequest(request) => {
-                if let Err(error) = answer(connection, atoms, content, &request) {
-                    tracing::debug!(%error, "回应剪贴板请求失败");
+            Event::SelectionClear(event) if event.owner == window => owned = false,
+            Event::SelectionRequest(request) if owned => {
+                answer(connection, atoms, content, &request, chunk, &mut transfers);
+            }
+            // 选择区已经不是我们的了，还在路上的请求一律拒绝。
+            Event::SelectionRequest(request) => notify(connection, &request, x11rb::NONE),
+            // 对方的窗口没了（程序退出、粘贴被取消），它那几次传输不用再等。
+            Event::DestroyNotify(event) => {
+                transfers.retain(|transfer| transfer.requestor != event.window);
+            }
+            // 对方删掉了属性，也就是取走了上一段，接着写下一段。
+            Event::PropertyNotify(event) if event.state == Property::DELETE => {
+                let Some(index) = transfers.iter().position(|transfer| {
+                    transfer.requestor == event.window && transfer.property == event.atom
+                }) else {
+                    continue;
+                };
+                match next_chunk(connection, &mut transfers[index], chunk) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        transfers.swap_remove(index);
+                        unwatch(connection, &transfers, event.window);
+                    }
+                    Err(error) => {
+                        tracing::debug!(error = format!("{error:#}"), "剪贴板分段传输失败");
+                        transfers.swap_remove(index);
+                        unwatch(connection, &transfers, event.window);
+                    }
                 }
             }
             _ => {}
@@ -295,12 +375,32 @@ fn serve(
     }
 }
 
+/// 等 X 服务器发来点什么，最多等 `POLL`。
+///
+/// 不能干睡：请求在队列里多躺几十毫秒，分段传输的每一段就多等几十毫秒；而请求方
+/// 退出后 X 会把它的窗口号分给下一个程序，晚到的旧请求就会答到新程序的窗口上。
+fn wait(connection: &x11rb::rust_connection::RustConnection) {
+    use std::os::fd::AsRawFd as _;
+    let mut poll = libc::pollfd {
+        fd: connection.stream().as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // Safe because `poll` only writes into the one descriptor it was given.
+    // 出错（包括被信号打断）和到点一样处理：回去看一眼停没停、再取事件。
+    let _ = unsafe { libc::poll(&mut poll, 1, POLL.as_millis() as i32) };
+}
+
+/// 回应一次请求。写属性出了错也照样回话（`property = None`，也就是拒绝）：不回话的
+/// 话，对方会一直等下去。
 fn answer(
     connection: &impl Connection,
     atoms: &Atoms,
     content: &Content,
     request: &SelectionRequestEvent,
-) -> Result<()> {
+    chunk: usize,
+    transfers: &mut Vec<Transfer>,
+) {
     // A requestor that sent no property is using the obsolete convention; the
     // target doubles as the property in that case.
     let property = if request.property == x11rb::NONE {
@@ -308,51 +408,156 @@ fn answer(
     } else {
         request.property
     };
-    let mut accepted = true;
+    let accepted = match reply(
+        connection, atoms, content, request, property, chunk, transfers,
+    ) {
+        Ok(accepted) => accepted,
+        Err(error) => {
+            tracing::debug!(error = format!("{error:#}"), "写剪贴板属性失败，按拒绝回应");
+            false
+        }
+    };
+    notify(
+        connection,
+        request,
+        if accepted { property } else { x11rb::NONE },
+    );
+}
+
+/// 把被问的那一份写到对方的属性上，返回「给了没有」。不支持的类型返回 `false`。
+///
+/// 每一笔都等 X 服务器确认（`check`）：属性没写成却回话说写好了，对方读到的是空的。
+fn reply(
+    connection: &impl Connection,
+    atoms: &Atoms,
+    content: &Content,
+    request: &SelectionRequestEvent,
+    property: Atom,
+    chunk: usize,
+    transfers: &mut Vec<Transfer>,
+) -> Result<bool> {
+    let requestor = request.requestor;
+    // 同一个窗口、同一个属性又来要了：上一次分段传输对方已经不要了。X 也会把退出的
+    // 程序用过的窗口号分给新程序，留着它会把旧数据写进新请求的属性里。
+    transfers.retain(|transfer| transfer.requestor != requestor || transfer.property != property);
     if request.target == atoms.targets {
         let mut list = vec![atoms.targets, atoms.timestamp];
         list.extend_from_slice(&atoms.data);
-        connection.change_property32(
-            PropMode::REPLACE,
-            request.requestor,
-            property,
-            AtomEnum::ATOM,
-            &list,
-        )?;
+        connection
+            .change_property32(
+                PropMode::REPLACE,
+                requestor,
+                property,
+                AtomEnum::ATOM,
+                &list,
+            )?
+            .check()?;
     } else if request.target == atoms.timestamp {
-        connection.change_property32(
-            PropMode::REPLACE,
-            request.requestor,
-            property,
-            AtomEnum::INTEGER,
-            &[request.time],
-        )?;
+        connection
+            .change_property32(
+                PropMode::REPLACE,
+                requestor,
+                property,
+                AtomEnum::INTEGER,
+                &[request.time],
+            )?
+            .check()?;
     } else if let Some(index) = atoms.data.iter().position(|atom| *atom == request.target) {
         let data = content.payload(content.targets()[index]);
-        connection.change_property8(
-            PropMode::REPLACE,
-            request.requestor,
-            property,
-            request.target,
-            &data,
-        )?;
+        let kind = request.target;
+        if data.len() <= chunk {
+            connection
+                .change_property8(PropMode::REPLACE, requestor, property, kind, &data)?
+                .check()?;
+        } else {
+            // 一次写不下，分段送。先盯住对方窗口上的属性变化，再放 `INCR` 记号、回话：
+            // 顺序反过来的话，对方删记号那一下可能在我们开始盯之前就发生了。窗口销毁
+            // 也一起盯，对方中途退出时好及早放手。
+            connection
+                .change_window_attributes(
+                    requestor,
+                    &ChangeWindowAttributesAux::new()
+                        .event_mask(EventMask::PROPERTY_CHANGE | EventMask::STRUCTURE_NOTIFY),
+                )?
+                .check()?;
+            // 值是总长度的下限；超过 32 位就写最大值，反正 `MAX_CLIP` 远小于它。
+            let size = u32::try_from(data.len()).unwrap_or(u32::MAX);
+            connection
+                .change_property32(PropMode::REPLACE, requestor, property, atoms.incr, &[size])?
+                .check()?;
+            tracing::debug!(
+                size = data.len(),
+                chunk,
+                "剪贴板内容超过单个请求上限，分段传输"
+            );
+            transfers.push(Transfer {
+                requestor,
+                property,
+                kind,
+                data,
+                sent: 0,
+                deadline: Instant::now() + INCR_WAIT,
+            });
+        }
     } else {
         // Refusing is reported by naming no property, which is what tells the
         // requestor to try a different target.
-        accepted = false;
+        return Ok(false);
     }
-    let notify = SelectionNotifyEvent {
+    Ok(true)
+}
+
+/// 对方取走了上一段，写下一段。返回「还有没有下文」：数据写完之后还要再写一段空的，
+/// 那一段写出去这次传输才算完。
+fn next_chunk(connection: &impl Connection, transfer: &mut Transfer, chunk: usize) -> Result<bool> {
+    let end = (transfer.sent + chunk).min(transfer.data.len());
+    let more = transfer.sent < transfer.data.len();
+    connection.change_property8(
+        PropMode::REPLACE,
+        transfer.requestor,
+        transfer.property,
+        transfer.kind,
+        &transfer.data[transfer.sent..end],
+    )?;
+    connection.flush()?;
+    transfer.sent = end;
+    transfer.deadline = Instant::now() + INCR_WAIT;
+    Ok(more)
+}
+
+/// 这个窗口上没有在途的传输了，就不再盯它的属性变化。窗口可能已经没了，出错不管。
+fn unwatch(connection: &impl Connection, transfers: &[Transfer], requestor: Window) {
+    if transfers
+        .iter()
+        .any(|transfer| transfer.requestor == requestor)
+    {
+        return;
+    }
+    let _ = connection.change_window_attributes(
+        requestor,
+        &ChangeWindowAttributesAux::new().event_mask(EventMask::NO_EVENT),
+    );
+    let _ = connection.flush();
+}
+
+/// 回话：`property` 是 `None` 就是拒绝。
+fn notify(connection: &impl Connection, request: &SelectionRequestEvent, property: Atom) {
+    let event = SelectionNotifyEvent {
         response_type: SELECTION_NOTIFY_EVENT,
         sequence: 0,
         time: request.time,
         requestor: request.requestor,
         selection: request.selection,
         target: request.target,
-        property: if accepted { property } else { x11rb::NONE },
+        property,
     };
-    connection.send_event(false, request.requestor, EventMask::NO_EVENT, notify)?;
-    connection.flush()?;
-    Ok(())
+    let sent = connection
+        .send_event(false, request.requestor, EventMask::NO_EVENT, event)
+        .map(|_| ())
+        .and_then(|()| connection.flush());
+    if let Err(error) = sent {
+        tracing::debug!(%error, "回应剪贴板请求失败");
+    }
 }
 
 #[cfg(test)]
