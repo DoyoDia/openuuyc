@@ -723,11 +723,11 @@ impl ApplicationHandler<UiEvent> for ConnectingWindowsRunner {
             return;
         }
         if let Stage::Playing(player) = &mut self.stage {
-            player.poll_pending();
+            let mut redraw = player.poll_pending();
             // 屏目录每 250 ms 对一次：切屏期间没有画面要画，但轮询交给它自己，
             // 不再把 UI 线程按在「立刻重画」上（那样会绕开帧率节拍一直占满一个核）。
             if let Some(window) = self.window.clone() {
-                player.refresh_catalog(&window);
+                redraw |= player.refresh_catalog(&window);
             }
             if player.connection_ended() {
                 // 和 Windows 一样干净地退出：结束的原因由 controller 那边报。
@@ -738,8 +738,13 @@ impl ApplicationHandler<UiEvent> for ConnectingWindowsRunner {
             // wake bridge covers the next frame, so the loop can sleep.
             // Repainting the whole UI at the display rate instead would
             // leave an arriving frame waiting for the pass in progress.
-            if player.poll() {
+            let frame = player.poll();
+            // 解码器出错的弹窗也要画出来，哪怕之后再没有新帧。
+            redraw |= player.error.is_some();
+            if frame {
                 self.schedule_now();
+            } else if redraw {
+                self.schedule(Instant::now());
             }
         }
         match self.next_repaint {
@@ -1072,10 +1077,10 @@ impl Player {
     }
 
     /// 等正在打开的那块屏就绪。没就绪就什么都不做，`ScreenPlayback::open` 传进去的
-    /// repaint 回调会把事件循环叫醒。
-    fn poll_pending(&mut self) {
+    /// repaint 回调会把事件循环叫醒。返回这次有没有收到结果（顶栏要重画）。
+    fn poll_pending(&mut self) -> bool {
         let Some(pending) = self.pending.as_mut() else {
-            return;
+            return false;
         };
         let ready = match pending.result.try_recv() {
             Ok(result) => Some((pending.id, result)),
@@ -1085,7 +1090,7 @@ impl Player {
             Err(tokio::sync::oneshot::error::TryRecvError::Empty) => None,
         };
         let Some((id, result)) = ready else {
-            return;
+            return false;
         };
         self.pending = None;
         match result {
@@ -1115,17 +1120,31 @@ impl Player {
             }
         }
         self.sync_screens();
+        true
     }
 
     /// 每 250 ms 对一遍目录，规则和 Windows 的 `refresh_catalog` 一样：正在看的屏从
     /// 目录里消失就换到第一块还在的；轨道或绑定和目录对不上就重开；对端报告它选中了
     /// 别的屏（刚加好的虚拟屏）就跟过去。`failed_screen` 挡住失败后的反复重试。
-    fn refresh_catalog(&mut self, window: &Arc<Window>) {
+    ///
+    /// 返回顶栏要不要重画：目录或等待中的屏变了，或者有错误要弹。Windows 每次核对完
+    /// 都重画一遍；这里对端画面静止时没有新帧推着 UI 走，新加的屏的 tab、核对触发的
+    /// 切屏的等待态和弹窗都得靠它排一次重画。
+    fn refresh_catalog(&mut self, window: &Arc<Window>) -> bool {
         let now = Instant::now();
         if now < self.next_refresh {
-            return;
+            return false;
         }
         self.next_refresh = now + Duration::from_millis(250);
+        let catalog = self.catalog.clone();
+        let pending = self.pending.as_ref().map(|pending| pending.id);
+        self.reconcile_catalog(window);
+        self.catalog != catalog
+            || self.pending.as_ref().map(|pending| pending.id) != pending
+            || self.error.is_some()
+    }
+
+    fn reconcile_catalog(&mut self, window: &Arc<Window>) {
         let topology = self.screens.topology();
         if topology.sequence != self.topology_sequence {
             self.topology_sequence = topology.sequence;
