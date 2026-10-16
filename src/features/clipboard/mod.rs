@@ -13,6 +13,9 @@ mod protocol;
 #[cfg(not(windows))]
 #[path = "x11_offer_linux.rs"]
 mod x11_offer;
+#[cfg(not(windows))]
+#[path = "x11_read_linux.rs"]
+mod x11_read;
 use anyhow::{Result, anyhow, bail, ensure};
 pub(crate) use native::{FileOffer, FileSummary};
 use prost::Message;

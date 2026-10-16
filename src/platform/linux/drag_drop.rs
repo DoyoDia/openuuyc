@@ -14,6 +14,8 @@ pub(crate) mod wayland;
 mod xdnd;
 
 pub(crate) use wayland::Catcher;
+// 剪贴板那边读 X11 选择区时也要解析 `text/uri-list`，一模一样的一份不必再写一遍。
+pub(crate) use xdnd::parse_uri_list;
 
 use anyhow::{Context as _, Result, bail, ensure};
 use std::{
