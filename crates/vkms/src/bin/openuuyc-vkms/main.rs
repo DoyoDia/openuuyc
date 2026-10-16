@@ -64,6 +64,8 @@ fn main() {
         Ok(listener) => listener,
         Err(error) => fail(error),
     };
+    // 日志里写实际在听的路径：套接字激活时它由单元的 ListenStream 决定，不是我们的默认值。
+    let socket = listening_on(&listener).unwrap_or(socket);
     // 设备建不出来也要继续监听。启动失败就退出的话，`Restart=on-failure` 会在一秒内
     // 重试 5 次，撞上 start limit 之后连套接字单元一起变成 failed
     // （`service-start-limit-hit`），诊断页只会看到「连不上」，看不到真正的原因；
@@ -760,6 +762,12 @@ fn listen(path: &str) -> Result<UnixListener> {
     Ok(listener)
 }
 
+/// 监听套接字绑在哪个路径上。抽象套接字或者查询失败时是 `None`。
+fn listening_on(listener: &UnixListener) -> Option<String> {
+    let address = listener.local_addr().ok()?;
+    Some(address.as_pathname()?.display().to_string())
+}
+
 fn activated() -> bool {
     let pid = std::env::var("LISTEN_PID")
         .ok()
@@ -941,6 +949,18 @@ mod tests {
         assert!(answer.contains("忙"), "{answer}");
         lingering.until = Instant::now();
         assert!(!lingering.drain());
+    }
+
+    #[test]
+    fn logs_the_path_it_actually_listens_on() {
+        let directory =
+            std::env::temp_dir().join(format!("openuuyc-vkms-listen-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("control.sock");
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        assert_eq!(listening_on(&listener).as_deref(), path.to_str());
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     /// 设备用不了的时候进程照样活着，只是每次请求都回同一句原因。
