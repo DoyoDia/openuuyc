@@ -96,12 +96,18 @@ impl Client {
     fn call(&mut self, request: &Request) -> Result<Reply> {
         let mut line = serde_json::to_vec(request)?;
         line.push(b'\n');
-        self.writer.write_all(&line).map_err(send_failed)?;
-        self.writer.flush().map_err(send_failed)?;
+        if let Err(error) = self
+            .writer
+            .write_all(&line)
+            .and_then(|()| self.writer.flush())
+        {
+            return Err(self.parting_words().unwrap_or_else(|| send_failed(error)));
+        }
         let mut answer = String::new();
         let read = match self.reader.read_line(&mut answer) {
-            // 空闲的连接会被辅助程序收掉（见 openuuyc-vkms 的 IDLE_TIMEOUT），
-            // 所以读失败也要算成「这条连接没了」，而不是一次业务失败。
+            // 空闲的连接会被辅助程序收掉（见 openuuyc-vkms 的 IDLE_TIMEOUT：没租屏的
+            // 连接两条请求之间最多隔 10 秒），所以读失败也要算成「这条连接没了」，
+            // 而不是一次业务失败。
             Ok(read) => read,
             Err(error) => {
                 return Err(Disconnected(format!("读取辅助程序的应答失败：{error}")).into());
@@ -113,6 +119,25 @@ impl Client {
         let reply: Reply = serde_json::from_str(&answer)
             .with_context(|| format!("辅助程序的应答无法解析：{}", answer.trim()))?;
         reply.into_result()
+    }
+}
+
+impl Client {
+    /// 请求写不进去时，看看辅助程序关连接之前有没有留下一句话。
+    ///
+    /// 它回绝一条连接（连接位满了、或者不认这个用户）时是先写一行原因、再关连接的；
+    /// 我们的请求晚到一步就会写失败，而那行原因还在接收缓冲里。不读出来的话，用户只能
+    /// 看到一句莫名其妙的「连接被重置」。
+    fn parting_words(&mut self) -> Option<anyhow::Error> {
+        // 对端已经关了的话这一读立刻返回；没关（比如写超时）就别再等满一整个 TIMEOUT。
+        self.reader
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .ok()?;
+        let mut answer = String::new();
+        self.reader.read_line(&mut answer).ok()?;
+        let reply: Reply = serde_json::from_str(answer.trim()).ok()?;
+        reply.into_result().err()
     }
 }
 
@@ -154,6 +179,32 @@ mod tests {
         let reply = Reply::connector("Virtual-5".into());
         let reply = reply.into_result().unwrap();
         assert_eq!(reply.connector.as_deref(), Some("Virtual-5"));
+    }
+
+    /// 辅助程序先回一句原因再关连接，而我们的请求晚到写不进去：用户该看到那句原因，
+    /// 而不是「连接被重置」。
+    #[test]
+    fn a_refusal_sent_before_the_request_still_reaches_the_user() {
+        let directory =
+            std::env::temp_dir().join(format!("openuuyc-vkms-test-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("refuse.sock");
+        let _ = std::fs::remove_file(&path);
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut line = serde_json::to_vec(&Reply::failed("虚拟显示器辅助程序忙")).unwrap();
+            line.push(b'\n');
+            (&stream).write_all(&line).unwrap();
+            // 不读请求就整个关掉：之后的 write 必然失败。
+            drop(stream);
+        });
+        let mut client = Client::connect_to(path.to_str().unwrap()).unwrap();
+        server.join().unwrap();
+        let error = client.status().unwrap_err();
+        assert!(error.to_string().contains("忙"), "{error:#}");
+        assert!(error.downcast_ref::<Disconnected>().is_none());
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]
