@@ -410,8 +410,8 @@ impl LocalSnapshot {
             ids.push((formats::register("FileContents"), "FileContents".into()));
             // `Preferred DropEffect` 不广告：Windows 生产端从来不把它放上线（见
             // `formats::supported`），只有 Linux 广告它就成了没有依据的平台差异，
-            // 而「不给它官方客户端就停在试探阶段」这个说法并没有日志支撑。真被问
-            // 到时照样按 COPY 答，见 `LocalSnapshot::data`。
+            // 而「不给它官方客户端就停在试探阶段」这个说法并没有日志支撑。不广告
+            // 也就不会被问到，见 `LocalSnapshot::data`。
             return ids;
         }
         if self.text.is_some() {
@@ -444,9 +444,11 @@ impl LocalSnapshot {
             // 描述符块那条要展开整棵树、还要登记任务，所以留在 `serve` 里做
             // （见 `descriptor_blob`）。
             //
-            // 这一条只做复制（DROPEFFECT_COPY = 1）。答成移动会让文件管理器把
-            // 被控端的原文件搬走——这条不是可选的礼貌，是安全线，所以即便我们
-            // 不广告这个格式，被问到也照答。
+            // 这一条现在走不到：`FormatDataAsk` 只答 `published` 里有的格式，而
+            // 这个格式既不广告（`format_ids`）也过不了 `formats::supported`，被问到
+            // 时答的是「未发布该剪贴板格式」。留着只是保险：哪天它又被加回广告
+            // 列表，答的也只能是复制（DROPEFFECT_COPY = 1）。答成移动会让文件
+            // 管理器把被控端的原文件搬走，这是安全线，不是可选的礼貌。
             _ if format
                 .wire
                 .name
@@ -689,6 +691,10 @@ struct State {
     /// 「用户又复制了一遍」，把刚收到的远端内容原样发回去——两台都装这类工具的
     /// 机器之间会来回互推，对端是 Windows 时则会用我们只含纯文本的提议顶掉它的
     /// HTML / RTF。有这一位就不会。
+    ///
+    /// 代价是这一位要到下一次本地复制广播出去才清：远端发来 R 以后，用户在本地把一
+    /// 模一样的 R 再复制一遍不会重发（Windows 按 `GetClipboardSequenceNumber` 判断，
+    /// 会重发）。对端手里本来就是 R，只是它粘完就放掉的 offer 不会因此重新武装。
     remote: bool,
     /// arboard 真的落在 Wayland 那一侧（而不是退回 X11）。合成器不给 data-control
     /// 时它会自己退回 X11，那时 `read_wayland` 读的本来就是 X11 那一份，再单独读

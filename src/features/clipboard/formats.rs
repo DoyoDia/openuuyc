@@ -189,9 +189,10 @@ pub(super) fn file_format(id: u32, name: &str) -> bool {
 /// it to say whether a file clipboard holds a copy or a cut, and a Windows producer
 /// never puts it on the wire (the enumeration in `native.rs` filters it out), so
 /// advertising it from Linux would be a platform difference with nothing behind it.
-/// The Linux side still answers it with `DROPEFFECT_COPY` if it is ever asked (see
-/// `LocalSnapshot::data`) — answering a cut there would let a remote file manager
-/// move the files off this machine.
+/// Not being advertised, it is never asked for either: a data request is only
+/// answered for formats that were published. `LocalSnapshot::data` on Linux keeps
+/// a `DROPEFFECT_COPY` answer in case it is ever advertised again — answering a
+/// cut there would let a remote file manager move the files off this machine.
 pub(super) fn supported(id: u32, name: &str, files: bool) -> bool {
     if name.eq_ignore_ascii_case("OpenUUYC.Clipboard.Remote")
         || name.eq_ignore_ascii_case("DataObject")
