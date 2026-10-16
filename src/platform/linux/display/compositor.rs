@@ -16,6 +16,44 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 /// 输出刚接上时合成器可能还没处理完热插拔，给它一点时间出现。
 const APPEAR: Duration = Duration::from_secs(5);
 
+/// 当前会话里有没有我们能指挥的输出配置接口。
+///
+/// 只有 niri 这一个后端，所以「能不能接管新输出」就等于「在不在 niri 里」。
+pub(crate) fn available() -> bool {
+    std::env::var_os("NIRI_SOCKET").is_some()
+}
+
+/// 接管不了就不要去惊动内核：辅助程序接上连接器会让合成器收到一次热插拔，本机用户
+/// 的屏幕布局要跳一下，发现不行再拔掉又跳一下（GNOME 的 mutter 还可能把这台新卡当成
+/// 第二块 GPU 去初始化）。原因要说清楚，它会被原样转给主控。
+pub(crate) fn ensure_available() -> Result<()> {
+    ensure!(available(), "{}", unavailable_reason());
+    Ok(())
+}
+
+/// [`ensure_available`] 里那句话，诊断页也用它。
+pub(crate) fn unavailable_reason() -> String {
+    format!(
+        "当前桌面还不支持创建虚拟显示器（{}），现在只有 niri 能接管新输出",
+        session_kind()
+    )
+}
+
+/// 从环境变量里认出来的桌面名，只用来把上面的原因说得具体一点。
+fn session_kind() -> String {
+    let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
+    let kind = match std::env::var("XDG_SESSION_TYPE").as_deref() {
+        Ok("wayland") => "Wayland",
+        Ok("x11") => "X11",
+        _ => "图形会话",
+    };
+    if desktop.is_empty() {
+        kind.to_owned()
+    } else {
+        format!("{desktop} / {kind}")
+    }
+}
+
 /// 把一块已经在用的显示器切到另一个分辨率。
 ///
 /// `custom_hz` 给的是我们自己造的虚拟屏的刷新率：那种屏的模式不在 VKMS 的模式表里，
@@ -31,10 +69,7 @@ pub(crate) fn set_mode(
         !connector.is_empty() && connector.len() <= 64,
         "连接器名无效：{connector}"
     );
-    ensure!(
-        std::env::var_os("NIRI_SOCKET").is_some(),
-        "当前合成器没有可用的输出配置接口，改不了本机显示器的分辨率"
-    );
+    ensure_available()?;
     match custom_hz {
         Some(hz) => niri_msg(&[
             "output",
@@ -53,10 +88,13 @@ pub(crate) fn adopt(connector: &str, width: u32, height: u32, hz: u32) -> Result
         !connector.is_empty() && connector.len() <= 64,
         "连接器名无效：{connector}"
     );
-    if std::env::var_os("NIRI_SOCKET").is_some() {
-        return niri(connector, width, height, hz);
-    }
-    bail!("当前合成器没有可用的输出配置接口，虚拟屏只能用它自己的默认分辨率")
+    // 建屏之前已经确认过合成器能接管（见 [`ensure_available`]），走到这里还没有接口，
+    // 只可能是它在接管之前退出了。
+    ensure!(
+        available(),
+        "合成器在接管虚拟屏之前退出了，这块屏只能用 VKMS 自己的默认模式"
+    );
+    niri(connector, width, height, hz)
 }
 
 fn niri(connector: &str, width: u32, height: u32, hz: u32) -> Result<()> {

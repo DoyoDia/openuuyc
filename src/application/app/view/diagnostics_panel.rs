@@ -26,10 +26,10 @@ pub(super) struct ViewState {
     /// 虚拟屏辅助程序的状态。探测要连一次套接字，所以放到后台线程；这个状态是人
     /// 手动装/启服务改出来的，几秒问一次就够。
     #[cfg(not(windows))]
-    virtual_display: Option<crate::platform::linux::virtual_display::Availability>,
+    virtual_display: Option<crate::platform::virtual_display::Availability>,
     #[cfg(not(windows))]
     virtual_display_probe:
-        Option<std::sync::mpsc::Receiver<crate::platform::linux::virtual_display::Availability>>,
+        Option<std::sync::mpsc::Receiver<crate::platform::virtual_display::Availability>>,
     #[cfg(not(windows))]
     virtual_display_checked: Option<std::time::Instant>,
 }
@@ -203,7 +203,7 @@ impl DeviceCenterApp {
     /// 探活会连一次辅助程序的套接字（必要时把它拉起来），所以不能放在绘制线程里等。
     #[cfg(not(windows))]
     fn virtual_display_row(&mut self, ui: &mut egui::Ui) {
-        use crate::platform::linux::virtual_display;
+        use crate::platform::virtual_display;
         let state = &mut self.center_ui.diagnostics;
         if let Some(rx) = &state.virtual_display_probe {
             match rx.try_recv() {

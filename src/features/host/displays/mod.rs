@@ -10,9 +10,13 @@ pub(crate) fn transfer_preferences(to_service: bool) -> anyhow::Result<()> {
 use super::{Lease, capture, lock};
 use crate::platform::display::{
     self,
-    topology::{self, SavedTarget, SavedTopology, Target, Topology},
+    topology::{SavedTarget, SavedTopology, Target, Topology},
     virtual_driver::Driver,
 };
+// 合成器那条路和 `topology::identity` / `output_name` 一样只在 Linux 上有：
+// Windows 的输出是驱动管的，不需要（也没有）这层。
+#[cfg(not(windows))]
+use crate::platform::display::{compositor, topology};
 use anyhow::{Context, Result, ensure};
 use sha2::{Digest, Sha256};
 use std::{
@@ -93,7 +97,7 @@ struct State {
     restoring: bool,
     /// Linux 上的虚拟屏：一条到 root 辅助程序的连接，连接在，租约就在。
     #[cfg(not(windows))]
-    virtual_display: Option<crate::platform::linux::virtual_display::Session>,
+    virtual_display: Option<crate::platform::virtual_display::Session>,
 }
 pub(crate) struct Session {
     lease: Lease,
@@ -268,8 +272,35 @@ impl Session {
             self.lease.display_expansion_allowed(),
             "本次会话不允许添加虚拟屏"
         );
-        self.run(move |state, lease| state.create_compositor(resolutions, 1, lease))
-            .await
+        self.run(move |state, lease| {
+            let screens = capture::screens()?;
+            // 主控报的是它自己那块屏的尺寸；它没报就退回本机第一块屏的尺寸。
+            let (width, height) = resolutions
+                .first()
+                .copied()
+                .or_else(|| screens.first().map(|s| (s.width, s.height)))
+                .context("没有可用的显示器")?;
+            let mut modes = resolutions;
+            if modes.is_empty() {
+                modes.push((width, height));
+            }
+            state.create_compositor(
+                Virtual {
+                    guid: uuid::Uuid::new_v4().to_string(),
+                    identity: None,
+                    width,
+                    height,
+                    hz: VIRTUAL_HZ,
+                    dpi: 0,
+                    kind: 1,
+                    resolution_type: 1,
+                    modes,
+                    layout: None,
+                },
+                lease,
+            )
+        })
+        .await
     }
 
     #[cfg(windows)]
@@ -335,6 +366,11 @@ impl Session {
                 .as_mut()
                 .context("虚拟显示器辅助程序不可用")?
                 .remove(topology::output_name(&identity))?;
+            // 和 Windows 一样：删掉自动建的那块屏就等于关掉「连接时自动建屏」，
+            // 否则用户删完下次连接它又回来了。
+            if state.journal.owned[index].kind == 3 {
+                state.preferences.default_virtual = false;
+            }
             state.journal.owned.remove(index);
             state.update_preferences()
         })
@@ -498,8 +534,11 @@ impl Session {
         })
         .await
     }
-    /// Linux：改分辨率就是让合成器换模式。物理显示器从它自己的模式表里挑，虚拟屏
-    /// 用 `custom-mode` 现造——那块屏的分辨率本来就是我们让合成器定出来的。
+    /// Linux：改分辨率分两种屏。
+    ///
+    /// 我们自己造的虚拟屏要让合成器现造一个模式（VKMS 的模式表里没有这个分辨率）；
+    /// 物理显示器走共享的 RandR + journal 那条路，和 X11、Windows 一样——旧模式记进
+    /// journal，会话结束时恢复。
     #[cfg(not(windows))]
     pub(crate) async fn set_resolution(
         &self,
@@ -508,45 +547,38 @@ impl Session {
         height: u32,
     ) -> Result<capture::Screen> {
         self.run(move |state, lease| {
+            if let Ok(current) = find_screen(&target.identity)
+                && (current.width, current.height) == (width, height)
+            {
+                return Ok(current);
+            }
             ensure!(lease.requested(), "显示操作已取消");
             validate_modes(&[(width, height)])?;
-            let owned = state
+            if state
                 .journal
                 .owned
                 .iter()
-                .position(|o| o.identity.as_deref() == Some(target.identity.as_str()));
-            let hz = owned.map(|index| state.journal.owned[index].hz);
-            // 合成器认的是输出名（连接器名），不是屏幕清单里的 identity。
-            crate::platform::linux::display::compositor::set_mode(
-                topology::output_name(&target.identity),
-                width,
-                height,
-                hz,
-            )?;
-            // 合成器说成功不等于显示器真的换了模式，所以只认观察到的尺寸。等不到就是
-            // 失败——这比让主控以为切成功了要好。
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            loop {
-                ensure!(lease.requested(), "显示操作已取消");
-                if let Ok(screen) = find_screen(&target.identity)
-                    && (screen.width, screen.height) == (width, height)
-                {
-                    if let Some(index) = owned {
-                        let record = &mut state.journal.owned[index];
-                        record.width = width;
-                        record.height = height;
-                        if !record.modes.contains(&(width, height)) {
-                            record.modes.push((width, height));
-                        }
-                    }
-                    return Ok(screen);
-                }
-                ensure!(
-                    std::time::Instant::now() < deadline,
-                    "显示器没有切到请求的分辨率"
-                );
-                std::thread::sleep(Duration::from_millis(50));
+                .any(|o| o.identity.as_deref() == Some(target.identity.as_str()))
+            {
+                return state.resize_virtual_compositor(&target.identity, width, height, lease);
             }
+            state.begin()?;
+            let previous = state.journal.mode_changes.clone();
+            state.intend_mode(&target.identity, width, height)?;
+            if let Err(error) = target.set_resolution(width, height, || lease.requested()) {
+                if error
+                    .downcast_ref::<display::topology::ModeTestRejected>()
+                    .is_some()
+                {
+                    state.journal.mode_changes = previous;
+                    state.journal.desired = None;
+                    state.save()?;
+                }
+                return Err(error);
+            }
+            state.applied()?;
+            state.remember_physical(&target.identity, None)?;
+            find_screen(&target.identity)
         })
         .await
     }
@@ -1047,9 +1079,9 @@ impl State {
     }
     /// 到辅助程序的连接按需建立：没人加虚拟屏就不该去惊动一个 root 服务。
     #[cfg(not(windows))]
-    fn virtual_display(&mut self) -> Result<&mut crate::platform::linux::virtual_display::Session> {
+    fn virtual_display(&mut self) -> Result<&mut crate::platform::virtual_display::Session> {
         if self.virtual_display.is_none() {
-            self.virtual_display = Some(crate::platform::linux::virtual_display::Session::open()?);
+            self.virtual_display = Some(crate::platform::virtual_display::Session::open()?);
         }
         Ok(self
             .virtual_display
@@ -1065,16 +1097,16 @@ impl State {
     /// `journal.owned`（`annotate` 靠它把这块屏报成虚拟屏并挂上 `openuuyc-virtual`
     /// 这个身份）。
     #[cfg(not(windows))]
-    fn create_compositor(
-        &mut self,
-        resolutions: Vec<(u32, u32)>,
-        kind: i32,
-        lease: &Lease,
-    ) -> Result<capture::Screen> {
+    fn create_compositor(&mut self, spec: Virtual, lease: &Lease) -> Result<capture::Screen> {
         ensure!(
             self.journal.super_baseline.is_none(),
             "超级屏内不能添加扩展屏"
         );
+        // 合成器接不住就别去惊动内核：接上连接器会让它收到一次热插拔、本机屏幕布局
+        // 跳一下，发现接管不了再拔掉又跳一下。
+        compositor::ensure_available()?;
+        let (width, height) = (spec.width, spec.height);
+        validate_modes(&[(width, height)])?;
         let screens = capture::screens()?;
         let before: Vec<String> = screens.iter().filter_map(|s| s.identity.clone()).collect();
         ensure!(
@@ -1088,19 +1120,12 @@ impl State {
                     < 3,
             "显示器数量已达上限"
         );
-        // 主控报的是它自己那块屏的尺寸；它没报就退回本机第一块屏的尺寸。
-        let (width, height) = resolutions
-            .first()
-            .copied()
-            .or_else(|| screens.first().map(|s| (s.width, s.height)))
-            .context("没有可用的显示器")?;
-        validate_modes(&[(width, height)])?;
         ensure!(lease.requested(), "显示操作已取消");
 
         // 先接连接器、再记账、最后等采集看见它：记账放中间，是因为连接器一接上合成器
         // 那边就多了一块屏，采集随时可能把它报上去，那时候它得已经是「我们造的」。
-        let connector = self.virtual_display()?.create(width, height, VIRTUAL_HZ)?;
-        let guid = uuid::Uuid::new_v4().to_string();
+        let connector = self.virtual_display()?.create(width, height, spec.hz)?;
+        let guid = spec.guid.clone();
         // 日志里记的是平台的 identity 而不是连接器名：owns、恢复、首屏选择比的都是
         // identity，只有跟辅助程序打交道时才换回连接器名（`topology::output_name`）。
         let identity = topology::identity(&connector);
@@ -1109,11 +1134,17 @@ impl State {
             identity: Some(identity.clone()),
             width,
             height,
-            hz: VIRTUAL_HZ,
-            dpi: 0,
-            kind,
-            resolution_type: 1,
-            modes: vec![(width, height)],
+            hz: spec.hz,
+            dpi: spec.dpi,
+            kind: spec.kind,
+            // 主控给的那几项都原样留着：重建保存下来的屏时，报回去的得和上次一样，
+            // 尤其是 guid——屏幕 id 是从它算出来的，每次换一个主控那边就对不上了。
+            resolution_type: spec.resolution_type,
+            modes: if spec.modes.is_empty() {
+                vec![(width, height)]
+            } else {
+                spec.modes.clone()
+            },
             layout: None,
         });
         let mut screen = match wait_for_screen(&connector, &before, lease) {
@@ -1135,6 +1166,45 @@ impl State {
         Ok(screen)
     }
 
+    /// 把一块我们自己造的虚拟屏切到另一个分辨率。
+    ///
+    /// 不能走物理屏那条 RandR 路：VKMS 的模式表里没有这个分辨率，只能让合成器现造。
+    #[cfg(not(windows))]
+    fn resize_virtual_compositor(
+        &mut self,
+        identity: &str,
+        width: u32,
+        height: u32,
+        lease: &Lease,
+    ) -> Result<capture::Screen> {
+        let index = self.owned_index(identity)?;
+        let hz = self.journal.owned[index].hz;
+        // 合成器认的是输出名（连接器名），不是屏幕清单里的 identity。
+        compositor::set_mode(topology::output_name(identity), width, height, Some(hz))?;
+        // 合成器说成功不等于显示器真的换了模式，所以只认观察到的尺寸。等不到就是
+        // 失败——这比让主控以为切成功了要好。
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            ensure!(lease.requested(), "显示操作已取消");
+            if let Ok(screen) = find_screen(identity)
+                && (screen.width, screen.height) == (width, height)
+            {
+                let record = &mut self.journal.owned[index];
+                record.width = width;
+                record.height = height;
+                if !record.modes.contains(&(width, height)) {
+                    record.modes.push((width, height));
+                }
+                return Ok(screen);
+            }
+            ensure!(
+                std::time::Instant::now() < deadline,
+                "显示器没有切到请求的分辨率"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     fn create(
         &mut self,
         spec: Virtual,
@@ -1146,13 +1216,14 @@ impl State {
         // kind 是 3（1 是会话里手动加的，3 是连接时自动加的）。
         #[cfg(not(windows))]
         if matches!(spec.kind, 1 | 3) {
-            // Windows 上「只用虚拟屏启动」还要用 CCD 把一份只有它的完整布局写下去，
-            // 物理显示器因此下线。那一步也要合成器配合，这边还没做，所以只把屏建出来，
-            // 原来的显示器照旧——至少如实说一声，别让人以为桌面被换掉了。
+            // 「只用虚拟屏启动」在 Linux 上还没有可写的路径：它要求合成器把物理输出
+            // 全部关掉，那是每个合成器一套接口。主控这次明确要的话，`prepare` 已经带着
+            // 原因失败了；走到这里的只剩本机存下来的偏好，那就如实说一声、把原来的
+            // 显示器留着——至少别让人以为桌面被换掉了。
             if super_screen {
                 tracing::warn!("Linux 被控端不支持「只用虚拟屏启动」，物理显示器会保留");
             }
-            return self.create_compositor(vec![(spec.width, spec.height)], spec.kind, lease);
+            return self.create_compositor(spec, lease);
         }
         let before = Topology::query(true)?.snapshot()?;
         let dpi = current_dpi()?;
