@@ -462,12 +462,36 @@ impl ConnectingWindowsRunner {
             } else if let Stage::Playing(player) = stage {
                 let relative = player.input().relative_mode();
                 let menu_open = player.stream_control_ui.open;
+                // 全屏那根浮动条和平时是同一根（Windows 也是），所以设备切换菜单
+                // 在这儿一样能点。
+                let switcher = player.device_switch();
                 close_requested |=
                     shell
                         .fullscreen_chrome
                         .show(&ctx, relative, menu_open, false, |ui| {
                             let bar = ui.available_rect_before_wrap();
-                            let close = window_title_bar(ui, &window, &title, None, true);
+                            let close = match switcher.as_ref() {
+                                Some(switcher) => {
+                                    crate::ui::chrome::window_title_bar_with_identity(
+                                        ui,
+                                        &window,
+                                        &title,
+                                        None,
+                                        true,
+                                        &mut |ui: &mut egui::Ui| {
+                                            let response =
+                                                crate::ui::controls::viewer_device_button(
+                                                    ui,
+                                                    title.trim_start_matches(
+                                                        crate::VIEWER_TITLE_PREFIX,
+                                                    ),
+                                                );
+                                            switcher.menu(&response, window.id());
+                                        },
+                                    )
+                                }
+                                None => window_title_bar(ui, &window, &title, None, true),
+                            };
                             player.title_bar_controls(ui, bar, &window);
                             close
                         });
@@ -1982,7 +2006,12 @@ impl Player {
     }
 
     fn local_ui_owns_input(&self, context: &egui::Context) -> bool {
+        // 切屏与设备切换期间不转发输入：两边都在换轨道，键鼠很容易落到别处。
         self.stream_control_ui.open
+            || self.pending.is_some()
+            || self
+                .device_switch()
+                .is_some_and(|switcher| switcher.is_switching())
             || context.any_popup_open()
             || context.text_edit_focused()
             || context.memory(|memory| memory.top_modal_layer().is_some())
