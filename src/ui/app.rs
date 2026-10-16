@@ -3,6 +3,11 @@ pub(crate) trait App {
     fn title_bar_alert(&self) -> Option<super::chrome::TitleBarAlert> {
         None
     }
+    /// 这台机器正在被远程访问。托盘角标与标题栏提示共用这一个判定，免得出现
+    /// 窗口说被控、托盘却没反应。
+    fn controlled(&self) -> bool {
+        self.title_bar_alert().is_some()
+    }
     fn uses_tray(&self) -> bool {
         true
     }

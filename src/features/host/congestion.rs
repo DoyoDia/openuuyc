@@ -1,6 +1,6 @@
 //! Sender transport feedback -> GoogCC. Times are taken at actual packet egress.
 use goog_cc::{
-    GoogCcConfig, GoogCcNetworkController,
+    AlrDetectorConfig, GoogCcConfig, GoogCcNetworkController,
     experiments::FieldTrials,
     network_control::{NetworkControllerConfig, NetworkControllerInterface},
     transport::*,
@@ -13,6 +13,32 @@ use std::{
 use webrtc::rtcp::transport_feedbacks::transport_layer_cc::{
     PacketStatusChunk, SymbolTypeTcc, TransportLayerCc,
 };
+
+/// Configure the effective GoogCC parameters for the verified UU sender path.
+fn field_trials() -> FieldTrials {
+    let mut field_trials = FieldTrials::default();
+    // T541A30 defaults robust estimator OFF in this UU SDK.
+    field_trials.robust_throughput_estimator_settings.enabled = false;
+    field_trials.rapid_recovery_experiment = true;
+    field_trials.no_bitrate_increase_in_alr = false;
+    field_trials.add_pacing_to_congestion_window_pushback = true;
+    // UU 4.41.2.2602: T53D277 parses screenshare 85/95/-60 into the
+    // detector ratios consumed by T53D536/T53D61A. This Rust port reads
+    // alr_detector_parameters directly; alr_experiment_settings is unused.
+    field_trials.alr_detector_parameters = AlrDetectorConfig {
+        bandwidth_usage_ratio: 0.85,
+        start_budget_level_ratio: 0.95,
+        stop_budget_level_ratio: -0.60,
+    };
+    field_trials.probing_configuration.probe_max_allocation = true;
+    field_trials.min_alloc_as_lower_bound = false;
+    field_trials.ignore_probes_lower_than_network_state_estimate = false;
+    field_trials.limit_probes_lower_than_throughput_estimate = false;
+    field_trials.safe_reset_on_route_change.enabled = false;
+    field_trials.loss_based_control.enabled = false;
+    field_trials.loss_based_bwe_v2.enabled = false;
+    field_trials
+}
 
 pub(crate) struct Controller {
     core: GoogCcNetworkController,
@@ -48,32 +74,22 @@ struct Tracked {
 impl Controller {
     pub fn new(bounds: super::parameters::Bounds) -> Self {
         let maximum = bounds.network_maximum();
-        let mut field_trials = FieldTrials::default();
-        // T541A30 defaults robust estimator OFF in this UU SDK.
-        field_trials.robust_throughput_estimator_settings.enabled = false;
-        field_trials.rapid_recovery_experiment = true;
-        field_trials.no_bitrate_increase_in_alr = false;
-        field_trials.add_pacing_to_congestion_window_pushback = true;
-        field_trials.alr_experiment_settings.pacing_factor = 1.6;
-        field_trials.alr_experiment_settings.max_paced_queue_time = 6;
-        field_trials
-            .alr_experiment_settings
-            .alr_bandwidth_usage_percent = 85;
-        field_trials
-            .alr_experiment_settings
-            .alr_start_budget_level_percent = 95;
-        field_trials
-            .alr_experiment_settings
-            .alr_stop_budget_level_percent = -60;
-        field_trials.alr_experiment_settings.group_id = 3;
-        field_trials.probing_configuration.probe_max_allocation = true;
-        field_trials.min_alloc_as_lower_bound = false;
-        field_trials.ignore_probes_lower_than_network_state_estimate = false;
-        field_trials.limit_probes_lower_than_throughput_estimate = false;
-        field_trials.safe_reset_on_route_change.enabled = false;
-        field_trials.loss_based_control.enabled = false;
-        field_trials.loss_based_bwe_v2.enabled = false;
+        let field_trials = field_trials();
         let at = Timestamp::from_micros(1_000_000);
+        // ALR 判定阈值只有 alr_detector_parameters 会被读到，打出来免得再有人
+        // 以为 field_trials 里那组 screenshare 参数有效。
+        tracing::info!(
+            maximum_bps = maximum,
+            startup_bps = bounds.initial,
+            alr_usage_ratio = field_trials.alr_detector_parameters.bandwidth_usage_ratio,
+            alr_start_ratio = field_trials
+                .alr_detector_parameters
+                .start_budget_level_ratio,
+            alr_stop_ratio = field_trials.alr_detector_parameters.stop_budget_level_ratio,
+            alr_interval_ms = field_trials.probing_configuration.alr_interval.ms(),
+            alr_scale = field_trials.probing_configuration.alr_scale,
+            "host congestion controller created"
+        );
         let core = GoogCcNetworkController::new(
             NetworkControllerConfig {
                 field_trials,
@@ -137,6 +153,23 @@ impl Controller {
             self.loss = f64::from(rate.network_estimate.loss_rate_ratio).clamp(0.0, 1.0);
             if rate.network_estimate.round_trip_time.is_finite() {
                 self.rtt = rate.network_estimate.round_trip_time;
+            }
+            if self.target != previous {
+                // ALR 状态和「限制估计值的原因」决定这次探测能不能发出去：探测被
+                // 静默抑制时（probe_controller.rs:576 里 DelayBasedLimitedDelay-
+                // Increased），只有这两项能说明为什么。
+                let (alr, cause) = self.core.probing_state();
+                tracing::debug!(
+                    target_bps = self.target,
+                    previous_bps = previous,
+                    bounded_target_bps = self.core.bounded_target_rate().bps_or(0),
+                    alr,
+                    cause = ?cause,
+                    delay_state = ?self.core.delay_state(),
+                    loss = self.loss,
+                    rtt_ms = self.rtt.ms(),
+                    "host bandwidth estimate changed"
+                );
             }
             if previous >= 600_000 && self.target < previous / 2 {
                 tracing::info!(
