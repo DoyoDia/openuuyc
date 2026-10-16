@@ -1225,6 +1225,8 @@ impl State {
                 if !record.modes.contains(&(width, height)) {
                     record.modes.push((width, height));
                 }
+                // 和 Windows 一样把新尺寸留下来：下次连接重建这块屏时用的就是它。
+                self.update_preferences()?;
                 return Ok(screen);
             }
             ensure!(
