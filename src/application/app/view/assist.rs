@@ -1,8 +1,46 @@
 use super::*;
 use crate::account::assist::{SavedKind, normalize_connect_id};
 use crate::application::app::assist::{DeletePrompt, FavoriteEditor};
+use crate::application::app::assist_link;
 
 impl DeviceCenterApp {
+    /// 处理系统按 `uuremote://` 协议注册拉起的协助链接：切到「开始协助」页、
+    /// 填好设备 ID 和验证码，然后走与手动输入完全一样的连接流程。界面还在登录、
+    /// 登出或别的写操作时先排队；未登录就只填内容，不代替用户按下连接。
+    pub(in crate::application::app) fn tick_assist_link(&mut self) {
+        let settled = !self.assist.busy
+            && !self.logout_pending
+            && !self.login_running
+            && !self.login_restoring
+            && !self.mutation_pending
+            && !self.exit_requested;
+        let Some(activation) = assist_link::take(settled) else {
+            return;
+        };
+        let link = match activation {
+            assist_link::Activation::Failed(message) => {
+                // 登录页不画协助弹窗，未登录时把原因留在登录页上。
+                if self.needs_login() {
+                    self.login_error = Some(message);
+                } else {
+                    self.assist.fail(message);
+                }
+                return;
+            }
+            assist_link::Activation::Link(link) => link,
+        };
+        self.center_ui.page = Page::Assist;
+        if self.needs_login() {
+            self.assist.connect_id.clone_from(&link.connect_id);
+            self.assist.direct_code.clone_from(&link.code);
+            self.assist.code.clear();
+            self.assist.message = "协助链接已填入，登录后点「连接」开始".into();
+            self.assist.message_until = None;
+            return;
+        }
+        self.request_assist_connect(link.connect_id, link.code);
+    }
+
     pub(super) fn assist_page(&mut self, ui: &mut egui::Ui, favorites: bool) {
         if let Some(deadline) = self.assist.message_until {
             let remaining = deadline.saturating_duration_since(Instant::now());

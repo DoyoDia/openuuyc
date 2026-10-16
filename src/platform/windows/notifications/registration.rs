@@ -1,4 +1,5 @@
 //! User-scoped identity and protocol activation for unpackaged desktop toasts.
+use super::super::registry::{Key, key, read, set, wide};
 use anyhow::{Context, Result, ensure};
 use std::path::{Path, PathBuf};
 use windows::{
@@ -20,78 +21,8 @@ const TOAST_KEY: PROPERTYKEY = PROPERTYKEY {
     pid: 26,
 };
 const ACTIVATOR: GUID = GUID::from_u128(0x8eafbec2_7395_44cd_96cb_78dfc53072db);
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(Some(0)).collect()
-}
-struct Key(HKEY);
-impl Drop for Key {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = RegCloseKey(self.0);
-        }
-    }
-}
-fn key(path: &str) -> Result<Key> {
-    let mut h = HKEY::default();
-    unsafe {
-        RegCreateKeyExW(
-            HKEY_CURRENT_USER,
-            PCWSTR(wide(path).as_ptr()),
-            None,
-            None,
-            REG_OPTION_NON_VOLATILE,
-            KEY_READ | KEY_WRITE,
-            None,
-            &mut h,
-            None,
-        )
-        .ok()?;
-    }
-    Ok(Key(h))
-}
-fn set(h: HKEY, name: &str, value: &str) -> Result<()> {
-    let value = wide(value);
-    unsafe {
-        RegSetValueExW(
-            h,
-            PCWSTR(wide(name).as_ptr()),
-            None,
-            REG_SZ,
-            Some(std::slice::from_raw_parts(
-                value.as_ptr().cast(),
-                value.len() * 2,
-            )),
-        )
-        .ok()?;
-    }
-    Ok(())
-}
 fn command(image: &Path) -> String {
     format!("\"{}\" notification \"%1\"", image.display())
-}
-fn read(path: &str, name: &str) -> Result<Option<String>> {
-    let mut value = vec![0u16; 32768];
-    let mut bytes = (value.len() * 2) as u32;
-    let result = unsafe {
-        RegGetValueW(
-            HKEY_CURRENT_USER,
-            PCWSTR(wide(path).as_ptr()),
-            PCWSTR(wide(name).as_ptr()),
-            RRF_RT_REG_SZ,
-            None,
-            Some(value.as_mut_ptr().cast()),
-            Some(&mut bytes),
-        )
-    };
-    if result == ERROR_FILE_NOT_FOUND || result == ERROR_PATH_NOT_FOUND {
-        return Ok(None);
-    }
-    result.ok()?;
-    let end = value
-        .iter()
-        .position(|&v| v == 0)
-        .context("通知注册值无效")?;
-    Ok(Some(String::from_utf16(&value[..end])?))
 }
 fn stored_command() -> Option<String> {
     read(&format!(r"{SCHEME}\shell\open\command"), "")
@@ -99,26 +30,10 @@ fn stored_command() -> Option<String> {
         .flatten()
 }
 fn owned_registration() -> bool {
-    let mut value = [0u16; 128];
-    let mut bytes = (value.len() * 2) as u32;
-    let result = unsafe {
-        RegGetValueW(
-            HKEY_CURRENT_USER,
-            PCWSTR(wide(SCHEME).as_ptr()),
-            w!("OpenUUYCOwner"),
-            RRF_RT_REG_SZ,
-            None,
-            Some(value.as_mut_ptr().cast()),
-            Some(&mut bytes),
-        )
-    };
-    result.is_ok()
-        && String::from_utf16_lossy(
-            &value[..value.iter().position(|&v| v == 0).unwrap_or(value.len())],
-        ) == OWNER
+    read(SCHEME, "OpenUUYCOwner").ok().flatten().as_deref() == Some(OWNER)
 }
 pub(crate) fn owns_shortcut(link: &IShellLinkW, target: &Path) -> bool {
-    let read = (|| -> Result<bool> {
+    let checks = (|| -> Result<bool> {
         let properties: IPropertyStore = link.cast()?;
         let value = unsafe { properties.GetValue(&APP_KEY)? };
         let name = windows::core::BSTR::try_from(&value)?.to_string();
@@ -126,7 +41,7 @@ pub(crate) fn owns_shortcut(link: &IShellLinkW, target: &Path) -> bool {
             && owned_registration()
             && stored_command().is_some_and(|v| v.eq_ignore_ascii_case(&command(target))))
     })();
-    read.unwrap_or(false)
+    checks.unwrap_or(false)
 }
 fn shortcut() -> Result<PathBuf> {
     let p = unsafe { SHGetKnownFolderPath(&FOLDERID_Programs, KF_FLAG_DEFAULT, None)? };
