@@ -6,10 +6,14 @@
 //! [`crate::application::app::instance`]），Wayland 与 X11 都没有对应的窗口属性，
 //! 这里用 `$XDG_RUNTIME_DIR` 下的一个 unix socket 代替。
 //!
-//! The request is one line, `show`, optionally followed by the launcher's
-//! startup-notification tokens (`wayland=<token>`, `x11=<token>`), which the
-//! running process uses to raise its window past focus-stealing prevention
-//! and to end the launcher's busy feedback. The answer is `ok` or `error`.
+//! 系统按 `uuremote://` 协议拉起的第二个进程也走这条通道，把协助链接交给
+//! 运行中的那个（Windows 上是 WM_COPYDATA）。
+//!
+//! The request is one line, `show` or `link <uri>`, optionally followed by the
+//! launcher's startup-notification tokens (`wayland=<token>`, `x11=<token>`),
+//! which the running process uses to raise its window past focus-stealing
+//! prevention and to end the launcher's busy feedback. The answer is `ok` or
+//! `error`.
 //! Both ends give up after [`TIMEOUT`], and every connection is served on its
 //! own thread, so a client that never finishes cannot hold up a later start.
 use crate::platform::linux::startup_notify::{LaunchToken, valid};
@@ -24,6 +28,13 @@ use std::time::Duration;
 const TIMEOUT: Duration = Duration::from_secs(2);
 /// The longest line either end reads.
 const MAX_LINE: u64 = 2048;
+/// 一条协助链接的上限，和 Windows 的 WM_COPYDATA 通道一样：要带上设备 ID、
+/// 验证码和几个来源参数。
+const MAX_LINK: usize = 1024;
+/// 协助链接是用户点出来的，运行中的实例可能正好在启动、还没开通道，
+/// 所以连不上时多等几轮；一旦请求发出去就不再重发，免得重复连接。
+const DELIVER_ATTEMPTS: usize = 5;
+const DELIVER_INTERVAL: Duration = Duration::from_millis(200);
 
 /// 控制通道的生命周期：`run` 结束或进程退出时把 socket 文件清掉。
 pub(crate) struct Control {
@@ -50,34 +61,54 @@ fn socket_path() -> Result<PathBuf> {
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
     Show(LaunchToken),
+    /// 一条 `uuremote://` 协助链接，交给运行中的实例解析，再把窗口叫出来。
+    Link(String, LaunchToken),
+}
+
+/// 能放进一行请求里的链接：协议名对、长度在上限内、没有空白和控制字符
+/// （合法的 URI 本来就没有）。内容由接手的那个进程解析。
+fn valid_link(uri: &str) -> bool {
+    uri.len() <= MAX_LINK
+        && uri
+            .get(..9)
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("uuremote:"))
+        && uri.chars().all(|c| c.is_ascii_graphic())
 }
 
 impl Command {
     fn parse(line: &str) -> Result<Self> {
         let mut words = line.split_ascii_whitespace();
-        match words.next() {
-            Some("show") => {
-                let mut token = LaunchToken::default();
-                for word in words {
-                    // Unknown or malformed fields are dropped: an activation
-                    // without a token still shows the window.
-                    match word.split_once('=') {
-                        Some(("wayland", value)) if valid(value) => {
-                            token.wayland = Some(value.to_owned())
-                        }
-                        Some(("x11", value)) if valid(value) => token.x11 = Some(value.to_owned()),
-                        _ => tracing::debug!(field = word, "控制请求里有无法识别的字段"),
-                    }
-                }
-                Ok(Self::Show(token))
+        let command = words.next();
+        let link = match command {
+            Some("show") => None,
+            Some("link") => match words.next() {
+                Some(uri) if valid_link(uri) => Some(uri.to_owned()),
+                // 不把链接本身写进错误：里面有验证码。
+                _ => bail!("控制请求里的协助链接无效"),
+            },
+            _ => bail!("未知的控制请求 {}", command.unwrap_or_default()),
+        };
+        let mut token = LaunchToken::default();
+        for word in words {
+            // Unknown or malformed fields are dropped: an activation
+            // without a token still shows the window.
+            match word.split_once('=') {
+                Some(("wayland", value)) if valid(value) => token.wayland = Some(value.to_owned()),
+                Some(("x11", value)) if valid(value) => token.x11 = Some(value.to_owned()),
+                _ => tracing::debug!(field = word, "控制请求里有无法识别的字段"),
             }
-            _ => bail!("未知的控制请求 {}", line.trim()),
         }
+        Ok(match link {
+            Some(uri) => Self::Link(uri, token),
+            None => Self::Show(token),
+        })
     }
 
     fn line(&self) -> String {
-        let Self::Show(token) = self;
-        let mut line = "show".to_owned();
+        let (mut line, token) = match self {
+            Self::Show(token) => ("show".to_owned(), token),
+            Self::Link(uri, token) => (format!("link {uri}"), token),
+        };
         if let Some(value) = token.wayland.as_deref().filter(|value| valid(value)) {
             line.push_str(" wayland=");
             line.push_str(value);
@@ -95,6 +126,12 @@ impl Command {
 pub(crate) fn listen() -> Result<Control> {
     listen_at(socket_path()?, |command| match command {
         Command::Show(token) => {
+            super::window_manager::send(super::window_manager::Request::ActivateMain(token))
+        }
+        // 和 Windows 一样：链接只入队（坏链接的原因也排进去给界面显示），
+        // 再把控制中心叫到前台——用户是点了一条链接，不能只入队却不见窗口。
+        Command::Link(uri, token) => {
+            crate::application::app::assist_link::receive(&uri);
             super::window_manager::send(super::window_manager::Request::ActivateMain(token))
         }
     })
@@ -185,19 +222,46 @@ pub(crate) fn activate() -> Result<()> {
     activate_at(&socket_path()?, &Command::Show(LaunchToken::from_env()))
 }
 
+/// 系统按协议拉起的第二个进程：把协助链接交给运行中的实例。
+pub(crate) fn deliver_link(uri: &str) -> Result<()> {
+    anyhow::ensure!(valid_link(uri), "协助链接参数无效或过长");
+    let command = Command::Link(uri.to_owned(), LaunchToken::from_env());
+    deliver_at(&socket_path()?, &command, DELIVER_ATTEMPTS)
+        .context("无法把协助链接交给正在运行的 OpenUUYC")
+}
+
+/// Retries only the connection: once the request is written, a lost answer
+/// has an unknown outcome and must not replay a connection request.
+fn deliver_at(path: &Path, command: &Command, attempts: usize) -> Result<()> {
+    for attempt in 1.. {
+        match UnixStream::connect(path) {
+            Ok(stream) => return exchange(stream, command),
+            Err(error) if attempt >= attempts => {
+                return Err(error).context("控制中心没有在运行或还没准备好");
+            }
+            Err(_) => std::thread::sleep(DELIVER_INTERVAL),
+        }
+    }
+    unreachable!()
+}
+
 fn activate_at(path: &Path, command: &Command) -> Result<()> {
-    let mut stream = UnixStream::connect(path)
+    let stream = UnixStream::connect(path)
         .with_context(|| format!("连接控制通道失败：{}", path.display()))?;
+    exchange(stream, command)
+}
+
+fn exchange(mut stream: UnixStream, command: &Command) -> Result<()> {
     stream.set_read_timeout(Some(TIMEOUT))?;
     stream.set_write_timeout(Some(TIMEOUT))?;
     stream
         .write_all(command.line().as_bytes())
-        .context("发送显示请求失败")?;
+        .context("发送控制请求失败")?;
     let mut reply = String::new();
     BufReader::new(stream.take(MAX_LINE))
         .read_line(&mut reply)
-        .context("读取显示请求答复失败")?;
-    anyhow::ensure!(reply.trim() == "ok", "运行中的实例没有接受显示请求");
+        .context("读取控制请求答复失败")?;
+    anyhow::ensure!(reply.trim() == "ok", "运行中的实例没有接受请求");
     Ok(())
 }
 
@@ -263,6 +327,54 @@ mod tests {
         );
         assert!(Command::parse("hide\n").is_err());
         assert!(Command::parse("").is_err());
+    }
+
+    #[test]
+    fn links_round_trip_and_bad_ones_are_refused() {
+        let uri = "uuremote://external/assistance?connect_id=123456789&code=abcd";
+        let token = LaunchToken {
+            wayland: None,
+            x11: Some("t".into()),
+        };
+        let command = Command::Link(uri.into(), token);
+        assert_eq!(Command::parse(&command.line()).unwrap(), command);
+        assert_eq!(
+            Command::parse(&format!("link UUREMOTE:{}\n", &uri[9..])).unwrap(),
+            Command::Link(format!("UUREMOTE:{}", &uri[9..]), LaunchToken::default())
+        );
+        assert!(Command::parse("link\n").is_err());
+        assert!(Command::parse("link https://example.com\n").is_err());
+        let long = format!("uuremote://x?{}", "a".repeat(MAX_LINK));
+        assert!(Command::parse(&format!("link {long}\n")).is_err());
+        assert!(!valid_link("uuremote://x?a=\u{7f}"));
+        assert!(!valid_link("uuremote://x?a=中"));
+    }
+
+    #[test]
+    fn a_link_waits_for_a_control_center_that_is_still_starting() {
+        let path = scratch("starting");
+        let uri = "uuremote://external/assistance?connect_id=1";
+        let (sender, received) = mpsc::channel();
+        let late = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(DELIVER_INTERVAL * 2);
+                listen_at(path, move |command| {
+                    sender.send(command).unwrap();
+                    Ok(())
+                })
+                .unwrap()
+            })
+        };
+        let command = Command::Link(uri.into(), LaunchToken::default());
+        deliver_at(&path, &command, DELIVER_ATTEMPTS).unwrap();
+        assert_eq!(received.recv().unwrap(), command);
+        drop(late.join().unwrap());
+        // Nobody ever listens: the start reports it instead of dropping the link.
+        let started = Instant::now();
+        assert!(deliver_at(&path, &command, 2).is_err());
+        assert!(started.elapsed() >= DELIVER_INTERVAL);
+        cleanup(&path);
     }
 
     #[test]

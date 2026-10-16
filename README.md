@@ -12,6 +12,8 @@ OpenUUYC 是用 Rust 编写的 UU 远程第三方客户端，支持 Windows 和 
 
 最新稳定版为 [v1.0.1](https://github.com/djkcyl/farwing/releases/tag/v1.0.1)。
 
+最新测试版为 [v1.0.2-beta.5](https://github.com/djkcyl/farwing/releases/tag/v1.0.2-beta.5)，包含协助邀请链接、被控托盘提示、观看窗口剪贴板开关，以及网络参数、单轨切屏和文件时间修正。
+
 接收测试版更新提醒：在“关于”中开启“允许测试版”（默认关闭）。
 
 **从 alpha.6 或更早版本升级需重新登录，设备 ID 会改变，旧设备条目需手动删除。**
@@ -23,7 +25,7 @@ OpenUUYC 是用 Rust 编写的 UU 远程第三方客户端，支持 Windows 和 
 | 功能 | 主控端 | 被控端 | 说明 |
 | --- | --- | --- | --- |
 | 同账号远程连接 | 支持同时连接多台设备 | 支持 | 本机在连接设置中开启“允许被控” |
-| 设备 ID / 验证码协助 | 支持主动连接 | 支持账号及游客协助 | 随机 / 自定义密码、本机确认；主控支持最近连接和收藏 |
+| 设备 ID / 验证码协助 | 支持主动连接，也能直接点开邀请链接 | 支持账号及游客协助 | 随机 / 自定义密码、本机确认；主控支持最近连接和收藏，对方分享的 `uuremote://external/assistance?...` 链接会拉起本程序并填好设备 ID 与验证码 |
 | 画面传输 | 接收与播放 | 采集与编码 | H.264 / H.265 / AV1、真彩及 HDR，可调画质、码率和帧率；AV1 与 SDR 自动 10 位需双方 OpenUUYC 支持 |
 | 编解码 | DXVA11 硬解 / Rust 软解 | NVENC、AMF、QSV 硬编 / Rust H.264 软编 | 可选格式与显卡首选；软解支持 H.264 / AV1，整个客户端最多一个软解播放窗口 |
 | 键鼠与触摸 | 键盘、鼠标控制 | 键鼠及移动端原生触摸接收 | 相对/绝对鼠标、组合键、光标同步；可选 125 / 500 / 1000 Hz 鼠标节流（默认关闭） |
@@ -56,6 +58,8 @@ OpenUUYC 是用 Rust 编写的 UU 远程第三方客户端，支持 Windows 和 
 
 安装服务并开启被控后，支持锁屏、PIN 界面及重启后未登录 Windows 时接入。
 
+“安装服务”的确认对话框里可勾选「用 OpenUUYC 打开 UU 远程协助邀请链接」：勾上后把本用户的 `uuremote://` 协议登记给本程序，别人分享的邀请链接就会直接拉起 OpenUUYC 并填入设备 ID 和验证码。登记在安装成功后指向已安装程序，也可在连接设置中更改。只写本用户注册表，不动官方客户端的 HKLM 登记；接管前备份已有的 HKCU 登记，取消或卸载时恢复。若其他程序后来接管，则保留其设置。链接里的 `controlledLogin` 只描述被协助端当时的登录状态，不影响连接方式。
+
 更新时运行新版 EXE，点击“更新并打开”即可更新已有安装。虚拟声卡在“连接设置 → 服务管理”中选装；卸载可选择保留虚拟显示驱动、虚拟声卡及用户数据。
 
 ### 虚拟音频驱动的使用条件
@@ -81,6 +85,7 @@ Linux 版可以登录、管理设备、观看和控制远端桌面，界面走 w
 - **访问通知**：「系统通知」走桌面的 freedesktop 通知服务（GNOME、KDE 等），允许、拒绝、查看按钮直接回到正在运行的程序；「程序浮窗」在 X11 下放在主显示器右下角，Wayland 下由合成器决定位置。
 - **设备资料**：上报本机真实硬件，取自主机名、`/etc/os-release` 与内核版本、`/proc`、DMI 主板信息、PCI 显卡（按 `pci.ids` 命名）和默认路由所在网卡。SMBIOS 系统 UUID 只有 root 能读，因此系统标识由 `/etc/machine-id` 派生，重装系统后视为新设备。壁纸从 GNOME、Cinnamon、MATE 的 GSettings 或 KDE Plasma 配置读取，其他桌面会在诊断页提示暂不支持。
 - **安装与托盘**：没有“安装服务”，直接运行构建出的程序。“开机自启”登录桌面后在托盘启动，按桌面选用两种机制之一。桌面接进了 `graphical-session.target`（GNOME、KDE、uwsm、niri 等）时是一个 systemd 用户单元 `openuuyc.service`：包与 `install-omarchy.sh` 把它装在 `/usr/lib/systemd/user/` 与 `/usr/local/lib/systemd/user/`，便携运行（没装包）时程序按当前可执行文件在 `~/.config/systemd/user/` 里写一份；单元 `WantedBy=graphical-session.target`，会话结束即停，崩溃后自动重启（500 秒内重启满 5 次即不再重试），开关与 `systemctl --user enable/disable openuuyc.service` 是同一件事，从服务启动时日志同时写进 journal，用 `journalctl --user -u openuuyc` 查看。XFCE、MATE、Cinnamon、普通 X 会话以及没有 systemd 的发行版到不了这个 target，开关改写 XDG 自启动条目 `~/.config/autostart/openuuyc.desktop`（指向当前运行的程序），由桌面的会话管理器启动；在桌面的“启动应用程序”里停用它，开关也显示为关闭。两种只会留一种，关闭开关时两种都删。直接启动、既不接这个 target 也不处理 XDG 自启动的合成器（没有 uwsm 或 dex 的 sway、Hyprland 等）两种都不会被拉起，请在合成器配置里自行启动 `OpenUUYC gui --background`。关闭窗口收进托盘（StatusNotifierItem；GNOME 需 AppIndicator 扩展，Ubuntu 默认启用），托盘“退出”结束运行：Xorg 下窗口被隐藏；Wayland 不允许程序隐藏自己的窗口，关闭时销毁主窗口（后台连接、被控与通知照常运行），从托盘打开时按原尺寸重建，位置由合成器决定。启动时桌面没有托盘（没有 StatusNotifierWatcher，例如未启用 AppIndicator 扩展的 GNOME）则关闭即退出。程序已在运行时再次启动（如再点一次图标），新进程经 `$XDG_RUNTIME_DIR/openuuyc/control.sock` 让运行中的实例显示控制中心后退出（Wayland 下收进托盘的窗口随之重建；`--background` 启动不会唤起）；启动器给出的启动通知令牌（Wayland 的 `XDG_ACTIVATION_TOKEN`、X11 的 `DESKTOP_STARTUP_ID`）随请求转交，用来把窗口提到前台并结束启动反馈，合成器或窗口管理器仍可能按自己的防抢焦点策略只做提示。没有 `XDG_RUNTIME_DIR` 时没有这条通道，第二次启动只提示已在运行。SIGTERM（如 `systemctl --user stop`）与 SIGINT（终端里的 Ctrl+C）和托盘“退出”一样先完成后台收尾再退出；收尾被拒或卡住时，再发一次信号即按默认方式立即结束。
+- **协助邀请链接**：deb、AUR 与 `install-omarchy.sh` 装的 `openuuyc.desktop` 声明处理 `x-scheme-handler/uuremote`，浏览器或 `xdg-open` 打开对方分享的 `uuremote://external/assistance?...` 链接时拉起 OpenUUYC，填好设备 ID 与验证码，流程与 Windows 相同；程序已在运行时，新进程经上面的控制通道把链接交给运行中的实例后退出，交不出去会报错而不是丢掉链接。没有 Windows 那样的「接管」勾选框：Linux 没有官方客户端争这个协议，登记随包安装、随包卸载，想交给别的程序用 `xdg-mime default <程序>.desktop x-scheme-handler/uuremote` 改。便携运行（没装包）时系统里没有这项登记，可以把链接作为唯一参数传给程序（`OpenUUYC 'uuremote://...'`）。
 - **未接入**：批注与白板（主控发送和被控接收；被控收到批注请求会拒绝）、插件节点图、多显示器独立窗口、HDR、全局快捷键（快捷键仅在播放窗口获得焦点时生效），以及诊断页中的解码检查。
 - **凭据**：登录态保存在系统密钥环（Secret Service），需要运行 gnome-keyring、KWallet 等服务；没有明文回退。
 

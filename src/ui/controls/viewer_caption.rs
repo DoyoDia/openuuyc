@@ -36,6 +36,7 @@ pub(crate) enum ViewerCaptionIcon {
     OneToOne,
     Mouse,
     Microphone,
+    Clipboard,
     Quality,
     Minimize,
     Maximize,
@@ -174,6 +175,20 @@ fn paint_caption_icon(
                     center + egui::vec2(4.5, -1.0),
                 ],
                 stroke,
+            );
+        }
+        ViewerCaptionIcon::Clipboard => {
+            // 一块带夹子的板子，缩到 12px 也还认得出。
+            let board =
+                egui::Rect::from_center_size(center + egui::vec2(0.0, 1.0), egui::vec2(11.0, 13.0));
+            painter.rect_stroke(board, 2.0, stroke, egui::StrokeKind::Inside);
+            painter.rect_filled(
+                egui::Rect::from_center_size(
+                    egui::pos2(center.x, board.top() + 1.0),
+                    egui::vec2(5.5, 3.5),
+                ),
+                1.0,
+                color,
             );
         }
         ViewerCaptionIcon::Quality => {

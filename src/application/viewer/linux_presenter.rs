@@ -1224,6 +1224,44 @@ impl Player {
         if row.button("串流设置").clicked() {
             self.stream_control_ui.open = !self.stream_control_ui.open;
         }
+        // The Windows caption's clipboard switch: the same per-device setting as
+        // the stream menu's, so either place turns it on or off.
+        let clip = self.session.stream_control.clipboard().snapshot();
+        let clip_hint = if !clip.enabled {
+            "同步剪贴板：把本机剪贴板发送到远端，并把远端剪贴板取回本机".to_owned()
+        } else if let Some(error) = clip.error.as_deref() {
+            error.to_owned()
+        } else if clip.active {
+            "剪贴板同步中，点击关闭".to_owned()
+        } else {
+            "剪贴板同步已开启，等待通道就绪，点击关闭".to_owned()
+        };
+        let control_ready = self.control().snapshot().ready;
+        if row
+            .add_enabled(
+                clip.enabled || (control_ready && self.input().mode() != MouseMode::View),
+                egui::Button::selectable(clip.enabled, "剪贴板"),
+            )
+            .on_hover_text(clip_hint)
+            .on_disabled_hover_text("请先连接并开启键鼠控制")
+            .clicked()
+        {
+            crate::ui::controls::clear_notice(row.ctx(), "clipboard-request-error");
+            match self
+                .session
+                .stream_control
+                .set_clipboard_enabled(!clip.enabled)
+            {
+                Ok(()) => crate::ui::controls::clear_notice(row.ctx(), "clipboard-error"),
+                Err(error) => crate::ui::controls::notice(
+                    row.ctx(),
+                    "clipboard-request-error",
+                    "剪贴板同步",
+                    crate::ui::controls::DialogIcon::Error,
+                    error.to_string(),
+                ),
+            }
+        }
         if row
             .selectable_label(controlling, "键鼠控制")
             .on_hover_text(if recovering {

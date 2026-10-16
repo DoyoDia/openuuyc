@@ -16,12 +16,35 @@ pub(in crate::application::app) struct Manager {
     error: Option<String>,
     reboot: bool,
     allow_sas: bool,
+    /// 是否用本程序打开系统里的 `uuremote://` 协助链接（见
+    /// `crate::platform::windows::assist_link`）。`None` 表示这次会话里还没选过，
+    /// 按注册表里的现状显示。
+    takeover_links: Option<bool>,
     removal: install::RemovalOptions,
     offered: bool,
     completed: bool,
     handoff: bool,
 }
 impl Manager {
+    /// 勾选框的状态。第一次用到时按注册表里的现状定，之后以用户的选择为准——
+    /// 重装或更新不会把上一次的决定悄悄翻掉。
+    fn link_takeover(&mut self) -> bool {
+        *self
+            .takeover_links
+            .get_or_insert_with(crate::platform::windows::assist_link::owned)
+    }
+    /// 协助链接的接管与交回都不需要提权，也不该拖累服务安装：注册失败只提示，
+    /// 服务照装——程序本体还在，链接随时能改。
+    fn apply_link_takeover(&mut self) {
+        let result = if self.link_takeover() {
+            crate::platform::windows::assist_link::enable()
+        } else {
+            crate::platform::windows::assist_link::disable()
+        };
+        if let Err(error) = result {
+            self.error = Some(format!("注册 uuremote:// 协助链接失败：{error:#}"));
+        }
+    }
     fn work(&mut self, operation: Option<Operation>, ctx: egui::Context) {
         self.work_kind(Kind::Suite, operation, ctx);
     }
@@ -80,8 +103,13 @@ impl Manager {
                         Ok(reboot) => {
                             self.reboot |= reboot;
                             self.completed = true;
-                            self.handoff =
-                                kind == Kind::Suite && operation == Operation::Install && !reboot;
+                            if kind == Kind::Suite && operation == Operation::Install {
+                                self.apply_link_takeover();
+                            }
+                            self.handoff = kind == Kind::Suite
+                                && operation == Operation::Install
+                                && !reboot
+                                && self.error.is_none();
                         }
                         Err(error) => self.error = Some(error),
                     }
@@ -137,6 +165,20 @@ impl Manager {
     pub(super) fn management(&mut self, ui: &mut egui::Ui, active: bool) {
         self.poll();
         section(ui, "服务管理");
+        if self.status.as_ref().is_some_and(|s| s.installed) {
+            let mut takeover = self.link_takeover();
+            if ui
+                .add_enabled(
+                    self.pending.is_none(),
+                    egui::Checkbox::new(&mut takeover, "用 OpenUUYC 打开 UU 远程协助邀请链接"),
+                )
+                .changed()
+            {
+                self.takeover_links = Some(takeover);
+                self.error = None;
+                self.apply_link_takeover();
+            }
+        }
         let label = self
             .status
             .as_ref()
@@ -303,6 +345,16 @@ impl Manager {
                     ui.label("程序安装到系统目录并创建桌面和开始菜单快捷方式，完成后重新打开控制中心。");
                     ui.label("当前账号授权和本机身份将加密保存在本机，由当前 Windows 用户和系统服务使用。退出账号会撤销授权。");
                     ui.checkbox(&mut self.allow_sas,"允许服务发送 Ctrl+Alt+Del");
+                    let mut takeover = self.link_takeover();
+                    if ui
+                        .checkbox(
+                            &mut takeover,
+                            "用 OpenUUYC 打开 UU 远程协助邀请链接（uuremote://）",
+                        )
+                        .changed()
+                    {
+                        self.takeover_links = Some(takeover);
+                    }
                     ui.collapsing("驱动与证书", |ui| {
                         if let Some((subject, thumbprint, _)) = Kind::InputDriver.certificate() { ui.label(subject); ui.label(egui::RichText::new(thumbprint).monospace().small()); }
                         ui.label("两个驱动共用此证书，安装时加入本机受信任根证书及受信任发布者。");
