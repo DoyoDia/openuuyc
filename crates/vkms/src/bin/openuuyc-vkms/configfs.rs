@@ -220,6 +220,20 @@ fn load_module() -> Result<()> {
     Ok(())
 }
 
+/// 内核的 VKMS 太老，没有 configfs 接口：这台机器换内核之前都做不了。
+///
+/// 单独一个类型，好让调用方把它和「这一次没成」（modprobe 失败、等不到 DRM 卡……）
+/// 分开报：前者是「内核不支持」，后者只是当前不可用。
+#[derive(Debug)]
+pub struct KernelTooOld(pub String);
+
+impl std::fmt::Display for KernelTooOld {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+impl std::error::Error for KernelTooOld {}
+
 /// 这个内核的 VKMS 有没有 configfs 接口。没有就不要碰它。
 ///
 /// 连接器上的 `status`、`create_default_dev` 参数和 configfs 接口是同一组补丁
@@ -234,19 +248,22 @@ fn ensure_supported() -> Result<()> {
         return Ok(());
     }
     if Path::new("/sys/module/vkms").exists() {
-        bail!(
+        return Err(KernelTooOld(format!(
             "本机加载的 VKMS 模块没有 configfs 接口（{ROOT} 不存在），虚拟屏需要 Linux 6.19 或更新的内核"
-        );
+        ))
+        .into());
     }
     ensure!(
         Path::new(CONFIGFS).exists(),
         "系统没有挂载 configfs（{CONFIGFS}），无法创建虚拟显示器"
     );
-    ensure!(
-        module_has_default_dev_parameter()?,
-        "本机内核 {} 的 VKMS 不支持 configfs，虚拟屏需要 Linux 6.19 或更新的内核",
-        kernel_release()
-    );
+    if !module_has_default_dev_parameter()? {
+        return Err(KernelTooOld(format!(
+            "本机内核 {} 的 VKMS 不支持 configfs，虚拟屏需要 Linux 6.19 或更新的内核",
+            kernel_release()
+        ))
+        .into());
+    }
     Ok(())
 }
 

@@ -82,7 +82,12 @@ fn main() {
             note(&format!(
                 "已就绪，监听 {socket}，但用不了虚拟显示器：{reason}"
             ));
-            Device::Unavailable(reason)
+            Device::Unavailable {
+                unsupported: error
+                    .chain()
+                    .any(|cause| cause.is::<configfs::KernelTooOld>()),
+                reason,
+            }
         }
     };
 
@@ -181,23 +186,33 @@ fn main() {
 /// 设备这一侧的状态。用不了的时候进程照样活着，只是把原因如实报给请求方。
 enum Device {
     Ready(configfs::Instance),
-    /// 原因会原样转给主控和诊断页，例如「本机内核 6.8 的 VKMS 不支持 configfs」。
-    Unavailable(String),
+    Unavailable {
+        /// 原因会原样转给主控和诊断页，例如「本机内核 6.8 的 VKMS 不支持 configfs」。
+        reason: String,
+        /// 是不是内核本身不够新。只有这种才报成「不支持」：modinfo 跑不起来、modprobe
+        /// 失败、等不到 DRM 卡这些是这一次没成，下次启动（空闲一分钟就会退出重来）
+        /// 未必还这样，诊断页说成「内核不支持」会让人去升级一个本来就够新的内核。
+        unsupported: bool,
+    },
 }
 
 impl Device {
-    /// 用不了的原因，能用就是 `None`。
-    fn unavailable(&self) -> Option<&str> {
+    /// 用不了时该回的那句话，能用就是 `None`。
+    fn unavailable(&self) -> Option<Reply> {
         match self {
             Self::Ready(_) => None,
-            Self::Unavailable(reason) => Some(reason),
+            Self::Unavailable {
+                reason,
+                unsupported: true,
+            } => Some(Reply::unsupported(reason)),
+            Self::Unavailable { reason, .. } => Some(Reply::failed(reason)),
         }
     }
 
     fn instance(&self) -> Result<&configfs::Instance> {
         match self {
             Self::Ready(instance) => Ok(instance),
-            Self::Unavailable(reason) => bail!("{reason}"),
+            Self::Unavailable { reason, .. } => bail!("{reason}"),
         }
     }
 }
@@ -221,8 +236,8 @@ impl Shared {
         }
     }
 
-    /// 设备本身用不了的原因，没有就是 `None`。每个请求都要先看这个。
-    fn unavailable(&self) -> Option<&str> {
+    /// 设备本身用不了时该回的话，没有就是 `None`。每个请求都要先看这个。
+    fn unavailable(&self) -> Option<Reply> {
         self.device.unavailable()
     }
 
@@ -361,7 +376,7 @@ fn serve(shared: &Shared, id: u64, stream: UnixStream, credentials: peer::Creden
         }
         let reply = match serde_json::from_str::<Request>(line.trim()) {
             Ok(request) => match shared.unavailable() {
-                Some(reason) => Reply::unsupported(reason),
+                Some(reply) => reply,
                 None => {
                     // 只在真的动内核的时候记一行：诊断页每 5 秒探一次的纯粹查询
                     // 不值得写进 journal，写下来就是刷屏。
@@ -931,11 +946,37 @@ mod tests {
     /// 设备用不了的时候进程照样活着，只是每次请求都回同一句原因。
     #[test]
     fn an_unusable_device_reports_its_reason() {
-        let device = Device::Unavailable("本机内核 6.8 的 VKMS 不支持 configfs".into());
+        let device = Device::Unavailable {
+            reason: "本机内核 6.8 的 VKMS 不支持 configfs".into(),
+            unsupported: true,
+        };
         assert_eq!(
             device.unavailable(),
-            Some("本机内核 6.8 的 VKMS 不支持 configfs")
+            Some(Reply::unsupported("本机内核 6.8 的 VKMS 不支持 configfs"))
         );
         assert!(device.instance().is_err());
+    }
+
+    /// 只有内核版本不够才说「不支持」；别的原因照常是失败，诊断页才不会叫人去升级内核。
+    #[test]
+    fn only_an_old_kernel_is_reported_as_unsupported() {
+        let old: anyhow::Error =
+            configfs::KernelTooOld("本机内核 6.8 的 VKMS 不支持 configfs".into()).into();
+        assert!(
+            old.chain()
+                .any(|cause| cause.is::<configfs::KernelTooOld>())
+        );
+        let other = anyhow::anyhow!("加载 vkms 模块失败").context("打开设备失败");
+        assert!(
+            !other
+                .chain()
+                .any(|cause| cause.is::<configfs::KernelTooOld>())
+        );
+        let device = Device::Unavailable {
+            reason: format!("{other:#}"),
+            unsupported: false,
+        };
+        let reply = device.unavailable().unwrap();
+        assert!(!reply.ok && !reply.unsupported);
     }
 }

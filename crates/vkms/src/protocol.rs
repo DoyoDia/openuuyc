@@ -26,8 +26,9 @@ pub struct Reply {
     pub ok: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    /// 明确的「这台机器做不了」：内核或者配置缺东西，重试也没有意义。诊断页据此
-    /// 把「内核不支持」和笼统的「连不上」分开说。
+    /// 明确的「这台机器做不了」：内核的 VKMS 太老、没有 configfs 接口，换内核之前
+    /// 重试也没有意义。诊断页据此把「内核不支持」和笼统的「连不上」分开说；别的
+    /// 失败（modprobe 失败、等不到 DRM 卡……）不带这个标记。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub unsupported: bool,
     /// 内核给这块屏起的连接器名（`Virtual-N`），客户端拿它去指挥合成器。
@@ -68,7 +69,7 @@ impl Reply {
             status: None,
         }
     }
-    /// 这台机器根本做不了（内核太老、模块没编进去……）。原因要原样送到用户眼前。
+    /// 这台机器的内核做不了（VKMS 没有 configfs 接口）。原因要原样送到用户眼前。
     pub fn unsupported(error: impl std::fmt::Display) -> Self {
         Self {
             unsupported: true,
