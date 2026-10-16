@@ -1887,12 +1887,16 @@ impl Player {
                     for screen in &catalog {
                         let id = screen.id;
                         // 只有 UU 虚拟屏能这样关掉，物理屏要留着，否则等于拔掉
-                        // 对端的显示器。
+                        // 对端的显示器。类型按对端报的屏来看（和 Windows 一样），
+                        // 拓扑里还没落定的瞬态屏不给关。
                         let closable = snapshot.ready
                             && snapshot.dpi_settings_supported
                             && snapshot.screens.len() > 1
                             && (!snapshot.topology.pending || snapshot.topology.dismissed)
-                            && screen.display.screen_type == 1;
+                            && snapshot
+                                .screens
+                                .iter()
+                                .any(|real| real.id == id && real.display.screen_type == 1);
                         let name = screen.label(&catalog);
                         let (response, close_clicked) = ui
                             .push_id(("player-screen-tab", id), |ui| {
