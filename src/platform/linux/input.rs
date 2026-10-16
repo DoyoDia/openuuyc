@@ -911,10 +911,10 @@ impl Injector {
         self.absolute.is_some()
     }
 
-    /// 移到合成器全局空间里的一点，由合成器按 `bounds`（它全部输出的外接
-    /// 矩形）解算。设备写入失败就不再用它，之后的绝对定位回到相对移动。
-    /// 请合成器重新判定一次指针底下是谁。返回「真的报了没有」：没有绝对指针
-    /// （X11 会话、或者合成器认不出这台设备）时这条路催不动它。
+    /// 请合成器重新判定一次指针底下是谁：把绝对指针最后写下的位置重报一次。
+    /// 返回「真的报了没有」：没有绝对指针（X11 会话、或者合成器认不出这台设备）
+    /// 时这条路催不动它。指针最后一次不是经 [`Self::aim`] 摆的时候，那个位置已经
+    /// 过期，调用方（引擎）不该再来请。
     pub fn realign(&mut self) -> Result<bool> {
         match self.absolute.as_mut() {
             Some(absolute) => absolute.realign().map(|()| true),
@@ -922,6 +922,8 @@ impl Injector {
         }
     }
 
+    /// 移到合成器全局空间里的一点，由合成器按 `bounds`（它全部输出的外接
+    /// 矩形）解算。设备写入失败就不再用它，之后的绝对定位回到相对移动。
     pub fn aim(&mut self, x: i32, y: i32, bounds: Desktop) -> Result<()> {
         let absolute = self.absolute.as_mut().context("虚拟绝对指针不可用")?;
         let result = absolute.aim(x, y, bounds);

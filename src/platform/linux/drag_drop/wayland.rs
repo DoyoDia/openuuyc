@@ -5,10 +5,11 @@
 //! 自己当那个合法的 drop target**。拖放本来就是合成器按指针位置投递给指针底下那
 //! 个客户端的，我们只要在那时候是那个客户端就行。
 //!
-//! 一个输入事件都不合成。被控这边的指针本来就停在拖动点上（那个点主控随 `Probe`
-//! 一起给了），所以只要把这块透明的 layer surface 摆到拖动点上去，指针就在它里
-//! 面，合成器下一轮判定就会把这次拖放交给它——niri 与 wlroots 系（sway、labwc）
-//! 都会在「指针底下的 surface 换了」时重新判定一次，不必再去推指针。
+//! 被控这边的指针本来就停在拖动点上（那个点主控随 `Probe` 一起给了），所以只要
+//! 把这块透明的 layer surface 摆到拖动点上去，指针就在它里面。之后要等合成器重新
+//! 判定一次指针底下是谁，才会把这次拖放交给它：sway 在 surface 上屏时自己就会重
+//! 判；niri 只在指针动过之后才重判，所以等不到时请键鼠注入的引擎把指针在原地重
+//! 报一次（见 `platform::linux::input::realign_pointer`），不另建注入设备。
 //!
 //! 和 X11 那条并存但只走一条（会话类型说了算，见 `features/drag_drop/mod.rs`）：
 //! 两个世界的拖放互相看不见（XWayland 不会把 XDND 拖拽桥接给 Wayland 客户端，
@@ -36,12 +37,13 @@ use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_l
 const SIDE: i32 = 512;
 /// 一直没等到拖放就安静收工。整体超时由 `tick` 管（30 秒），这里不必等那么久。
 const LIMIT: Duration = Duration::from_secs(20);
-/// 摆好之后等合成器把拖放交过来。指针底下换了 surface 就会重新判定一次，正常一个
-/// roundtrip 就到；等不到就是这台合成器不吃这一套，和 X11 那条一样趁早报
-/// `Unavailable`（对齐 `portal.rs` 的 `CAPTURE_WAIT`）。
+/// 摆好之后等合成器把拖放交过来。上屏时自己重判的合成器一个 roundtrip 就到，靠
+/// 原地重报的要到 `REALIGN_AT` 之后；过了这么久还没到，就当这台合成器上这条路走
+/// 不通，和 X11 那条一样趁早报 `Unavailable`（对齐 `portal.rs` 的 `CAPTURE_WAIT`）。
 const ENTER_WAIT: Duration = Duration::from_millis(600);
-/// 摆好之后按这几个时刻各请指针在原地动一下（见 `realign`）。先等一小会儿是给
-/// wlroots 系留的：它们自己会在面上屏时重判，那就不必注入任何东西了。
+/// 摆好之后按这几个时刻各请指针在原地动一下（见
+/// `platform::linux::input::realign_pointer`）。先等一小会儿是给 sway 这类合成器
+/// 留的：它们自己会在面上屏时重判，那就不必注入任何东西了。
 const REALIGN_AT: [Duration; 2] = [Duration::from_millis(50), Duration::from_millis(300)];
 /// 接住之后还要等原来那次拖动收场，等不到也最多等这么久：主控那头等的是这一句
 /// （见 `run` 末尾），一直不吭声它就一直卡在「正在准备文件」。
@@ -152,13 +154,7 @@ fn logical_point(point: Position, size: (u32, u32), logical: (i32, i32)) -> (i32
     )
 }
 
-/// 挑出 `device` 指的是哪块屏。
-///
-/// 名字对不上是常态：XWayland 那边给的可能压根不是合成器的输出名（老版本直接叫
-/// `XWAYLAND0`），而 `wl_output` 在 v4 之前根本不发名字（绑上去拿到的是空串）。
-/// 所以照采集那边的三段式来：按名字 → 只有一块屏就用它 → 都不行就按物理尺寸认
-/// （尺寸按无序对比较，转过 90 度的屏宽高是换过来的）→ 还不行就报错，并把合成器
-/// 有的输出列出来。
+/// 第 `index` 块屏的逻辑尺寸，合成器还没报时为 `(0, 0)`。
 fn logical_size(state: &State, index: usize) -> (i32, i32) {
     state
         .logical
@@ -168,6 +164,13 @@ fn logical_size(state: &State, index: usize) -> (i32, i32) {
         .map_or((0, 0), |(_, size)| size)
 }
 
+/// 挑出 `device` 指的是哪块屏。
+///
+/// 名字对不上是常态：XWayland 那边给的可能压根不是合成器的输出名（老版本直接叫
+/// `XWAYLAND0`），而 `wl_output` 在 v4 之前根本不发名字（绑上去拿到的是空串）。
+/// 所以照采集那边的三段式来：按名字 → 只有一块屏就用它 → 都不行就按尺寸认，物理
+/// 与逻辑尺寸有一种对得上就算（尺寸按无序对比较，转过 90 度的屏宽高是换过来的）
+/// → 还不行就报错，并把合成器有的输出列出来。
 fn pick(state: &State, device: &str, size: (u32, u32)) -> Result<usize> {
     if let Some(index) = state
         .outputs
@@ -371,7 +374,7 @@ fn run(
     shell.ack_configure(serial);
     surface.commit();
 
-    // 摆好了就等合成器把这次拖放交过来。指针底下换了 surface 时，wlroots 系会自己
+    // 摆好了就等合成器把这次拖放交过来。指针底下换了 surface 时，sway 会自己
     // 重新判定一次，所以先等一小会儿、什么也不注入；等不到再请引擎把指针在原地重报
     // 一次——niri 只在指针真的动过之后才更新拖放目标（`layout.dnd_update` 只在
     // `on_pointer_motion*` 里调用），没有这一下它永远不会把拖放交过来。走的是引擎平时
@@ -873,13 +876,6 @@ impl Dispatch<zxdg_output_v1::ZxdgOutputV1, ()> for State {
 mod tests {
     use super::*;
 
-    /// 「创建子对象」的事件必须在 `Dispatch` 里给出特化，缺了会在合成器真送来
-    /// 事件时 panic，而那个 panic 直接 abort 整个进程。这条就是把这个坑钉住：
-    /// 不连真拖放也能查出来。
-    ///
-    /// 要的只是一个 `QueueHandle`，它只要求一条连接、不要求对面坐着合成器。所以
-    /// 用一对 unix socket 自己喂一条连接进去：CI 和 Xorg 会话里没有 Wayland 显示，
-    /// `connect_to_env` 会直接失败，而这条测试不该只在有合成器的机器上跑得起来。
     /// 拖动点的换算：这块屏是本机 DP-3 那样转过 90 度、1.6 倍缩放的，采集那边报
     /// 1600x2560，合成器报逻辑 1000x1600。
     #[test]
@@ -893,6 +889,13 @@ mod tests {
         );
     }
 
+    /// 「创建子对象」的事件必须在 `Dispatch` 里给出特化，缺了会在合成器真送来
+    /// 事件时 panic，而那个 panic 直接 abort 整个进程。这条就是把这个坑钉住：
+    /// 不连真拖放也能查出来。
+    ///
+    /// 要的只是一个 `QueueHandle`，它只要求一条连接、不要求对面坐着合成器。所以
+    /// 用一对 unix socket 自己喂一条连接进去：CI 和 Xorg 会话里没有 Wayland 显示，
+    /// `connect_to_env` 会直接失败，而这条测试不该只在有合成器的机器上跑得起来。
     #[test]
     fn data_offer_has_a_child_specialization() {
         let (ours, _theirs) = std::os::unix::net::UnixStream::pair().unwrap();
