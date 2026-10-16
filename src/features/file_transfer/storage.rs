@@ -638,6 +638,10 @@ mod tests {
             "\\home\\clansty\\Downloads"
         );
         assert_eq!(wire_path("/"), "\\");
+        // What a Windows host hands out already has this shape.
+        for windows in ["C:\\", "D:\\Users\\u\\a b.txt", "\\\\srv\\share\\x"] {
+            assert_eq!(wire_path(windows), windows);
+        }
         assert_eq!(
             local_path("\\home\\clansty\\Downloads").unwrap(),
             PathBuf::from("/home/clansty/Downloads")
