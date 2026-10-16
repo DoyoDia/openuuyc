@@ -1,12 +1,23 @@
 //! Measure the cost of a size mismatch on the GPU conversion path.
 //!
-//! Production converts the compositor frame to NV12 at its native size. When
-//! the negotiated output size differs (a controller quality that maps to a
-//! smaller geometry), `capture/mod.rs` falls back to `OwnedNv12::pixels()` --
-//! a VA readback to BGRA -- followed by a CPU bilinear `scale`. This probe
-//! compares that path with the native-size fast path so the penalty is known.
+//! When the controller's quality maps to a smaller geometry than the source,
+//! the frame has to be scaled somewhere. Three passes are timed per frame:
+//!
+//! - `native`: convert at the source size and encode it, the cost with no
+//!   mismatch at all;
+//! - `readback`: what `capture/mod.rs` did for every frame before the
+//!   converter could scale: convert at the source size, read the NV12 back to
+//!   BGRA with `OwnedNv12::pixels()`, scale it with the CPU `scale` and encode
+//!   the BGRA. This is the "before" column of the scaler's measurements;
+//! - `gpu-scale`: convert straight to the target geometry and encode the NV12.
+//!
+//! Each pass writes its own H.264 stream to `/tmp/uu-mismatch-<pass>-*.h264`.
 #![allow(dead_code)]
-use std::{io::Write, os::fd::AsRawFd, time::Instant};
+use std::{
+    io::Write,
+    os::fd::AsRawFd,
+    time::{Duration, Instant},
+};
 
 mod media {
     pub mod encoding {
@@ -73,8 +84,8 @@ fn rate() -> media::encoding::Rate {
     }
 }
 
-/// Verbatim copy of the capture path's bilinear BGRA scaling, so the probe
-/// charges the same CPU work the product does.
+/// Verbatim copy of `scale` in `capture/mod.rs`, so the readback pass charges
+/// the same CPU work the product does.
 fn scale(source: &[u8], from: (u32, u32), to: (u32, u32)) -> Vec<u8> {
     let (source_width, source_height) = (from.0 as usize, from.1 as usize);
     let (width, height) = (to.0 as usize, to.1 as usize);
@@ -170,52 +181,106 @@ fn main() -> anyhow::Result<()> {
     }
     let gpu = gpu_convert::Converter::new(display.clone())?;
     let enc_display = cros_libva::Display::open_drm_display("/dev/dri/renderD128")?;
+    let report = |pass: &str, size: String, times: &[(&str, Duration)]| {
+        let per_frame = |t: Duration| t.as_secs_f64() * 1000. / f64::from(frames);
+        let total: Duration = times.iter().map(|(_, t)| *t).sum();
+        let parts: Vec<_> = times
+            .iter()
+            .map(|(name, t)| format!("{name}={:.2}", per_frame(*t)))
+            .collect();
+        println!(
+            "{pass:<9} {size}  {} total={:.2} ms/frame",
+            parts.join(" "),
+            per_frame(total)
+        );
+    };
+    let stream = |pass: &str| {
+        std::fs::File::create(format!("/tmp/uu-mismatch-{pass}-{w}x{h}-{tw}x{th}.h264"))
+    };
+    let timestamp = |n: u32| 10_000_000 + i64::from(n) * 333_333;
 
-    // Fast path: encoder opened at the source size, NV12 handed over directly.
-    let mut enc_native =
+    // No mismatch: encoder opened at the source size, NV12 handed over.
+    let mut enc =
         encoder::Encoder::new(&enc_display, (w, h), media::encoding::Format::AVC, rate())?;
-    let mut out = std::fs::File::create(format!("/tmp/uu-mismatch-{w}x{h}-{tw}x{th}.h264"))?;
-    let (mut t_convert, mut t_encode) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
+    let mut out = stream("native")?;
+    let (mut convert, mut encode) = (Duration::ZERO, Duration::ZERO);
     for n in 0..frames {
         let t = Instant::now();
         let nv = gpu.convert(&rgb, (0, 0, w, h), (w, h))?;
-        t_convert += t.elapsed();
+        convert += t.elapsed();
         let t = Instant::now();
-        let encoded = enc_native.encode_nv12(&nv, 10_000_000 + n as i64 * 333_333, n % 30 == 0)?;
-        t_encode += t.elapsed();
+        let encoded = enc.encode_nv12(&nv, timestamp(n), n % 30 == 0)?;
+        encode += t.elapsed();
         for packet in encoded {
             out.write_all(&packet.data)?;
         }
     }
-    println!(
-        "native   {w}x{h}  convert={:.2} encode={:.2} total={:.2} ms/frame",
-        t_convert.as_secs_f64() * 1000. / f64::from(frames),
-        t_encode.as_secs_f64() * 1000. / f64::from(frames),
-        (t_convert + t_encode).as_secs_f64() * 1000. / f64::from(frames),
+    report(
+        "native",
+        format!("{w}x{h}"),
+        &[("convert", convert), ("encode", encode)],
     );
-    drop(enc_native);
+    drop(enc);
 
-    // Mismatch path, now scaled on the GPU: convert straight to the target
-    // geometry and hand the NV12 over, with no CPU readback or scale.
-    let mut enc_scaled =
+    // The CPU fallback: native conversion, VA readback, CPU scale, BGRA encode.
+    let mut enc =
         encoder::Encoder::new(&enc_display, (tw, th), media::encoding::Format::AVC, rate())?;
-    let (mut t_convert, mut t_encode) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
+    let mut out = stream("readback")?;
+    let (mut convert, mut readback, mut scaling, mut encode) = (
+        Duration::ZERO,
+        Duration::ZERO,
+        Duration::ZERO,
+        Duration::ZERO,
+    );
+    for n in 0..frames {
+        let t = Instant::now();
+        let nv = gpu.convert(&rgb, (0, 0, w, h), (w, h))?;
+        convert += t.elapsed();
+        let t = Instant::now();
+        let pixels = nv.pixels()?;
+        readback += t.elapsed();
+        let t = Instant::now();
+        let bgra = scale(&pixels, (w, h), (tw, th));
+        scaling += t.elapsed();
+        let t = Instant::now();
+        let encoded = enc.encode(&bgra, tw as usize * 4, timestamp(n), n % 30 == 0)?;
+        encode += t.elapsed();
+        for packet in encoded {
+            out.write_all(&packet.data)?;
+        }
+    }
+    report(
+        "readback",
+        format!("{w}x{h}->{tw}x{th}"),
+        &[
+            ("convert", convert),
+            ("readback", readback),
+            ("scale", scaling),
+            ("encode", encode),
+        ],
+    );
+    drop(enc);
+
+    // Scaled on the GPU: convert straight to the target and hand the NV12 over.
+    let mut enc =
+        encoder::Encoder::new(&enc_display, (tw, th), media::encoding::Format::AVC, rate())?;
+    let mut out = stream("gpu-scale")?;
+    let (mut convert, mut encode) = (Duration::ZERO, Duration::ZERO);
     for n in 0..frames {
         let t = Instant::now();
         let nv = gpu.convert(&rgb, (0, 0, w, h), (tw, th))?;
-        t_convert += t.elapsed();
+        convert += t.elapsed();
         let t = Instant::now();
-        let encoded = enc_scaled.encode_nv12(&nv, 10_000_000 + n as i64 * 333_333, n % 30 == 0)?;
-        t_encode += t.elapsed();
+        let encoded = enc.encode_nv12(&nv, timestamp(n), n % 30 == 0)?;
+        encode += t.elapsed();
         for packet in encoded {
             out.write_all(&packet.data)?;
         }
     }
-    println!(
-        "gpu-scale {w}x{h}->{tw}x{th}  convert={:.2} encode={:.2} total={:.2} ms/frame",
-        t_convert.as_secs_f64() * 1000. / f64::from(frames),
-        t_encode.as_secs_f64() * 1000. / f64::from(frames),
-        (t_convert + t_encode).as_secs_f64() * 1000. / f64::from(frames),
+    report(
+        "gpu-scale",
+        format!("{w}x{h}->{tw}x{th}"),
+        &[("convert", convert), ("encode", encode)],
     );
     Ok(())
 }

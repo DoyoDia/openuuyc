@@ -90,15 +90,18 @@ interaction with the encoder. All of them link the production
   same reference moved by half a source pixel must fail that bound, so a
   shifted sampling grid cannot pass. Repeated conversions must be identical.
 - `mismatch` — measures the cost of a controller quality whose output geometry
-  differs from the source, comparing the native pass with the scaled one. This
-  is the regression the scaler fixed: reading the NV12 back to the CPU and
-  scaling in Rust cost 90-172 ms/frame at 2880x1800; scaling on the GPU costs
-  9-14 ms/frame, below the native pass at the largest targets.
+  differs from the source. It times three passes: `native` (no mismatch),
+  `readback` (the CPU fallback the scaler replaced: convert at the source size,
+  `OwnedNv12::pixels()`, the CPU `scale`, encode the BGRA) and `gpu-scale`
+  (convert straight to the target). Measured on Haswell from 2880x1800 to
+  1280x720 and 2560x1440: readback 89.5 and 172 ms/frame, GPU scale 8.8 and
+  13.9 ms/frame, both below the native pass.
 
 ```sh
 cargo run --release --manifest-path devtools/probes/gpu-conversion/Cargo.toml --bin overlap -- 2880 1800 128
 cargo run --release --manifest-path devtools/probes/gpu-conversion/Cargo.toml --bin churn -- 2880 1800 1500 2
 cargo run --release --manifest-path devtools/probes/gpu-conversion/Cargo.toml --bin scale -- 2880 1800 1728 1080
+cargo run --release --manifest-path devtools/probes/gpu-conversion/Cargo.toml --bin mismatch -- 2880 1800 1728 1080 96
 ```
 
 Measured on Haswell at idle (load < 2), 2880x1800: pipelined CPU 40-41 fps vs
