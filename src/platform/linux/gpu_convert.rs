@@ -21,8 +21,12 @@ type DestroyContext = unsafe extern "C" fn(Handle, Handle) -> u32;
 type Terminate = unsafe extern "C" fn(Handle) -> u32;
 type DestroyGbm = unsafe extern "C" fn(Handle);
 
-const Y_SHADER: &str = "#version 300 es\nprecision highp float;uniform sampler2D rgb;uniform ivec2 origin;layout(location=0) out vec4 outColor;void main(){vec3 c=texelFetch(rgb,origin+ivec2(gl_FragCoord.xy),0).rgb;outColor=vec4((16.0+dot(c,vec3(65.481,128.553,24.966)))/255.0,0,0,1);}";
-const UV_SHADER: &str = "#version 300 es\nprecision highp float;uniform sampler2D rgb;uniform ivec2 origin;layout(location=0) out vec4 outColor;void main(){ivec2 p=origin+ivec2(gl_FragCoord.xy)*2;vec3 c=(texelFetch(rgb,p,0).rgb+texelFetch(rgb,p+ivec2(1,0),0).rgb+texelFetch(rgb,p+ivec2(0,1),0).rgb+texelFetch(rgb,p+ivec2(1,1),0).rgb)*0.25;outColor=vec4((128.0+dot(c,vec3(-37.797,-74.203,112.0)))/255.0,(128.0+dot(c,vec3(112.0,-93.786,-18.214)))/255.0,0,1);}";
+// Native-size sampling stays an exact `texelFetch` (the original behaviour).
+// When the target geometry differs, the shader scales during the conversion so
+// the frame never has to be read back to the CPU. Chroma averages the same 2x2
+// luma block the CPU path did, only at the scaled positions.
+const Y_SHADER: &str = "#version 300 es\nprecision highp float;uniform sampler2D rgb;uniform ivec2 origin;uniform ivec2 src;uniform ivec2 dst;layout(location=0) out vec4 outColor;void main(){vec3 c;if(src==dst){c=texelFetch(rgb,origin+ivec2(gl_FragCoord.xy),0).rgb;}else{vec2 s=vec2(src)/vec2(dst);vec2 p=vec2(origin)+gl_FragCoord.xy*s;c=texture(rgb,p/vec2(textureSize(rgb,0))).rgb;}outColor=vec4((16.0+dot(c,vec3(65.481,128.553,24.966)))/255.0,0,0,1);}";
+const UV_SHADER: &str = "#version 300 es\nprecision highp float;uniform sampler2D rgb;uniform ivec2 origin;uniform ivec2 src;uniform ivec2 dst;layout(location=0) out vec4 outColor;void main(){vec3 c;if(src==dst){ivec2 p=origin+ivec2(gl_FragCoord.xy)*2;c=(texelFetch(rgb,p,0).rgb+texelFetch(rgb,p+ivec2(1,0),0).rgb+texelFetch(rgb,p+ivec2(0,1),0).rgb+texelFetch(rgb,p+ivec2(1,1),0).rgb)*0.25;}else{vec2 s=vec2(src)/vec2(dst);vec2 sz=vec2(textureSize(rgb,0));vec2 o=vec2(origin);vec2 b=2.0*gl_FragCoord.xy-0.5;c=(texture(rgb,(o+b*s)/sz).rgb+texture(rgb,(o+(b+vec2(1.0,0.0))*s)/sz).rgb+texture(rgb,(o+(b+vec2(0.0,1.0))*s)/sz).rgb+texture(rgb,(o+(b+vec2(1.0,1.0))*s)/sz).rgb)*0.25;}outColor=vec4((128.0+dot(c,vec3(-37.797,-74.203,112.0)))/255.0,(128.0+dot(c,vec3(112.0,-93.786,-18.214)))/255.0,0,1);}";
 
 /// Exported allocation is immutable after GPU completion. FDs own its memory
 /// even after the allocating VA surface is destroyed; no pool reuses it.
@@ -403,12 +407,12 @@ impl Converter {
             gl.tex_parameter_i32(
                 glow::TEXTURE_2D,
                 glow::TEXTURE_MIN_FILTER,
-                glow::NEAREST as i32,
+                glow::LINEAR as i32,
             );
             gl.tex_parameter_i32(
                 glow::TEXTURE_2D,
                 glow::TEXTURE_MAG_FILTER,
-                glow::NEAREST as i32,
+                glow::LINEAR as i32,
             );
             gl.tex_parameter_i32(
                 glow::TEXTURE_2D,
@@ -425,8 +429,19 @@ impl Converter {
     }
 
     /// The source fd must remain dequeued and unchanged until this returns.
-    pub fn convert(&self, rgb: &RgbDma, crop: (u32, u32, u32, u32)) -> Result<Arc<OwnedNv12>> {
+    ///
+    /// `crop` selects the source region and `target` the output geometry, so a
+    /// controller quality that maps to a smaller frame is scaled here instead of
+    /// being read back to the CPU. At equal sizes the sampling is a texel
+    /// centre, so the result matches the previous exact pass.
+    pub fn convert(
+        &self,
+        rgb: &RgbDma,
+        crop: (u32, u32, u32, u32),
+        target: (u32, u32),
+    ) -> Result<Arc<OwnedNv12>> {
         let (x, y, w, h) = crop;
+        let (tw, th) = target;
         ensure!(
             w > 0
                 && h > 0
@@ -436,13 +451,17 @@ impl Converter {
                 && y.checked_add(h).is_some_and(|n| n <= rgb.height),
             "NV12 crop 无效"
         );
+        ensure!(
+            tw > 0 && th > 0 && tw % 2 == 0 && th % 2 == 0,
+            "NV12 目标尺寸无效"
+        );
         let surface = self
             .va
             .create_surfaces(
                 cros_libva::VA_RT_FORMAT_YUV420,
                 Some(cros_libva::VA_FOURCC_NV12),
-                w,
-                h,
+                tw,
+                th,
                 None,
                 vec![()],
             )?
@@ -467,8 +486,8 @@ impl Converter {
                     targets.push(self.image_texture(
                         &RgbDma {
                             fd: p.objects[obj].fd.as_raw_fd(),
-                            width: w >> plane,
-                            height: h >> plane,
+                            width: tw >> plane,
+                            height: th >> plane,
                             pitch: p.layers[0].pitch[plane],
                             offset: p.layers[0].offset[plane],
                             fourcc: if plane == 0 {
@@ -497,7 +516,7 @@ impl Converter {
                             == glow::FRAMEBUFFER_COMPLETE,
                         "NV12 平面不可渲染"
                     );
-                    gl.viewport(0, 0, (w >> plane) as i32, (h >> plane) as i32);
+                    gl.viewport(0, 0, (tw >> plane) as i32, (th >> plane) as i32);
                     let prog = self.programs[plane];
                     gl.use_program(Some(prog));
                     gl.uniform_1_i32(gl.get_uniform_location(prog, "rgb").as_ref(), 0);
@@ -505,6 +524,16 @@ impl Converter {
                         gl.get_uniform_location(prog, "origin").as_ref(),
                         x as i32,
                         y as i32,
+                    );
+                    gl.uniform_2_i32(
+                        gl.get_uniform_location(prog, "src").as_ref(),
+                        w as i32,
+                        h as i32,
+                    );
+                    gl.uniform_2_i32(
+                        gl.get_uniform_location(prog, "dst").as_ref(),
+                        tw as i32,
+                        th as i32,
                     );
                     gl.draw_arrays(glow::TRIANGLES, 0, 3);
                 }

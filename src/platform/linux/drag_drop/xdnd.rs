@@ -193,7 +193,7 @@ pub(super) fn uri_list(paths: &[PathBuf]) -> String {
 
 /// Local paths from a `text/uri-list`; anything that is not a local `file:`
 /// URI is skipped.
-pub(super) fn parse_uri_list(data: &[u8]) -> Vec<PathBuf> {
+pub(crate) fn parse_uri_list(data: &[u8]) -> Vec<PathBuf> {
     use std::os::unix::ffi::OsStringExt as _;
     String::from_utf8_lossy(data)
         .lines()

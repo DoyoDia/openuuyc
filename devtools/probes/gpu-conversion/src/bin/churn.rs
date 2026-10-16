@@ -124,7 +124,7 @@ fn capture_thread(
                 }
             }
         }
-        let nv = gpu.convert(&rgb, (0, 0, w, h))?;
+        let nv = gpu.convert(&rgb, (0, 0, w, h), (w, h))?;
         let encoded = enc.encode_nv12(&nv, 10_000_000 + n as i64 * 333_333, n % 30 == 0)?;
         for packet in encoded {
             bytes += packet.data.len() as u64;

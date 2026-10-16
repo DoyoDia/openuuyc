@@ -18,7 +18,7 @@
 //! as the compositor announces them, and publishes a snapshot; readers only
 //! clone the latest one. A compositor that cannot describe its layout leaves
 //! the snapshot empty and is asked again later, with a growing pause.
-use crate::platform::{CompositorLayout, CompositorOutput};
+use crate::platform::{CompositorLayout, CompositorOutput, Rotation};
 use anyhow::{Context, Result, bail};
 use std::os::fd::AsRawFd;
 use std::sync::{Arc, OnceLock, RwLock};
@@ -202,6 +202,8 @@ struct Entry {
     name: Option<String>,
     position: Option<(i32, i32)>,
     size: Option<(i32, i32)>,
+    /// How far the compositor turned this panel; only the touch path reads it.
+    rotation: Rotation,
 }
 
 impl State {
@@ -221,6 +223,7 @@ impl State {
                         top,
                         width: width as u32,
                         height: height as u32,
+                        rotation: entry.rotation,
                     })
                 })
                 .collect(),
@@ -271,6 +274,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                         name: None,
                         position: None,
                         size: None,
+                        rotation: Rotation::default(),
                     });
                     state.describe(name, handle);
                 }
@@ -307,10 +311,33 @@ impl Dispatch<wl_output::WlOutput, u32> for State {
         };
         match event {
             wl_output::Event::Name { name } => entry.name = Some(name),
+            wl_output::Event::Geometry { transform, .. } => {
+                entry.rotation = rotation(
+                    transform
+                        .into_result()
+                        .unwrap_or(wl_output::Transform::Normal),
+                );
+            }
             // From xdg_output 3 on, a finished description ends here.
             wl_output::Event::Done => state.changed = true,
             _ => {}
         }
+    }
+}
+
+/// `wl_output.transform` names the same turns this side does, so the mapping is
+/// only the error case turning into "not rotated".
+fn rotation(transform: wl_output::Transform) -> Rotation {
+    match transform {
+        wl_output::Transform::Normal => Rotation::Normal,
+        wl_output::Transform::_90 => Rotation::Rotate90,
+        wl_output::Transform::_180 => Rotation::Rotate180,
+        wl_output::Transform::_270 => Rotation::Rotate270,
+        wl_output::Transform::Flipped => Rotation::Flipped,
+        wl_output::Transform::Flipped90 => Rotation::Flipped90,
+        wl_output::Transform::Flipped180 => Rotation::Flipped180,
+        wl_output::Transform::Flipped270 => Rotation::Flipped270,
+        _ => Rotation::Normal,
     }
 }
 

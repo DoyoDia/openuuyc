@@ -4,6 +4,7 @@
 use super::geometry::{Geometry, Rect, Screen};
 use super::wire::{Event, KeyOrButton};
 use crate::platform::linux::input::{self as native, Injector, Lock};
+use crate::platform::{CompositorLayout, Rotation};
 use anyhow::{Result, ensure};
 use std::{
     collections::BTreeSet,
@@ -44,6 +45,65 @@ pub(crate) struct Engine {
     /// Why absolute positions last went where they did, so a change is
     /// logged once rather than on every event.
     aim_space: Option<Result<(), String>>,
+    /// The pointer was last placed through the absolute device, so the
+    /// device's axis values are where the pointer is. After a relative move
+    /// (or an absolute position that fell back to one) they are stale, and
+    /// writing them again would throw the pointer back there.
+    aimed: bool,
+    /// 这一串触摸走哪条路（见 `touch`）。选好之后整串都走它，抬起后再清掉。
+    touch_route: Option<Route>,
+    /// 选路的结果，只为让日志在变化时记一条（和 `aim_space` 一样）。
+    touch_space: Option<Result<(), String>>,
+}
+
+/// 一串触摸走哪条路。
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Route {
+    /// 交给虚拟多点触摸屏。带上这一串要用的旋转与屏幕宽度，免得每一帧再查一次
+    /// 屏幕——抬手指那一帧查不到屏幕也得照样发得出去。
+    Touchscreen { rotation: Rotation, width: f64 },
+    /// 退回单指指针模拟。模拟走绝对指针，落点总是对的。
+    Simulated,
+}
+
+/// 这一串触摸该走哪条路。
+///
+/// 只有「合成器必然把这块触摸屏认到唯一那块屏上」时才敢用设备。合成器怎么给触摸屏
+/// 和输出配对各家都不一样：Hyprland 找不到绑定就用当前聚焦的显示器（触点落在哪块屏
+/// 取决于被控端此刻的焦点），mutter 按 EDID 与物理尺寸匹配、都匹配不上就归给内置屏，
+/// KWin 又是另一套。猜错就是「主控看着这块屏、点下去落在另一块屏上」，比单指模拟更
+/// 差——模拟走绝对指针，落点总是对的。所以三件事都得成立：
+///
+/// - 合成器布局拿得到（Wayland 会话），而且里面恰好一块输出；
+/// - 被控端也恰好一块屏（`geometry.screens` 是被控端全部的屏幕，不只是主控正在
+///   看的那块）；
+/// - 合成器里这块输出没被转过：转过的屏上触摸屏坐标转不转，取决于合成器和用户的
+///   配置。niri 和 KWin 总是按输出旋转；mutter 只在把触摸屏映射到某块屏时转，不
+///   映射时铺满整个舞台、不转；wlroots（sway）只在配了 `map_to_output` 时转；
+///   Hyprland 只在配了 `input:touchdevice:transform` 时转。这边看不出是哪一种，
+///   反算错了就落错地方。
+///
+/// 以后某个合成器的映射能确切知道了（按合成器逐个放开、或者读 niri 的
+/// `map-to-output`），再改这里。
+fn route_for(layout: Option<&CompositorLayout>, screens: &[Screen]) -> Result<Route, String> {
+    let Some(layout) = layout else {
+        return Err("读不到合成器的输出布局".into());
+    };
+    let [output] = layout.outputs.as_slice() else {
+        return Err(format!("合成器有 {} 块屏", layout.outputs.len()));
+    };
+    let [screen] = screens else {
+        return Err(format!("被控端有 {} 块屏", screens.len()));
+    };
+    // 旋转看合成器里这块输出自己的，不看 `screen`：屏幕和输出是按名字配对的，
+    // XWayland 起的名字和 `wl_output` 的对不上时，屏幕那边就只剩默认的不旋转。
+    if output.rotation != Rotation::Normal {
+        return Err(format!("屏幕转过 {:?}", output.rotation));
+    }
+    Ok(Route::Touchscreen {
+        rotation: output.rotation,
+        width: f64::from(screen.width).max(1.0),
+    })
 }
 
 impl Engine {
@@ -80,6 +140,9 @@ impl Engine {
             foreground: None,
             mouse_policy: Default::default(),
             aim_space: None,
+            touch_route: None,
+            touch_space: None,
+            aimed: false,
         })
     }
     pub fn backend(&self) -> &'static str {
@@ -89,6 +152,20 @@ impl Engine {
     /// ever withheld for a secure-attention path.
     pub fn take_sas(&mut self) -> bool {
         false
+    }
+    /// 请合成器重新判定一次指针底下是谁：把指针在原地重报一次。Wayland 的拖放接取
+    /// 面摆在指针底下，而合成器只在指针真的动过之后才重判（见
+    /// `platform::linux::input::realign_pointer`）。
+    ///
+    /// 只在指针最后一次是经绝对设备摆的位置时才重报：设备轴上的值只在那时与指针
+    /// 一致，相对移动之后再写它，指针会被甩回旧位置。被控本机的人在最后一次注入
+    /// 之后自己动过鼠标，轴上的值同样会过期，这里看不出来；拖出时被控端一般没人
+    /// 碰鼠标，所以不另做处理。
+    pub fn realign_pointer(&mut self) -> Result<bool> {
+        if !self.aimed {
+            return Ok(false);
+        }
+        self.injector.realign()
     }
     pub fn configure(&mut self, configuration: super::config::Configuration) -> Result<()> {
         configuration.validate()?;
@@ -213,8 +290,11 @@ impl Engine {
             && let Some(logical) = logical
         {
             let (px, py) = point_in(logical, x, y);
-            return self.injector.aim(px, py, bounds);
+            let result = self.injector.aim(px, py, bounds);
+            self.aimed = result.is_ok();
+            return result;
         }
+        self.aimed = false;
         let (px, py) = point_in(rect?, x, y);
         self.injector.move_to(px, py)
     }
@@ -233,10 +313,39 @@ impl Engine {
         }
         Ok(())
     }
-    /// Emulated touch: X Test has no touch devices, so the primary contact
-    /// drives the pointer with the left button, as a touchscreen's pointer
-    /// emulation would. Further contacts are not delivered.
+    /// 触摸。合成的触摸屏设备才是这些触点该去的地方：合成器拿到的是一个真正的
+    /// 多点设备，触点有几个就是几个，双指滚动、捏合、手势都是真的，而不是把一个
+    /// 触点翻成鼠标左键。
+    ///
+    /// 走哪条路在一串触摸开始时定好、整串都走它：中途换路会让已经按下的触点在原来
+    /// 那条路上没人抬起。设备那条路有前提（合成器必然把触摸屏认到唯一那块屏上，见
+    /// `route_for`），不满足就整串走单指模拟——模拟走绝对指针，落点总是对的。
+    ///
+    /// 没有设备时（Xorg 会话，或者 Wayland 下没有 `/dev/uinput` 写权限）在选路时
+    /// 就定成模拟。只有设备在一串触摸中途写入失败被丢掉时，`deliver_touch` 才会
+    /// 返回 false，这一串余下的触点改走模拟：设备移除时合成器已经把它上面的触点
+    /// 全部收尾，模拟从下一个触点重新按下。
     fn touch(&mut self, kind: u8, points: &[super::wire::Point]) -> Result<()> {
+        let route = match self.touch_route {
+            Some(route) => route,
+            None => {
+                let route = self.choose_route();
+                self.touch_route = Some(route);
+                route
+            }
+        };
+        // 3 是抬起、4 是取消：这一串到此为止，下一串重新选路。
+        if kind >= 3 {
+            self.touch_route = None;
+        }
+        if let Route::Touchscreen { rotation, width } = route
+            && self.deliver_touch(kind, points, rotation, width)?
+        {
+            // 触摸屏不经绝对指针，可合成器会让光标跟着触点走（sway 在触点底下的
+            // 表面不收触摸时就拿它模拟指针），绝对指针轴上那个位置也就过期了。
+            self.aimed = false;
+            return Ok(());
+        }
         if kind == 1 || kind >= 3 {
             if self.touch.take().is_some() {
                 self.button(1, false)?;
@@ -262,6 +371,51 @@ impl Engine {
         }
         Ok(())
     }
+    /// 选这一串触摸走哪条路，判定变化时记一条日志（和 `aim_space` 一样只记一次）。
+    fn choose_route(&mut self) -> Route {
+        let decision = if self.injector.has_touchscreen() {
+            route_for(
+                crate::platform::display::compositor_layout().as_deref(),
+                &self.geometry.screens,
+            )
+        } else {
+            Err("没有虚拟触摸屏".into())
+        };
+        let state = decision.as_ref().map(|_| ()).map_err(Clone::clone);
+        if self.touch_space.as_ref() != Some(&state) {
+            match &state {
+                Ok(()) => tracing::info!("触摸交给虚拟多点触摸屏"),
+                Err(reason) => tracing::info!(%reason, "触摸退回单指指针模拟"),
+            }
+            self.touch_space = Some(state);
+        }
+        decision.unwrap_or(Route::Simulated)
+    }
+    /// 把触点交给触摸屏设备。旋转与屏幕宽度由 `route_for` 在选路时算好带过来，这一
+    /// 帧不再查屏幕。返回 false 表示设备已经在这一串中途被丢掉，调用方退回模拟。
+    fn deliver_touch(
+        &mut self,
+        kind: u8,
+        points: &[super::wire::Point],
+        rotation: Rotation,
+        width: f64,
+    ) -> Result<bool> {
+        let touches = points
+            .iter()
+            .map(|point| native::Touch {
+                id: point.id,
+                x: point.x as f32,
+                y: point.y as f32,
+                // 接触椭圆的长轴半径，按屏幕宽度换算成触摸屏的量程。libinput 处理
+                // 触摸屏的那条路径不读这个轴（`ABS_MT_TOUCH_MAJOR`），公开接口里也
+                // 没有接触面积，所以报了也没有人看得见；留着只是照实体设备的样子
+                // 报一个值。旋转过的屏上两条轴的半径混在一起，取平均。
+                radius: (((point.radius_x + point.radius_y) / 2.0) / width) as f32,
+            })
+            .collect::<Vec<_>>();
+        self.injector.touch(kind, &touches, rotation)
+    }
+
     fn chord(&mut self, keys: &[u16], permitted: &impl Fn() -> bool) -> Result<()> {
         for &key in keys {
             ensure!(permitted(), "快捷输入已撤销");
@@ -343,6 +497,7 @@ impl Engine {
                 self.button(button, false)?;
             }
             Event::Relative { x, y } => {
+                self.aimed = false;
                 ensure!(
                     x.unsigned_abs() <= 1_000_000 && y.unsigned_abs() <= 1_000_000,
                     "相对位移过大"
@@ -350,6 +505,7 @@ impl Engine {
                 self.injector.move_by(x, y)?;
             }
             Event::RelativeScaled { screen, x, y } => {
+                self.aimed = false;
                 let s = self.geometry.screen(screen)?;
                 self.injector.move_by(
                     (f64::from(s.width) * x).round() as i32,
@@ -406,11 +562,17 @@ impl Engine {
                 failure = Some(e);
             }
         }
+        // 触摸屏上的触点也要抬起来，否则合成器会一直以为有一根手指按着。
+        if let Err(e) = self.injector.release_touch() {
+            failure = Some(e);
+        }
         self.touch = None;
+        self.touch_route = None;
         self.wheel = [0; 2];
         self.interruptible = false;
         self.backspace = false;
         self.injector.forget_aim();
+        self.aimed = false;
         let flushed = self.injector.flush();
         match failure {
             Some(e) => Err(e),
@@ -509,6 +671,7 @@ mod tests {
             top,
             width,
             height,
+            rotation: crate::platform::Rotation::default(),
         }
     }
 
@@ -536,6 +699,56 @@ mod tests {
                 output(Some("DP-1"), 1000, 0, 3793, 1600),
             ],
         }
+    }
+
+    #[test]
+    fn a_single_unrotated_screen_takes_the_touchscreen() {
+        let layout = CompositorLayout {
+            outputs: vec![output(Some("DP-1"), 0, 0, 1920, 1080)],
+        };
+        let screens = vec![screen(0, (0, 0, 1920, 1080), layout.outputs.first())];
+        assert_eq!(
+            route_for(Some(&layout), &screens),
+            Ok(Route::Touchscreen {
+                rotation: Rotation::Normal,
+                width: 1920.0
+            })
+        );
+    }
+
+    /// 多屏、旋转、读不到布局，一律退回单指模拟：合成器怎么把触摸屏认到哪块屏上各
+    /// 家都不一样，猜错就是主控看着这块屏、点下去落在另一块屏上，比单指模拟更差
+    /// （模拟走绝对指针，落点总是对的）。
+    #[test]
+    fn anything_but_a_single_unrotated_screen_falls_back_to_simulation() {
+        let single = CompositorLayout {
+            outputs: vec![output(Some("DP-1"), 0, 0, 1920, 1080)],
+        };
+        let one = vec![screen(0, (0, 0, 1920, 1080), single.outputs.first())];
+        assert!(route_for(None, &one).is_err(), "没有布局");
+        assert!(route_for(Some(&scaled()), &one).is_err(), "合成器两块屏");
+
+        let mut two = one.clone();
+        two.push(screen(1, (0, 0, 1920, 1080), single.outputs.first()));
+        assert!(route_for(Some(&single), &two).is_err(), "被控端两块屏");
+
+        let mut turned = single.clone();
+        turned.outputs[0].rotation = Rotation::Rotate90;
+        assert!(route_for(Some(&turned), &one).is_err(), "屏幕转过 90 度");
+    }
+
+    /// 旋转只看合成器那块输出：屏幕的名字和 `wl_output` 的没配上时，屏幕这边看不出
+    /// 输出转过，也照样退回模拟。
+    #[test]
+    fn a_rotated_output_falls_back_even_when_the_screen_is_unpaired() {
+        let mut layout = CompositorLayout {
+            outputs: vec![output(Some("DP-1"), 0, 0, 1080, 1920)],
+        };
+        layout.outputs[0].rotation = Rotation::Rotate90;
+        let unpaired = vec![screen(0, (0, 0, 1080, 1920), None)];
+        assert!(unpaired[0].logical.is_none());
+        let error = route_for(Some(&layout), &unpaired).unwrap_err();
+        assert!(error.contains("Rotate90"), "{error}");
     }
 
     #[test]

@@ -395,6 +395,12 @@ impl ProbeController {
         self.enable_periodic_alr_probing = enable;
     }
 
+    /// 观测用：当前限制估计值的原因决定这次探测发不发得出去
+    /// （`initiate_probing` 里的抑制分支），调用方需要它来解释「为什么没探」。
+    pub fn bandwidth_limited_cause(&self) -> BandwidthLimitedCause {
+        self.bandwidth_limited_cause
+    }
+
     // Probes are sent periodically every 1s during the first 5s after the network
     // becomes available or until OnMaxTotalAllocatedBitrate is invoked with a
     // none zero max_total_allocated_bitrate (there are active streams being
