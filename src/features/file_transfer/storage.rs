@@ -390,8 +390,9 @@ pub(super) async fn finish(
     );
     v.file.sync_all().await?;
     let file = v.file.into_std().await;
-    if let Some(time) =
-        UNIX_EPOCH.checked_add(std::time::Duration::from_secs(v.partial.info.modified_time))
+    if v.partial.info.modified_time != 0
+        && let Some(time) =
+            UNIX_EPOCH.checked_add(std::time::Duration::from_secs(v.partial.info.modified_time))
     {
         file.set_modified(time)?;
     }
