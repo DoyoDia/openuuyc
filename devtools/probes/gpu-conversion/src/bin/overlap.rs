@@ -139,7 +139,7 @@ fn main() -> anyhow::Result<()> {
     let (mut c, mut e) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
     for n in 0..frames {
         let t = Instant::now();
-        let nv = gpu.convert(&rgb, (0, 0, w, h))?;
+        let nv = gpu.convert(&rgb, (0, 0, w, h), (w, h))?;
         c += t.elapsed();
         let t = Instant::now();
         let encoded = enc.encode_nv12(&nv, 10_000_000 + n as i64 * 333_333, n % 30 == 0)?;
@@ -187,7 +187,7 @@ fn run_pipeline(w: u32, h: u32, frames: u32, pattern: &[u8], rgb: &gpu_convert::
             let gpu = gpu_convert::Converter::new(display)?;
             for _ in 0..frames {
                 let t = Instant::now();
-                let nv = gpu.convert(&rgb, (0, 0, w, h))?;
+                let nv = gpu.convert(&rgb, (0, 0, w, h), (w, h))?;
                 total += t.elapsed();
                 if tx.send(Item::Nv12(nv)).is_err() {
                     break;
