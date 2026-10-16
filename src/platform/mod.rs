@@ -14,7 +14,7 @@ pub(crate) mod linux;
 pub(crate) use linux::{
     audio_thread, capture, cursor_shape, deadline, decoder, device_profile, display, display_hdr,
     drag_drop, encoder, file_locations, graphics, host_service, loopback, notifications,
-    power_request, surface, system_power, transfer, virtual_audio, wol,
+    power_request, surface, system_power, transfer, virtual_audio, virtual_display, wol,
 };
 /// One output as the compositor lays it out, in the global space it resolves
 /// an absolute pointer position in. X11 and Windows have no such thing: their

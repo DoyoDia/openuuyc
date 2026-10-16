@@ -18,6 +18,12 @@ elif [[ -x target/release/OpenUUYC ]]; then
 else
     BINARY=OpenUUYC # the release archive
 fi
+# 虚拟显示器辅助程序（可选）。发布归档里有，自己构建时要用 crates/vkms 单独编一次。
+if [[ -x target/release/openuuyc-vkms ]]; then
+    HELPER=target/release/openuuyc-vkms
+else
+    HELPER=openuuyc-vkms # the release archive
+fi
 PREFIX="${PREFIX:-/usr/local}"
 MENU="$HOME/.config/omarchy/extensions/omarchy-menu.jsonc"
 
@@ -46,12 +52,17 @@ uninstall() {
     # 先关掉自启：单元文件删掉之后 systemctl 找不到它，disable 会剩下悬空的
     # graphical-session.target.wants 符号链接。
     systemctl --user disable openuuyc.service 2>/dev/null || true
+    "${SUDO[@]}" systemctl disable --now openuuyc-vkms.socket 2>/dev/null || true
     "${SUDO[@]}" rm -f \
         "$PREFIX/bin/OpenUUYC" \
         "$PREFIX/lib/systemd/user/openuuyc.service" \
         "$PREFIX/share/applications/openuuyc.desktop" \
         "$PREFIX/share/icons/hicolor/256x256/apps/openuuyc.png" \
+        /usr/bin/openuuyc-vkms \
+        /usr/lib/systemd/system/openuuyc-vkms.socket \
+        /usr/lib/systemd/system/openuuyc-vkms.service \
         /usr/lib/udev/rules.d/60-openuuyc-uinput.rules
+    "${SUDO[@]}" systemctl daemon-reload 2>/dev/null || true
     # 便携运行（没走这个脚本）时程序会自己写一份到用户配置目录，一并清掉。
     # 不接 graphical-session.target 的桌面上，开关写的是 XDG 自启动条目。
     rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/openuuyc.service" \
@@ -154,6 +165,22 @@ done <packaging/linux/openuuyc.service >"$unit"
 systemctl --user daemon-reload 2>/dev/null || true
 remove_legacy_service
 
+say "安装虚拟显示器辅助程序"
+if [[ -x $HELPER ]]; then
+    # 这三样的路径在程序里是写死的（客户端的 HELPER 与 HELPER_SOCKET_UNITS，
+    # 见 crates/vkms/src/client.rs），所以和 udev 规则一样装到 /usr，不跟着
+    # $PREFIX 走。服务是套接字激活的，默认不启用：装完不启用一切照旧。
+    "${SUDO[@]}" install -Dm755 "$HELPER" /usr/bin/openuuyc-vkms
+    "${SUDO[@]}" install -Dm644 packaging/linux/openuuyc-vkms.socket \
+        /usr/lib/systemd/system/openuuyc-vkms.socket
+    "${SUDO[@]}" install -Dm644 packaging/linux/openuuyc-vkms.service \
+        /usr/lib/systemd/system/openuuyc-vkms.service
+    "${SUDO[@]}" systemctl daemon-reload 2>/dev/null || true
+else
+    warn "找不到 $HELPER，跳过虚拟显示器辅助程序（被控端给主控加虚拟屏要用它）"
+    warn "需要时先在源码目录构建：(cd crates/vkms && cargo build --release --locked)"
+fi
+
 # Omarchy only: add an Install → Service row so the app is discoverable there.
 if [[ -d $HOME/.config/omarchy ]]; then
     say "添加 Omarchy 菜单项"
@@ -177,6 +204,11 @@ cat <<EOF
 
 下一步：扫码登录 → 连接设置 → 打开「允许被控」；需要登录后自动启动时，
 打开「连接设置 → 启动 → 开机自启」。
+
+被控端给主控添加虚拟屏需要内核 6.19+ 并带 CONFIG_DRM_VKMS，且当前合成器是 niri；
+辅助程序已装好但按需启用，需要时执行：
+
+  sudo systemctl enable --now openuuyc-vkms.socket
 
 首次被控时会在本机屏幕弹出一次屏幕共享授权，点「共享」即可，之后不再询问。
 若弹窗被 Hyprland 插件遮挡（例如 overview 常驻表面），可临时提层：

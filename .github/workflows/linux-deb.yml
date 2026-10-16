@@ -36,7 +36,18 @@ jobs:
           tool: cargo-deb
 
       - name: Build
-        run: cargo build --release --locked --bin OpenUUYC
+        run: |
+          cargo build --release --locked --bin OpenUUYC
+          # 虚拟显示器辅助程序是独立的 crate（自己的 workspace 与 Cargo.lock），
+          # 产物落到同一个 target/ 里，打包时只认一处。
+          (cd crates/vkms && CARGO_TARGET_DIR=../../target cargo build --release --locked)
+
+      - name: Test the virtual display helper
+        # 它有自己的 workspace，根目录的 cargo fmt 与 cargo test 都管不到它。
+        run: |
+          cd crates/vkms
+          cargo fmt --check
+          CARGO_TARGET_DIR=../../target cargo test --locked
 
       - name: Check the developer probes still build
         # They include the production VA-API encoder and GPU converter sources

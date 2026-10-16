@@ -37,6 +37,9 @@ recommends = "libpulse0, libpipewire-0.3-0, gnome-keyring | kwalletmanager, libg
 suggests = "ethtool"
 assets = [
     ["target/release/OpenUUYC", "usr/bin/", "755"],
+    # 被控端加虚拟屏要写 configfs，只有 root 能写，所以另有一个按需启动的系统服务。
+    # 它的两个单元由下面的 systemd-units 装进 /usr/lib/systemd/system。
+    ["target/release/openuuyc-vkms", "usr/bin/", "755"],
     ["packaging/linux/openuuyc.desktop", "usr/share/applications/", "644"],
     ["assets/icon-256.png", "usr/share/icons/hicolor/256x256/apps/openuuyc.png", "644"],
     ["packaging/linux/60-openuuyc-uinput.rules", "usr/lib/udev/rules.d/", "644"],
@@ -45,6 +48,13 @@ assets = [
     ["THIRD_PARTY_NOTICES", "usr/share/doc/openuuyc/", "644"],
     ["assets/licenses/*", "usr/share/doc/openuuyc/licenses/", "644"],
 ]
+# 只为 openuuyc-vkms 的两个单元生成维护者脚本（packaging/linux 里没有自己写的脚本）：
+# 卸载时停掉套接字与服务、daemon-reload，清除时清掉 enable 留下的链接；升级时只
+# try-restart 已经在跑的。enable/start 都关着——装包不会替用户把一个 root 服务开起来，
+# 要用虚拟屏的人自己 `systemctl enable --now openuuyc-vkms.socket`；以前 enable 过的，
+# 升级后保持 enable。
+maintainer-scripts = "packaging/linux"
+systemd-units = { unit-name = "openuuyc-vkms", enable = false, start = false }
 
 [dependencies]
 anyhow = "1.0"
@@ -180,6 +190,9 @@ windows = { version = "0.62.2", default-features = false, features = [
 glow = "0.17.0"
 # Local display geometry for the viewer, on X11 and Wayland alike.
 display-info = "0.5.9"
+# 被控端加虚拟屏要写 configfs，只有 root 能写，中间隔一个专用的辅助程序
+# （crates/vkms）。这里用的是它的客户端部分。
+openuuyc-vkms = { path = "crates/vkms" }
 cros-libva = { path = "vendor/cros-libva" }
 # The H.264 syntax and its error kinds for the VA-API slice parameters; the
 # software session itself goes through openuuyc-codec like on Windows.

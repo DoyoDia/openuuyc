@@ -78,8 +78,8 @@ OpenUUYC 是用 Rust 编写的 UU 远程第三方客户端，支持 Windows 和 
 | 多显示器切屏 | ✅ | ✅ | ✅ 顶栏屏标签，跟随远端拓扑 | ✅ | ✅ 门户需共享多屏 |
 | 播放中切换设备 | ✅ | — | ⚠️ 顶栏与全屏浮动栏，未实测 | — | — |
 | 多屏独立窗口 | ✅ 标签拖出 | — | ❌ | — | — |
-| 分辨率 / DPI 调整 | ✅ 远端设置、本地拉伸 | ✅ | ✅ 远端设置、本地拉伸 | ⚠️ RandR 分辨率，无 DPI | ⚠️ 经 XWayland RandR，无 DPI |
-| 虚拟屏 / 超级屏 / 无屏兜底 | ✅ 操作远端 | ✅ 需显示驱动 | ✅ 操作远端 | ❌ | ❌ |
+| 分辨率 / DPI 调整 | ✅ 远端设置、本地拉伸 | ✅ | ✅ 远端设置、本地拉伸 | ⚠️ RandR 分辨率，无 DPI | ⚠️ 经 XWayland RandR，虚拟屏经 niri；无 DPI |
+| 虚拟屏 / 超级屏 / 无屏兜底 | ✅ 操作远端 | ✅ 需显示驱动 | ✅ 操作远端 | ❌ | ⚠️ 仅虚拟屏：niri，内核 ≥ 6.19，需启用 openuuyc-vkms |
 | 桌面声音 | ✅ 播放、调音质 | ✅ | ✅ Pulse / PipeWire / ALSA | ✅ 录监听源 | ✅ 录监听源 |
 | 仅音频连接 | ✅ | ✅ | ✅ | ✅ | ✅ |
 | 麦克风 / 虚拟声卡 | ✅ 发送麦克风 | ⚠️ 选装测试签名驱动 | ✅ 发送麦克风 | ❌ 无虚拟声卡 | ❌ 无虚拟声卡 |
@@ -181,6 +181,30 @@ git clone https://github.com/djkcyl/openuuyc.git
 cd openuuyc
 cargo build --release
 ./target/release/OpenUUYC gui
+```
+
+#### 被控端虚拟显示器（可选）
+
+主控可以要求被控端凭空多出一块显示器。写内核的 configfs 只有 root 能做，所以包里另带一个小程序 `openuuyc-vkms` 和一份套接字激活的系统服务：平时不跑，第一次用到时由套接字拉起。条件：
+
+- **Linux 6.19 或更新的内核**，且编译了 `CONFIG_DRM_VKMS`。更老的内核上 VKMS 没有 configfs 接口（`modinfo -F parm vkms` 里没有 `create_default_dev` 就是），程序不会去碰它，诊断页会写「内核不支持」；
+- systemd（套接字激活）；
+- 当前合成器能把新输出接进桌面布局，**目前只有 niri**。其他桌面（GNOME、KDE、sway、Xorg……）上主控不会出现「添加虚拟屏」这个入口。
+
+deb 与 AUR 包都会装上它，但**不会替你启用**：不启用一切照旧，只是诊断页里「虚拟显示器」那一行显示「已安装，服务未启用」。启用：
+
+```bash
+sudo systemctl enable --now openuuyc-vkms.socket
+```
+
+从源码构建或手动安装时，把 `crates/vkms` 编出来的 `openuuyc-vkms` 装到 `/usr/bin/`、两份单元装到 `/usr/lib/systemd/system/`，再执行上面那条命令：
+
+```bash
+(cd crates/vkms && CARGO_TARGET_DIR=../../target cargo build --release --locked)
+sudo install -Dm755 target/release/openuuyc-vkms /usr/bin/openuuyc-vkms
+sudo install -Dm644 packaging/linux/openuuyc-vkms.socket \
+    packaging/linux/openuuyc-vkms.service /usr/lib/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now openuuyc-vkms.socket
 ```
 
 #### 被控端输入权限（Wayland 必需）
