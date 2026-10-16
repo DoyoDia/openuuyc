@@ -1164,6 +1164,16 @@ impl Player {
         if self.catalog.is_empty() {
             return;
         }
+        // 等着打开的那块屏已经不在对端的目录里了（比如点了它又马上在 tab 上关掉）：
+        // 和 Windows 一样直接放弃这次切换，不当成失败弹窗，也不记进 `failed_screen`。
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| !actual.iter().any(|screen| screen.id == pending.id))
+        {
+            self.pending = None;
+            self.sync_screens();
+        }
         // 对端拓扑刚选中的那块屏（刚加好的虚拟屏），和 Windows 的 `topology_selection`
         // 一样只是换掉核对的对象，要不要真的切由 `replacement_target` 判断。
         let mut focus = None;
