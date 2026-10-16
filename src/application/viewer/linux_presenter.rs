@@ -992,19 +992,26 @@ impl Player {
         self.session.stream_control.mouse()
     }
 
-    /// 切到另一块屏。正在显示的那块等于取消这次切换；否则请对端开始推新屏，
-    /// 窗口仍画着原来的画面，直到 [`Player::poll_pending`] 把新解码器接上。
-    ///
-    /// 一律走 [`ScreenPlayback::open`]，和 Windows 的 `begin_screen` 一样：采集被停掉
-    /// 之后要由它补发 action 8 重新开始，复用已有解码器时还得重新绑定轨道并要一个
-    /// 关键帧。绕开它直接换会话，硬解下就会一直停在「等待画面」。
+    /// 用户点了某块屏的 tab。点的是正在显示的那块，就等于取消这次切换（open 任务
+    /// 随之 abort）；否则交给 [`Player::begin_screen`]。
     fn select(&mut self, screen_id: i32, window: &Arc<Window>) -> Result<()> {
         if screen_id == self.session.screen_id() {
-            // 正在看的就是它：把等着的这次切换丢掉（open 任务随之 abort）。
             self.pending.take();
             self.sync_screens();
             return Ok(());
         }
+        self.begin_screen(screen_id, window)
+    }
+
+    /// 请对端开始推这块屏，窗口仍画着原来的画面，直到 [`Player::poll_pending`] 把新
+    /// 解码器接上。目录核对要重开正在显示的那块（轨道或绑定变了）时也直接走这里，
+    /// 不经过 [`Player::select`] 的「点了当前屏＝取消」：Windows 的 `refresh_catalog`
+    /// 先把 `slot.selected` 清掉再调 `begin_screen`，是同一个意思。
+    ///
+    /// 一律走 [`ScreenPlayback::open`]，和 Windows 的 `begin_screen` 一样：采集被停掉
+    /// 之后要由它补发 action 8 重新开始，复用已有解码器时还得重新绑定轨道并要一个
+    /// 关键帧。绕开它直接换会话，硬解下就会一直停在「等待画面」。
+    fn begin_screen(&mut self, screen_id: i32, window: &Arc<Window>) -> Result<()> {
         if self
             .pending
             .as_ref()
@@ -1078,6 +1085,20 @@ impl Player {
         };
         self.pending = None;
         match result {
+            // 打开期间映射又变了（加减虚拟屏后轨道重排、对端重新分配轨道）：拿到的这一路
+            // 已经不是这块屏了。和 Windows `ScreenWindows::update` 一样作废这次结果，并让
+            // 目录核对马上重跑，由它决定重开哪块。
+            Ok(session)
+                if !screen_mapped(
+                    &self.screens.screens(),
+                    id,
+                    session.track_index,
+                    session.screen_binding(),
+                ) =>
+            {
+                tracing::debug!(screen_id = id, "screen mapping changed while opening");
+                self.next_refresh = Instant::now();
+            }
             Ok(session) => {
                 if let Err(error) = self.adopt(id, session) {
                     self.report("显示器操作失败", format!("无法显示显示器 {id}：{error:#}"));
@@ -1116,7 +1137,9 @@ impl Player {
         if self.catalog.is_empty() {
             return;
         }
-        let mut target = None;
+        // 对端拓扑刚选中的那块屏（刚加好的虚拟屏），和 Windows 的 `topology_selection`
+        // 一样只是换掉核对的对象，要不要真的切由 `replacement_target` 判断。
+        let mut focus = None;
         if self.topology_focused != topology.selected_screen
             && topology.reported
             && !matches!(
@@ -1127,13 +1150,30 @@ impl Player {
                 .selected_screen
                 .filter(|id| actual.iter().any(|screen| screen.id == *id))
         {
+            if self
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.id != selected)
+            {
+                self.pending = None;
+                self.sync_screens();
+            }
             self.topology_focused = Some(selected);
             self.failed_screen = None;
-            target = Some(selected);
+            focus = Some(selected);
         }
-        let target = target.or_else(|| self.replacement_screen(&actual));
+        if self.pending.is_some() {
+            return;
+        }
+        let target = replacement_target(
+            &self.catalog,
+            &actual,
+            focus.unwrap_or_else(|| self.session.screen_id()),
+            (self.session.track_index, self.session.screen_binding()),
+            self.failed_screen,
+        );
         if let Some(target) = target
-            && let Err(error) = self.select(target, window)
+            && let Err(error) = self.begin_screen(target, window)
         {
             self.failed_screen = Some(self.failed_screen_for(target));
             self.report(
@@ -1141,44 +1181,6 @@ impl Player {
                 format!("切到显示器 {target} 失败：{error:#}"),
             );
         }
-    }
-
-    /// 本窗口正显示的那块屏和目录对不上时该换到哪块，`None` 表示不用动。
-    fn replacement_screen(&self, actual: &[RemoteScreen]) -> Option<i32> {
-        if self.pending.is_some() {
-            return None;
-        }
-        let selected = self
-            .catalog
-            .iter()
-            .find(|screen| screen.id == self.session.screen_id());
-        // 还只在拓扑的瞬态清单里（对端正在改），等一下再说。
-        if selected.is_some_and(|screen| !actual.iter().any(|real| real.id == screen.id)) {
-            return None;
-        }
-        let target = match selected {
-            // 轨道与绑定都对上了：这块屏就是现在这一路，不用动。
-            Some(screen)
-                if self.session.track_index == screen.video_track_index
-                    && self.session.screen_binding() == screen_binding(screen) =>
-            {
-                return None;
-            }
-            Some(screen) => screen.id,
-            // 正在看的屏整个没了：退回目录里第一块真在的屏。
-            None => self
-                .catalog
-                .iter()
-                .find(|screen| actual.iter().any(|real| real.id == screen.id))
-                .map(|screen| screen.id)?,
-        };
-        if actual
-            .iter()
-            .any(|screen| screen.id == target && self.failed_screen == Some(screen_key(screen)))
-        {
-            return None;
-        }
-        Some(target)
     }
 
     /// 失败标记用的三元组，取不到目录条目时退回 `(id, -1, -1)`。
@@ -2684,6 +2686,54 @@ impl Drop for Player {
     }
 }
 
+/// 本窗口该换到哪块屏，`None` 表示不用动。规则和 Windows `refresh_catalog` 里的
+/// `replacements` 一样：
+/// - `focus`（正在显示的那块，或对端拓扑刚选中的那块）还只在拓扑的瞬态清单里：
+///   对端正在改，等一下再说；
+/// - 它的轨道和绑定都和正在显示的会话 `(track, binding)` 对得上：就是现在这一路，不动；
+/// - 对不上（包括 `focus` 就是正在显示的那块、但对端把它挪到了别的轨道）：重开它；
+/// - 它整个从目录里消失了：退回目录里第一块真在的屏；
+/// - 选出来的那块刚失败过、而且没变样（`failed`）：不再重试。
+fn replacement_target(
+    catalog: &[RemoteScreen],
+    actual: &[RemoteScreen],
+    focus: i32,
+    (track, binding): (i32, u64),
+    failed: Option<(i32, i32, i32)>,
+) -> Option<i32> {
+    let selected = catalog.iter().find(|screen| screen.id == focus);
+    if selected.is_some_and(|screen| !actual.iter().any(|real| real.id == screen.id)) {
+        return None;
+    }
+    let target = match selected {
+        Some(screen) if track == screen.video_track_index && binding == screen_binding(screen) => {
+            return None;
+        }
+        Some(screen) => screen.id,
+        None => catalog
+            .iter()
+            .find(|screen| actual.iter().any(|real| real.id == screen.id))
+            .map(|screen| screen.id)?,
+    };
+    if actual
+        .iter()
+        .any(|screen| screen.id == target && failed == Some(screen_key(screen)))
+    {
+        return None;
+    }
+    Some(target)
+}
+
+/// 刚打开的这一路 `(track, binding)` 还是不是目录里这块屏的，和 Windows
+/// `ScreenWindows::update` 接上新会话前的核对一样。
+fn screen_mapped(actual: &[RemoteScreen], screen_id: i32, track: i32, binding: u64) -> bool {
+    actual.iter().any(|screen| {
+        screen.id == screen_id
+            && screen.video_track_index == track
+            && screen_binding(screen) == binding
+    })
+}
+
 /// 一块屏在会话里的绑定值，和 `NativeViewerSession::bind_screen` 写进去的是同一套。
 fn screen_binding(screen: &RemoteScreen) -> u64 {
     (screen.id as u32 as u64) | ((screen.display.screen_type as u32 as u64) << 32)
@@ -2869,4 +2919,145 @@ fn device_key(device: DeviceId) -> usize {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     device.hash(&mut hasher);
     (hasher.finish() as usize).max(1)
+}
+
+#[cfg(test)]
+mod screen_tests {
+    use super::*;
+    use crate::features::stream_control::{RemoteDisplayInfo, RemoteDisplayMode};
+
+    fn screen(id: i32, track: i32, screen_type: i32) -> RemoteScreen {
+        let mode = RemoteDisplayMode {
+            width: 1920,
+            height: 1080,
+            pixel_width: 1920,
+            pixel_height: 1080,
+        };
+        RemoteScreen {
+            id,
+            name: format!("DISPLAY{id}"),
+            primary: id == 0,
+            video_track_index: track,
+            width: 1920,
+            height: 1080,
+            refresh_hz: 60,
+            display: RemoteDisplayInfo {
+                preferred: None,
+                current: mode,
+                initial: None,
+                modes: vec![mode],
+                current_dpi: 96,
+                recommended_dpi: 96,
+                dpis: vec![96],
+                screen_type,
+                builtin_screen_type: screen_type,
+                dpr: 1.0,
+                resolution_type: 0,
+                left: 0,
+                top: 0,
+            },
+        }
+    }
+
+    fn playing(screen: &RemoteScreen) -> (i32, u64) {
+        (screen.video_track_index, screen_binding(screen))
+    }
+
+    #[test]
+    fn matching_track_and_binding_needs_nothing() {
+        let actual = vec![screen(0, 0, 0), screen(1, 1, 0)];
+        assert_eq!(
+            replacement_target(&actual, &actual, 1, playing(&actual[1]), None),
+            None
+        );
+    }
+
+    /// The case review round 4 found unreachable: the displayed screen moved to
+    /// another track. The target is the displayed screen itself, so the caller
+    /// must open it directly instead of treating it as "clicked the current tab".
+    #[test]
+    fn displayed_screen_on_a_new_track_is_reopened() {
+        let before = screen(1, 1, 0);
+        let actual = vec![screen(0, 0, 0), screen(1, 2, 0)];
+        assert_eq!(
+            replacement_target(&actual, &actual, 1, playing(&before), None),
+            Some(1)
+        );
+        // Same track, but the peer now reports it as a virtual screen.
+        let actual = vec![screen(0, 0, 0), screen(1, 1, 1)];
+        assert_eq!(
+            replacement_target(&actual, &actual, 1, playing(&before), None),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn a_failed_screen_is_not_retried_until_it_changes() {
+        let before = screen(1, 1, 0);
+        let actual = vec![screen(0, 0, 0), screen(1, 2, 0)];
+        let failed = Some(screen_key(&actual[1]));
+        assert_eq!(
+            replacement_target(&actual, &actual, 1, playing(&before), failed),
+            None
+        );
+        let moved = vec![screen(0, 0, 0), screen(1, 3, 0)];
+        assert_eq!(
+            replacement_target(&moved, &moved, 1, playing(&before), failed),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn vanished_screen_falls_back_to_the_first_real_one() {
+        let gone = screen(2, 2, 1);
+        let actual = vec![screen(0, 0, 0), screen(1, 1, 0)];
+        assert_eq!(
+            replacement_target(&actual, &actual, 2, playing(&gone), None),
+            Some(0)
+        );
+        // Only the topology's transient list still has it: wait for the peer.
+        let mut catalog = actual.clone();
+        catalog.push(gone.clone());
+        assert_eq!(
+            replacement_target(&catalog, &actual, 2, playing(&gone), None),
+            None
+        );
+    }
+
+    #[test]
+    fn topology_focus_switches_to_the_reported_screen() {
+        let shown = screen(0, 0, 0);
+        let actual = vec![shown.clone(), screen(5, 1, 1)];
+        assert_eq!(
+            replacement_target(&actual, &actual, 5, playing(&shown), None),
+            Some(5)
+        );
+        assert_eq!(
+            replacement_target(&actual, &actual, 0, playing(&shown), None),
+            None
+        );
+    }
+
+    #[test]
+    fn opened_session_must_still_match_the_catalog() {
+        let opened = screen(1, 1, 0);
+        let (track, binding) = playing(&opened);
+        assert!(screen_mapped(
+            &[screen(0, 0, 0), opened.clone()],
+            1,
+            track,
+            binding
+        ));
+        // Tracks were renumbered while the open was in flight.
+        assert!(!screen_mapped(
+            &[screen(0, 1, 0), screen(1, 0, 0)],
+            1,
+            track,
+            binding
+        ));
+        // The screen is gone.
+        assert!(!screen_mapped(&[screen(0, 0, 0)], 1, track, binding));
+        // Same track, different screen type.
+        assert!(!screen_mapped(&[screen(1, 1, 1)], 1, track, binding));
+    }
 }
