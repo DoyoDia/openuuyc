@@ -159,3 +159,21 @@ fn display_session(connection: &Connection, manager: &Proxy<'_>, uid: u32) -> Op
     let (id, path): (String, OwnedObjectPath) = user.get_property("Display").ok()?;
     (!id.is_empty()).then(|| path.as_str().to_owned())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 真机：把「当前用户有没有一个我们会放行的会话」实际问一遍 logind。
+    ///
+    /// 只读查询，不动任何东西，但它要这台机器上有 systemd-logind，所以不放进默认
+    /// 测试集：`cargo test --bin openuuyc-vkms -- --ignored --nocapture`
+    #[test]
+    #[ignore = "需要本机的 systemd-logind"]
+    fn the_current_user_is_matched_against_a_real_logind() {
+        // SAFETY: getuid 只是读一个进程属性。
+        let uid = unsafe { libc::getuid() };
+        let session = graphical_session(uid).expect("查询 logind 失败");
+        println!("uid {uid} 匹配到的会话：{session:?}");
+    }
+}
