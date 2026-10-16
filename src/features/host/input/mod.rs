@@ -155,8 +155,9 @@ impl Session {
             .name("host-input".into())
             .spawn(move || {
                 #[cfg(target_os = "linux")]
-                let realign = crate::platform::linux::input::realign_channel();
-                run(state, rx, realign)
+                run(state, rx, crate::platform::linux::input::realign_channel());
+                #[cfg(not(target_os = "linux"))]
+                run(state, rx);
             })
             .context("无法启动被控输入线程")?;
         Ok(Self {
@@ -341,7 +342,7 @@ impl Shared {
 fn run(
     shared: Arc<Shared>,
     rx: mpsc::Receiver<()>,
-    #[cfg(target_os = "linux")] mut realign: std::sync::mpsc::Receiver<()>,
+    #[cfg(target_os = "linux")] realign: std::sync::mpsc::Receiver<()>,
 ) {
     let mut engine: Option<Backend> = None;
     let mut generation = None;
