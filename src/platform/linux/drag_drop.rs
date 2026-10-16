@@ -10,7 +10,10 @@ pub(crate) mod appearance;
 pub(crate) mod original;
 pub(crate) mod portal;
 pub(crate) mod send_target;
+pub(crate) mod wayland;
 mod xdnd;
+
+pub(crate) use wayland::Catcher;
 
 use anyhow::{Context as _, Result, bail, ensure};
 use std::{

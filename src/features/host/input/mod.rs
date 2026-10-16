@@ -153,7 +153,12 @@ impl Session {
         let state = shared.clone();
         let thread = std::thread::Builder::new()
             .name("host-input".into())
-            .spawn(move || run(state, rx))
+            .spawn(move || {
+                #[cfg(target_os = "linux")]
+                run(state, rx, crate::platform::linux::input::realign_channel());
+                #[cfg(not(target_os = "linux"))]
+                run(state, rx);
+            })
             .context("无法启动被控输入线程")?;
         Ok(Self {
             receiver: Receiver { shared, tx },
@@ -334,7 +339,11 @@ impl Shared {
             && self.connected.load(Ordering::Acquire)
     }
 }
-fn run(shared: Arc<Shared>, rx: mpsc::Receiver<()>) {
+fn run(
+    shared: Arc<Shared>,
+    rx: mpsc::Receiver<()>,
+    #[cfg(target_os = "linux")] realign: std::sync::mpsc::Receiver<()>,
+) {
     let mut engine: Option<Backend> = None;
     let mut generation = None;
     let mut require_service = false;
@@ -415,6 +424,24 @@ fn run(shared: Arc<Shared>, rx: mpsc::Receiver<()>) {
                         }
                     }
                 }
+            }
+        }
+        // 有人（Wayland 上摆好接取面的那条路）请指针在原地动一下：合成器只在指针
+        // 动过之后才重新判定指针底下是谁。见
+        // `platform::linux::input::realign_pointer`。这也是一次注入，所以和别的
+        // 输入一样要在许可之内（`generation` 只在许可之内才有值）；请求照样取走，
+        // 许可收回时不会攒到之后再报。
+        #[cfg(target_os = "linux")]
+        if realign.try_recv().is_ok()
+            && generation.is_some()
+            && let Some(engine) = engine.as_mut()
+        {
+            match engine.realign_pointer() {
+                Ok(true) => tracing::debug!("指针在原地重报了一次"),
+                Ok(false) => {
+                    tracing::debug!("指针不是经绝对指针摆的位置，接取面只能等合成器自己重判")
+                }
+                Err(error) => tracing::debug!(%error, "指针原地重报失败"),
             }
         }
         let mut item = lock(&shared.gate).pending.pop_front();
