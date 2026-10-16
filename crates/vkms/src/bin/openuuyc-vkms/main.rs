@@ -8,6 +8,7 @@
 //! 它刻意不依赖任何应用代码，也不做日志框架：特权进程的每一行都该是能一眼看完的。
 mod configfs;
 mod peer;
+mod privilege;
 
 use anyhow::{Context, Result, bail, ensure};
 use openuuyc_vkms::protocol::{MAX_DIMENSION, MAX_HZ, MIN_DIMENSION, Reply, Request};
@@ -84,6 +85,10 @@ fn main() {
             Device::Unavailable(reason)
         }
     };
+
+    // 加载模块的权限只在上面那一步用得到，成没成都不再需要了。必须在开任何线程之前：
+    // capset 只管调用它的那个线程。
+    privilege::drop_all();
 
     let shared = Arc::new(Shared::new(device));
     watch_signals();

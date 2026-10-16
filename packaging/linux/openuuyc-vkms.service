@@ -46,7 +46,11 @@ RestrictSUIDSGID=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 NoNewPrivileges=yes
-CapabilityBoundingSet=CAP_SYS_MODULE
+# CAP_SYS_MODULE 只在启动时加载 vkms 的那一下用；CAP_SETPCAP 是为了用完之后能把
+# bounding 集合也清空。设备一打开（成没成都一样），进程就放掉全部能力再开始接受
+# 连接（crates/vkms/src/bin/openuuyc-vkms/privilege.rs），之后只剩 uid 0 对 configfs
+# 的属主写权限。
+CapabilityBoundingSet=CAP_SYS_MODULE CAP_SETPCAP
 SystemCallArchitectures=native
 # @module 是给 finit_module 用的：加载 vkms 走的正是它。
 SystemCallFilter=@system-service @module
