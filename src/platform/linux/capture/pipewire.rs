@@ -688,11 +688,19 @@ impl cros_libva::SurfaceMemoryDescriptor for CaptureImport {
 
 // --- Stream ----------------------------------------------------------------------
 
-/// One captured picture as the stream delivered it, converted to BGRA.
+/// One captured picture as the stream delivered it, converted to BGRA, or
+/// converted to NV12 on the GPU.
 pub(super) struct Picture {
+    /// The size of the captured region: the BGRA `pixels` with no `nv12`, the
+    /// cropped source with one. The GPU converter may already have scaled
+    /// that frame, so its geometry is `nv12.size()`, not this.
     pub width: u32,
     pub height: u32,
+    /// BGRA rows of `width * 4` bytes; empty when `nv12` carries the frame.
     pub pixels: Vec<u8>,
+    /// The frame converted on the GPU, at the output geometry the worker had
+    /// requested through `Stream::set_target` when the picture arrived (the
+    /// crop size before any request). A quality change can make it stale.
     pub nv12: Option<Arc<super::super::gpu_convert::OwnedNv12>>,
 }
 
@@ -806,8 +814,10 @@ unsafe extern "C" fn on_process(data: *mut c_void) {
     if newest.is_null() {
         return;
     }
-    let format = lock(&callbacks.shared.state).format;
-    let target = lock(&callbacks.shared.state).target;
+    let (format, target) = {
+        let state = lock(&callbacks.shared.state);
+        (state.format, state.target)
+    };
     let picture =
         format.and_then(|format| unsafe { read_picture((*newest).buffer, format, target) });
     unsafe { (api.stream_queue_buffer)(callbacks.stream, newest) };
