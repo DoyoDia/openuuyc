@@ -234,10 +234,14 @@ pub(super) fn wire_path(value: &str) -> String {
 #[cfg(not(windows))]
 pub(super) fn local_path(value: &str) -> Result<PathBuf> {
     let text = if value == ":/Default" {
+        // A download folder whose name is not UTF-8 cannot be spoken on the wire;
+        // say so here instead of sending on a U+FFFD path that is then "not found".
         known_folder(KnownFolder::Downloads)
             .context("用户下载目录不可用")?
-            .to_string_lossy()
-            .into_owned()
+            .into_os_string()
+            .into_string()
+            .ok()
+            .context("文件路径无效")?
     } else {
         // 对端按 `wire_path` 的形状回话：反斜杠是分隔符，先换回 POSIX 再校验。
         value.replace('\\', "/")
