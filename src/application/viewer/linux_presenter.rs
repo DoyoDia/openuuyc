@@ -1594,6 +1594,46 @@ impl Player {
                 .on_disabled_hover_text(hint);
         }
 
+        // 这一排从右往左排，先加的落在右边，所以代码顺序和屏幕上的左右顺序相反：
+        // 剪贴板写在麦克风前头，显示出来才在麦克风右边，和 Windows 一样。剪贴板按
+        // 设备记住开没开，和串流设置里那个开关是同一份设置。
+        let control = self.session.stream_control.snapshot();
+        let clip = self.session.stream_control.clipboard().snapshot();
+        let clip_hint = if !clip.enabled {
+            "同步剪贴板：把本机剪贴板发送到远端，并把远端剪贴板取回本机".to_owned()
+        } else if let Some(error) = clip.error.as_deref() {
+            error.to_owned()
+        } else if clip.active {
+            "剪贴板同步中，点击关闭".to_owned()
+        } else {
+            "剪贴板同步已开启，等待通道就绪，点击关闭".to_owned()
+        };
+        if row
+            .add_enabled_ui(
+                clip.enabled || (control.ready && control.mouse_mode != MouseMode::View),
+                |ui| caption_button(ui, ViewerCaptionIcon::Clipboard, clip.enabled, &clip_hint),
+            )
+            .inner
+            .on_disabled_hover_text("请先连接并开启键鼠控制")
+            .clicked()
+        {
+            crate::ui::controls::clear_notice(row.ctx(), "clipboard-request-error");
+            match self
+                .session
+                .stream_control
+                .set_clipboard_enabled(!clip.enabled)
+            {
+                Ok(()) => crate::ui::controls::clear_notice(row.ctx(), "clipboard-error"),
+                Err(error) => crate::ui::controls::notice(
+                    row.ctx(),
+                    "clipboard-request-error",
+                    "剪贴板同步",
+                    crate::ui::controls::DialogIcon::Error,
+                    error.to_string(),
+                ),
+            }
+        }
+
         // 麦克风：和 Windows 同一套判定，用的是同一份共享状态。
         let mic = self.session.stream_control.microphone().snapshot();
         let mic_hint = if mic.pending {
@@ -1607,7 +1647,6 @@ impl Player {
         } else {
             "将所选麦克风发送到远端（设备可在高级设置中切换）"
         };
-        let control = self.session.stream_control.snapshot();
         if row
             .add_enabled_ui(
                 mic.enabled
