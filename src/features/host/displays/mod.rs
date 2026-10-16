@@ -1135,6 +1135,9 @@ impl State {
         // 合成器接不住就别去惊动内核：接上连接器会让它收到一次热插拔、本机屏幕布局
         // 跳一下，发现接管不了再拔掉又跳一下。
         compositor::ensure_available()?;
+        // 辅助程序重启过的话，旧连接上的屏已经没了；先把它们从记账里去掉，不然它们
+        // 占着下面「最多 3 块」的名额。
+        self.forget_lost_virtual()?;
         let (width, height) = (spec.width, spec.height);
         validate_modes(&[(width, height)])?;
         let screens = capture::screens()?;
@@ -1194,6 +1197,28 @@ impl State {
         screen.id = display::source_id(&format!("openuuyc-virtual/{guid}"))?;
         screen.render_adapter = self.render_adapter;
         Ok(screen)
+    }
+
+    /// 辅助程序已经收回的虚拟屏（它重启过，旧连接上的租约就都没了），不再记在本次
+    /// 会话名下。
+    #[cfg(not(windows))]
+    fn forget_lost_virtual(&mut self) -> Result<()> {
+        let Some(session) = self.virtual_display.as_mut() else {
+            return Ok(());
+        };
+        let lost: Vec<String> = session
+            .sync()?
+            .iter()
+            .map(|connector| topology::identity(connector))
+            .collect();
+        if lost.is_empty() {
+            return Ok(());
+        }
+        tracing::warn!(?lost, "这些虚拟屏已被辅助程序收回，不再记在本次会话名下");
+        self.journal
+            .owned
+            .retain(|o| !o.identity.as_ref().is_some_and(|id| lost.contains(id)));
+        Ok(())
     }
 
     /// 把一块我们自己造的虚拟屏切到另一个分辨率。

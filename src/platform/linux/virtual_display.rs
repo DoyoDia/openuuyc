@@ -16,17 +16,28 @@ pub(crate) fn helper_installed() -> bool {
 /// 连接本身就是租约：辅助程序在我们断开时把所有连接器还回去，所以进程被杀掉也不会
 /// 在用户屏幕上留下收不回的虚拟屏。
 pub(crate) struct Session {
+    /// 辅助程序的套接字。平时就是 [`openuuyc_vkms::SOCKET`]，测试里换成假的。
+    socket: String,
     /// 连接按需建立：没租到屏的连接会被辅助程序按空闲超时收掉，所以这里是
     /// `Option`，下次要用再连。
     client: Option<openuuyc_vkms::Client>,
     leased: Vec<String>,
+    /// 连接断过以后，旧连接上租的屏：辅助程序看到连接断开时已经把它们收回了（它重启
+    /// 过、被 OOM 杀过……），这边只是还没告诉上层。
+    lost: Vec<String>,
 }
 
 impl Session {
     pub(crate) fn open() -> Result<Self> {
+        Self::open_at(openuuyc_vkms::SOCKET)
+    }
+
+    fn open_at(socket: &str) -> Result<Self> {
         let mut session = Self {
+            socket: socket.to_owned(),
             client: None,
             leased: Vec::new(),
+            lost: Vec::new(),
         };
         session.client()?;
         Ok(session)
@@ -36,7 +47,7 @@ impl Session {
     /// 图形会话）时，这里就要报出来，而不是等主控点了「添加虚拟屏」才发现。
     fn client(&mut self) -> Result<&mut openuuyc_vkms::Client> {
         if self.client.is_none() {
-            let mut client = openuuyc_vkms::Client::connect()?;
+            let mut client = openuuyc_vkms::Client::connect_to(&self.socket)?;
             let status = client.status().context("虚拟显示器辅助程序不可用")?;
             tracing::debug!(capacity = status.capacity, "虚拟显示器辅助程序已就绪");
             self.client = Some(client);
@@ -48,18 +59,23 @@ impl Session {
     /// 重连一次再试。
     ///
     /// 重试是安全的：断开连接本身就等于归还这一条连接租的所有连接器，所以死在半路的
-    /// 那次请求不会在屏幕上留下收拾不掉的东西。
+    /// 那次请求不会在屏幕上留下收拾不掉的东西。反过来，旧连接上租着的屏这时候也已经
+    /// 没了，要从 `leased` 挪到 `lost`：留在 `leased` 里的话，之后删它们只会一直得到
+    /// 「不是这条连接创建的虚拟显示器」。
     fn call<T>(&mut self, run: impl Fn(&mut openuuyc_vkms::Client) -> Result<T>) -> Result<T> {
         let first = run(self.client()?);
         match first {
             Ok(value) => Ok(value),
-            Err(error)
-                if error
-                    .chain()
-                    .any(|cause| cause.is::<openuuyc_vkms::Disconnected>()) =>
-            {
+            Err(error) if disconnected(&error) => {
                 tracing::debug!(%error, "虚拟显示器辅助程序的连接已失效，重连一次");
                 self.client = None;
+                if !self.leased.is_empty() {
+                    tracing::warn!(
+                        connectors = ?self.leased,
+                        "到虚拟显示器辅助程序的连接断过，这些虚拟屏已经被它收回"
+                    );
+                    self.lost.append(&mut self.leased);
+                }
                 run(self.client()?)
             }
             Err(error) => Err(error),
@@ -82,19 +98,67 @@ impl Session {
     }
 
     pub(crate) fn remove(&mut self, connector: &str) -> Result<()> {
-        self.call(|client| client.destroy(connector))?;
+        let result = self.call(|client| client.destroy(connector));
+        // 连接断过的话，这块屏在旧连接断开时就已经被收回了：要删的东西已经不在，
+        // 这次删除算成功。
+        if let Some(index) = self.lost.iter().position(|name| name == connector) {
+            self.lost.remove(index);
+            return Ok(());
+        }
+        result?;
         self.leased.retain(|name| name != connector);
         Ok(())
     }
 
+    /// 跟辅助程序对一次账，返回已经不归我们的那些连接器（并且不再记着它们）。
+    ///
+    /// 上层在加屏之前问一次：辅助程序重启过的话，旧连接上的屏都没了，它们还留在上层
+    /// 的记账里就会占着「最多 3 块」的名额，而且永远删不掉。没租着屏就不去惊动辅助
+    /// 程序。
+    pub(crate) fn sync(&mut self) -> Result<Vec<String>> {
+        if !self.leased.is_empty() {
+            let status = self.call(|client| client.status())?;
+            let (kept, gone): (Vec<String>, Vec<String>) = std::mem::take(&mut self.leased)
+                .into_iter()
+                .partition(|name| status.leased.contains(name));
+            if !gone.is_empty() {
+                tracing::warn!(connectors = ?gone, "虚拟显示器辅助程序已经不再为本连接保留这些虚拟屏");
+            }
+            self.leased = kept;
+            self.lost.extend(gone);
+        }
+        Ok(std::mem::take(&mut self.lost))
+    }
+
     /// 会话结束时把所有屏还回去。失败也不拦着退出：辅助程序那边看到连接断开一样会还。
+    ///
+    /// 不重连：连接已经断了的话，辅助程序那时就把这条连接上的屏全收回了，在新连接上
+    /// 删只会得到「不是这条连接创建的」。
     pub(crate) fn release_all(&mut self) {
-        for connector in std::mem::take(&mut self.leased) {
-            if let Err(error) = self.call(|client| client.destroy(&connector)) {
-                tracing::warn!(%error, connector, "虚拟显示器归还失败");
+        let leased = std::mem::take(&mut self.leased);
+        self.lost.clear();
+        let Some(mut client) = self.client.take() else {
+            return;
+        };
+        for connector in leased {
+            match client.destroy(&connector) {
+                Ok(()) => {}
+                Err(error) if disconnected(&error) => {
+                    tracing::debug!(%error, "到虚拟显示器辅助程序的连接已断开，它已经收回了这些屏");
+                    return;
+                }
+                Err(error) => tracing::warn!(%error, connector, "虚拟显示器归还失败"),
             }
         }
+        // 这里丢掉连接：辅助程序看到它断开，把剩下的（如果有）也一并收回。
     }
+}
+
+/// 这条连接已经不能用了（而不是辅助程序拒绝了这次请求）。
+fn disconnected(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<openuuyc_vkms::Disconnected>())
 }
 
 /// 虚拟屏辅助程序现在的状态，直接就是界面上要显示的那几句话。
@@ -176,6 +240,112 @@ pub(crate) fn availability() -> Availability {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openuuyc_vkms::{Reply, Request, Status};
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+
+    /// 一个假的辅助程序：按顺序接 `connections` 条连接，每条请求交给 `answer`
+    /// （参数是第几条连接、请求），它返回 `None` 就当场断开这条连接，模拟辅助程序重启。
+    fn fake_helper(
+        name: &str,
+        connections: usize,
+        answer: impl Fn(usize, &Request) -> Option<Reply> + Send + 'static,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        let directory = std::env::temp_dir().join(format!(
+            "openuuyc-virtual-display-{}-{name}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("control.sock");
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            for index in 0..connections {
+                let (stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut writer = stream;
+                let mut line = String::new();
+                while {
+                    line.clear();
+                    reader.read_line(&mut line).unwrap_or(0) > 0
+                } {
+                    let request: Request = serde_json::from_str(line.trim()).unwrap();
+                    let Some(reply) = answer(index, &request) else {
+                        break;
+                    };
+                    let mut text = serde_json::to_vec(&reply).unwrap();
+                    text.push(b'\n');
+                    writer.write_all(&text).unwrap();
+                }
+            }
+        });
+        (path.to_string_lossy().into_owned(), server)
+    }
+
+    fn status(leased: &[&str]) -> Reply {
+        Reply::status(Status {
+            capacity: 3,
+            leased: leased.iter().map(|name| (*name).to_owned()).collect(),
+            in_use: Vec::new(),
+        })
+    }
+
+    /// 辅助程序重启过：旧连接上的屏已经没了，对账时要把它们交出去，不再记着。
+    #[test]
+    fn screens_on_a_lost_connection_are_handed_back_to_the_caller() {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let (socket, server) = fake_helper("sync", 2, move |connection, request| {
+            match (connection, request) {
+                // 第一条连接：握手的那次 status 照答，对账的那次直接断开。
+                (0, Request::Status)
+                    if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 =>
+                {
+                    Some(status(&["Virtual-1", "Virtual-2"]))
+                }
+                (0, _) => None,
+                (_, Request::Status) => Some(status(&[])),
+                _ => Some(Reply::failed("意外的请求")),
+            }
+        });
+        let mut session = Session::open_at(&socket).unwrap();
+        session.leased = vec!["Virtual-1".into(), "Virtual-2".into()];
+        let mut lost = session.sync().unwrap();
+        lost.sort();
+        assert_eq!(lost, ["Virtual-1", "Virtual-2"]);
+        assert!(session.leased.is_empty());
+        // 交出去以后就不再记着了。
+        assert!(session.sync().unwrap().is_empty());
+        drop(session);
+        server.join().unwrap();
+        let _ = std::fs::remove_dir_all(std::path::Path::new(&socket).parent().unwrap());
+    }
+
+    /// 删的正好是重连时丢掉的那块：它已经不在了，删除算成功，而不是一直报
+    /// 「不是这条连接创建的虚拟显示器」。
+    #[test]
+    fn removing_a_screen_lost_with_the_old_connection_succeeds() {
+        let (socket, server) = fake_helper("remove", 2, |connection, request| {
+            match (connection, request) {
+                (_, Request::Status) => Some(status(&[])),
+                (0, Request::Destroy { .. }) => None,
+                (_, Request::Destroy { connector }) => Some(Reply::failed(format!(
+                    "{connector} 不是这条连接创建的虚拟显示器"
+                ))),
+                _ => Some(Reply::failed("意外的请求")),
+            }
+        });
+        let mut session = Session::open_at(&socket).unwrap();
+        session.leased = vec!["Virtual-1".into(), "Virtual-2".into()];
+        session.remove("Virtual-1").unwrap();
+        assert!(session.leased.is_empty());
+        // 另一块也跟着旧连接没了，留给上层对账时去掉。
+        assert_eq!(session.sync().unwrap(), ["Virtual-2"]);
+        // 真的不是我们的屏，照样报错。
+        assert!(session.remove("Virtual-9").is_err());
+        drop(session);
+        server.join().unwrap();
+        let _ = std::fs::remove_dir_all(std::path::Path::new(&socket).parent().unwrap());
+    }
 
     /// 真机端到端：要装好并启用辅助程序，还要合成器能接管新输出。
     ///
