@@ -149,24 +149,6 @@ pub(crate) mod startup {
         })
     }
 
-    /// 跑一次 `systemctl --user`。没有 systemd 的发行版上根本没有 systemctl，那时
-    /// 返回 `None`，由调用方决定这算不算错。
-    fn run_systemctl(args: &[&str]) -> Result<Option<std::process::Output>> {
-        match std::process::Command::new("systemctl")
-            .arg("--user")
-            .args(args)
-            .output()
-        {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            result => result.context("无法执行 systemctl").map(Some),
-        }
-    }
-
-    fn systemctl(args: &[&str]) -> Result<()> {
-        let output = run_systemctl(args)?.context("找不到 systemctl")?;
-        checked(args, &output)
-    }
-
     fn checked(args: &[&str], output: &std::process::Output) -> Result<()> {
         // 有的子命令（is-enabled）把状态写在标准输出上、错误时标准错误是空的。
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
@@ -240,6 +222,9 @@ pub(crate) mod startup {
     struct Places<'a> {
         config: PathBuf,
         packaged: &'a [&'a str],
+        /// 测试指向一个不存在的程序，当作没有 systemd 的系统，免得读到、甚至停用
+        /// 跑测试的人自己启用的单元。
+        systemctl: &'a str,
     }
 
     impl Places<'static> {
@@ -247,11 +232,30 @@ pub(crate) mod startup {
             Ok(Self {
                 config: config_dir()?,
                 packaged: &PACKAGED_UNITS,
+                systemctl: "systemctl",
             })
         }
     }
 
     impl Places<'_> {
+        /// 跑一次 `systemctl --user`。没有 systemd 的发行版上根本没有 systemctl，那时
+        /// 返回 `None`，由调用方决定这算不算错。
+        fn run_systemctl(&self, args: &[&str]) -> Result<Option<std::process::Output>> {
+            match std::process::Command::new(self.systemctl)
+                .arg("--user")
+                .args(args)
+                .output()
+            {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                result => result.context("无法执行 systemctl").map(Some),
+            }
+        }
+
+        fn systemctl(&self, args: &[&str]) -> Result<()> {
+            let output = self.run_systemctl(args)?.context("找不到 systemctl")?;
+            checked(args, &output)
+        }
+
         /// 我们自己写的那份单元，与包装的同名单元不同路径。
         fn generated_unit(&self) -> PathBuf {
             self.config.join("systemd/user").join(UNIT)
@@ -339,7 +343,7 @@ pub(crate) mod startup {
             }
             // 包里的单元文件在、系统却没有 systemd（systemctl 不存在）时，单元不会被
             // 任何人启动，就是没启用；别让开关读成「无法读取」，旧条目也还得能关掉。
-            let Some(output) = run_systemctl(&["is-enabled", UNIT])? else {
+            let Some(output) = self.run_systemctl(&["is-enabled", UNIT])? else {
                 return Ok(false);
             };
             // 未启用、被 mask 都是非零退出，状态只写在标准输出上。
@@ -371,24 +375,24 @@ pub(crate) mod startup {
                 }
                 std::fs::write(&generated, unit_body(image))
                     .with_context(|| format!("无法写入自启动单元 {}", generated.display()))?;
-                systemctl(&["daemon-reload"])?;
+                self.systemctl(&["daemon-reload"])?;
             }
             // 这里只 enable 不 --now：正在跑的就是本进程，再起一份会被实例锁挡住。
-            systemctl(&["enable", UNIT])?;
+            self.systemctl(&["enable", UNIT])?;
             Ok(())
         }
 
         fn disable_unit(&self) -> Result<()> {
             // 没启用（包括单元不在）时不必让 systemctl 再报一次错，那就是我们要的结果。
             if self.unit_enabled()? {
-                systemctl(&["disable", UNIT])?;
+                self.systemctl(&["disable", UNIT])?;
             }
             // 只删我们自己写的那份；包装的单元归包管。
             let generated = self.generated_unit();
             if generated.exists() {
                 std::fs::remove_file(&generated).context("删除自启动单元失败")?;
                 // 没有 systemd 时也就没有要重新加载的用户管理器。
-                if let Some(output) = run_systemctl(&["daemon-reload"])? {
+                if let Some(output) = self.run_systemctl(&["daemon-reload"])? {
                     checked(&["daemon-reload"], &output)?;
                 }
             }
@@ -526,6 +530,7 @@ pub(crate) mod startup {
             Places {
                 config,
                 packaged: &[],
+                systemctl: "/nonexistent/openuuyc-test/systemctl",
             }
         }
 

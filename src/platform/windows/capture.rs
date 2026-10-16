@@ -198,6 +198,12 @@ fn outputs() -> Result<Vec<(IDXGIAdapter1, IDXGIOutput1, Screen)>> {
     }
 }
 
+/// Windows 这一侧从来不是 Wayland 会话。共享代码用这个问题挑「摆窗口接取拖放」
+/// 还是「走 OLE 那条路」，这里永远是后者（见 `features::drag_drop`）。
+pub(crate) fn wayland_session() -> bool {
+    false
+}
+
 pub(crate) fn screens() -> Result<Vec<Screen>> {
     Ok(outputs()?
         .into_iter()
