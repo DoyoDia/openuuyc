@@ -292,13 +292,7 @@ pub(super) fn operation(
                 };
                 Res::FileDirectory(FileDirectory {
                     id: v.id.clone(),
-                    // The official directory producer echoes the requested directory;
-                    // only its virtual default-directory alias resolves to a real path.
-                    path: if v.path == ":/Default" {
-                        path
-                    } else {
-                        v.path.clone()
-                    },
+                    path: reply_directory(&v.path, &path),
                     entries,
                     dir_data,
                     file_error: 1,
@@ -435,6 +429,18 @@ pub(super) fn operation(
         }
     }
 }
+/// The directory a `FileDirectory` reply names. The official directory producer
+/// echoes the requested directory; only its virtual default-directory alias
+/// resolves to a real path, which leaves in wire shape like every other path we
+/// hand out (see `storage::wire_path`), or the official controller would browse,
+/// go up and upload from a POSIX path it cannot split.
+fn reply_directory(requested: &str, resolved: &str) -> String {
+    if requested == ":/Default" {
+        storage::wire_path(resolved)
+    } else {
+        requested.to_owned()
+    }
+}
 fn remove_tree(path: &Path, stop: &CancellationToken, depth: usize) -> Result<()> {
     ensure!(
         !stop.is_cancelled() && depth < 128,
@@ -474,5 +480,21 @@ mod tests {
         assert!(within("/home", "/"));
         // Linux names are case-sensitive.
         assert!(!within("/home/A", "/home/a"));
+    }
+
+    #[test]
+    fn default_directory_replies_in_wire_shape() {
+        assert_eq!(
+            reply_directory(":/Default", "/home/u/Downloads"),
+            "\\home\\u\\Downloads"
+        );
+        // Any other request is echoed as the peer sent it.
+        assert_eq!(reply_directory("\\home\\u", "/home/u"), "\\home\\u");
+        assert_eq!(reply_directory("/home/u", "/home/u"), "/home/u");
+        // A Windows host's resolved download folder is already in wire shape.
+        assert_eq!(
+            reply_directory(":/Default", "C:\\Users\\u\\Downloads"),
+            "C:\\Users\\u\\Downloads"
+        );
     }
 }
