@@ -163,6 +163,50 @@ pub(super) fn modified(m: &std::fs::Metadata) -> u64 {
         .and_then(|v| v.duration_since(UNIX_EPOCH).ok())
         .map_or(0, |v| v.as_secs())
 }
+
+/// 传输清单里的修改时间是 1601 纪元的 100ns ticks（Windows FILETIME 量纲）：官方
+/// 被控端把收到的值直接写进目标文件的 FILETIME，所以推送清单必须用这套量纲。发
+/// Unix 秒过去会落到 1601 年，接收方那个文件的「修改日期」在资源管理器里就是空的。
+/// 目录列举（`FileEntry.modified_time`）是另一个字段，仍按 Unix 秒。
+const FILETIME_EPOCH_TICKS: u64 = 116_444_736_000_000_000;
+const TICKS_PER_SECOND: u64 = 10_000_000;
+/// 小于它的线上时间戳只可能是 Unix 秒：1970 年之后的时刻在 ticks 量纲上至少是
+/// `FILETIME_EPOCH_TICKS`。
+const SECONDS_CEILING: u64 = 1_000_000_000_000;
+/// 这一层能表示的最大 Unix 秒（9999-12-31），再大就是回绕或坏值。
+const MAX_UNIX_SECONDS: u64 = 253_402_300_799;
+
+/// [`modified`] 取到的修正时间放进清单时的量纲。`0`（未知）保持 `0`，协议就是这么约定的。
+pub(super) fn wire_time(seconds: u64) -> u64 {
+    if seconds == 0 {
+        0
+    } else {
+        seconds * TICKS_PER_SECOND + FILETIME_EPOCH_TICKS
+    }
+}
+
+/// [`wire_time`] 的逆：把对端来的清单时间读成本地时间。官方被控端发来的下载清单、以及
+/// 这个版本之前的我们自己，带的都是 Unix 秒，所以两种量纲都认——两套量纲差五个数量级
+/// 以上、不重叠，而 `0` 仍是「未指定」。回绕到 1970 年之前的值与晚于 9999 年的一律当
+/// 未知，绝不写一个假的时间戳。
+pub(super) fn local_time(value: u64) -> Option<std::time::SystemTime> {
+    if value == 0 || value > wire_time(MAX_UNIX_SECONDS) {
+        return None;
+    }
+    if value < SECONDS_CEILING {
+        return UNIX_EPOCH.checked_add(std::time::Duration::from_secs(value));
+    }
+    let ticks = value - FILETIME_EPOCH_TICKS;
+    let seconds = ticks / TICKS_PER_SECOND;
+    if seconds == 0 {
+        return None;
+    }
+    UNIX_EPOCH.checked_add(std::time::Duration::new(
+        seconds,
+        ((ticks % TICKS_PER_SECOND) * 100) as u32,
+    ))
+}
+
 fn not_link(p: &Path) -> Result<std::fs::Metadata> {
     let m = std::fs::symlink_metadata(p)?;
     ensure!(
@@ -359,7 +403,11 @@ pub(super) fn open_source(root: &Path, item: &FileInfo) -> Result<File> {
     check_handle(&f, root)?;
     let m = f.metadata()?;
     ensure!(
-        m.is_file() && m.len() == item.size && modified(&m) == item.modified_time,
+        m.is_file()
+            && m.len() == item.size
+            // 清单条目可能是任一套量纲（推送清单带 ticks，旧版本的对端或下载清单带
+            // 秒）；文件得在它实际用的那套量纲上对得上。
+            && (modified(&m) == item.modified_time || wire_time(modified(&m)) == item.modified_time),
         "源文件已变化，不能继续原任务"
     );
     Ok(f)
@@ -486,9 +534,7 @@ pub(super) async fn finish(
     );
     v.file.sync_all().await?;
     let file = v.file.into_std().await;
-    if let Some(time) =
-        UNIX_EPOCH.checked_add(std::time::Duration::from_secs(v.partial.info.modified_time))
-    {
+    if let Some(time) = local_time(v.partial.info.modified_time) {
         file.set_modified(time)?;
     }
     drop(file);
@@ -615,10 +661,47 @@ impl Store {
     }
 }
 
-#[cfg(all(test, not(windows)))]
+#[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
+    /// 2026 年的一个 Unix 秒值：客户端推的就是它，而量纲弄错时官方被控端落盘的
+    /// FILETIME 也是从它来的——正是这次修复要处理的那个值。
+    const SAMPLE: u64 = 1_791_980_189;
+
+    #[test]
+    fn push_manifests_carry_filetime_ticks() {
+        assert_eq!(
+            wire_time(SAMPLE),
+            SAMPLE * TICKS_PER_SECOND + FILETIME_EPOCH_TICKS
+        );
+        assert_eq!(wire_time(0), 0, "未知时间仍是未指定");
+        assert_eq!(
+            local_time(wire_time(SAMPLE)).unwrap(),
+            UNIX_EPOCH + Duration::from_secs(SAMPLE)
+        );
+        // 回程要保住 ticks 的 100ns 精度。
+        assert_eq!(
+            local_time(wire_time(SAMPLE) + 5).unwrap(),
+            UNIX_EPOCH + Duration::from_secs(SAMPLE) + Duration::from_nanos(500)
+        );
+    }
+
+    #[test]
+    fn received_times_accept_either_scale() {
+        // 官方被控端发来的下载清单、以及这个版本之前的我们，带的都是 Unix 秒。
+        assert_eq!(
+            local_time(SAMPLE).unwrap(),
+            UNIX_EPOCH + Duration::from_secs(SAMPLE)
+        );
+        assert_eq!(local_time(0), None, "时间为 0 表示未指定");
+        // 回绕到 1970 年之前的值是未知，绝不能变成 1601 年或公元 9999 年之后的戳。
+        assert_eq!(local_time(18_446_744_062_065_078_195), None);
+        assert_eq!(local_time(u64::MAX), None);
+    }
+
+    #[cfg(not(windows))]
     #[test]
     fn unix_protocol_paths() {
         assert_eq!(local_path("/").unwrap(), PathBuf::from("/"));
