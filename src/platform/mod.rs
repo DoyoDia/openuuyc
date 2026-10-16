@@ -28,6 +28,29 @@ pub(crate) struct CompositorOutput {
     pub top: i32,
     pub width: u32,
     pub height: u32,
+    pub rotation: Rotation,
+}
+
+/// How far the compositor has turned the panel, as `wl_output.transform`
+/// states it. Only the touch path needs it: a touchscreen reports a position
+/// on its own panel, which some compositors turn with the output and others
+/// do not, while every other device names a position that is already a screen
+/// position.
+///
+/// Only the Wayland layout reader builds one; Windows has no compositor
+/// layout, so there the variants are never constructed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(windows, allow(dead_code))]
+pub(crate) enum Rotation {
+    #[default]
+    Normal,
+    Rotate90,
+    Rotate180,
+    Rotate270,
+    Flipped,
+    Flipped90,
+    Flipped180,
+    Flipped270,
 }
 
 /// Every output the compositor lays out, named or not.

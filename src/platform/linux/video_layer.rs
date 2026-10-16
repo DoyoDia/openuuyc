@@ -437,12 +437,7 @@ impl VideoLayer {
         // Clip space is [-1, 1] with y up; the placement is in pixels with y down.
         let center_x = (placement.x + placement.width / 2.0) / width * 2.0 - 1.0;
         let center_y = 1.0 - (placement.y + placement.height / 2.0) / height * 2.0;
-        let rotation = match placement.rotation % 360 {
-            90 => [0.0, 1.0, -1.0, 0.0],
-            180 => [-1.0, 0.0, 0.0, -1.0],
-            270 => [0.0, -1.0, 1.0, 0.0],
-            _ => [1.0, 0.0, 0.0, 1.0],
-        };
+        let rotation = uv_rotation(placement.rotation);
         queue.write_buffer(
             &self.uniform,
             0,
@@ -605,6 +600,21 @@ fn write_plane(
     );
 }
 
+/// 屏幕方向 → 纹理坐标的旋转矩阵（列主序，和着色器里 `mat2x2` 的写法一致）。
+///
+/// 这里的角度是「把画面顺时针转这么多」（CVO/WebRTC 的约定，Windows 那条路就是这么
+/// 用的）；而着色器算的是**采样**用的 uv，也就是画面变换的逆，所以 90 度对应的是逆时针
+/// 那个矩阵。写成顺时针会让转过 90°/270° 的被控屏在 Linux 主控上整体差 180°——
+/// 0°/180° 两个方向一样，所以只有那两档会看出来。
+fn uv_rotation(degrees: u16) -> [f32; 4] {
+    match degrees % 360 {
+        90 => [0.0, -1.0, 1.0, 0.0],
+        180 => [-1.0, 0.0, 0.0, -1.0],
+        270 => [0.0, 1.0, -1.0, 0.0],
+        _ => [1.0, 0.0, 0.0, 1.0],
+    }
+}
+
 const SHADER: &str = r#"
 struct Uniform {
     offset: vec2<f32>,
@@ -662,3 +672,39 @@ fn fs_nv12(in: VertexOutput) -> @location(0) vec4<f32> {
     return vec4<f32>(clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
 }
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::uv_rotation;
+
+    /// 屏幕四角的 `corner`（和顶点着色器里一样：左上、右上、左下、右下）各采到纹理的哪一点。
+    fn sampled_corners(degrees: u16) -> [(f32, f32); 4] {
+        let matrix = uv_rotation(degrees);
+        [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)].map(|(x, y)| {
+            let (dx, dy) = (x - 0.5, y - 0.5);
+            (
+                matrix[0] * dx + matrix[2] * dy + 0.5,
+                matrix[1] * dx + matrix[3] * dy + 0.5,
+            )
+        })
+    }
+
+    fn same(a: (f32, f32), b: (f32, f32)) -> bool {
+        (a.0 - b.0).abs() < 1e-6 && (a.1 - b.1).abs() < 1e-6
+    }
+
+    /// 报的是「顺时针转多少」，画面就得顺时针转：90 度时屏幕左上角采到的是纹理左下角
+    /// （顺时针转 90° 正是把左下角转到左上角），270 度反过来。写反了整幅画差 180°。
+    #[test]
+    fn a_clockwise_angle_turns_the_picture_clockwise() {
+        let corners = sampled_corners(90);
+        assert!(same(corners[0], (0.0, 1.0)), "{corners:?}");
+        assert!(same(corners[1], (0.0, 0.0)), "{corners:?}");
+        let corners = sampled_corners(270);
+        assert!(same(corners[0], (1.0, 0.0)), "{corners:?}");
+        assert!(same(corners[1], (1.0, 1.0)), "{corners:?}");
+        // 0 和 180 两个方向一样，只钉住它们的落点。
+        assert!(same(sampled_corners(0)[0], (0.0, 0.0)));
+        assert!(same(sampled_corners(180)[0], (1.0, 1.0)));
+    }
+}

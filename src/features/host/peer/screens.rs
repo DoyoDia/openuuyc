@@ -26,7 +26,9 @@ pub(crate) const TRACK_COUNT: usize = 5;
 pub(super) struct Inventory {
     targets: Vec<Target>,
     screens: Vec<capture::Screen>,
-    layout: crate::platform::display::topology::SavedTopology,
+    // Restoration bookkeeping needs a complete, identified layout. A transient
+    // failure there must not discard an otherwise valid live screen inventory.
+    layout: Result<crate::platform::display::topology::SavedTopology>,
 }
 impl Inventory {
     pub fn read() -> Result<Self> {
@@ -34,7 +36,7 @@ impl Inventory {
         Ok(Self {
             targets: topology.targets()?,
             screens: capture::screens()?,
-            layout: Topology::query(true)?.snapshot()?,
+            layout: Topology::query(true).and_then(|topology| topology.snapshot()),
         })
     }
     pub async fn collect(cancel: &CancellationToken) -> Result<Option<Self>> {
@@ -97,6 +99,7 @@ pub(crate) struct Slot {
 }
 pub(crate) struct Screens {
     inventory_revision: u64,
+    layout_error: Option<String>,
     pub displays: Arc<crate::features::host::displays::Session>,
     pub slots: Vec<Slot>,
     pub registered: Vec<usize>,
@@ -119,7 +122,7 @@ pub(crate) struct Deferred {
     pub encoding: crate::features::host::EncodingSettings,
 }
 impl Screens {
-    pub(super) fn update_media_intent(&self) -> VideoConfig {
+    pub(crate) fn update_media_intent(&self) -> VideoConfig {
         self.base
     }
     pub(crate) async fn resume_capture(&mut self) -> Result<()> {
@@ -294,6 +297,7 @@ impl Screens {
         }
         let mut state = Self {
             inventory_revision: 0,
+            layout_error: None,
             displays,
             slots,
             registered: vec![0],
@@ -328,7 +332,24 @@ impl Screens {
             screens,
             layout,
         } = inventory;
-        self.displays.observe_layout(&layout)?;
+        match layout {
+            Ok(layout) => {
+                self.displays.observe_layout(&layout)?;
+                if self.layout_error.take().is_some() {
+                    tracing::info!("host restoration layout observation recovered");
+                }
+            }
+            Err(error) => {
+                let message = format!("{error:#}");
+                if self.layout_error.as_ref() != Some(&message) {
+                    tracing::warn!(error = %message,
+                        "host restoration layout unavailable; preserving ownership and continuing live display recovery");
+                    self.layout_error = Some(message);
+                }
+                // Do not substitute an empty or partial layout: that would
+                // wrongly relinquish restoration ownership for existing targets.
+            }
+        }
         let mut catalog = Vec::new();
         for mut screen in screens {
             let mut target = targets
@@ -448,6 +469,24 @@ impl Screens {
         } else {
             self.base
         };
+        self.start_at(index, screen, config).await
+    }
+    pub(crate) async fn start_configured(
+        &mut self,
+        screen: capture::Screen,
+        config: VideoConfig,
+    ) -> Result<()> {
+        ensure!(
+            self.lease.requested() && !self.cancel.is_cancelled(),
+            "被控许可已失效"
+        );
+        ensure!(
+            self.registered.len() == 1 && self.deferred.is_none(),
+            "指定屏幕切换需要已准备的单视频轨道"
+        );
+        let index = self.registered[0];
+        ensure!(self.slots[index].screen.is_some(), "当前视频采集已停止");
+        self.headless.choose(screen.id);
         self.start_at(index, screen, config).await
     }
     async fn start_at(

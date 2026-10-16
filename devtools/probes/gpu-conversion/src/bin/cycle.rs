@@ -113,7 +113,7 @@ fn main() -> anyhow::Result<()> {
             let display = cros_libva::Display::open_drm_display("/dev/dri/renderD128")?;
             let gpu = gpu_convert::Converter::new(display)?;
             for _ in 0..8 {
-                let _ = gpu.convert(rgb, (0, 0, w, h))?;
+                let _ = gpu.convert(rgb, (0, 0, w, h), (w, h))?;
             }
             drop(gpu);
             if round % 5 == 0 {

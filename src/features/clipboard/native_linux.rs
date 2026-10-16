@@ -22,6 +22,11 @@ pub(super) use super::formats::safe_name;
 /// Anything larger is a transfer, not a clipboard paste.
 const MAX_CLIP: usize = 32 * 1024 * 1024;
 const POLL: Duration = Duration::from_millis(400);
+/// 剪贴板这条路上双方都用固定任务号 0：官方 Windows 客户端写死的，我们发
+/// `FileDescListRequest` 时也用这个。`accept_files` 按这个号读对面的清单，
+/// `descriptor_blob` 答自己的清单时登记在同一个号上，好让对面接下来的
+/// `FileContentsRequest` 找得到。
+const CLIPBOARD_TASK: u32 = 0;
 
 pub(super) enum Command {
     Activate(Weak<Inner>),
@@ -378,14 +383,14 @@ struct LocalFiles {
 }
 
 /// What this client currently owns locally, as the remote would see it.
-#[derive(Default)]
-struct LocalSnapshot {
-    text: Option<String>,
-    image: Option<Vec<u8>>,
+#[derive(Default, Clone, PartialEq, Eq, Debug)]
+pub(super) struct LocalSnapshot {
+    pub(super) text: Option<String>,
+    pub(super) image: Option<Vec<u8>>,
     /// The paths a local copy put on the clipboard. They are only walked when
     /// the remote asks for the list, so copying a large tree locally costs
     /// nothing until someone pastes it there.
-    sources: Vec<PathBuf>,
+    pub(super) sources: Vec<PathBuf>,
 }
 
 impl LocalSnapshot {
@@ -403,6 +408,10 @@ impl LocalSnapshot {
                 "FileGroupDescriptorW".into(),
             ));
             ids.push((formats::register("FileContents"), "FileContents".into()));
+            // `Preferred DropEffect` 不广告：Windows 生产端从来不把它放上线（见
+            // `formats::supported`），只有 Linux 广告它就成了没有依据的平台差异，
+            // 而「不给它官方客户端就停在试探阶段」这个说法并没有日志支撑。不广告
+            // 也就不会被问到，见 `LocalSnapshot::data`。
             return ids;
         }
         if self.text.is_some() {
@@ -432,7 +441,22 @@ impl LocalSnapshot {
                 })
                 .context("本地剪贴板没有文本"),
             8 => self.image.clone().context("本地剪贴板没有图片"),
-            _ => bail!("不支持的本地剪贴板格式"),
+            // 描述符块那条要展开整棵树、还要登记任务，所以留在 `serve` 里做
+            // （见 `descriptor_blob`）。
+            //
+            // 这一条现在走不到：`FormatDataAsk` 只答 `published` 里有的格式，而
+            // 这个格式既不广告（`format_ids`）也过不了 `formats::supported`，被问到
+            // 时答的是「未发布该剪贴板格式」。留着只是保险：哪天它又被加回广告
+            // 列表，答的也只能是复制（DROPEFFECT_COPY = 1）。答成移动会让文件
+            // 管理器把被控端的原文件搬走，这是安全线，不是可选的礼貌。
+            _ if format
+                .wire
+                .name
+                .eq_ignore_ascii_case("Preferred DropEffect") =>
+            {
+                Ok(1u32.to_le_bytes().to_vec())
+            }
+            _ => bail!("不支持的本地剪贴板格式 {}", format.wire.name),
         }
     }
 }
@@ -576,20 +600,81 @@ impl LocalFiles {
     }
 }
 
+/// 本地剪贴板的「写次数」。
+///
+/// 判「本地剪贴板变了没有」不能只看内容：同一个文件复制第二遍，路径、文本、像素
+/// 全都一样，可它仍然是一次新的复制——对端可能已经把上一次那份用掉了（官方
+/// Windows 客户端粘完就不再拿那个 offer），不重新广播它就一直粘不上。
+///
+/// Windows 那边用的是 `GetClipboardSequenceNumber()`，Linux 这边没有这个调用，
+/// 但等价的信号是现成的：Wayland 监听每认领一次剪贴板就发一个 `LocalChanged`
+/// （内容相同也发，见 `start_watcher`）。收不到它的会话（纯 X11、合成器不给
+/// data-control）里计数不前进，调用方自动退回按内容判断。
+#[derive(Default)]
+struct Writes {
+    /// 收到过多少个 `LocalChanged`。
+    generation: u64,
+    /// 上面这个数字对应的是我们已经知道的那一次。
+    seen: u64,
+    /// 我们自己写了几次还没被数到。合成器把我们自己的写也数进去，那不是用户复制。
+    pending: u32,
+}
+
+impl Writes {
+    /// 收到一次 `LocalChanged`。
+    fn tick(&mut self) {
+        self.generation = self.generation.saturating_add(1);
+    }
+
+    /// 我们马上要写剪贴板了。**要在写之前**记：写下去到事件到达之间用户完全
+    /// 可能自己复制一次，那一次要认得出来。
+    fn wrote(&mut self) {
+        self.pending = self.pending.saturating_add(1);
+    }
+
+    /// 这一笔没写下去（写入报错，或者 Wayland 那一侧根本没写成）。写次数不会因此
+    /// 前进，那一格要撤回——留着它会把用户下一次「同一份又复制了一遍」吞掉。
+    fn not_written(&mut self) {
+        self.pending = self.pending.saturating_sub(1);
+    }
+
+    /// 这一轮观察到的写次数里，有没有「用户自己又复制了一遍」。
+    fn observe(&mut self) -> bool {
+        let advanced = self.generation.saturating_sub(self.seen);
+        // 前 `pending` 次前进是我们自己写的那几次，一次吃掉一个。
+        let ours = advanced.min(u64::from(self.pending));
+        self.pending -= ours as u32;
+        self.seen = self.generation;
+        advanced > ours
+    }
+}
+
 struct State {
     receiver: Receiver<Command>,
     clipboard: Option<arboard::Clipboard>,
     sessions: HashMap<u64, Weak<Inner>>,
     published: HashMap<u64, Vec<Format>>,
     local: LocalSnapshot,
+    /// 上一次在 Wayland 那一侧看到的、以及上一次在 X11 那一侧看到的。两座孤岛各记
+    /// 各的——共用一个的话，刚发布完 X11 那侧的内容，下一轮就会被 Wayland 那侧的
+    /// 旧内容顶掉。
+    wayland: LocalSnapshot,
+    x11: LocalSnapshot,
     /// File lists handed out per session and task, kept until the clipboard
     /// changes so a slow remote can keep reading the copy it started on.
     tasks: HashMap<(u64, u32), Arc<LocalFiles>>,
+    /// 本地那一批路径展开出来的清单，和 `local` 配套。
+    ///
+    /// 展开一次要整树遍历，而对方是按格式一个个来问的（描述符块还可能被问好几
+    /// 遍），每次都重走一遍就把剪贴板线程按住了。本地剪贴板一换它就作废，见
+    /// `retire`——包括「同一份又复制了一遍」那种：那时内容没变，可文件本身可能
+    /// 已经改过，重新走一遍才能拿到新的大小与改动时间。
+    local_files: Option<Arc<LocalFiles>>,
     /// The remote copy currently published locally, mounted for as long as the
     /// clipboard points at it.
     mounted: Option<super::fuse::Mount>,
-    /// Holds the clipboard selection while those paths are the copy on it.
-    offer: Option<super::x11_offer::FileOffer>,
+    /// 我们替这次复制持有的 X11 选择区（远端发来的文件、或者远端发来的文本）。
+    offer: Option<super::x11_offer::Offer>,
     /// Files offered to one session for a drag or a drop rather than through
     /// the clipboard: a drop's list is handed out once, to the descriptor
     /// request that answers it; a drag's stays for every read of its session.
@@ -598,9 +683,49 @@ struct State {
     drag_tasks: HashMap<(u64, u32), Arc<LocalFiles>>,
     /// Set while this adapter writes, so the poll does not report its own write.
     writing: bool,
+    /// 本地剪贴板上现在这一份是远端写进来的（`write_text`/`write_image`/
+    /// `write_files` 置位，本地复制广播出去时清掉）。
+    ///
+    /// 剪贴板管理器（`wl-clip-persist` 一类）会在我们每次写入之后再以自己的名义
+    /// 认领一次，于是每写一次就会多收一个 `LocalChanged`。多出来的那个会被算成
+    /// 「用户又复制了一遍」，把刚收到的远端内容原样发回去——两台都装这类工具的
+    /// 机器之间会来回互推，对端是 Windows 时则会用我们只含纯文本的提议顶掉它的
+    /// HTML / RTF。有这一位就不会。
+    ///
+    /// 代价是这一位要到下一次本地复制广播出去才清：远端发来 R 以后，用户在本地把一
+    /// 模一样的 R 再复制一遍不会重发（Windows 按 `GetClipboardSequenceNumber` 判断，
+    /// 会重发）。对端手里本来就是 R，只是它粘完就放掉的 offer 不会因此重新武装。
+    remote: bool,
+    /// arboard 真的落在 Wayland 那一侧（而不是退回 X11）。合成器不给 data-control
+    /// 时它会自己退回 X11，那时 `read_wayland` 读的本来就是 X11 那一份，再单独读
+    /// 一遍 X11 等于把同一个选择区每轮读两次。两件事都要 data-control，所以 watcher
+    /// 起不起得来就是这一位的现成答案（见 `run`）。
+    wayland_clipboard: bool,
     /// Set once a Wayland watcher is posting `LocalChanged`, which makes the
     /// loop block instead of polling on a timer.
     watching: bool,
+    /// 本地剪贴板的写次数，见 `Writes`。
+    writes: Writes,
+}
+
+impl State {
+    /// 本地剪贴板这一份到此为止：发出去的文件清单和展开出来的树都跟着重来。
+    fn retire(&mut self) {
+        self.tasks.clear();
+        self.local_files = None;
+    }
+
+    /// 本地这份清单（按会话登记的任务用同一份）。展开过一次就留着，见
+    /// `local_files`。
+    fn local_files(&mut self) -> Result<Arc<LocalFiles>> {
+        if let Some(files) = &self.local_files {
+            return Ok(files.clone());
+        }
+        ensure!(!self.local.sources.is_empty(), "本地剪贴板没有文件");
+        let files = Arc::new(collect_files(&self.local.sources)?);
+        self.local_files = Some(files.clone());
+        Ok(files)
+    }
 }
 
 pub(super) fn start() -> Result<()> {
@@ -663,35 +788,51 @@ fn run(receiver: Receiver<Command>, watcher_sender: SyncSender<Command>) {
         clipboard,
         sessions: HashMap::new(),
         published: HashMap::new(),
+        wayland: LocalSnapshot::default(),
+        x11: LocalSnapshot::default(),
         local: LocalSnapshot::default(),
         tasks: HashMap::new(),
+        local_files: None,
         mounted: None,
         offer: None,
         drag_files: HashMap::new(),
         drag_tasks: HashMap::new(),
         writing: false,
+        remote: false,
+        wayland_clipboard: false,
         watching: false,
+        writes: Writes::default(),
     };
     // A Wayland watcher turns the poll into an event. X11 has no equivalent, so
     // it keeps the timer; either way `poll_local` does the reading.
-    state.watching = start_watcher(watcher_sender);
+    state.wayland_clipboard = start_watcher(watcher_sender);
+    state.watching = state.wayland_clipboard;
     loop {
-        // With a watcher running, a `LocalChanged` arrives when the selection
-        // actually changes, so the loop blocks instead of waking every `POLL`.
-        // Without one it falls back to the timer.
-        let command = if state.watching {
-            state.receiver.recv().ok()
-        } else {
+        // 有 watcher 时 `LocalChanged` 会在选择区真的变了时来一次，所以循环可以
+        // 阻塞等它，不必每 `POLL` 醒一次——当初拿事件换掉轮询就是为这个：每 400
+        // 毫秒全量读一遍剪贴板，图片要 PNG 解码一次。
+        //
+        // 但 watcher 只看得见 Wayland 那一侧。只要还要单独去 X11 那边读（见
+        // `x11_read::wanted`），就得留着定时轮询：XWayland 里的程序复制完，
+        // Wayland 这一侧什么都不会发生，阻塞着的线程没人唤得醒。这一轮定时器只读
+        // X11 那一侧：Wayland 那一侧已经交给 `LocalChanged` 了，再陪着每 400 毫秒
+        // 读一遍，等于把当初省下来的开销又花了回去。
+        let poll_x11 = state.watching && super::x11_read::wanted(state.wayland_clipboard);
+        let timed = !state.watching || poll_x11;
+        let command = if timed {
             match state.receiver.recv_timeout(POLL) {
                 Ok(command) => Some(command),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    if let Err(error) = poll_local(&mut state) {
+                    let sides = if poll_x11 { Sides::X11 } else { Sides::Both };
+                    if let Err(error) = poll_local(&mut state, sides) {
                         tracing::debug!(%error, "读取本地剪贴板失败");
                     }
                     continue;
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => None,
             }
+        } else {
+            state.receiver.recv().ok()
         };
         let Some(command) = command else { break };
         if matches!(command, Command::Remove(u64::MAX)) {
@@ -700,8 +841,18 @@ fn run(receiver: Receiver<Command>, watcher_sender: SyncSender<Command>) {
         if matches!(command, Command::WatchEnded) {
             state.watching = false;
         }
+        if matches!(command, Command::LocalChanged) {
+            state.writes.tick();
+        }
         if matches!(command, Command::LocalChanged | Command::WatchEnded) {
-            if let Err(error) = poll_local(&mut state) {
+            // `LocalChanged` 是从 Wayland 那一侧来的，只读它；`WatchEnded` 之后
+            // 定时轮询重新接手两侧，这一轮先把两边都对一遍。
+            let sides = if matches!(command, Command::LocalChanged) {
+                Sides::Wayland
+            } else {
+                Sides::Both
+            };
+            if let Err(error) = poll_local(&mut state, sides) {
                 tracing::debug!(%error, "读取本地剪贴板失败");
             }
             continue;
@@ -822,7 +973,7 @@ fn process(state: &mut State, command: Command) {
             {
                 // The notice shows the outermost line; the cause is only in
                 // the chain, and it is the part worth reading.
-                tracing::debug!(error = format!("{error:#}"), "接受远端剪贴板失败");
+                tracing::warn!(error = format!("{error:#}"), "接受远端剪贴板失败");
                 session.fail(error.to_string());
             }
         }
@@ -1024,9 +1175,7 @@ fn offer_files(
 /// Only the list is fetched here. The contents follow one read at a time,
 /// through the filesystem, if and when something actually opens them.
 fn accept_files(state: &mut State, session: &Arc<Inner>, epoch: u64) -> Result<()> {
-    // The task id the official Windows client uses for an inbound offer.
-    const TASK: u32 = 0;
-    let descriptors = session.descriptors(epoch, TASK)?;
+    let descriptors = session.descriptors(epoch, CLIPBOARD_TASK)?;
     ensure!(!descriptors.is_empty(), "远端剪贴板文件列表为空");
     let tree = super::fuse::Tree::build(&descriptors)?;
     let parent = super::fuse::mount_parent()?;
@@ -1034,14 +1183,33 @@ fn accept_files(state: &mut State, session: &Arc<Inner>, epoch: u64) -> Result<(
         let session = Arc::downgrade(session);
         Arc::new(move |index: u32, offset: u64, length: usize| {
             let session = session.upgrade().context("剪贴板会话已结束")?;
-            session.read_file(epoch, TASK, index, offset, length.min(FILE_BLOCK), 2)
+            session.read_file(
+                epoch,
+                CLIPBOARD_TASK,
+                index,
+                offset,
+                length.min(FILE_BLOCK),
+                2,
+            )
         })
     };
-    let mount = super::fuse::Mount::new(&parent, super::fuse::generation(), tree, reader)?;
+    let generation = super::fuse::generation();
+    let mount = super::fuse::Mount::new(&parent, generation, tree, reader)?;
     let paths = mount.paths();
-    tracing::debug!(
+    // 每次远端复制都会走到这里，而且只此一次。这条把两个关键事实分开记：「清单
+    // 里是什么」说明远端给的目录是不是新那一份，「挂到了哪一代」说明本地剪贴板有
+    // 没有跟着换过去。两件事坏掉的样子完全不同（内容还是旧的 / 粘贴根本不动），
+    // 光看现象分不出来。
+    //
+    // 名字不记：文件名本身是远端用户的内容，而发布出去的路径就是挂载点加上这些
+    // 名字，所以只记挂载代号和顶层项数。「是不是新那份」看大小与改动时间就够了
+    // （改两个字长度可能一样，改动时间一定不一样）。
+    tracing::info!(
+        mount = generation,
+        roots = paths.len(),
         files = descriptors.len(),
-        root = %mount.root().display(),
+        size = descriptors[0].file_size,
+        modified = descriptors[0].last_write_time,
         "已挂载远端剪贴板文件"
     );
     write_files(state, &paths)?;
@@ -1071,58 +1239,171 @@ fn utf16_text(bytes: &[u8]) -> Result<String> {
 
 fn write_text(state: &mut State, text: &str) -> Result<()> {
     let clipboard = state.clipboard.as_mut().context("系统剪贴板不可用")?;
+    state.writes.wrote();
     state.writing = true;
     let result = clipboard.set_text(text.to_owned());
     state.writing = false;
+    if result.is_err() {
+        state.writes.not_written();
+    }
     result.context("写入系统剪贴板失败")?;
+    // XWayland 的程序只看得到 X11 那一侧的选择区，而 arboard 在 Wayland 会话里写的是
+    // 另一座孤岛（niri 这类合成器不桥接），光靠它远端发来的文本在 XWayland 程序里粘不
+    // 出来。所以文本也像文件那样自己挂一份到 X11 上——`x11_read::wanted` 说的正是「这
+    // 个会话里 arboard 落在 Wayland 那一侧、而且另有一座 X11 孤岛」，也只有那时才需
+    // 要（它落回 X11 时，上面那次 `set_text` 写的就是 X11）。
+    state.offer = None;
     state.local = LocalSnapshot {
         text: Some(text.to_owned()),
         ..Default::default()
     };
-    state.tasks.clear();
+    // 写成的那一侧「上次看到的」当场就记成这一份，不能等下一轮把它读回来再记：读回
+    // 来之前用户可能已经复制了别的。那时 X11 那一侧读到的是我们自己挂的这份，和旧
+    // 记录一比像是「变了」，会把它当成本地复制发回去，顶掉对端随后收到的那份；
+    // Wayland 那一侧读到的是用户复制的东西，而它要是恰好和旧记录一样（同一份又复制
+    // 了一遍），就会被当成「没变」吞掉。
+    state.wayland = state.local.clone();
+    if super::x11_read::wanted(state.wayland_clipboard) {
+        match super::x11_offer::Offer::publish_text(text.to_owned()) {
+            Ok(offer) => {
+                state.offer = Some(offer);
+                state.x11 = state.local.clone();
+            }
+            Err(error) => tracing::debug!(error = format!("{error:#}"), "接管 X11 剪贴板失败"),
+        }
+    }
+    state.remote = true;
+    state.retire();
     state.mounted = None;
-    state.offer = None;
     Ok(())
 }
 
-/// Publish paths as a file copy on the local clipboard.
+/// Publish paths as a file copy on the local clipboard, and record them as the
+/// copy this adapter put there so the poll does not announce them back.
 ///
-/// A file copy has to be offered under several names at once, and only the
-/// owner of the selection can answer for more than one, so this takes the
-/// clipboard itself rather than going through the library used for text and
-/// images. On a desktop where that fails there is still `text/uri-list`, which
-/// is enough for anything that does not insist on the GTK file-manager name.
+/// Which clipboard that is takes some care: see `publish_files`.
 fn write_files(state: &mut State, paths: &[PathBuf]) -> Result<()> {
+    state.writes.wrote();
     state.writing = true;
-    let offer = super::x11_offer::FileOffer::publish(paths.to_vec());
-    let result = match offer {
-        Ok(offer) => {
-            state.offer = Some(offer);
-            Ok(())
-        }
-        Err(error) => {
-            tracing::debug!(error = format!("{error:#}"), "接管剪贴板失败，改用单一格式");
-            state.offer = None;
-            let clipboard = state.clipboard.as_mut().context("系统剪贴板不可用")?;
-            clipboard
-                .set()
-                .file_list(paths)
-                .map_err(anyhow::Error::from)
-        }
-    };
+    let result = publish_files(state, paths);
     state.writing = false;
-    result.context("写入系统剪贴板失败")?;
+    // 只有 Wayland 那一侧真的写成了才会有 `LocalChanged` 来核销这一格（写次数数的
+    // 就是那一侧），没写成时自己撤回，否则它会把用户下一次「同一份又复制了一遍」
+    // 吞掉。
+    if !result.as_ref().is_ok_and(|published| published.counted) {
+        state.writes.not_written();
+    }
+    let published = result.context("写入系统剪贴板失败")?;
     state.local = LocalSnapshot {
         sources: paths.to_vec(),
         ..Default::default()
     };
-    state.tasks.clear();
+    // 和 `write_text` 一样，写成的那一侧当场记成这一份。没写成的那一侧不动：它上面
+    // 还是原来那份，记成这一份的话，下一轮读到原来那份就会被当成一次新复制发出去。
+    if published.arboard {
+        state.wayland = state.local.clone();
+    }
+    if published.x11 {
+        state.x11 = state.local.clone();
+    }
+    state.remote = true;
+    state.retire();
     Ok(())
+}
+
+/// 把这一批路径挂到本地剪贴板上。
+///
+/// X11 与 Wayland 的选择区是两个互不相通的剪贴板：这条路在 niri 上实测双向都
+/// 不过桥——xclip 写进去的东西 `wl-paste` 看不见，反过来也一样。X11 的 offer
+/// 只有 XWayland 里的程序看得见，而 Wayland 原生的程序（GNOME 那套文件管理器
+/// 就是）只读 Wayland 那一侧。只写一边，本地总有一半程序粘不出来。
+///
+/// 所以两边都写。arboard 的后端跟着 `WAYLAND_DISPLAY` 走（有这个变量就走
+/// Wayland data-control），Wayland 会话里由它写 Wayland 那侧；X11 会话里它自己
+/// 就落在 X11 上，这时不能让它抢先——它只会挂 `text/uri-list` 一个名字，而
+/// GNOME 的文件管理器只认 `x-special/gnome-copied-files`，多个名字只有 X11
+/// 的 offer 给得出。
+///
+/// 返回值说哪几侧写成了，见 `Published`。
+fn publish_files(state: &mut State, paths: &[PathBuf]) -> Result<Published> {
+    let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
+    let mut published = Published::default();
+    let mut failures = Vec::new();
+    // 两侧都试，谁也不给谁让路：Wayland 那一侧写不上（合成器没有 data-control、
+    // arboard 起不来）时 XWayland 那半个桌面照样粘得出来，反过来也一样。原先
+    // Wayland 失败就直接返回，会把本来能成的那一侧一起带走。只有两边都没成，
+    // 这次发布才算失败。
+    if wayland {
+        match arboard_files(state, paths) {
+            Ok(()) => {
+                published.arboard = true;
+                // 以 arboard 真的落在 Wayland 上为准：合成器不给 data-control 时它会
+                // 退回 X11，那一笔写的其实也是 X11，写次数不会因此前进。
+                published.counted = state.wayland_clipboard;
+            }
+            Err(error) => {
+                tracing::debug!(error = format!("{error:#}"), "写入 Wayland 剪贴板失败");
+                failures.push(format!("{error:#}"));
+            }
+        }
+    }
+    match super::x11_offer::Offer::publish_files(paths.to_vec()) {
+        Ok(offer) => {
+            state.offer = Some(offer);
+            published.x11 = true;
+            // arboard 没落在 Wayland 上时它读的就是 X11，那一侧现在也是这一份。
+            published.arboard |= !state.wayland_clipboard;
+        }
+        Err(error) => {
+            state.offer = None;
+            tracing::debug!(error = format!("{error:#}"), "接管 X11 剪贴板失败");
+            failures.push(format!("{error:#}"));
+            // X11 会话里 arboard 自己就落在 X11 上，那条 offer 没成时只能退回它
+            // 的单格式。Wayland 会话里它写的是另一座孤岛，上面已经试过了。
+            if !wayland {
+                match arboard_files(state, paths) {
+                    Ok(()) => published.arboard = true,
+                    Err(error) => failures.push(format!("{error:#}")),
+                }
+            }
+        }
+    }
+    ensure!(
+        published.arboard || published.x11,
+        "写入系统剪贴板失败：{}",
+        failures.join("；")
+    );
+    Ok(published)
+}
+
+/// `publish_files` 写成了哪几侧。
+#[derive(Clone, Copy, Default)]
+struct Published {
+    /// arboard 那一侧（`read_wayland` 读的那一侧）挂上了这一份。
+    arboard: bool,
+    /// X11 那一侧挂的是我们的 offer。
+    x11: bool,
+    /// Wayland 那一侧写成了，写次数会因此前进：调用方要靠它决定要不要撤回还没被
+    /// 核销的那一格（见 `write_files`）。
+    counted: bool,
+}
+
+/// 让 arboard 挂上这一批文件：Wayland 会话里它写 Wayland 那一侧，X11 会话里它
+/// 就在 X11 上——而那时它一次只挂 `text/uri-list` 一个名字，GNOME 的文件管理器
+/// 只认 `x-special/gnome-copied-files`，所以它排在 X11 那条 offer 后面。
+fn arboard_files(state: &mut State, paths: &[PathBuf]) -> Result<()> {
+    let clipboard = state.clipboard.as_mut().context("系统剪贴板不可用")?;
+    clipboard
+        .set()
+        .file_list(paths)
+        .map_err(anyhow::Error::from)
+        .context("写入系统剪贴板失败")
 }
 
 fn write_image(state: &mut State, dib: &[u8]) -> Result<()> {
     let image = dib_to_rgba(dib)?;
     let clipboard = state.clipboard.as_mut().context("系统剪贴板不可用")?;
+    state.writes.wrote();
     state.writing = true;
     let result = clipboard.set_image(arboard::ImageData {
         width: image.0 as usize,
@@ -1130,12 +1411,16 @@ fn write_image(state: &mut State, dib: &[u8]) -> Result<()> {
         bytes: std::borrow::Cow::Owned(image.2),
     });
     state.writing = false;
+    if result.is_err() {
+        state.writes.not_written();
+    }
     result.context("写入系统剪贴板失败")?;
     state.local = LocalSnapshot {
         image: Some(dib.to_vec()),
         ..Default::default()
     };
-    state.tasks.clear();
+    state.remote = true;
+    state.retire();
     state.mounted = None;
     state.offer = None;
     Ok(())
@@ -1160,13 +1445,218 @@ fn trim_uri_path(path: PathBuf) -> PathBuf {
     PathBuf::from(std::ffi::OsString::from_vec(bytes[..trimmed].to_vec()))
 }
 
+/// 这一轮读哪一侧。
+///
+/// 有 watcher 时 Wayland 那一侧的变化由 `LocalChanged` 送来，只有 X11 那一侧还得
+/// 定时轮询；两件事拆开做，Wayland 那一侧就不必陪着每 400 毫秒读一遍（arboard 每
+/// 读一次都要新开一条连接，剪贴板里是图片时还要 PNG 解码一次）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Sides {
+    Both,
+    Wayland,
+    X11,
+}
+
+/// 这一轮该广播哪一份。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Copy {
+    /// 什么都不用发。
+    None,
+    /// 发 Wayland 那一侧读到的。
+    Wayland,
+    /// 发 X11 那一侧读到的。
+    X11,
+    /// 内容没变，把这一轮读到的 Wayland 那份重发一遍。
+    Again,
+}
+
+/// 这一轮真正要发出去的那一份。
+///
+/// `Again`（内容没变、只是又复制了一遍）发的必须是这一轮从 Wayland 读到的那份：
+/// 写次数只数那一侧，而手里那份 `local` 可能停在 X11 那侧的旧内容上——先在 Wayland
+/// 复制 A、再到 X11 复制 B、又回 Wayland 复制一次 A，对端该拿到 A，不是 B。
+fn publish<'a>(
+    choice: Copy,
+    wayland: &'a LocalSnapshot,
+    x11: &'a LocalSnapshot,
+) -> Option<&'a LocalSnapshot> {
+    match choice {
+        Copy::None => None,
+        Copy::Again | Copy::Wayland => Some(wayland),
+        Copy::X11 => Some(x11),
+    }
+}
+
+/// 把一侧这一轮读到的值与它「上次看到的」对一轮，返回「变了没有」，并把记录推进到
+/// 这一轮读到的值。
+///
+/// `empty_counts` 说空快照算不算一次变化：Wayland 那一侧的选择区被清空时要把本地
+/// 这份一起清掉；X11 那一侧「没人持有选择区」是常态（在 Wayland 里复制的东西那一
+/// 侧就没有），空的对比不算变化。
+///
+/// **自有副本（远端发来、我们挂上去的那份）也照记**：跳过它的话，这一侧就停在挂载
+/// 之前的值上，用户再复制一次挂载前那份内容时两边一模一样，被判成「没变」而发不
+/// 出去。
+fn observe(seen: &mut LocalSnapshot, read: &LocalSnapshot, empty_counts: bool) -> bool {
+    let changed = read != seen && (empty_counts || !read.is_empty());
+    *seen = read.clone();
+    changed
+}
+
+/// 这一轮该广播哪一份。`wayland` 是这一轮从 Wayland 那一侧读到的那份（发什么见
+/// `publish`），`again` 见 `poll_local`。
+///
+/// 单独拆出来是为了能测：里面几条规则都是踩过的坑，而它们只在真实的合成器与
+/// 桌面下才走得到。
+fn decide(changed: (bool, bool), wayland: &LocalSnapshot, again: bool) -> Copy {
+    let (wayland_changed, x11_changed) = changed;
+    match (x11_changed, wayland_changed) {
+        // 两侧同一轮都变了时让给 X11：XWayland 里的程序只在那一侧看得见，而
+        // Wayland 那一侧的变化更可能是我们自己的东西在动。
+        (true, _) => Copy::X11,
+        (false, true) => Copy::Wayland,
+        // 内容没变，但写次数前进了：有人把同一份又复制了一遍。对面（官方
+        // Windows 客户端粘完就把 offer 放掉）要一次新的 FormatList 才会重新
+        // 武装，所以把这一轮读到的那份再广播一遍。
+        //
+        // 这一条**不能**顺手把两侧都当成「变了」去走上面第一条：那样会挑中
+        // X11，把 X11 上的旧内容广播出去；它带 sources 的时候还会把本地那份
+        // 路径当成文件清单发给对端。
+        (false, false) if again && !wayland.is_empty() => Copy::Again,
+        (false, false) => Copy::None,
+    }
+}
+
 /// Read the local clipboard and, when it changed, announce the new formats.
-fn poll_local(state: &mut State) -> Result<()> {
+///
+/// 两个剪贴板都要读。X11 与 Wayland 在这里互不相通（见 `publish_files`）：XWayland
+/// 里的程序复制时 Wayland 那一侧什么都不会变，光看 Wayland 就等于看不见它们。
+/// `sides` 说明这一轮读哪一侧，没读的那一侧原样带过（见 `Sides`）。
+fn poll_local(state: &mut State, sides: Sides) -> Result<()> {
     if state.writing || state.sessions.is_empty() {
         return Ok(());
     }
-    let Some(clipboard) = state.clipboard.as_mut() else {
+    let wayland = if sides == Sides::X11 {
+        state.wayland.clone()
+    } else {
+        read_wayland(state)?
+    };
+    let x11 = if sides == Sides::Wayland {
+        state.x11.clone()
+    } else {
+        super::x11_read::read(state.wayland_clipboard)
+    };
+    // 自己挂上去的远端副本不算「本地复制」：发回去等于向远端要它刚给我们的东西。
+    let (own_wayland, own_x11) = (own_copy(&wayland.sources), own_copy(&x11.sources));
+    // 「哪一侧变了」和「各侧上次看到的是什么」一起算：自有副本也要记进去，否则用户
+    // 再复制一次挂载前那份内容时两侧都比不出来（见 `observe`）。
+    let moved = observe(&mut state.wayland, &wayland, true);
+    let wayland_changed = moved && !own_wayland;
+    let moved = observe(&mut state.x11, &x11, false);
+    let x11_changed = moved && !own_x11;
+    // 内容一个字节都没变时，只有写次数看得出来「又复制了一遍」。写次数只数 Wayland
+    // 那一侧（`LocalChanged`），所以这件事只在读了那一侧的轮次里认得出来，能重发的
+    // 也只有那一份。自己挂上去的副本不算本地复制；远端刚写进来的那份也不算——剪贴
+    // 板管理器（`wl-clip-persist` 一类）会在我们每次写入之后又认领一次，多出来的
+    // 那个计数会把刚收到的东西原样发回去。
+    let again = sides != Sides::X11
+        && state.writes.observe()
+        && !own_wayland
+        && !state.remote
+        && !wayland.is_empty();
+    let choice = decide((wayland_changed, x11_changed), &wayland, again);
+    let Some(snapshot) = publish(choice, &wayland, &x11) else {
         return Ok(());
+    };
+    // 内容一模一样就不必再发。`Again` 那条要的正是「再发一遍」，另外两条不能省：
+    // 刚把远端发来的文本写进本地剪贴板（`write_text`）之后，下一轮读回来的就是
+    // 那段文字本身，当成新复制发回去就是回声——文本和图片没有 `own_copy` 那样的
+    // 记号可认。
+    if choice != Copy::Again && *snapshot == state.local {
+        return Ok(());
+    }
+    if !snapshot.sources.is_empty() || !state.local.sources.is_empty() {
+        tracing::debug!(
+            files = snapshot.sources.len(),
+            text = snapshot.text.is_some(),
+            image = snapshot.image.is_some(),
+            "本地剪贴板已变化"
+        );
+    }
+    // 从这一刻起本地剪贴板上这一份是我们自己广播出去的本地复制，不再是远端写进来
+    // 的那份。
+    state.remote = false;
+    state.local = snapshot.clone();
+    // The previous copy is gone; a read still in flight against it now fails.
+    state.retire();
+    if state.local.is_empty() {
+        state.published.clear();
+        return Ok(());
+    }
+    let ids = state.local.format_ids();
+    for session in sessions(state) {
+        let links = formats::outgoing(
+            &ids,
+            session.platform.load(Ordering::Acquire),
+            session.file_allowed(),
+        );
+        // 本地复制的文件有没有真的广告出去：`advertised=0` 就是没发（文件权限被
+        // 关或格式全被过滤），对面那头自然什么都不动。
+        if !state.local.sources.is_empty() {
+            tracing::info!(
+                files = state.local.sources.len(),
+                files_allowed = session.file_allowed(),
+                advertised = links.len(),
+                formats = %links.iter().map(|f| f.wire.name.clone()).collect::<Vec<_>>().join(","),
+                "本地文件剪贴板已发布给对端"
+            );
+        }
+        if links.is_empty() {
+            state.published.remove(&session.id);
+            continue;
+        }
+        state.published.insert(session.id, links.clone());
+        session.emit(
+            session.epoch.load(Ordering::Acquire),
+            request(
+                session.next(),
+                ClipboardRequestKind::FormatList(ClipboardFormatListRequest {
+                    formats: links.into_iter().map(|format| format.wire).collect(),
+                    has_action: 0,
+                    drag_drop_action: None,
+                }),
+            ),
+        )?;
+        *lock(&session.error) = None;
+    }
+    Ok(())
+}
+
+/// 答一次 `FileGroupDescriptorW`。
+///
+/// 这个二进制块是官方 Windows 客户端会问的描述符形态，而它按名字问完就可能直接
+/// 来要 `FileContents`——**可能**不走 `FileDescListRequest`（对面那半见
+/// `accept_files`；它真实的请求顺序还没拿到日志，`formats.rs` 里那条修复的根因
+/// 恰恰是它会用固定的 0 去发这个请求）。所以清单要在这里就登记成任务，否则下一步
+/// 的 `FileContentsRequest` 会答「文件任务已失效」。登记用的是双方约定好的固定任务
+/// 号。
+fn descriptor_blob(state: &mut State, session: &Arc<Inner>) -> Result<Vec<u8>> {
+    tracing::debug!("对面来问 FileGroupDescriptorW 描述符块");
+    let key = (session.id, CLIPBOARD_TASK);
+    ensure!(
+        state.tasks.len() < 32 || state.tasks.contains_key(&key),
+        "文件任务过多"
+    );
+    let files = state.local_files()?;
+    state.tasks.insert(key, files.clone());
+    let descriptors: Vec<_> = files.items.iter().map(|file| file.desc.clone()).collect();
+    formats::descriptor_bytes(&descriptors, "不安全的文件名称")
+}
+
+/// Wayland 那一侧：进程里那个 arboard 实例。
+fn read_wayland(state: &mut State) -> Result<LocalSnapshot> {
+    let Some(clipboard) = state.clipboard.as_mut() else {
+        return Ok(LocalSnapshot::default());
     };
     // The whole outbound path starts here, so when files never reach the remote
     // this says whether they were on the local clipboard at all.
@@ -1189,85 +1679,32 @@ fn poll_local(state: &mut State) -> Result<()> {
         .map(trim_uri_path)
         .filter(|path| path.is_absolute())
         .collect::<Vec<_>>();
-    // A copy the remote sent is published as paths into this process's own
-    // filesystem, and under plain-text targets too. While it is still what the
-    // clipboard holds, nothing changed here: offering the paths back would
-    // ask the remote for the files it just gave us, and offering their text
-    // would replace the remote's copy with a path that only exists here.
-    if own_copy(&files) {
-        return Ok(());
-    }
-    let sources = files;
-    let snapshot = if !sources.is_empty() {
-        LocalSnapshot {
-            sources,
+    if !files.is_empty() {
+        return Ok(LocalSnapshot {
+            sources: files,
             ..Default::default()
-        }
-    } else if let Some(text) = clipboard.get_text().ok().filter(|text| !text.is_empty()) {
-        LocalSnapshot {
+        });
+    }
+    // A copy the remote sent is published as paths into this process's own
+    // filesystem, and under plain-text targets too. Offering their text would
+    // replace the remote's copy with a path that only exists here.
+    if let Some(text) = clipboard.get_text().ok().filter(|text| !text.is_empty()) {
+        return Ok(LocalSnapshot {
             text: Some(text),
             ..Default::default()
-        }
-    } else {
-        match clipboard.get_image() {
-            Ok(image) => LocalSnapshot {
-                image: Some(rgba_to_dib(
-                    image.width as u32,
-                    image.height as u32,
-                    &image.bytes,
-                )?),
-                ..Default::default()
-            },
-            Err(_) => LocalSnapshot::default(),
-        }
-    };
-    if snapshot.text == state.local.text
-        && snapshot.image == state.local.image
-        && snapshot.sources == state.local.sources
-    {
-        return Ok(());
+        });
     }
-    if !state.local.sources.is_empty() || !snapshot.sources.is_empty() {
-        tracing::debug!(
-            files = snapshot.sources.len(),
-            text = snapshot.text.is_some(),
-            image = snapshot.image.is_some(),
-            "本地剪贴板已变化"
-        );
+    match clipboard.get_image() {
+        Ok(image) => Ok(LocalSnapshot {
+            image: Some(rgba_to_dib(
+                image.width as u32,
+                image.height as u32,
+                &image.bytes,
+            )?),
+            ..Default::default()
+        }),
+        Err(_) => Ok(LocalSnapshot::default()),
     }
-    state.local = snapshot;
-    // The previous copy is gone; a read still in flight against it now fails.
-    state.tasks.clear();
-    if state.local.is_empty() {
-        state.published.clear();
-        return Ok(());
-    }
-    let ids = state.local.format_ids();
-    for session in sessions(state) {
-        let links = formats::outgoing(
-            &ids,
-            session.platform.load(Ordering::Acquire),
-            session.file_allowed(),
-        );
-        if links.is_empty() {
-            state.published.remove(&session.id);
-            continue;
-        }
-        state.published.insert(session.id, links.clone());
-        session.emit(
-            session.epoch.load(Ordering::Acquire),
-            request(
-                session.next(),
-                ClipboardRequestKind::FormatList(ClipboardFormatListRequest {
-                    formats: links.into_iter().map(|format| format.wire).collect(),
-                    has_action: 0,
-                    drag_drop_action: None,
-                }),
-            ),
-        )?;
-        *lock(&session.error) = None;
-    }
-    Ok(())
 }
 
 fn serve(
@@ -1280,17 +1717,43 @@ fn serve(
     match kind {
         ClipboardRequestKind::FormatDataAsk(ask) => {
             let result = (|| -> Result<Vec<u8>> {
-                let formats = state.published.get(&session.id).context("原剪贴板已失效")?;
-                let format = formats
+                let format = state
+                    .published
+                    .get(&session.id)
+                    .context("原剪贴板已失效")?
                     .iter()
                     .find(|format| {
                         format.wire.id == ask.format_id
                             && (ask.format_name.is_empty() || ask.format_name == format.wire.name)
                     })
-                    .context("未发布该剪贴板格式")?;
-                let data = state.local.data(format)?;
-                formats::convert(data, format, session.platform.load(Ordering::Acquire), true)
-            })();
+                    .context("未发布该剪贴板格式")?
+                    .clone();
+                // 官方 Windows 客户端会按名字来问这个二进制块（DWORD 个数 + N ×
+                // 592 字节的 FILEDESCRIPTORW），答不上就不再往下问 FileContents，
+                // 粘贴永远不动。它是不是**总是**跳过 `FileDescListRequest` 还没拿到
+                // 日志，见 `descriptor_blob`。我们自己两个客户端之间看不出这件事
+                // ——我们走的是 FileDescList。
+                if format.wire.name == "FileGroupDescriptorW" {
+                    return descriptor_blob(state, session);
+                }
+                let data = state.local.data(&format)?;
+                formats::convert(
+                    data,
+                    &format,
+                    session.platform.load(Ordering::Acquire),
+                    true,
+                )
+            })()
+            .inspect_err(|error| {
+                // 官方客户端是逐个格式来问的，答不上哪一条只在这里看得出来；
+                // 之前这里一声不吭，「粘贴不动」在日志里什么都没有。
+                tracing::info!(
+                    format = %ask.format_name,
+                    format_id = ask.format_id,
+                    %error,
+                    "剪贴板格式答不上"
+                );
+            });
             match result {
                 Ok(data) if !data.is_empty() => {
                     session.enqueue(Outbound::Blocks(epoch, id, ask.block_key, data))
@@ -1309,6 +1772,12 @@ fn serve(
             }
         }
         ClipboardRequestKind::FileDescListRequest(ask) => {
+            // 对面走的是哪一条路，只有这里看得出来：官方客户端可能不发这一条
+            // （见 `descriptor_blob`），所以「它有没来过」本身就是证据。
+            tracing::debug!(
+                task_id = ask.task_id,
+                "对面来问文件清单（FileDescListRequest）"
+            );
             let explicit = drag_list(state, session, ask.task_id);
             let dragged = explicit.is_some() || session.file_offers.is_some();
             let result = (|| -> Result<Arc<LocalFiles>> {
@@ -1325,7 +1794,7 @@ fn serve(
                 );
                 ensure!(!state.local.sources.is_empty(), "本地剪贴板没有文件");
                 ensure!(state.tasks.len() < 32, "文件任务过多");
-                Ok(Arc::new(collect_files(&state.local.sources)?))
+                state.local_files()
             })();
             let Ok(files) = result else {
                 return session.emit(
@@ -1388,6 +1857,14 @@ fn serve(
             session.enqueue(Outbound::Packets(epoch, messages))
         }
         ClipboardRequestKind::FileContentsRequest(ask) => {
+            // 和上一条配着看：跳过 FileDescListRequest 的对面会直接来这里，
+            // task_id 也说明它是接着哪一次答的清单。
+            tracing::debug!(
+                task_id = ask.task_id,
+                list_index = ask.list_index,
+                pos_offset = ask.pos_offset,
+                "对面来要文件内容（FileContentsRequest）"
+            );
             let result = if session.file_allowed() {
                 state
                     .tasks
@@ -1526,7 +2003,7 @@ fn dib_to_rgba(dib: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
     Ok((width, height, rgba))
 }
 
-fn rgba_to_dib(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>> {
+pub(super) fn rgba_to_dib(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>> {
     ensure!(width > 0 && height > 0, "图片尺寸无效");
     let pixels = width as usize * height as usize;
     ensure!(rgba.len() >= pixels * 4, "图片数据不完整");
@@ -1556,6 +2033,148 @@ fn rgba_to_dib(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn local_text(text: &str) -> LocalSnapshot {
+        LocalSnapshot {
+            text: Some(text.into()),
+            ..Default::default()
+        }
+    }
+
+    fn local_paths(paths: &[&str]) -> LocalSnapshot {
+        LocalSnapshot {
+            sources: paths.iter().map(PathBuf::from).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// 复制完 A 之后又复制了一遍 A：内容逐字段相同，只有写次数前进。这时要重
+    /// 发手里这份。原先的实现（靠一个 `written` 标志）会把两侧都当成「变了」，
+    /// 于是走「两边都变了让给 X11」那条，把 X11 上的旧内容广播出去——带
+    /// `sources` 时还会把本地路径当文件清单发给对端。
+    #[test]
+    fn a_repeated_copy_of_the_same_thing_is_announced_again() {
+        let files = local_paths(&["/home/a/b.txt"]);
+        assert_eq!(
+            decide((false, false), &files, true),
+            Copy::Again,
+            "写次数前进、内容没变时要重发手里这份"
+        );
+        assert_eq!(
+            decide((false, false), &files, false),
+            Copy::None,
+            "内容没变、写次数也没动就不该发"
+        );
+    }
+
+    /// 重复复制时重发的是这一轮从 Wayland 读到的那份，不是手里那份。先在 Wayland
+    /// 复制 A、再到 X11 复制 B、然后又回 Wayland 复制一次 A，对端该拿到 A 而不是
+    /// B——`Again` 从前发的是 `state.local`，而它那时停在 X11 的旧内容上。
+    #[test]
+    fn a_repeated_copy_publishes_the_wayland_side_not_the_clipboard() {
+        let a = local_text("A");
+        let b = local_text("B");
+        let choice = decide((false, false), &a, true);
+        assert_eq!(choice, Copy::Again, "写次数前进、内容没变时要重发");
+        assert_eq!(publish(choice, &a, &b), Some(&a));
+        assert_ne!(publish(choice, &a, &b), Some(&b));
+    }
+
+    /// 自己挂上去的那份自有副本也要记进这一侧的「上次看到的」。跳过它的话，这一侧
+    /// 就停在挂载之前的值上，用户再复制一次挂载前那份内容时两边一模一样，被判成
+    /// 「没变」而发不出去。
+    #[test]
+    fn an_own_copy_still_advances_what_the_side_looked_like() {
+        let before = local_text("user-D");
+        let mounted = local_paths(&["/run/user/1000/openuuyc/7/0"]);
+        let mut seen = before.clone();
+        // 远端发来文件、我们把它挂上本地剪贴板：这一侧读到的是挂载点那份。
+        assert!(observe(&mut seen, &mounted, true));
+        assert_eq!(seen, mounted, "自有副本也要记进去");
+        // 用户再复制一次挂载前那份：和挂载点那份不同，照样认得出来。
+        assert!(observe(&mut seen, &before, true));
+    }
+
+    /// 空快照算不算一次变化：Wayland 那一侧清空要跟着清，X11 那一侧空着是常态。
+    #[test]
+    fn an_empty_x11_selection_is_not_a_change() {
+        let mut seen = local_text("A");
+        assert!(!observe(&mut seen, &LocalSnapshot::default(), false));
+        let mut seen = local_text("A");
+        assert!(observe(&mut seen, &LocalSnapshot::default(), true));
+    }
+
+    /// 手里什么都没有时没有可重发的。
+    #[test]
+    fn nothing_to_repeat_when_the_clipboard_is_empty() {
+        assert_eq!(
+            decide((false, false), &LocalSnapshot::default(), true),
+            Copy::None
+        );
+    }
+
+    /// 两侧同一轮都变了让给 X11：XWayland 里的程序只在那一侧看得见，而 Wayland
+    /// 那一侧的变化更可能是我们自己的东西在动。
+    #[test]
+    fn x11_wins_when_both_sides_changed() {
+        let current = local_text("手里这份");
+        // 参数是 (Wayland 变了, X11 变了)。
+        assert_eq!(decide((true, true), &current, false), Copy::X11);
+        assert_eq!(decide((false, true), &current, false), Copy::X11);
+        assert_eq!(decide((true, false), &current, false), Copy::Wayland);
+        assert_eq!(decide((false, false), &current, false), Copy::None);
+    }
+
+    /// 自己写进剪贴板的那几次会被合成器数进去，不能当成用户复制。
+    #[test]
+    fn our_own_writes_are_not_counted_as_user_copies() {
+        let mut writes = Writes::default();
+        // 把远端发来的文本写进本地剪贴板：那一次前进是自己的。
+        writes.wrote();
+        writes.tick();
+        assert!(!writes.observe(), "自己写的那一次不该被当成用户复制");
+        // 用户随后复制了同一份东西：这一次才算。
+        writes.tick();
+        assert!(writes.observe(), "用户自己的那一次要认出来");
+        // 又一次自己的写。
+        writes.wrote();
+        writes.tick();
+        assert!(!writes.observe());
+    }
+
+    /// 写下去到事件到达之间用户自己复制了一次：写次数一次前进两格，一格是自己
+    /// 的、一格是用户的，不能把用户那次一起吃掉。
+    #[test]
+    fn a_user_copy_between_our_write_and_its_event_still_counts() {
+        let mut writes = Writes::default();
+        writes.wrote();
+        writes.tick();
+        writes.tick();
+        assert!(writes.observe());
+        // 已经吃过的那一格不会再吃第二遍。
+        assert!(!writes.observe());
+    }
+
+    /// 本机这台 Wayland 桌面上，X11 与 Wayland 的剪贴板互不相通（实测 `xclip`
+    /// 写的 `wl-paste` 看不见，反过来也一样），所以文件复制只写 X11 那条 offer
+    /// 时，Wayland 原生的文件管理器根本读不到 `text/uri-list`——伸手粘贴什么也
+    /// 没有。这条验证 arboard 的 Wayland 后端确实能把文件挂上去，也就是
+    /// `publish_files` 那一步的前提。
+    #[test]
+    #[ignore = "会占用真实剪贴板，需要 Wayland 会话"]
+    fn file_copies_reach_the_wayland_selection() {
+        let path = std::env::temp_dir().join("openuuyc-clipboard-probe.txt");
+        std::fs::write(&path, b"probe").unwrap();
+        let mut clipboard = arboard::Clipboard::new().unwrap();
+        clipboard
+            .set()
+            .file_list(std::slice::from_ref(&path))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        let read = clipboard.get().file_list().unwrap_or_default();
+        println!("从剪贴板读回 {read:?}");
+        assert_eq!(read, vec![path]);
+    }
 
     fn read_tree(path: &Path, out: &mut Vec<(String, Vec<u8>)>, base: &Path) {
         if path.is_dir() {
@@ -1764,5 +2383,32 @@ mod tests {
             &[PathBuf::from("/run/user/1000/openuuyc/clipboard-other/x")],
             parent
         ));
+    }
+
+    #[test]
+    fn remote_copies_under_a_symlinked_runtime_dir_are_still_ours() {
+        let base = std::env::temp_dir().join(format!("openuuyc-runtime-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let real = base.join("real");
+        let link = base.join("link");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let root = super::super::fuse::root_under(&link);
+        let file = root.join("7/a.txt");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, b"a").unwrap();
+        // What the clipboard hands back after arboard wrote our mount's path.
+        let published = std::fs::canonicalize(&file).unwrap();
+        assert!(own_paths(std::slice::from_ref(&published), &root));
+        // The unresolved root is what used to be compared, and it misses.
+        let raw = link.join("openuuyc").join("clipboard");
+        assert!(!own_paths(&[published], &raw));
+        // A runtime directory that cannot be resolved falls back to the raw path.
+        let missing = base.join("missing");
+        assert_eq!(
+            super::super::fuse::root_under(&missing),
+            missing.join("openuuyc").join("clipboard")
+        );
+        std::fs::remove_dir_all(&base).unwrap();
     }
 }

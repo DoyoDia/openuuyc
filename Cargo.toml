@@ -1,6 +1,6 @@
 [package]
 name = "openuuyc"
-version = "1.0.2-beta.1"
+version = "1.0.2-beta.3"
 edition = "2024"
 description = "Third-party Rust client for UU Remote protocol interoperability"
 license-file = "LICENSE"
@@ -31,7 +31,9 @@ depends = """$auto, fuse3, libx11-6, libx11-xcb1, libxcursor1, libxrandr2, libxi
 libxfixes3, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, \
 libvulkan1 | libegl1, \
 fonts-noto-cjk | fonts-wqy-microhei | fonts-arphic-uming"""
-recommends = "libpulse0, libpipewire-0.3-0, gnome-keyring | kwalletmanager"
+# gio (libglib2.0-bin) and rsvg-convert (librsvg2-bin) draw the host's drag
+# preview images; without them a drag goes out with no image.
+recommends = "libpulse0, libpipewire-0.3-0, gnome-keyring | kwalletmanager, libglib2.0-bin, librsvg2-bin"
 suggests = "ethtool"
 assets = [
     ["target/release/OpenUUYC", "usr/bin/", "755"],
@@ -209,8 +211,9 @@ wayland-protocols-misc = { version = "0.3", default-features = false, features =
 wayland-protocols = { version = "0.32", default-features = false, features = ["client", "staging", "unstable"] }
 # wlr-screencopy, the compositor's own copy protocol: niri, wlroots and
 # everything built on them serve it, and unlike the portal it never asks the
-# local user for consent.
-wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+# local user for consent. The same crate also gives the layer shell, which the
+# Wayland drag-out catcher puts its transparent surface on.
+wayland-protocols-wlr = { version = "0.3", default-features = false, features = ["client"] }
 libc = "0.2"
 fuser = { version = "0.15", default-features = false }
 x11rb = { version = "0.13", features = ["dpms", "randr", "shm", "xfixes", "xtest"] }

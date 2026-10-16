@@ -32,6 +32,7 @@ optdepends=(
     'xdg-desktop-portal-kde: ScreenCast portal on KDE'
     'vulkan-swrast: software Vulkan for old GPUs and VMs'
     'ethtool: remote power-on NIC check'
+    'librsvg: SVG file-type icons in host drag preview images'
 )
 provides=('openuuyc')
 conflicts=('openuuyc' 'openuuyc-git')

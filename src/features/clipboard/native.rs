@@ -1447,26 +1447,6 @@ fn parse_descriptors(bytes: &[u8]) -> Result<Vec<ClipboardFileDescriptor>> {
     }
     Ok(out)
 }
-fn descriptor_bytes(items: &[ClipboardFileDescriptor]) -> Result<Vec<u8>> {
-    ensure!(items.len() <= MAX_FILES, "文件数量过多");
-    let mut bytes = vec![0; 4 + items.len() * 592];
-    bytes[..4].copy_from_slice(&(items.len() as u32).to_le_bytes());
-    for (b, f) in bytes[4..].chunks_exact_mut(592).zip(items) {
-        ensure!(safe_name(&f.file_name), "不安全的远端文件名称");
-        b[..4].copy_from_slice(&0x4064u32.to_le_bytes());
-        b[36..40].copy_from_slice(&f.file_attributes.to_le_bytes());
-        b[56..64].copy_from_slice(&f.last_write_time.to_le_bytes());
-        b[64..68].copy_from_slice(&((f.file_size >> 32) as u32).to_le_bytes());
-        b[68..72].copy_from_slice(&(f.file_size as u32).to_le_bytes());
-        for (out, c) in b[72..]
-            .chunks_exact_mut(2)
-            .zip(f.file_name.replace('/', "\\").encode_utf16())
-        {
-            out.copy_from_slice(&c.to_le_bytes());
-        }
-    }
-    Ok(bytes)
-}
 pub(super) struct RemoteOffer {
     file_operation: bool,
     failure: Mutex<Option<String>>,
@@ -1748,7 +1728,13 @@ impl IDataObject_Impl for RemoteData_Impl {
             });
         }
         let data = if id == formats::register("FileGroupDescriptorW") {
-            descriptor_bytes(&self.offer.list().map_err(com_error)?).map_err(com_error)?
+            // 编码器在 `formats` 里：Linux 生产端答 `FileGroupDescriptorW`
+            // 时用的是同一份，两边各存一个迟早会漂。
+            formats::descriptor_bytes(
+                &self.offer.list().map_err(com_error)?,
+                "不安全的远端文件名称",
+            )
+            .map_err(com_error)?
         } else {
             let cache = lock(&self.offer.cached).get(&id).cloned();
             if let Some(v) = cache {

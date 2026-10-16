@@ -100,11 +100,20 @@ impl Image {
     }
 }
 
-/// A backend's picture before it is scaled: tightly packed BGRA rows.
+/// A backend's picture before it is scaled: tightly packed BGRA rows, or NV12
+/// converted on the GPU.
 pub(super) struct Picture {
+    /// The size of the captured region: the BGRA `pixels` with no `nv12`, the
+    /// cropped source with one. The GPU converter may already have scaled
+    /// that frame, so its geometry is `nv12.size()`, not this.
     pub width: u32,
     pub height: u32,
+    /// BGRA rows of `width * 4` bytes; empty when `nv12` carries the frame.
     pub pixels: Vec<u8>,
+    /// The frame converted on the GPU (portal stream only), at the output
+    /// geometry the worker had requested through the stream's `set_target`
+    /// when the picture arrived (the crop size before any request). A quality
+    /// change can make it stale.
     pub nv12: Option<Arc<super::gpu_convert::OwnedNv12>>,
 }
 
@@ -154,7 +163,7 @@ pub(crate) fn screens() -> Result<Vec<Screen>> {
 }
 
 /// Whether this is a Wayland session, where X11 sees only XWayland clients.
-pub(super) fn wayland_session() -> bool {
+pub(crate) fn wayland_session() -> bool {
     std::env::var_os("WAYLAND_DISPLAY").is_some()
         || std::env::var("XDG_SESSION_TYPE").is_ok_and(|kind| kind == "wayland")
 }
@@ -398,6 +407,12 @@ impl Desktop {
         {
             self.backend = Backend::NvFbc(nvfbc::Grab::open(&self.screen, cursor, wanted)?);
         }
+        // The portal converter derives its output from each picture's own size.
+        // Hand it the current request so a controller quality that differs from
+        // the source is scaled on the GPU instead of read back to the CPU.
+        if let Backend::Portal(grab) = &self.backend {
+            grab.set_target(Some((quality, maximum)));
+        }
         self.cursor = match self.sampler.sample() {
             Ok(pointer) => Some(pointer),
             Err(error) => {
@@ -469,6 +484,9 @@ impl Desktop {
                     Ok(Some(picture)) => {
                         let size = output(picture.width, picture.height, quality, maximum);
                         if let Some(frame) = picture.nv12 {
+                            // The converter already produced `size`; a mismatch
+                            // would mean a stale target, so keep the GPU frame
+                            // only when it matches and fall back otherwise.
                             if size == frame.size() {
                                 self.available = true;
                                 self.last_size = size;
@@ -481,10 +499,20 @@ impl Desktop {
                                     hdr_metadata: None,
                                 }));
                             }
+                            // The converter produced a different geometry than
+                            // the current request (a stale target during a
+                            // quality change). Scale from the frame's own size,
+                            // not the source crop, and let the next frame use
+                            // the refreshed target.
                             let pixels = frame.pixels()?;
+                            let from = frame.size();
                             Ok(Some((
                                 size,
-                                scale(&pixels, (picture.width, picture.height), size),
+                                if from == size {
+                                    pixels
+                                } else {
+                                    scale(&pixels, from, size)
+                                },
                             )))
                         } else {
                             let image = if size == (picture.width, picture.height) {
