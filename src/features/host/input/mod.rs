@@ -428,9 +428,12 @@ fn run(
         }
         // 有人（Wayland 上摆好接取面的那条路）请指针在原地动一下：合成器只在指针
         // 动过之后才重新判定指针底下是谁。见
-        // `platform::linux::input::realign_pointer`。
+        // `platform::linux::input::realign_pointer`。这也是一次注入，所以和别的
+        // 输入一样要在许可之内（`generation` 只在许可之内才有值）；请求照样取走，
+        // 许可收回时不会攒到之后再报。
         #[cfg(target_os = "linux")]
         if realign.try_recv().is_ok()
+            && generation.is_some()
             && let Some(engine) = engine.as_mut()
         {
             match engine.realign_pointer() {
