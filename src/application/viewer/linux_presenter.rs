@@ -1768,6 +1768,9 @@ impl Player {
             .inner
             .clicked()
         {
+            if !controlling {
+                crate::ui::controls::clear_notice(row.ctx(), "remote-input-error");
+            }
             self.set_control(!controlling);
         }
 
@@ -1984,14 +1987,17 @@ impl Player {
         }
     }
 
+    /// 开关键鼠控制，和 Windows 顶栏的键鼠按钮同一套：打开时用这台设备记住的鼠标模式
+    /// （串流设置里选的），失败记进共享的键鼠状态，由每帧调用的
+    /// `show_stream_control_window` 弹出「控制已停止」。
     fn set_control(&mut self, enabled: bool) {
         let mode = if enabled {
-            MouseMode::Smart
+            self.control().snapshot().mouse_preference
         } else {
             MouseMode::View
         };
         if let Err(error) = self.control().set_mouse_mode(mode) {
-            self.report("键鼠控制", format!("{error:#}"));
+            self.input().fail(error.to_string());
         }
         if !enabled {
             self.release_keys();
