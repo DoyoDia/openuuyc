@@ -174,6 +174,21 @@ fn window_title_bar_impl(
     } else {
         caption_rect
     };
+    // 让调用方画标题时（设备切换按钮），这一格也要像 Windows 的 caption 那样封顶，
+    // 否则长别名会一直画到屏标签那一行上。
+    let brand_rect = if identity.is_some() {
+        egui::Rect::from_min_max(
+            brand_rect.min,
+            egui::pos2(
+                (brand_rect.left()
+                    + crate::ui::theme::VIEWER_IDENTITY_MAX_WIDTH.min(brand_rect.width()))
+                .min(brand_rect.right()),
+                brand_rect.max.y,
+            ),
+        )
+    } else {
+        brand_rect
+    };
     let mut caption = ui.new_child(
         egui::UiBuilder::new()
             .max_rect(brand_rect)

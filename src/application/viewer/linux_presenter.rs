@@ -1582,7 +1582,8 @@ impl Player {
         }
 
         // 这三样是 Windows 播放器里才有的东西：插件面板和批注整套界面都在那边，
-        // 1:1 的「固定左上角」在 Wayland 下也没有可写的地方（合成器不给客户端摆窗口）。
+        // 1:1 也还没做（Windows 那边只是往右下 request_inner_size，不挪窗口，
+        // Wayland 上也做得到）。
         for (icon, hint) in [
             (ViewerCaptionIcon::Plugins, "Linux 主控还没有插件面板"),
             (ViewerCaptionIcon::Annotation, "Linux 主控还没有批注"),
@@ -1604,7 +1605,7 @@ impl Player {
         } else if mic.enabled {
             "麦克风已开启，等待远端应用使用，点击关闭"
         } else {
-            "将所选麦克风发送到远端（设备可在串流设置中切换）"
+            "将所选麦克风发送到远端（设备可在高级设置中切换）"
         };
         let control = self.session.stream_control.snapshot();
         if row
