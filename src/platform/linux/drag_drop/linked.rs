@@ -181,10 +181,14 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 /// 一次性的管道；`receive` 只认 fd。
+///
+/// `O_CLOEXEC` 不能省：这个进程会 spawn 一堆子进程（被控端的 agent、门户、
+/// 编码器），写端被它们一起继承的话，对端写完关闭之后我们这头也等不到 EOF——
+/// 清单永远读不完，拖动就一直停在「正在准备文件」。测试并行跑时踩到过一次。
 fn pipe() -> Option<(OwnedFd, OwnedFd)> {
     let mut fds = [0i32; 2];
     // SAFETY: 两个 fd 都是这里创建的，立刻被 OwnedFd 接管。
-    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
         return None;
     }
     // SAFETY: `pipe` 成功时两个 fd 都是新的、有效的。
