@@ -58,7 +58,9 @@ const HOVER_LIMIT: Duration = Duration::from_secs(30);
 /// 本机的一次拖动，此刻悬停在这个观看窗口上的样子。
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Hovering {
-    /// 窗口内的物理像素，和 winit 的 `PhysicalPosition` 同一套。
+    /// 窗口内的表面坐标：`wl_data_device` 报的**逻辑**坐标，本机缩放 1.35 时
+    /// 和物理像素差着一整个比例。要用它当 winit 的 `PhysicalPosition` 得先乘
+    /// 缩放（见 `linux_drag`），直接混用会让整个落点偏出去。
     pub position: (f64, f64),
     pub paths: Vec<PathBuf>,
     /// 这次读到的是不是「已经落下」——落点和悬停走同一套上报。

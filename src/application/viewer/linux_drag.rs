@@ -112,7 +112,7 @@ impl WindowDrag {
         point: impl Fn(PhysicalPosition<f64>) -> Option<Point>,
     ) {
         if let Some(linked) = self.linked.clone() {
-            self.tick_wayland(&linked, ctx, available, point);
+            self.tick_wayland(window, &linked, ctx, available, point);
             return;
         }
         if !self.dropped.is_empty() {
@@ -149,6 +149,7 @@ impl WindowDrag {
     /// 而且是另一条 `wl_data_device` 上的同一份事件，不带上位置就没法用。
     fn tick_wayland(
         &mut self,
+        window: &Window,
         linked: &Linked,
         ctx: &egui::Context,
         available: bool,
@@ -161,7 +162,10 @@ impl WindowDrag {
             return;
         };
         ctx.request_repaint_after(Duration::from_millis(30));
-        let position = PhysicalPosition::new(hover.position.0, hover.position.1);
+        // 协议报的是 surface-local（逻辑）坐标，winit 的 `PhysicalPosition` 是
+        // 物理像素：本机 DP-1 缩放 1.35，直接当物理用会整体偏到左上角去。
+        let scale = f64::from(window.scale_factor());
+        let position = PhysicalPosition::new(hover.position.0 * scale, hover.position.1 * scale);
         let target = point(position).filter(|_| available);
         if !self.hovering {
             // `leave` 会把上一份清单清掉，所以清单要在它之后再补。
