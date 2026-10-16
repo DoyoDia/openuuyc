@@ -283,6 +283,7 @@ pub(crate) fn request_uninstall(removal: super::RemovalOptions) -> Result<bool> 
     startup::set(false)?;
     integration::shortcuts(false)?;
     crate::platform::windows::notifications::unregister(&notification_image)?;
+    crate::platform::windows::assist_link::disable().context("交回 uuremote:// 协助链接失败")?;
     if removal.remove_data && !reboot {
         data::user()?;
     }

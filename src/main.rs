@@ -23,6 +23,9 @@ use openuuyc::session::controller;
     about = "OpenUUYC — 第三方 UU 远程协议兼容客户端"
 )]
 struct Cli {
+    /// 系统按 `uuremote://` 协议注册拉起的协助链接
+    #[arg(value_name = "URL", hide = true)]
+    link: Option<String>,
     #[arg(long, hide = true)]
     bootstrap_version: bool,
     /// 日志过滤器，例如 info、debug、trace 或 openuuyc=trace
@@ -153,7 +156,7 @@ enum Commands {
 
 fn main() -> Result<()> {
     openuuyc::application::bootstrap::initialize()?;
-    let parsed = Cli::try_parse();
+    let parsed = parse_cli();
 
     if !parsed.as_ref().is_ok_and(|cli| {
         matches!(
@@ -178,6 +181,7 @@ fn main() -> Result<()> {
         println!("1");
         return Ok(());
     }
+    let link = cli.link.clone();
     let command = cli.command.unwrap_or(Commands::Gui {
         background: false,
         fps: None,
@@ -194,17 +198,18 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let _instance = if matches!(command, Commands::Gui { .. }) {
-        match if matches!(
-            command,
-            Commands::Gui {
-                background: true,
-                ..
-            }
-        ) {
-            app::instance::acquire_background()?
-        } else {
-            app::instance::acquire()?
-        } {
+        let activation = match (link.as_deref(), &command) {
+            // 链接是用户点出来的，哪怕这次是后台启动也得把窗口叫出来。
+            (Some(uri), _) => app::instance::Activation::Link(uri),
+            (
+                None,
+                Commands::Gui {
+                    background: true, ..
+                },
+            ) => app::instance::Activation::Quiet,
+            (None, _) => app::instance::Activation::Show,
+        };
+        match app::instance::acquire(activation)? {
             Some(instance) => Some(instance),
             None => {
                 openuuyc::application::bootstrap::handoff();
@@ -333,6 +338,7 @@ fn main() -> Result<()> {
                 background,
                 media: options,
                 startup_warning,
+                link,
             })
         }
         Commands::Login => {
@@ -377,6 +383,37 @@ fn main() -> Result<()> {
         openuuyc::application::launch_installed(std::env::args_os().skip(1))?;
     }
     result
+}
+
+/// 协议注册把链接当作第一个参数交给程序，所以根上有一个位置参数。子命令名
+/// 要优先当子命令，否则 `OpenUUYC gui` 会被读成一条链接。
+fn parse_cli() -> std::result::Result<Cli, clap::Error> {
+    use clap::{CommandFactory, FromArgMatches};
+    let args: Vec<_> = std::env::args_os().collect();
+    let has_link = args.iter().skip(1).any(|a| {
+        a.to_string_lossy()
+            .to_ascii_lowercase()
+            .starts_with("uuremote:")
+    });
+    // An OS protocol activation is a single argument, never a second command.
+    // Clap diagnostics must not echo an invite or its verification code.
+    if has_link && args.len() != 2 {
+        return Err(clap::Error::raw(
+            clap::error::ErrorKind::InvalidValue,
+            "协助链接启动参数无效",
+        ));
+    }
+    let matches = Cli::command()
+        .subcommand_precedence_over_arg(true)
+        .try_get_matches_from(args)
+        .map_err(|error| {
+            if has_link {
+                clap::Error::raw(clap::error::ErrorKind::InvalidValue, "协助链接启动参数无效")
+            } else {
+                error
+            }
+        })?;
+    Cli::from_arg_matches(&matches)
 }
 
 fn attach_parent_console() {
