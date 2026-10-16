@@ -114,6 +114,12 @@ jobs:
             OpenUUYC-*-x86_64-linux.tar.zst
             OpenUUYC-*-x86_64-linux.tar.zst.sha256
             OpenUUYC
+          # v<version>-linux.<n>: the Cargo version names the release, and an
+          # alpha, beta or rc version is published as a pre-release like upstream.
+          name: OpenUUYC ${{ github.ref_name }}
+          prerelease: ${{ contains(github.ref_name, '-alpha') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-rc') }}
+          # Lists the fork PRs merged since the previous tag after the body.
+          generate_release_notes: true
           # The LICENSE reserves all rights on original material and requires
           # attribution and third-party notices; say so before anyone downloads.
           body: |
