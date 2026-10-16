@@ -465,8 +465,6 @@ impl LocalSnapshot {
 const FILE_ATTRIBUTE_READONLY: u32 = 0x1;
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
 const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
-/// Seconds between the Windows epoch (1601-01-01) and the Unix one.
-const FILETIME_EPOCH_OFFSET: u64 = 11_644_473_600;
 
 /// A Unix mtime as the FILETIME a Windows peer stamps the pasted file with.
 fn filetime(meta: &std::fs::Metadata) -> u64 {
@@ -476,7 +474,7 @@ fn filetime(meta: &std::fs::Metadata) -> u64 {
     }
     let ticks = (seconds + FILETIME_EPOCH_OFFSET as i64) as u64;
     ticks
-        .saturating_mul(10_000_000)
+        .saturating_mul(TICKS_PER_SECOND)
         .saturating_add(meta.mtime_nsec().max(0) as u64 / 100)
 }
 
@@ -1829,7 +1827,11 @@ fn serve(
                     segments.push(std::mem::take(&mut current));
                     bytes = 0;
                 }
-                current.push(item.desc.clone());
+                // 线上发 Unix 秒（见 `wire_seconds`）：官方客户端按秒读，
+                // 而我们内部、以及给 Windows 的 FILEDESCRIPTORW 里都是 ticks。
+                let mut wire = item.desc.clone();
+                wire.last_write_time = wire_seconds(wire.last_write_time);
+                current.push(wire);
                 bytes += size;
             }
             if !current.is_empty() {

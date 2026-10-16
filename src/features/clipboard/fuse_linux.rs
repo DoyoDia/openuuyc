@@ -19,14 +19,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use super::protocol::ClipboardFileDescriptor;
+use super::protocol::{ClipboardFileDescriptor, local_mtime};
 
 /// How long the kernel may trust an attribute or lookup. The tree never changes
 /// once mounted -- a new copy gets a new directory -- so this only bounds how
 /// long a stale generation stays visible after it is retired.
 const TTL: Duration = Duration::from_secs(60);
-/// Seconds between the Windows epoch (1601-01-01) and the Unix one.
-const FILETIME_EPOCH_OFFSET: u64 = 11_644_473_600;
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
 /// The kernel asks for at most this much in one `read`; the protocol caps a
 /// single `FileContentsRequest` lower, so a read may take several of them.
@@ -50,15 +48,6 @@ impl Node {
     const fn is_dir(&self) -> bool {
         self.index.is_none()
     }
-}
-
-/// A Windows FILETIME as the local clock reads it.
-fn mtime(filetime: u64) -> SystemTime {
-    let seconds = filetime / 10_000_000;
-    let nanos = (filetime % 10_000_000) as u32 * 100;
-    seconds
-        .checked_sub(FILETIME_EPOCH_OFFSET)
-        .map_or(UNIX_EPOCH, |unix| UNIX_EPOCH + Duration::new(unix, nanos))
 }
 
 /// One remote copy, laid out as a tree. Names arrive flat, each relative to the
@@ -125,7 +114,7 @@ impl Tree {
                 parent,
                 index: Some(index),
                 size: descriptor.file_size,
-                mtime: mtime(descriptor.last_write_time),
+                mtime: local_mtime(descriptor.last_write_time),
                 children: Vec::new(),
             },
         );
