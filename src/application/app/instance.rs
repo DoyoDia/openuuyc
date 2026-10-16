@@ -1,5 +1,16 @@
 //! One control center per desktop login session, independent of the EXE name.
-use anyhow::Result;
+
+/// 第二个进程要不要把已经在跑的控制中心叫到前台，以及顺带交给它的东西。
+#[derive(Clone, Copy)]
+pub enum Activation<'a> {
+    /// 再点一次图标：把窗口叫出来就行。
+    Show,
+    /// 系统按 `uuremote://` 协议注册拉起的协助链接。链接原样转发，由接手的
+    /// 那个进程解析——窗口消息只负责搬运。
+    Link(&'a str),
+    /// 后台启动，不打扰已经在跑的实例。
+    Quiet,
+}
 
 #[cfg(windows)]
 mod platform {
@@ -16,9 +27,17 @@ mod platform {
     };
     use windows::core::{BOOL, PCWSTR, w};
 
+    use super::Activation;
+
     pub struct Instance(HANDLE);
     const SHOW_SUBCLASS: usize = 0x4f554943;
-    const NOTIFICATION_MESSAGE: usize = 0x4f554e54;
+    /// 激活链接在 WM_COPYDATA 上的标记；通知按钮和协助链接共用一条通道，
+    /// 由 URI 的 scheme 区分。
+    const ACTIVATION_MESSAGE: usize = 0x4f554e54;
+    /// 一条激活链接的上限：协助链接要带上设备 ID、验证码和几个来源参数。
+    const MAX_ACTIVATION: usize = 1024;
+    const DELIVER_ATTEMPTS: usize = 5;
+    const DELIVER_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
     static UPDATE_EXIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     pub(crate) fn take_update_exit() -> bool {
         UPDATE_EXIT.swap(false, std::sync::atomic::Ordering::AcqRel)
@@ -49,13 +68,8 @@ mod platform {
         }
     }
 
-    pub fn acquire() -> Result<Option<Instance>> {
-        acquire_with_activation(true)
-    }
-    pub fn acquire_background() -> Result<Option<Instance>> {
-        acquire_with_activation(false)
-    }
-    fn acquire_with_activation(activate: bool) -> Result<Option<Instance>> {
+    /// 抢实例锁。抢不到就把这次启动的来意交给已经在跑的那个实例，然后自己去退出。
+    pub fn acquire(activation: Activation<'_>) -> Result<Option<Instance>> {
         // The confirmed updater owns startup until replacement or recovery finishes.
         if acquire_named(w!("Local\\OpenUUYC.Updating.v1"))?.is_none() {
             return Ok(None);
@@ -64,8 +78,12 @@ mod platform {
         let message = match &result {
             Ok(Some(_)) => return result,
             Ok(None) => {
-                if activate {
-                    activate_existing()?;
+                match activation {
+                    // A second start and a protocol activation both hand the
+                    // foreground grant to the window that already owns the UI.
+                    Activation::Quiet => (),
+                    Activation::Show => activate_existing()?,
+                    Activation::Link(uri) => deliver_uri(uri)?,
                 }
                 return result;
             }
@@ -109,6 +127,18 @@ mod platform {
         result
     }
 
+    /// 转发进来的激活链接。通知按钮和协助链接共用一条通道，按 scheme 分开；
+    /// 协助链接还要把控制中心叫到前台——用户是点了一条链接，不是点了一个按钮。
+    fn receive_uri(uri: &str) -> bool {
+        if uri.starts_with(crate::application::app::notifications::SCHEME) {
+            return crate::platform::windows::notifications::receive_activation(uri);
+        }
+        crate::application::app::assist_link::receive(uri);
+        // 回 1 让发送端停止重试；用户点的是链接，不能只入队却不见窗口。
+        let _ = crate::ui::window_manager::send(crate::ui::window_manager::Request::ShowMain);
+        true
+    }
+
     unsafe extern "system" fn window_message(
         hwnd: HWND,
         message: u32,
@@ -122,8 +152,8 @@ mod platform {
             let data = unsafe {
                 &*(lparam.0 as *const windows::Win32::System::DataExchange::COPYDATASTRUCT)
             };
-            if data.dwData == NOTIFICATION_MESSAGE
-                && data.cbData <= 256
+            if data.dwData == ACTIVATION_MESSAGE
+                && data.cbData as usize <= MAX_ACTIVATION
                 && data.cbData > 0
                 && !data.lpData.is_null()
             {
@@ -131,9 +161,7 @@ mod platform {
                     std::slice::from_raw_parts(data.lpData.cast::<u8>(), data.cbData as usize)
                 };
                 if let Ok(uri) = std::str::from_utf8(bytes) {
-                    return LRESULT(isize::from(
-                        crate::platform::windows::notifications::receive_activation(uri),
-                    ));
+                    return LRESULT(isize::from(receive_uri(uri)));
                 }
             }
             return LRESULT(0);
@@ -303,11 +331,31 @@ mod platform {
         }
         Ok(found)
     }
-    pub(crate) fn deliver_notification(uri: &str) -> Result<()> {
+    /// 把激活链接（通知按钮或协助链接）交给已经在跑的控制中心。
+    ///
+    /// 协助链接是用户点出来的，控制中心可能正好在启动，所以比通知多等几轮；
+    /// 错过就再也没有第二次机会了。
+    pub(crate) fn deliver_uri(uri: &str) -> Result<()> {
         use windows::Win32::{System::DataExchange::COPYDATASTRUCT, UI::WindowsAndMessaging::*};
-        anyhow::ensure!(uri.len() <= 256, "通知参数过长");
-        let running = running_image(&std::env::current_exe()?, false)?
-            .context("通知已过期或控制中心已退出")?;
+        anyhow::ensure!(uri.len() <= MAX_ACTIVATION, "链接参数过长");
+        let assistance = uri
+            .get(..9)
+            .is_some_and(|s| s.eq_ignore_ascii_case("uuremote:"));
+        let image = std::env::current_exe()?;
+        let attempts = if assistance { DELIVER_ATTEMPTS } else { 1 };
+        let mut running = None;
+        for attempt in 0..attempts {
+            running = running_image(&image, false)?;
+            if running.is_some() {
+                break;
+            }
+            if attempt + 1 < attempts {
+                std::thread::sleep(DELIVER_INTERVAL);
+            }
+        }
+        let running = running.context("请求已过期或控制中心已退出")?;
+        // Retry only discovery. Once WM_COPYDATA is sent, a timeout has an unknown
+        // delivery result and must not replay notifications or connection requests.
         // Protocol activation carries the user's foreground grant to the existing UI.
         let mut pid = 0;
         unsafe {
@@ -317,7 +365,7 @@ mod platform {
             let _ = unsafe { AllowSetForegroundWindow(pid) };
         }
         let data = COPYDATASTRUCT {
-            dwData: NOTIFICATION_MESSAGE,
+            dwData: ACTIVATION_MESSAGE,
             cbData: uri.len() as u32,
             lpData: uri.as_ptr().cast_mut().cast(),
         };
@@ -335,7 +383,7 @@ mod platform {
         };
         anyhow::ensure!(
             result.0 != 0 && accepted == 1,
-            "通知已失效或控制中心暂时不可用"
+            "请求已失效或控制中心暂时不可用"
         );
         Ok(())
     }
@@ -394,6 +442,7 @@ mod platform {
 
 #[cfg(not(windows))]
 mod platform {
+    use super::Activation;
     use anyhow::{Context, Result};
     use std::fs::{File, OpenOptions};
     use std::path::PathBuf;
@@ -412,23 +461,8 @@ mod platform {
         }))
     }
 
-    pub fn acquire() -> Result<Option<Instance>> {
-        acquire_with(Activation::Show)
-    }
-
-    /// Starting in the background never brings the running window forward.
-    pub fn acquire_background() -> Result<Option<Instance>> {
-        acquire_with(Activation::Quiet)
-    }
-
-    /// Whether losing the lock race should ask the running process to show its
-    /// window before this one gives up.
-    enum Activation {
-        Show,
-        Quiet,
-    }
-
-    fn acquire_with(activation: Activation) -> Result<Option<Instance>> {
+    /// 抢实例锁。抢不到就把这次启动的来意交给已经在跑的那个实例，然后自己去退出。
+    pub fn acquire(activation: Activation<'_>) -> Result<Option<Instance>> {
         let path = lock_path();
         let file = OpenOptions::new()
             .read(true)
@@ -439,16 +473,20 @@ mod platform {
             .with_context(|| format!("创建程序实例保护失败：{}", path.display()))?;
         match file.try_lock() {
             Ok(()) => Ok(Some(Instance(file))),
-            Err(std::fs::TryLockError::WouldBlock) => {
+            Err(std::fs::TryLockError::WouldBlock) => match activation {
                 // 运行的实例可能是服务，也可能只是收在托盘里，先把它的窗口叫出来；
                 // 叫不动（旧版本、通道不可用）就保持沉默，别假装又起了一份。
-                if matches!(activation, Activation::Show) && crate::ui::control::activate().is_ok()
-                {
-                    return Ok(None);
+                Activation::Show if crate::ui::control::activate().is_ok() => Ok(None),
+                Activation::Show | Activation::Quiet => {
+                    eprintln!("OpenUUYC 已在运行，请勿重复启动。");
+                    Ok(None)
                 }
-                eprintln!("OpenUUYC 已在运行，请勿重复启动。");
-                Ok(None)
-            }
+                // 链接是用户点出来的，交不出去就得说出来，不能悄悄丢掉。
+                Activation::Link(uri) => {
+                    crate::ui::control::deliver_link(uri)?;
+                    Ok(None)
+                }
+            },
             Err(std::fs::TryLockError::Error(error)) => {
                 eprintln!("无法启动 OpenUUYC：{error}");
                 Err(anyhow::Error::new(error).context("锁定程序实例保护失败"))
@@ -468,14 +506,9 @@ mod platform {
     }
 }
 
-pub use platform::Instance;
-pub use platform::acquire_background;
+pub use platform::{Instance, acquire};
 #[cfg(windows)]
 pub(crate) use platform::{
-    deliver_notification, reserve_after_exit, reserve_installer, reserve_update, running_installed,
+    deliver_uri, reserve_after_exit, reserve_installer, reserve_update, running_installed,
 };
 pub(crate) use platform::{register_window, take_update_exit};
-
-pub fn acquire() -> Result<Option<Instance>> {
-    platform::acquire()
-}

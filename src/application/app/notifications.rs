@@ -129,6 +129,8 @@ impl Card {
         actions
     }
 }
+/// 通知按钮回传的协议前缀，也是激活链接里区分「通知」与「协助」的那一段。
+pub(crate) const SCHEME: &str = "openuuyc-notification://";
 #[derive(Clone)]
 pub(crate) struct Action {
     pub ticket: String,
@@ -137,7 +139,7 @@ pub(crate) struct Action {
 impl Action {
     pub(crate) fn parse(uri: &str) -> anyhow::Result<Self> {
         let s = uri
-            .strip_prefix("openuuyc-notification://")
+            .strip_prefix(SCHEME)
             .ok_or_else(|| anyhow::anyhow!("通知地址无效"))?;
         let (verb, ticket) = s
             .split_once('/')
@@ -167,7 +169,7 @@ impl Action {
             Verb::Disconnect => "disconnect",
             _ => "open",
         };
-        format!("openuuyc-notification://{verb}/{ticket}")
+        format!("{SCHEME}{verb}/{ticket}")
     }
 }
 struct Target {
