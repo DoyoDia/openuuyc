@@ -19,6 +19,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::window::{Window, WindowAttributes, WindowId};
 
 use crate::features::remote_input::MouseMode;
+use crate::features::stream_control::RemoteScreen;
 use crate::media::decoder::RenderSurface;
 use crate::platform::graphics::VideoPlacement;
 use crate::ui::chrome::{
@@ -26,6 +27,7 @@ use crate::ui::chrome::{
     resize_regions, set_fullscreen, title_bar_height, title_bar_panel,
     update_nonmodal_window_resize, window_title_bar,
 };
+use crate::ui::controls::{ViewerCaptionIcon, viewer_caption_button as caption_button};
 use crate::ui::gfx::{UiPresenter, UiTimingAudit, split_output};
 use crate::ui::window_manager::{Event as UiEvent, Repaint as UiRepaintEvent};
 
@@ -422,15 +424,37 @@ impl ConnectingWindowsRunner {
             let fullscreen = window.fullscreen().is_some();
             shell.fullscreen_chrome.sync(fullscreen);
             if !fullscreen {
+                // Windows 的 caption 里，别名那一格是可以点开的设备切换菜单；没有可切换
+                // 的设备时才是普通标签。这里跟着它走，所以标题那一格由播放器自己画。
+                let switcher = match stage {
+                    Stage::Playing(player) => player.device_switch(),
+                    _ => None,
+                };
                 title_bar_panel(ui, "player-window-chrome", title_bar_height(), |ui| {
                     let bar = ui.available_rect_before_wrap();
-                    close_requested |= window_title_bar(
-                        ui,
-                        &window,
-                        &title,
-                        Some(&mut shell.move_state),
-                        audio.is_none(),
-                    );
+                    close_requested |= match switcher.as_ref() {
+                        Some(switcher) => crate::ui::chrome::window_title_bar_with_identity(
+                            ui,
+                            &window,
+                            &title,
+                            Some(&mut shell.move_state),
+                            audio.is_none(),
+                            &mut |ui: &mut egui::Ui| {
+                                let response = crate::ui::controls::viewer_device_button(
+                                    ui,
+                                    title.trim_start_matches(crate::VIEWER_TITLE_PREFIX),
+                                );
+                                switcher.menu(&response, window.id());
+                            },
+                        ),
+                        None => window_title_bar(
+                            ui,
+                            &window,
+                            &title,
+                            Some(&mut shell.move_state),
+                            audio.is_none(),
+                        ),
+                    };
                     if let Stage::Playing(player) = stage {
                         player.title_bar_controls(ui, bar, &window);
                     }
@@ -438,12 +462,39 @@ impl ConnectingWindowsRunner {
             } else if let Stage::Playing(player) = stage {
                 let relative = player.input().relative_mode();
                 let menu_open = player.stream_control_ui.open;
+                // 切屏、切设备期间浮动栏不收起，等待态一直看得见（Windows 传的是
+                // `screen_tabs.is_pending()`，同一个判断）。
+                let pending = player.is_pending();
+                // 全屏那根浮动条和平时是同一根（Windows 也是），所以设备切换菜单
+                // 在这儿一样能点。
+                let switcher = player.device_switch();
                 close_requested |=
                     shell
                         .fullscreen_chrome
-                        .show(&ctx, relative, menu_open, false, |ui| {
+                        .show(&ctx, relative, menu_open, pending, |ui| {
                             let bar = ui.available_rect_before_wrap();
-                            let close = window_title_bar(ui, &window, &title, None, true);
+                            let close = match switcher.as_ref() {
+                                Some(switcher) => {
+                                    crate::ui::chrome::window_title_bar_with_identity(
+                                        ui,
+                                        &window,
+                                        &title,
+                                        None,
+                                        true,
+                                        &mut |ui: &mut egui::Ui| {
+                                            let response =
+                                                crate::ui::controls::viewer_device_button(
+                                                    ui,
+                                                    title.trim_start_matches(
+                                                        crate::VIEWER_TITLE_PREFIX,
+                                                    ),
+                                                );
+                                            switcher.menu(&response, window.id());
+                                        },
+                                    )
+                                }
+                                None => window_title_bar(ui, &window, &title, None, true),
+                            };
                             player.title_bar_controls(ui, bar, &window);
                             close
                         });
@@ -504,6 +555,11 @@ impl ConnectingWindowsRunner {
             }
             player.publish(&frame, upload.elapsed());
             player.current = Some(frame);
+        }
+        // 这一帧画完之后再发错误弹窗：`notice` 自己会要求下一帧把它显示出来，
+        // 而写在标题栏里会把屏标签挤没（Windows 对同样的错误也是弹窗）。
+        if let Stage::Playing(player) = &mut self.stage {
+            player.publish_error(&shell.context);
         }
         let placement = placement.filter(|_| shell.presenter.has_video());
         shell.presenter.set_video_placement(placement);
@@ -670,17 +726,28 @@ impl ApplicationHandler<UiEvent> for ConnectingWindowsRunner {
             return;
         }
         if let Stage::Playing(player) = &mut self.stage {
-            match player.poll() {
-                Ok(true) => self.schedule_now(),
-                // Nothing decoded: egui asks for the repaints it needs and the
-                // wake bridge covers the next frame, so the loop can sleep.
-                // Repainting the whole UI at the display rate instead would
-                // leave an arriving frame waiting for the pass in progress.
-                Ok(false) => {}
-                Err(error) => {
-                    self.fail(event_loop, &error);
-                    return;
-                }
+            let mut redraw = player.poll_pending();
+            // 屏目录每 250 ms 对一次：切屏期间没有画面要画，但轮询交给它自己，
+            // 不再把 UI 线程按在「立刻重画」上（那样会绕开帧率节拍一直占满一个核）。
+            if let Some(window) = self.window.clone() {
+                redraw |= player.refresh_catalog(&window);
+            }
+            if player.connection_ended() {
+                // 和 Windows 一样干净地退出：结束的原因由 controller 那边报。
+                self.exit(event_loop);
+                return;
+            }
+            // Nothing decoded: egui asks for the repaints it needs and the
+            // wake bridge covers the next frame, so the loop can sleep.
+            // Repainting the whole UI at the display rate instead would
+            // leave an arriving frame waiting for the pass in progress.
+            let frame = player.poll();
+            // 解码器出错的弹窗也要画出来，哪怕之后再没有新帧。
+            redraw |= player.error.is_some();
+            if frame {
+                self.schedule_now();
+            } else if redraw {
+                self.schedule(Instant::now());
             }
         }
         match self.next_repaint {
@@ -692,10 +759,16 @@ impl ApplicationHandler<UiEvent> for ConnectingWindowsRunner {
             }
             _ => {}
         }
-        event_loop.set_control_flow(
-            self.next_repaint
-                .map_or(ControlFlow::Wait, ControlFlow::WaitUntil),
-        );
+        // 目录核对也有自己的节拍，和重画一样要能把事件循环叫醒。
+        let catalog = match &self.stage {
+            Stage::Playing(player) => Some(player.next_refresh),
+            _ => None,
+        };
+        let wake = match (self.next_repaint, catalog) {
+            (Some(repaint), Some(catalog)) => Some(repaint.min(catalog)),
+            (repaint, catalog) => repaint.or(catalog),
+        };
+        event_loop.set_control_flow(wake.map_or(ControlFlow::Wait, ControlFlow::WaitUntil));
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
@@ -705,11 +778,52 @@ impl ApplicationHandler<UiEvent> for ConnectingWindowsRunner {
     }
 }
 
+/// 正在打开的一块屏：解码器还没就绪，tab 先显示等待态。
+struct PendingScreen {
+    id: i32,
+    /// 让 `ScreenPlayback` 申请对端开始推这块屏。丢掉这次等待就是把请求取消掉，
+    /// 所以句柄留着、Drop 里 abort（和 Windows 侧一致）。
+    task: Option<tokio::task::AbortHandle>,
+    result: tokio::sync::oneshot::Receiver<Result<Arc<NativeViewerSession>>>,
+}
+
+impl Drop for PendingScreen {
+    fn drop(&mut self) {
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
+}
+
 /// The playing half of the window: video, input forwarding and the menus.
 struct Player {
     /// Reloads shortcut settings changed in the control center while playing.
     _shortcuts: crate::application::viewer_shortcuts::Watcher,
-    session: NativeViewerSession,
+    /// 本窗口正在显示的那块屏的解码器。窗口「选中的」屏就是它的绑定，
+    /// 切换中的那块另记在 `pending` 里（与 Windows 的 `slot.selected` 同义）。
+    session: Arc<NativeViewerSession>,
+    /// 连接开始时的那条会话。带着「连接结束」句柄的是它
+    /// （`session/controller/viewing.rs` 的 `present_video`），切到别的屏之后也得靠它
+    /// 的 shutdown 标志发现连接没了（见 [`Player::connection_ended`]）。
+    initial: Arc<NativeViewerSession>,
+    /// 正在显示的那块屏的解码器已经报过致命错误：弹一次窗就够了，换屏时复位。
+    session_failed: bool,
+    /// 这个连接上所有能看的屏，以及每块屏各自的解码器。多窗口时共用同一份。
+    screens: super::screens::ScreenPlayback,
+    /// 顶栏 tab 用的屏目录：对端报的屏，加上拓扑里还没落定的那几块。
+    catalog: Vec<RemoteScreen>,
+    /// 下次核对目录的时间。
+    next_refresh: Instant,
+    /// 上一次看过的拓扑序号，变了就重新跟一次对端选中的屏。
+    topology_sequence: Option<i64>,
+    /// 已经跟过去的那块对端选中的屏，免得同一份报告反复切。
+    topology_focused: Option<i32>,
+    /// 开失败的那块屏 `(id, 轨道, 类型)`，它变样之前不再重试。
+    failed_screen: Option<(i32, i32, i32)>,
+    /// 正在打开的那块屏。
+    pending: Option<PendingScreen>,
+    proxy: EventLoopProxy<UiEvent>,
+    window_id: WindowId,
     /// Keeps the decoder publishing frames and nudges the event loop; held for
     /// its lifetime, which is what registers this window with the session.
     #[allow(dead_code, reason = "Owned for its registration and its Drop.")]
@@ -738,8 +852,9 @@ struct Player {
     physical_buttons: u8,
     /// Pixels per point of the last frame, for pointer mapping.
     scale: f32,
-    /// Last failure from a control request, shown next to the toolbar.
-    control_error: Option<String>,
+    /// 待显示的错误 `(标题, 正文)`。取走时做成可关闭的弹窗：顶栏那一格是留给屏标签
+    /// 的，一条常驻的红色文字能把它挤没。
+    error: Option<(&'static str, String)>,
     /// The remote cursor shape, decoded once per distinct image.
     cursor: Option<(usize, egui::TextureHandle, [u32; 2], [u32; 2])>,
     /// Whether the pointer is currently locked to the window for raw motion.
@@ -769,19 +884,40 @@ struct Player {
 
 impl Player {
     fn new(
-        session: NativeViewerSession,
+        mut session: NativeViewerSession,
         window: &Arc<Window>,
         proxy: EventLoopProxy<UiEvent>,
     ) -> Result<Self> {
         session.ensure_running()?;
+        // 屏目录与每屏的解码器由 `ScreenPlayback` 统一持有：同一个设备连接上的
+        // 所有窗口共用它，才不会两块窗口各推一份同样的屏。
+        let screens = session
+            .take_screen_playback()
+            .context("screen playback owner unavailable")?;
+        let session = Arc::new(session);
+        screens.register(Arc::clone(&session));
+        let initial = Arc::clone(&session);
+        let catalog = screens.screens();
         let owner = u64::from(window.id());
-        let wake = FrameWakeBridge::install(&session, proxy, window.id())?;
+        let window_id = window.id();
+        let wake = FrameWakeBridge::install(&session, proxy.clone(), window_id)?;
         let drag = super::linux_drag::WindowDrag::new(owner, &session.stream_control);
         Ok(Self {
             shortcuts: super::linux_shortcuts::Shortcuts::new(window),
             drag,
             _shortcuts: crate::application::viewer_shortcuts::Watcher::new()?,
             session,
+            initial,
+            session_failed: false,
+            screens,
+            catalog,
+            next_refresh: Instant::now(),
+            topology_sequence: None,
+            topology_focused: None,
+            failed_screen: None,
+            pending: None,
+            proxy,
+            window_id,
             wake,
             owner,
             stream_control_ui: StreamControlUi::default(),
@@ -799,7 +935,7 @@ impl Player {
             physical_keys: Vec::new(),
             physical_buttons: 0,
             scale: window.scale_factor() as f32,
-            control_error: None,
+            error: None,
             cursor: None,
             pointer_locked: false,
             focused: window.has_focus(),
@@ -851,6 +987,7 @@ impl Player {
             && window.is_minimized() != Some(true)
             && !control.drag_drop().interactive()
             && !self.stream_control_ui.open
+            && !self.is_pending()
             && !ctx.any_popup_open()
             && !ctx.text_edit_focused()
             && let Err(error) = control.restore_input_control()
@@ -867,11 +1004,307 @@ impl Player {
         self.session.stream_control.mouse()
     }
 
+    /// 用户点了某块屏的 tab。点的是正在显示的那块，就等于取消这次切换（open 任务
+    /// 随之 abort）；否则交给 [`Player::begin_screen`]。
+    fn select(&mut self, screen_id: i32, window: &Arc<Window>) -> Result<()> {
+        if screen_id == self.session.screen_id() {
+            self.pending.take();
+            self.sync_screens();
+            return Ok(());
+        }
+        self.begin_screen(screen_id, window)
+    }
+
+    /// 请对端开始推这块屏，窗口仍画着原来的画面，直到 [`Player::poll_pending`] 把新
+    /// 解码器接上。目录核对要重开正在显示的那块（轨道或绑定变了）时也直接走这里，
+    /// 不经过 [`Player::select`] 的「点了当前屏＝取消」：Windows 的 `refresh_catalog`
+    /// 先把 `slot.selected` 清掉再调 `begin_screen`，是同一个意思。
+    ///
+    /// 一律走 [`ScreenPlayback::open`]，和 Windows 的 `begin_screen` 一样：采集被停掉
+    /// 之后要由它补发 action 8 重新开始，复用已有解码器时还得重新绑定轨道并要一个
+    /// 关键帧。绕开它直接换会话，硬解下就会一直停在「等待画面」。
+    fn begin_screen(&mut self, screen_id: i32, window: &Arc<Window>) -> Result<()> {
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.id == screen_id)
+        {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            self.catalog.iter().any(|screen| screen.id == screen_id),
+            "显示器已断开"
+        );
+        self.failed_screen = None;
+        // 换屏前收尾，和 Windows 的 `begin_screen` 一样：不再等这块屏的显示设置，
+        // 并把指针交回本地（切屏期间不转发输入，见 `local_ui_owns_input`）。
+        self.control()
+            .cancel_display_change(self.session.screen_id());
+        self.release_pointer(window);
+        let cancelled = self.pending.take().map(|pending| pending.id);
+        let repaint = self.repaint();
+        let (task, result) = self.screens.open(
+            screen_id,
+            ViewerDisplayHandle::default(),
+            Some(self.session.screen_id()),
+            cancelled,
+            repaint,
+        );
+        self.pending = Some(PendingScreen {
+            id: screen_id,
+            task,
+            result,
+        });
+        self.sync_screens();
+        Ok(())
+    }
+
+    /// 把窗口接到某块屏的解码器上，并把旧屏的画面缓存全部作废。
+    fn adopt(&mut self, screen_id: i32, session: Arc<NativeViewerSession>) -> Result<()> {
+        session.ensure_running()?;
+        // 对端把目标屏放到了当前这条轨道上时，拿回来的是同一个会话。这时不能再装一次
+        // bridge：新 bridge 登记完之后旧的那个才 Drop，而它的 Drop 会把登记清掉，
+        // 解码器随后丢掉每一帧，画面就永远停在「等待画面」。
+        if !Arc::ptr_eq(&session, &self.session) {
+            self.wake = FrameWakeBridge::install(&session, self.proxy.clone(), self.window_id)?;
+        }
+        self.session = session;
+        self.session_failed = false;
+        self.pending = None;
+        self.current = None;
+        self.video_size = None;
+        self.video_rect = None;
+        self.cursor = None;
+        // 对端按「选中」的那块屏送指针与输入，换屏就得告诉它。
+        self.screens.focus(screen_id);
+        Ok(())
+    }
+
+    /// 等正在打开的那块屏就绪。没就绪就什么都不做，`ScreenPlayback::open` 传进去的
+    /// repaint 回调会把事件循环叫醒。返回这次有没有收到结果（顶栏要重画）。
+    fn poll_pending(&mut self) -> bool {
+        let Some(pending) = self.pending.as_mut() else {
+            return false;
+        };
+        let ready = match pending.result.try_recv() {
+            Ok(result) => Some((pending.id, result)),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                Some((pending.id, Err(anyhow!("屏幕加载已取消"))))
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => None,
+        };
+        let Some((id, result)) = ready else {
+            return false;
+        };
+        self.pending = None;
+        match result {
+            // 打开期间映射又变了（加减虚拟屏后轨道重排、对端重新分配轨道）：拿到的这一路
+            // 已经不是这块屏了。和 Windows `ScreenWindows::update` 一样作废这次结果，并让
+            // 目录核对马上重跑，由它决定重开哪块。
+            Ok(session)
+                if !screen_mapped(
+                    &self.screens.screens(),
+                    id,
+                    session.track_index,
+                    session.screen_binding(),
+                ) =>
+            {
+                tracing::debug!(screen_id = id, "screen mapping changed while opening");
+                self.next_refresh = Instant::now();
+            }
+            Ok(session) => {
+                if let Err(error) = self.adopt(id, session) {
+                    self.report("显示器操作失败", format!("无法显示显示器 {id}：{error:#}"));
+                }
+            }
+            Err(error) => {
+                // 没切成：显示的还是原来那块（`session` 没动），记下这次失败不再重试。
+                self.failed_screen = Some(self.failed_screen_for(id));
+                self.report("显示器操作失败", format!("无法打开显示器 {id}：{error:#}"));
+            }
+        }
+        self.sync_screens();
+        true
+    }
+
+    /// 每 250 ms 对一遍目录，规则和 Windows 的 `refresh_catalog` 一样：正在看的屏从
+    /// 目录里消失就换到第一块还在的；轨道或绑定和目录对不上就重开；对端报告它选中了
+    /// 别的屏（刚加好的虚拟屏）就跟过去。`failed_screen` 挡住失败后的反复重试。
+    ///
+    /// 返回顶栏要不要重画：目录或等待中的屏变了，或者有错误要弹。Windows 每次核对完
+    /// 都重画一遍；这里对端画面静止时没有新帧推着 UI 走，新加的屏的 tab、核对触发的
+    /// 切屏的等待态和弹窗都得靠它排一次重画。
+    fn refresh_catalog(&mut self, window: &Arc<Window>) -> bool {
+        let now = Instant::now();
+        if now < self.next_refresh {
+            return false;
+        }
+        self.next_refresh = now + Duration::from_millis(250);
+        let catalog = self.catalog.clone();
+        let pending = self.pending.as_ref().map(|pending| pending.id);
+        self.reconcile_catalog(window);
+        self.catalog != catalog
+            || self.pending.as_ref().map(|pending| pending.id) != pending
+            || self.error.is_some()
+    }
+
+    fn reconcile_catalog(&mut self, window: &Arc<Window>) {
+        let topology = self.screens.topology();
+        if topology.sequence != self.topology_sequence {
+            self.topology_sequence = topology.sequence;
+            self.topology_focused = None;
+        }
+        let actual = self.screens.screens();
+        self.catalog = actual.clone();
+        for screen in &topology.transient_screens {
+            if !self.catalog.iter().any(|known| known.id == screen.id) {
+                self.catalog.push(screen.clone());
+            }
+        }
+        if self.catalog.is_empty() {
+            return;
+        }
+        // 等着打开的那块屏已经不在对端的目录里了（比如点了它又马上在 tab 上关掉）：
+        // 和 Windows 一样直接放弃这次切换，不当成失败弹窗，也不记进 `failed_screen`。
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| !actual.iter().any(|screen| screen.id == pending.id))
+        {
+            self.pending = None;
+            self.sync_screens();
+        }
+        // 对端拓扑刚选中的那块屏（刚加好的虚拟屏），和 Windows 的 `topology_selection`
+        // 一样只是换掉核对的对象，要不要真的切由 `replacement_target` 判断。
+        let mut focus = None;
+        if self.topology_focused != topology.selected_screen
+            && topology.reported
+            && !matches!(
+                topology.action,
+                Some(crate::features::stream_control::DisplayTopologyAction::Remove { .. })
+            )
+            && let Some(selected) = topology
+                .selected_screen
+                .filter(|id| actual.iter().any(|screen| screen.id == *id))
+        {
+            if self
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.id != selected)
+            {
+                self.pending = None;
+                self.sync_screens();
+            }
+            self.topology_focused = Some(selected);
+            self.failed_screen = None;
+            focus = Some(selected);
+        }
+        if self.pending.is_some() {
+            return;
+        }
+        let target = replacement_target(
+            &self.catalog,
+            &actual,
+            focus.unwrap_or_else(|| self.session.screen_id()),
+            (self.session.track_index, self.session.screen_binding()),
+            self.failed_screen,
+        );
+        if let Some(target) = target
+            && let Err(error) = self.begin_screen(target, window)
+        {
+            self.failed_screen = Some(self.failed_screen_for(target));
+            self.report(
+                "显示器操作失败",
+                format!("切到显示器 {target} 失败：{error:#}"),
+            );
+        }
+    }
+
+    /// 失败标记用的三元组，取不到目录条目时退回 `(id, -1, -1)`。
+    fn failed_screen_for(&self, screen_id: i32) -> (i32, i32, i32) {
+        self.catalog
+            .iter()
+            .find(|screen| screen.id == screen_id)
+            .map_or((screen_id, -1, -1), screen_key)
+    }
+
+    /// 告诉对端现在要看哪几块屏：本窗口正在显示的那块，加上正在打开的那块。软解一次
+    /// 只跟得上一条流，换屏期间就不再要原来那块（与 Windows 侧同一条规则）。
+    fn sync_screens(&self) {
+        let switching = self.pending.as_ref().map(|pending| pending.id);
+        let mut visible = Vec::new();
+        if !(switching.is_some() && self.session.is_software()) {
+            visible.push(self.session.screen_id());
+        }
+        visible.extend(switching);
+        self.screens.set_visible(visible);
+    }
+
+    /// 记下一条待显示的错误，下一帧由 [`Player::publish_error`] 做成弹窗。
+    fn report(&mut self, title: &'static str, message: impl Into<String>) {
+        self.error = Some((title, message.into()));
+    }
+
+    /// 把待显示的错误做成可关闭的弹窗。顶栏不放常驻错误：那一格是给屏标签的，
+    /// Windows 对同样的错误也是弹窗。
+    fn publish_error(&mut self, context: &egui::Context) {
+        let Some((title, message)) = self.error.take() else {
+            return;
+        };
+        crate::ui::controls::notice(
+            context,
+            "player-error",
+            title,
+            crate::ui::controls::DialogIcon::Error,
+            message,
+        );
+    }
+
+    /// 让事件循环尽快再跑一轮：切屏期间要画等待态，也要及时接过新解码器。
+    fn repaint(&self) -> impl FnOnce() + Send + 'static {
+        let proxy = self.proxy.clone();
+        let window = self.window_id;
+        move || {
+            let _ = proxy.send_event(UiEvent::Repaint(UiRepaintEvent {
+                window,
+                generation: 0,
+                pass: 0,
+                when: Instant::now(),
+            }));
+        }
+    }
+
+    /// 连接结束了：和 Windows `ScreenWindows::update` 一样，只看连接开始时那条会话的
+    /// shutdown 标志。连接结束时 controller 关的是它（`present_video` 交出去的
+    /// close 句柄），切到别的屏之后也一样；它的解码器在后台出错不算连接结束。
+    fn connection_ended(&self) -> bool {
+        self.initial
+            .shutdown
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// True when a decoded frame is waiting to go up.
-    fn poll(&mut self) -> Result<bool> {
+    ///
+    /// 正在显示的那块屏的解码器停了（硬解初始化失败、回退失败等写进 `fatal_error`
+    /// 的错误），窗口不再有新帧：和 Windows 播放器每帧查 `fatal_error` 一样弹出
+    /// 「显示器操作失败」，但不关窗口，用户还能切到别的屏。
+    fn poll(&mut self) -> bool {
         self.confirm_neutral();
-        self.session.ensure_running()?;
-        Ok(mutex_lock(&self.session.frame_queue).is_some())
+        let failure = if self.session_failed {
+            None
+        } else {
+            mutex_lock(&self.session.fatal_error).clone()
+        };
+        if let Some(error) = failure {
+            self.session_failed = true;
+            tracing::error!(
+                screen_id = self.session.screen_id(),
+                %error,
+                "displayed screen decoder stopped"
+            );
+            self.report("显示器操作失败", error);
+        }
+        mutex_lock(&self.session.frame_queue).is_some()
     }
 
     /// Take the newest decoded frame; the decoder already replaced any the
@@ -1169,7 +1602,9 @@ impl Player {
     }
 
     /// The player commands, placed in the window caption between the title and
-    /// the window buttons. The Windows player has the same row.
+    /// the window buttons. The Windows player has the same row, in the same
+    /// order, with the same icons — 鼠标、麦克风、1:1、批注、插件、画质，最右是
+    /// 窗口按钮。Linux 上还没实现的那几个画成禁用而不是不画：一眼就能看出缺什么。
     pub(super) fn title_bar_controls(
         &mut self,
         ui: &mut egui::Ui,
@@ -1195,37 +1630,37 @@ impl Player {
                 .layout(egui::Layout::right_to_left(egui::Align::Center)),
         );
         row.set_clip_rect(rect);
-        row.spacing_mut().item_spacing.x = 6.0;
-        // As in the Windows caption, control waiting for released keys or for
-        // a stalled input channel counts as on, and a click cancels it.
-        let recovering = self.input().transport_recovering();
-        let controlling = self.input().mode() != MouseMode::View
-            || self.input().waiting_for_neutral()
-            || recovering;
-        if row.button("全屏").clicked() {
-            toggle_fullscreen(window);
-        }
-        let always_visible = self
-            .session
-            .stream_control
-            .device_preferences()
-            .performance_always_visible;
-        if row
-            .selectable_label(always_visible, "性能")
-            .on_hover_text("关闭后仅在异常时临时显示")
-            .clicked()
+        row.spacing_mut().item_spacing.x = 4.0;
+
+        // 画质与串流设置。Windows 的 Quality 也在最右。
+        if caption_button(
+            &mut row,
+            ViewerCaptionIcon::Quality,
+            self.stream_control_ui.open,
+            "画质与串流设置",
+        )
+        .clicked()
         {
-            // The caption button is the stream menu's「性能监控常驻」switch;
-            // the menu chooses between the compact and detailed panels.
-            self.session
-                .stream_control
-                .set_performance_always_visible(!always_visible);
-        }
-        if row.button("串流设置").clicked() {
             self.stream_control_ui.open = !self.stream_control_ui.open;
         }
-        // The Windows caption's clipboard switch: the same per-device setting as
-        // the stream menu's, so either place turns it on or off.
+
+        // 这三样是 Windows 播放器里才有的东西：插件面板和批注整套界面都在那边，
+        // 1:1 也还没做（Windows 那边只是往右下 request_inner_size，不挪窗口，
+        // Wayland 上也做得到）。
+        for (icon, hint) in [
+            (ViewerCaptionIcon::Plugins, "Linux 主控还没有插件面板"),
+            (ViewerCaptionIcon::Annotation, "Linux 主控还没有批注"),
+            (ViewerCaptionIcon::OneToOne, "Linux 主控还没有 1:1 实际像素"),
+        ] {
+            row.add_enabled_ui(false, |ui| caption_button(ui, icon, false, ""))
+                .inner
+                .on_disabled_hover_text(hint);
+        }
+
+        // 这一排从右往左排，先加的落在右边，所以代码顺序和屏幕上的左右顺序相反：
+        // 剪贴板写在麦克风前头，显示出来才在麦克风右边，和 Windows 一样。剪贴板按
+        // 设备记住开没开，和串流设置里那个开关是同一份设置。
+        let control = self.session.stream_control.snapshot();
         let clip = self.session.stream_control.clipboard().snapshot();
         let clip_hint = if !clip.enabled {
             "同步剪贴板：把本机剪贴板发送到远端，并把远端剪贴板取回本机".to_owned()
@@ -1236,13 +1671,12 @@ impl Player {
         } else {
             "剪贴板同步已开启，等待通道就绪，点击关闭".to_owned()
         };
-        let control_ready = self.control().snapshot().ready;
         if row
-            .add_enabled(
-                clip.enabled || (control_ready && self.input().mode() != MouseMode::View),
-                egui::Button::selectable(clip.enabled, "剪贴板"),
+            .add_enabled_ui(
+                clip.enabled || (control.ready && control.mouse_mode != MouseMode::View),
+                |ui| caption_button(ui, ViewerCaptionIcon::Clipboard, clip.enabled, &clip_hint),
             )
-            .on_hover_text(clip_hint)
+            .inner
             .on_disabled_hover_text("请先连接并开启键鼠控制")
             .clicked()
         {
@@ -1262,40 +1696,318 @@ impl Player {
                 ),
             }
         }
+
+        // 麦克风：和 Windows 同一套判定，用的是同一份共享状态。
+        let mic = self.session.stream_control.microphone().snapshot();
+        let mic_hint = if mic.pending {
+            "麦克风：等待远端确认"
+        } else if let Some(error) = mic.error.as_deref() {
+            error
+        } else if mic.capturing {
+            "正在将麦克风发送到远端，点击关闭"
+        } else if mic.enabled {
+            "麦克风已开启，等待远端应用使用，点击关闭"
+        } else {
+            "将所选麦克风发送到远端（设备可在高级设置中切换）"
+        };
         if row
-            .selectable_label(controlling, "键鼠控制")
-            .on_hover_text(if recovering {
-                "键鼠控制正在自动恢复；点击取消".to_owned()
-            } else {
-                format!(
-                    "退出控制：{}",
-                    crate::application::viewer_shortcuts::label(ViewerShortcut::ReleaseMouse)
-                )
-            })
+            .add_enabled_ui(
+                mic.enabled
+                    || (self.session.stream_control.microphone_available()
+                        && control.ready
+                        && control.mouse_mode != MouseMode::View),
+                |ui| caption_button(ui, ViewerCaptionIcon::Microphone, mic.enabled, mic_hint),
+            )
+            .inner
+            .on_disabled_hover_text("请先连接支持麦克风的 Windows 设备并开启键鼠控制")
             .clicked()
         {
+            crate::ui::controls::clear_notice(row.ctx(), "microphone-request-error");
+            match self
+                .session
+                .stream_control
+                .set_microphone_enabled(!mic.enabled)
+            {
+                Ok(()) => crate::ui::controls::clear_notice(row.ctx(), "microphone-error"),
+                Err(error) => crate::ui::controls::notice(
+                    row.ctx(),
+                    "microphone-request-error",
+                    "麦克风",
+                    crate::ui::controls::DialogIcon::Error,
+                    error.to_string(),
+                ),
+            }
+        }
+
+        // 键鼠控制。等键鼠松开、或输入通道卡住重连时都算「开着」，点一下就取消。
+        let recovering = self.input().transport_recovering();
+        let controlling = self.input().mode() != MouseMode::View
+            || self.input().waiting_for_neutral()
+            || recovering;
+        let mouse_hint = if recovering {
+            "键鼠控制正在自动恢复；点击取消".to_owned()
+        } else if self.input().waiting_for_neutral() {
+            format!(
+                "等待松开全部键鼠；退出控制快捷键：{}",
+                crate::application::viewer_shortcuts::label(ViewerShortcut::ReleaseMouse)
+            )
+        } else if controlling {
+            format!(
+                "退出控制（{}）",
+                crate::application::viewer_shortcuts::label(ViewerShortcut::ReleaseMouse)
+            )
+        } else if self.input().keyboard_supported() {
+            "开启键鼠控制".to_owned()
+        } else {
+            "开启鼠标控制（此平台暂未适配键盘）".to_owned()
+        };
+        // 桌面不让锁定指针时（见 `update_pointer_lock`）只在这里说一声，不弹窗挡输入。
+        let mouse_hint = if self.input().relative_available() {
+            mouse_hint
+        } else {
+            format!("{mouse_hint}\n当前桌面不允许锁定指针，已改用绝对坐标")
+        };
+        if row
+            .add_enabled_ui(controlling || control.ready, |ui| {
+                caption_button(ui, ViewerCaptionIcon::Mouse, controlling, &mouse_hint)
+            })
+            .inner
+            .clicked()
+        {
+            if !controlling {
+                crate::ui::controls::clear_notice(row.ctx(), "remote-input-error");
+            }
             self.set_control(!controlling);
         }
-        if let Some(error) = &self.control_error {
-            row.add(
+
+        // 这里没有全屏按钮，和 Windows 一样：Linux 本来就有全屏的浮动操作栏
+        // （`fullscreen_chrome.show`），里面画的还是这根条子，窗口按钮在全屏时变成
+        // 「退出全屏」；进入全屏走快捷键。两边都不多一个入口。
+        //
+        // 这里也没有常驻的错误文字：屏标签要用这排按钮左边的全部宽度，错误一律走
+        // 可关闭的弹窗（见 `publish_error`）。
+        let free = egui::Rect::from_min_max(
+            rect.min,
+            egui::pos2((row.min_rect().left() - 6.0).max(rect.min.x), rect.max.y),
+        );
+        self.title_bar_screens(ui, free, window);
+    }
+
+    /// 这台播放器能切到哪些设备。连接时由 controller 装进来，和 Windows 那份是同一个。
+    fn device_switch(&self) -> Option<super::device_switch::DeviceSwitcher> {
+        self.screens.device_switch.clone()
+    }
+
+    /// 顶栏中间的屏标签与码流信息：每块远端屏一个 tab（点一下切过去，右键是这块
+    /// 屏的显示器设置，虚拟屏可以关掉），右边一格写当前画面的「分辨率 · 帧率 ·
+    /// 编码」。Windows 的 caption 是同一套内容，只是那边的按钮是图标。
+    fn title_bar_screens(&mut self, ui: &mut egui::Ui, rect: egui::Rect, window: &Arc<Window>) {
+        // 与 Windows 同一个宽度，够放 "3840×1620 · 35 FPS · H.265"。
+        const METRICS_WIDTH: f32 = 184.0;
+        const MINIMUM: f32 = 60.0;
+        if rect.width() < MINIMUM {
+            return;
+        }
+        let metrics_rect = egui::Rect::from_min_max(
+            egui::pos2((rect.max.x - METRICS_WIDTH).max(rect.min.x), rect.min.y),
+            rect.max,
+        );
+        let tabs_rect = egui::Rect::from_min_max(
+            rect.min,
+            egui::pos2((metrics_rect.min.x - 6.0).max(rect.min.x), rect.max.y),
+        );
+        let stats = self.session.performance.snapshot();
+        // 和 Windows 的 caption 同一套判断：解码器的字符串里带 264/265 时以它为准
+        // （那才是实际在解的东西，比如 "H.265 (VAAPI)"），否则退回编解码器名。
+        let codec_info = if stats.video_format.contains("264") || stats.video_format.contains("265")
+        {
+            &stats.video_format
+        } else {
+            &stats.video_codec
+        };
+        let codec = if codec_info.contains("AV1") {
+            "AV1"
+        } else if codec_info.contains("265") || codec_info.contains("HEVC") {
+            "H.265"
+        } else if codec_info.contains("264") || codec_info.contains("AVC") {
+            "H.264"
+        } else {
+            "—"
+        };
+        let parameters = stats.decoded_resolution.map_or_else(
+            || "等待画面".to_owned(),
+            |(width, height)| {
+                format!(
+                    "{width}×{height} · {:.0} FPS · {codec}",
+                    stats.actual_fps.max(1.0)
+                )
+            },
+        );
+        let mut metrics = ui.new_child(egui::UiBuilder::new().max_rect(metrics_rect).layout(
+            egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
+        ));
+        metrics.set_clip_rect(metrics_rect);
+        metrics
+            .add(
                 egui::Label::new(
-                    egui::RichText::new(error)
-                        .size(crate::ui::theme::SMALL)
-                        .color(crate::ui::theme::DANGER_FILL),
+                    egui::RichText::new(parameters)
+                        .size(crate::ui::theme::TINY)
+                        .color(crate::ui::theme::MUTED),
                 )
                 .truncate(),
-            );
+            )
+            .on_hover_text(&stats.video_format);
+        if tabs_rect.width() < 40.0 {
+            return;
+        }
+        let catalog = self.catalog.clone();
+        let control = self.session.stream_control.clone();
+        let snapshot = control.snapshot();
+        let selected = self.session.screen_id();
+        let pending = self.pending.as_ref().map(|pending| pending.id);
+        let software = self.session.is_software();
+        let mut open = None;
+        let mut message = None;
+        let mut tabs = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(tabs_rect)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        tabs.set_clip_rect(tabs_rect);
+        egui::ScrollArea::horizontal()
+            .id_salt("player-screen-tabs")
+            .auto_shrink([false, false])
+            .scroll_source(
+                egui::scroll_area::ScrollSource::SCROLL_BAR
+                    | egui::scroll_area::ScrollSource::MOUSE_WHEEL,
+            )
+            .show(&mut tabs, |ui| {
+                ui.horizontal_centered(|ui| {
+                    ui.spacing_mut().item_spacing.x = 3.0;
+                    for screen in &catalog {
+                        let id = screen.id;
+                        // 只有 UU 虚拟屏能这样关掉，物理屏要留着，否则等于拔掉
+                        // 对端的显示器。类型按对端报的屏来看（和 Windows 一样），
+                        // 拓扑里还没落定的瞬态屏不给关。
+                        let closable = snapshot.ready
+                            && snapshot.dpi_settings_supported
+                            && snapshot.screens.len() > 1
+                            && (!snapshot.topology.pending || snapshot.topology.dismissed)
+                            && snapshot
+                                .screens
+                                .iter()
+                                .any(|real| real.id == id && real.display.screen_type == 1);
+                        let name = screen.label(&catalog);
+                        let (response, close_clicked) = ui
+                            .push_id(("player-screen-tab", id), |ui| {
+                                crate::ui::controls::screen_tab(
+                                    ui,
+                                    &name,
+                                    selected == id,
+                                    pending == Some(id) || control.display_change_pending(id),
+                                    !software,
+                                    closable,
+                                )
+                            })
+                            .inner;
+                        let response = response.on_hover_text(&name);
+                        if close_clicked {
+                            super::stream_menu::topology_menu::request(
+                                ui.ctx(),
+                                &control,
+                                id,
+                                crate::features::stream_control::DisplayTopologyAction::Remove {
+                                    screen_id: id,
+                                },
+                            );
+                        } else if response.clicked() {
+                            open = Some(id);
+                        }
+                        response.context_menu(|ui| {
+                            super::stream_menu::menu_style(ui);
+                            ui.set_width(crate::ui::theme::CONTEXT_MENU_WIDTH);
+                            if let Some(error) = super::stream_menu::tab_display_menu(
+                                ui,
+                                &control,
+                                id,
+                                window
+                                    .current_monitor()
+                                    .map(|monitor| (monitor.size().width, monitor.size().height)),
+                            ) {
+                                message = Some(error);
+                            }
+                            ui.separator();
+                            // Windows 这一项能把一块屏挪到独立窗口里，Linux 还没有独立
+                            // 窗口，所以照 PR 里那几个图标的做法画成禁用并说明原因。
+                            crate::ui::controls::menu_row(
+                                ui,
+                                "在独立窗口打开",
+                                "",
+                                None,
+                                false,
+                                false,
+                            )
+                            .on_disabled_hover_text("Linux 主控还没有独立窗口，请用标签切换屏幕");
+                        });
+                    }
+                    if snapshot.topology_support.create_visible
+                        && crate::ui::controls::screen_add(
+                            ui,
+                            snapshot.ready
+                                && snapshot.topology_support.create
+                                && (!snapshot.topology.pending || snapshot.topology.dismissed),
+                        )
+                        .on_hover_text("添加虚拟屏")
+                        .on_disabled_hover_text(
+                            snapshot
+                                .topology_support
+                                .create_unavailable
+                                .unwrap_or("正在处理显示器操作"),
+                        )
+                        .clicked()
+                    {
+                        let (width, height, _) =
+                            super::stream_menu::topology_menu::local_parameters(
+                                ui.ctx(),
+                                &control,
+                                window
+                                    .current_monitor()
+                                    .map(|monitor| (monitor.size().width, monitor.size().height)),
+                            );
+                        super::stream_menu::topology_menu::request(
+                            ui.ctx(),
+                            &control,
+                            selected,
+                            crate::features::stream_control::DisplayTopologyAction::Create {
+                                width,
+                                height,
+                            },
+                        );
+                    }
+                });
+            });
+        if let Some(error) = message {
+            self.report("显示器操作失败", error);
+        }
+        if let Some(id) = open
+            && let Err(error) = self.select(id, window)
+        {
+            self.failed_screen = Some(self.failed_screen_for(id));
+            self.report("显示器操作失败", format!("切到显示器 {id} 失败：{error:#}"));
         }
     }
 
+    /// 开关键鼠控制，和 Windows 顶栏的键鼠按钮同一套：打开时用这台设备记住的鼠标模式
+    /// （串流设置里选的），失败记进共享的键鼠状态，由每帧调用的
+    /// `show_stream_control_window` 弹出「控制已停止」。
     fn set_control(&mut self, enabled: bool) {
         let mode = if enabled {
-            MouseMode::Smart
+            self.control().snapshot().mouse_preference
         } else {
             MouseMode::View
         };
         if let Err(error) = self.control().set_mouse_mode(mode) {
-            self.control_error = Some(format!("{error:#}"));
+            self.input().fail(error.to_string());
         }
         if !enabled {
             self.release_keys();
@@ -1382,8 +2094,10 @@ impl Player {
                     tracing::warn!(%error, "无法锁定指针，改用绝对坐标");
                     // Without the pointer the deltas would drift; the session
                     // falls back to absolute positioning on its next poll.
+                    // Only a notice, not a question: a modal would hold input
+                    // back until dismissed, so the caption's mouse button says
+                    // it in its tooltip instead.
                     self.input().set_relative_available(false);
-                    self.control_error = Some("当前桌面不允许锁定指针，已改用绝对坐标".to_owned());
                 }
             }
         } else {
@@ -1412,8 +2126,18 @@ impl Player {
         }
     }
 
+    /// 正在切屏或切设备，和 Windows `ScreenTabBar::is_pending` 同一个判断。
+    fn is_pending(&self) -> bool {
+        self.pending.is_some()
+            || self
+                .device_switch()
+                .is_some_and(|switcher| switcher.is_switching())
+    }
+
     fn local_ui_owns_input(&self, context: &egui::Context) -> bool {
+        // 切屏与设备切换期间不转发输入：两边都在换轨道，键鼠很容易落到别处。
         self.stream_control_ui.open
+            || self.is_pending()
             || context.any_popup_open()
             || context.text_edit_focused()
             || context.memory(|memory| memory.top_modal_layer().is_some())
@@ -2035,9 +2759,77 @@ mod input_tests {
 
 impl Drop for Player {
     fn drop(&mut self) {
+        // 顺序和 Windows 的 `ScreenWindows::drop` 一致：先丢掉正在打开的那块屏
+        // （abort 掉 open 任务），再关掉每条解码会话、取消这个窗口的任务域，别的屏的
+        // 解码线程因此马上收到停止信号，而不是等到最后一个 `ScreenPlayback` 克隆
+        // 释放时在 tokio worker 上 join。
+        self.pending.take();
         self.release_keys();
         self.input().disable();
+        self.screens.close_decoders();
     }
+}
+
+/// 本窗口该换到哪块屏，`None` 表示不用动。规则和 Windows `refresh_catalog` 里的
+/// `replacements` 一样：
+/// - `focus`（正在显示的那块，或对端拓扑刚选中的那块）还只在拓扑的瞬态清单里：
+///   对端正在改，等一下再说；
+/// - 它的轨道和绑定都和正在显示的会话 `(track, binding)` 对得上：就是现在这一路，不动；
+/// - 对不上（包括 `focus` 就是正在显示的那块、但对端把它挪到了别的轨道）：重开它；
+/// - 它整个从目录里消失了：退回目录里第一块真在的屏；
+/// - 选出来的那块刚失败过、而且没变样（`failed`）：不再重试。
+fn replacement_target(
+    catalog: &[RemoteScreen],
+    actual: &[RemoteScreen],
+    focus: i32,
+    (track, binding): (i32, u64),
+    failed: Option<(i32, i32, i32)>,
+) -> Option<i32> {
+    let selected = catalog.iter().find(|screen| screen.id == focus);
+    if selected.is_some_and(|screen| !actual.iter().any(|real| real.id == screen.id)) {
+        return None;
+    }
+    let target = match selected {
+        Some(screen) if track == screen.video_track_index && binding == screen_binding(screen) => {
+            return None;
+        }
+        Some(screen) => screen.id,
+        None => catalog
+            .iter()
+            .find(|screen| actual.iter().any(|real| real.id == screen.id))
+            .map(|screen| screen.id)?,
+    };
+    if actual
+        .iter()
+        .any(|screen| screen.id == target && failed == Some(screen_key(screen)))
+    {
+        return None;
+    }
+    Some(target)
+}
+
+/// 刚打开的这一路 `(track, binding)` 还是不是目录里这块屏的，和 Windows
+/// `ScreenWindows::update` 接上新会话前的核对一样。
+fn screen_mapped(actual: &[RemoteScreen], screen_id: i32, track: i32, binding: u64) -> bool {
+    actual.iter().any(|screen| {
+        screen.id == screen_id
+            && screen.video_track_index == track
+            && screen_binding(screen) == binding
+    })
+}
+
+/// 一块屏在会话里的绑定值，和 `NativeViewerSession::bind_screen` 写进去的是同一套。
+fn screen_binding(screen: &RemoteScreen) -> u64 {
+    (screen.id as u32 as u64) | ((screen.display.screen_type as u32 as u64) << 32)
+}
+
+/// 失败标记的三元组：屏的 id、轨道、类型。任一项变了就值得再试一次。
+fn screen_key(screen: &RemoteScreen) -> (i32, i32, i32) {
+    (
+        screen.id,
+        screen.video_track_index,
+        screen.display.screen_type,
+    )
 }
 
 /// The decoder drops every decoded frame unless a render thread is registered
@@ -2211,4 +3003,145 @@ fn device_key(device: DeviceId) -> usize {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     device.hash(&mut hasher);
     (hasher.finish() as usize).max(1)
+}
+
+#[cfg(test)]
+mod screen_tests {
+    use super::*;
+    use crate::features::stream_control::{RemoteDisplayInfo, RemoteDisplayMode};
+
+    fn screen(id: i32, track: i32, screen_type: i32) -> RemoteScreen {
+        let mode = RemoteDisplayMode {
+            width: 1920,
+            height: 1080,
+            pixel_width: 1920,
+            pixel_height: 1080,
+        };
+        RemoteScreen {
+            id,
+            name: format!("DISPLAY{id}"),
+            primary: id == 0,
+            video_track_index: track,
+            width: 1920,
+            height: 1080,
+            refresh_hz: 60,
+            display: RemoteDisplayInfo {
+                preferred: None,
+                current: mode,
+                initial: None,
+                modes: vec![mode],
+                current_dpi: 96,
+                recommended_dpi: 96,
+                dpis: vec![96],
+                screen_type,
+                builtin_screen_type: screen_type,
+                dpr: 1.0,
+                resolution_type: 0,
+                left: 0,
+                top: 0,
+            },
+        }
+    }
+
+    fn playing(screen: &RemoteScreen) -> (i32, u64) {
+        (screen.video_track_index, screen_binding(screen))
+    }
+
+    #[test]
+    fn matching_track_and_binding_needs_nothing() {
+        let actual = vec![screen(0, 0, 0), screen(1, 1, 0)];
+        assert_eq!(
+            replacement_target(&actual, &actual, 1, playing(&actual[1]), None),
+            None
+        );
+    }
+
+    /// The case review round 4 found unreachable: the displayed screen moved to
+    /// another track. The target is the displayed screen itself, so the caller
+    /// must open it directly instead of treating it as "clicked the current tab".
+    #[test]
+    fn displayed_screen_on_a_new_track_is_reopened() {
+        let before = screen(1, 1, 0);
+        let actual = vec![screen(0, 0, 0), screen(1, 2, 0)];
+        assert_eq!(
+            replacement_target(&actual, &actual, 1, playing(&before), None),
+            Some(1)
+        );
+        // Same track, but the peer now reports it as a virtual screen.
+        let actual = vec![screen(0, 0, 0), screen(1, 1, 1)];
+        assert_eq!(
+            replacement_target(&actual, &actual, 1, playing(&before), None),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn a_failed_screen_is_not_retried_until_it_changes() {
+        let before = screen(1, 1, 0);
+        let actual = vec![screen(0, 0, 0), screen(1, 2, 0)];
+        let failed = Some(screen_key(&actual[1]));
+        assert_eq!(
+            replacement_target(&actual, &actual, 1, playing(&before), failed),
+            None
+        );
+        let moved = vec![screen(0, 0, 0), screen(1, 3, 0)];
+        assert_eq!(
+            replacement_target(&moved, &moved, 1, playing(&before), failed),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn vanished_screen_falls_back_to_the_first_real_one() {
+        let gone = screen(2, 2, 1);
+        let actual = vec![screen(0, 0, 0), screen(1, 1, 0)];
+        assert_eq!(
+            replacement_target(&actual, &actual, 2, playing(&gone), None),
+            Some(0)
+        );
+        // Only the topology's transient list still has it: wait for the peer.
+        let mut catalog = actual.clone();
+        catalog.push(gone.clone());
+        assert_eq!(
+            replacement_target(&catalog, &actual, 2, playing(&gone), None),
+            None
+        );
+    }
+
+    #[test]
+    fn topology_focus_switches_to_the_reported_screen() {
+        let shown = screen(0, 0, 0);
+        let actual = vec![shown.clone(), screen(5, 1, 1)];
+        assert_eq!(
+            replacement_target(&actual, &actual, 5, playing(&shown), None),
+            Some(5)
+        );
+        assert_eq!(
+            replacement_target(&actual, &actual, 0, playing(&shown), None),
+            None
+        );
+    }
+
+    #[test]
+    fn opened_session_must_still_match_the_catalog() {
+        let opened = screen(1, 1, 0);
+        let (track, binding) = playing(&opened);
+        assert!(screen_mapped(
+            &[screen(0, 0, 0), opened.clone()],
+            1,
+            track,
+            binding
+        ));
+        // Tracks were renumbered while the open was in flight.
+        assert!(!screen_mapped(
+            &[screen(0, 1, 0), screen(1, 0, 0)],
+            1,
+            track,
+            binding
+        ));
+        // The screen is gone.
+        assert!(!screen_mapped(&[screen(0, 0, 0)], 1, track, binding));
+        // Same track, different screen type.
+        assert!(!screen_mapped(&[screen(1, 1, 1)], 1, track, binding));
+    }
 }
