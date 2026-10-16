@@ -1547,8 +1547,14 @@ impl Injector {
         self.absolute.is_some()
     }
 
-    /// 真实的多点触摸，由合成器派发给应用。返回 false 表示这个后端没有触摸屏，
-    /// 调用方要退回单指模拟。
+    /// 有没有虚拟触摸屏。Xorg 会话不建它，Wayland 下没有 `/dev/uinput` 写权限
+    /// 或者建失败了也没有；写入失败后会被丢掉，之后也是没有。
+    pub fn has_touchscreen(&self) -> bool {
+        self.touchscreen.is_some()
+    }
+
+    /// 真实的多点触摸，由合成器派发给应用。返回 false 表示触摸屏已经没有了（见
+    /// `has_touchscreen`），调用方要退回单指模拟。
     pub fn touch(&mut self, kind: u8, points: &[Touch], rotation: Rotation) -> Result<bool> {
         let Some(touchscreen) = &mut self.touchscreen else {
             return Ok(false);

@@ -294,8 +294,10 @@ impl Engine {
     /// 那条路上没人抬起。设备那条路有前提（合成器必然把触摸屏认到唯一那块屏上，见
     /// `route_for`），不满足就整串走单指模拟——模拟走绝对指针，落点总是对的。
     ///
-    /// 拿不到设备时（X Test 后端）也退回模拟：那种会话里 `route_for` 本来就选不出
-    /// 设备，所以这是同一串里的稳定选择，不会中途变。
+    /// 没有设备时（Xorg 会话，或者 Wayland 下没有 `/dev/uinput` 写权限）在选路时
+    /// 就定成模拟。只有设备在一串触摸中途写入失败被丢掉时，`deliver_touch` 才会
+    /// 返回 false，这一串余下的触点改走模拟：设备移除时合成器已经把它上面的触点
+    /// 全部收尾，模拟从下一个触点重新按下。
     fn touch(&mut self, kind: u8, points: &[super::wire::Point]) -> Result<()> {
         let route = match self.touch_route {
             Some(route) => route,
@@ -341,10 +343,14 @@ impl Engine {
     }
     /// 选这一串触摸走哪条路，判定变化时记一条日志（和 `aim_space` 一样只记一次）。
     fn choose_route(&mut self) -> Route {
-        let decision = route_for(
-            crate::platform::display::compositor_layout().as_deref(),
-            &self.geometry.screens,
-        );
+        let decision = if self.injector.has_touchscreen() {
+            route_for(
+                crate::platform::display::compositor_layout().as_deref(),
+                &self.geometry.screens,
+            )
+        } else {
+            Err("没有虚拟触摸屏".into())
+        };
         let state = decision.as_ref().map(|_| ()).map_err(Clone::clone);
         if self.touch_space.as_ref() != Some(&state) {
             match &state {
@@ -356,7 +362,7 @@ impl Engine {
         decision.unwrap_or(Route::Simulated)
     }
     /// 把触点交给触摸屏设备。旋转与屏幕宽度由 `route_for` 在选路时算好带过来，这一
-    /// 帧不再查屏幕。返回 false 表示这个后端没有触摸屏，调用方退回模拟。
+    /// 帧不再查屏幕。返回 false 表示设备已经在这一串中途被丢掉，调用方退回模拟。
     fn deliver_touch(
         &mut self,
         kind: u8,
