@@ -1761,6 +1761,12 @@ impl Player {
         } else {
             "开启鼠标控制（此平台暂未适配键盘）".to_owned()
         };
+        // 桌面不让锁定指针时（见 `update_pointer_lock`）只在这里说一声，不弹窗挡输入。
+        let mouse_hint = if self.input().relative_available() {
+            mouse_hint
+        } else {
+            format!("{mouse_hint}\n当前桌面不允许锁定指针，已改用绝对坐标")
+        };
         if row
             .add_enabled_ui(controlling || control.ready, |ui| {
                 caption_button(ui, ViewerCaptionIcon::Mouse, controlling, &mouse_hint)
@@ -2084,8 +2090,10 @@ impl Player {
                     tracing::warn!(%error, "无法锁定指针，改用绝对坐标");
                     // Without the pointer the deltas would drift; the session
                     // falls back to absolute positioning on its next poll.
+                    // Only a notice, not a question: a modal would hold input
+                    // back until dismissed, so the caption's mouse button says
+                    // it in its tooltip instead.
                     self.input().set_relative_available(false);
-                    self.report("指针锁定", "当前桌面不允许锁定指针，已改用绝对坐标");
                 }
             }
         } else {
