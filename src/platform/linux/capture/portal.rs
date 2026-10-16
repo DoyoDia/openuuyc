@@ -200,8 +200,11 @@ fn pick(sources: &[Source], screen: &Screen, layout: Option<&CompositorLayout>) 
     if let Some(output) = layout.and_then(|layout| layout.output(&screen.device_name)) {
         if let Some(index) = sources.iter().position(|s| {
             s.position == Some((output.left, output.top))
-                // A toolkit that rounds a fractional layout size on its way to
-                // XWayland (KWin) is off by a unit; a position is never rounded.
+                // The portal and xdg-output each make a whole number of a
+                // fractional logical size, and not always the same way (niri's
+                // portal truncates, smithay's xdg-output rounds), so a size may
+                // be a unit off; a position is a whole layout coordinate and is
+                // never rounded.
                 && s.size.is_some_and(|(width, height)| {
                     (i64::from(width) - i64::from(output.width)).abs() <= 1
                         && (i64::from(height) - i64::from(output.height)).abs() <= 1
@@ -400,6 +403,10 @@ mod tests {
     /// turned upright. The display server places an output at the compositor's
     /// logical position and sizes it in the output's own pixels, so on the
     /// fractionally scaled monitor the size alone gives it away.
+    ///
+    /// 5120 / 1.35 = 3792.59: niri's portal truncates it to 3792 (its
+    /// `logical_output()` casts), while smithay's xdg-output rounds it to 3793,
+    /// so the two sides really do disagree by a unit here.
     #[test]
     fn a_fractionally_scaled_monitor_matches_by_its_name() {
         let sources = [stream(0, 0, 1000, 1600), stream(1000, 0, 3792, 1600)];
@@ -408,7 +415,7 @@ mod tests {
                 rotation: Rotation::Rotate90,
                 ..output("DP-3", 0, 0, 1000, 1600)
             },
-            output("DP-1", 1000, 0, 3792, 1600),
+            output("DP-1", 1000, 0, 3793, 1600),
         ]);
         assert_eq!(
             pick(
@@ -426,8 +433,9 @@ mod tests {
         );
     }
 
-    /// The layout's size is what the portal reports, so a unit either way still
-    /// pairs; a position is exact, since two monitors can sit a unit apart.
+    /// The portal and the layout may round a fractional size differently, so a
+    /// unit either way still pairs; a position is exact, since two monitors can
+    /// sit a unit apart.
     #[test]
     fn a_rounded_size_pairs_but_a_shifted_position_does_not() {
         let layout = layout(vec![output("DP-2", 1920, 0, 1920, 1080)]);
