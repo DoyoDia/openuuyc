@@ -94,6 +94,10 @@ pub(crate) fn window_title_bar(
 ///
 /// 播放器窗口要在这儿放设备切换菜单（Windows 的 caption 也是这么做的），而设备列表
 /// 只有它自己知道。除了这一格，拖动、品牌图标、窗口按钮都照旧。
+///
+/// 目前只有 Linux 的播放器用它：Windows 播放器整条 caption 都是自己画的
+/// （`windows_presenter/chrome.rs`），不经过 [`window_title_bar`]。
+#[cfg_attr(windows, allow(dead_code, reason = "Windows 播放器自己画 caption"))]
 pub(crate) fn window_title_bar_with_identity(
     ui: &mut egui::Ui,
     window: &Window,
