@@ -11,9 +11,15 @@
 //! One portal session serves every captured monitor of this process, and its
 //! cursor mode is fixed when it starts; a desktop wanting the other mode gets
 //! its own session.
+//!
+//! A shared monitor is paired with the screen the controller asked for by the
+//! rectangle the compositor lays it out at, not by anything the portal names it
+//! with: the portal's `id` is an opaque counter and the streams arrive in no
+//! particular order.
 use super::Picture;
 use super::Screen;
 use super::pipewire::Stream;
+use crate::platform::CompositorLayout;
 use anyhow::{Context, Result, bail};
 use ashpd::desktop::PersistMode;
 use ashpd::desktop::screencast::{
@@ -155,69 +161,67 @@ impl Session {
         Ok(session)
     }
 
-    /// The shared monitor that is `screen`, matched by the rectangle it covers
-    /// on the desktop.
+    /// The shared monitor that is `screen`.
     fn source(&self, screen: &Screen) -> Result<&Source> {
-        let rectangle = (
-            (screen.left, screen.top),
-            (screen.width as i32, screen.height as i32),
-        );
-        if let Some(source) = self
-            .sources
-            .iter()
-            .find(|s| s.position == Some(rectangle.0) && s.size == Some(rectangle.1))
-        {
-            return Ok(source);
-        }
-        // A desktop scaled by anything but 1 leaves that comparison without an
-        // answer: the portal gives the monitor as the compositor lays it out,
-        // while `Screen` carries the size XWayland gives the output, which is
-        // the layout size times the output's own scale. The two rectangles sit
-        // at the same place all the same, and the scale cancels out of their
-        // shapes, so the monitor is found by the shape it shares with the
-        // portal rectangle at that position. Without this a scaled desktop has
-        // no working capture method at all on a compositor without
-        // wlroots screencopy, such as Mutter or KWin.
-        if let Some(source) = self.sources.iter().find(|s| {
-            s.position == Some(rectangle.0)
-                && s.size.is_some_and(|size| same_shape(size, rectangle.1))
-        }) {
-            return Ok(source);
-        }
-        match self.sources.as_slice() {
-            // A single shared monitor without geometry can only be this one.
-            [only] if only.position.is_none() => Ok(only),
-            _ => bail!("所选显示器不在本机授权共享的屏幕中"),
-        }
+        // A desktop at scale 1 describes a monitor with the same rectangle in
+        // both spaces, so the display server's own answer is tried first and
+        // most sessions never ask the compositor anything.
+        let index = match pick(&self.sources, screen, None) {
+            Some(index) => index,
+            None => {
+                let layout = crate::platform::display::compositor_layout_soon();
+                pick(&self.sources, screen, layout.as_deref())
+                    .context("所选显示器不在本机授权共享的屏幕中")?
+            }
+        };
+        Ok(&self.sources[index])
     }
 }
 
-/// How far the shapes of a portal rectangle and a screen rectangle may drift
-/// apart and still be one monitor. Rounding the scaled size to whole layout
-/// units moves the ratio by about one part in a thousand on a 4K monitor and
-/// by under a percent on the smallest one, while the shapes of any two
-/// monitors a desktop holds are at least several percent apart.
-const SHAPE_TOLERANCE: f64 = 0.01;
-
-/// Whether the rectangle a portal stream covers and the rectangle `Screen`
-/// carries are the same monitor.
+/// Which of the portal's streams is `screen`, by index.
 ///
-/// They differ by the output's scale — the portal counts layout units, `Screen`
-/// counts the output's own pixels — and a scale is the same in both directions,
-/// so it cancels out of the aspect ratio. A monitor turned a quarter turn is
-/// described with its sides swapped by one of the two, so the ratio is also
-/// tried the other way round.
-fn same_shape(logical: (i32, i32), pixels: (i32, i32)) -> bool {
-    let (width, height) = (f64::from(logical.0), f64::from(logical.1));
-    let (pixel_width, pixel_height) = (f64::from(pixels.0), f64::from(pixels.1));
-    // A source the portal left empty describes nothing to compare against.
-    if width <= 0.0 || height <= 0.0 || pixel_width <= 0.0 || pixel_height <= 0.0 {
-        return false;
+/// The portal describes a monitor the way the compositor lays it out, while
+/// `Screen` carries the rectangle the display server gives the output. Those
+/// are the same rectangle at scale 1 and disagree on a scaled desktop, and how
+/// they disagree is the compositor's business: XWayland on Mutter and KWin
+/// scales both the position and the size by the display's scale, while
+/// xwayland-satellite keeps the logical position and sizes the output in its
+/// own pixels. So the compositor's own layout — the space the portal describes
+/// the monitor in — is what a scaled desktop is paired by, through the name the
+/// output is known by (`DP-1`, which RandR also reports as the monitor name).
+///
+/// Nothing here guesses: a monitor the layout cannot name, or a stream whose
+/// rectangle is not the layout's, leaves the screen unmatched, and the caller
+/// reports that rather than capturing a monitor nobody asked for.
+fn pick(sources: &[Source], screen: &Screen, layout: Option<&CompositorLayout>) -> Option<usize> {
+    let rectangle = (
+        (screen.left, screen.top),
+        (screen.width as i32, screen.height as i32),
+    );
+    if let Some(index) = sources
+        .iter()
+        .position(|s| s.position == Some(rectangle.0) && s.size == Some(rectangle.1))
+    {
+        return Some(index);
     }
-    let ratio = width / height;
-    let pixel_ratio = pixel_width / pixel_height;
-    let close = |other: f64| (ratio - other).abs() <= ratio * SHAPE_TOLERANCE;
-    close(pixel_ratio) || close(pixel_ratio.recip())
+    if let Some(output) = layout.and_then(|layout| layout.output(&screen.device_name))
+        && let Some(index) = sources.iter().position(|s| {
+            s.position == Some((output.left, output.top))
+                // A toolkit that rounds a fractional layout size on its way to
+                // XWayland (KWin) is off by a unit; a position is never rounded.
+                && s.size.is_some_and(|(width, height)| {
+                    (i64::from(width) - i64::from(output.width)).abs() <= 1
+                        && (i64::from(height) - i64::from(output.height)).abs() <= 1
+                })
+        })
+    {
+        return Some(index);
+    }
+    match sources {
+        // A single shared monitor without geometry can only be this one.
+        [only] if only.position.is_none() => Some(0),
+        _ => None,
+    }
 }
 
 impl Drop for Session {
@@ -268,42 +272,183 @@ impl Grab {
 
 #[cfg(test)]
 mod tests {
-    use super::same_shape;
+    use super::{Source, pick};
+    use crate::media::capture::Screen;
+    use crate::platform::{CompositorLayout, CompositorOutput, Rotation};
 
-    /// The desktop this went wrong on: an AMD output of 5120x2160 at scale
-    /// 1.35, which the portal describes as 3792x1600 layout units.
-    #[test]
-    fn a_fractionally_scaled_monitor_matches_by_its_shape() {
-        assert!(same_shape((3792, 1600), (5120, 2160)));
+    /// A stream as the portal described it.
+    fn stream(x: i32, y: i32, width: i32, height: i32) -> Source {
+        Source {
+            node: 0,
+            position: Some((x, y)),
+            size: Some((width, height)),
+        }
     }
 
-    /// A desktop at scale 1 is the same rectangle in both coordinate spaces.
-    #[test]
-    fn an_unscaled_monitor_matches_to_the_pixel() {
-        assert!(same_shape((1920, 1080), (1920, 1080)));
+    /// A monitor as the display server gives it to `Screen`.
+    fn screen(device_name: &str, left: i32, top: i32, width: u32, height: u32) -> Screen {
+        Screen {
+            id: 0,
+            device_name: device_name.to_owned(),
+            display_name: device_name.to_owned(),
+            width,
+            height,
+            left,
+            top,
+            primary: false,
+            fps: 60,
+            dpi_scale: None,
+            hdr: false,
+            adapter: 0,
+            render_adapter: None,
+            identity: None,
+        }
     }
 
-    /// A monitor turned a quarter turn is described with its sides swapped by
-    /// one of the two coordinate spaces.
-    #[test]
-    fn a_rotated_monitor_matches_with_its_sides_the_other_way_round() {
-        assert!(same_shape((1080, 1920), (1920, 1080)));
-        assert!(same_shape((1200, 1920), (1920, 1200)));
+    /// The same monitor in the compositor's own layout, upright.
+    fn output(name: &str, left: i32, top: i32, width: u32, height: u32) -> CompositorOutput {
+        CompositorOutput {
+            name: Some(name.to_owned()),
+            left,
+            top,
+            width,
+            height,
+            rotation: Rotation::Normal,
+        }
     }
 
-    /// 4:3 and 5:4 are the closest two monitors get, and they stay apart.
-    #[test]
-    fn monitors_of_other_shapes_do_not_match() {
-        assert!(!same_shape((1280, 960), (1280, 1024)));
-        assert!(!same_shape((1920, 1080), (2560, 1600)));
-        assert!(!same_shape((5120, 2160), (2560, 1600)));
+    fn layout(outputs: Vec<CompositorOutput>) -> CompositorLayout {
+        CompositorLayout { outputs }
     }
 
-    /// An empty rectangle is not a shape, and never the monitor asked for.
+    /// A desktop at scale 1 is described with one rectangle by both sides.
     #[test]
-    fn an_empty_rectangle_does_not_match() {
-        assert!(!same_shape((0, 0), (0, 0)));
-        assert!(!same_shape((1920, 1080), (0, 0)));
-        assert!(!same_shape((0, 0), (1920, 1080)));
+    fn an_unscaled_desktop_matches_the_display_servers_rectangle() {
+        let sources = [stream(0, 0, 1920, 1080), stream(1920, 0, 1920, 1080)];
+        assert_eq!(
+            pick(&sources, &screen("DP-2", 1920, 0, 1920, 1080), None),
+            Some(1)
+        );
+    }
+
+    /// Three 4K monitors side by side at scale 2, as GNOME 50 and KDE lay them
+    /// out: the portal reports the logical rectangles, XWayland scales both the
+    /// position and the size. Matching the second monitor must find the second
+    /// stream — the third one has the rectangle the display server reports for
+    /// it, which is where pairing by shape used to land.
+    #[test]
+    fn a_scaled_desktop_matches_the_stream_by_the_compositors_layout() {
+        let sources = [
+            stream(0, 0, 1920, 1080),
+            stream(1920, 0, 1920, 1080),
+            stream(3840, 0, 1920, 1080),
+        ];
+        let layout = layout(vec![
+            output("DP-1", 0, 0, 1920, 1080),
+            output("DP-2", 1920, 0, 1920, 1080),
+            output("DP-3", 3840, 0, 1920, 1080),
+        ]);
+        assert_eq!(
+            pick(
+                &sources,
+                &screen("DP-2", 3840, 0, 3840, 2160),
+                Some(&layout)
+            ),
+            Some(1)
+        );
+    }
+
+    /// The desktop this went wrong on: niri behind xwayland-satellite, with a
+    /// 5120x2160 monitor at scale 1.35 beside a 2560x1600 one at scale 1.6
+    /// turned upright. The display server places an output at the compositor's
+    /// logical position and sizes it in the output's own pixels, so on the
+    /// fractionally scaled monitor the size alone gives it away.
+    #[test]
+    fn a_fractionally_scaled_monitor_matches_by_its_name() {
+        let sources = [stream(0, 0, 1000, 1600), stream(1000, 0, 3792, 1600)];
+        let layout = layout(vec![
+            CompositorOutput {
+                rotation: Rotation::Rotate90,
+                ..output("DP-3", 0, 0, 1000, 1600)
+            },
+            output("DP-1", 1000, 0, 3792, 1600),
+        ]);
+        assert_eq!(
+            pick(
+                &sources,
+                &screen("DP-1", 1000, 0, 5120, 2160),
+                Some(&layout)
+            ),
+            Some(1)
+        );
+        // The turned monitor is described with its sides swapped by the display
+        // server, and the layout still names it: no second orientation to try.
+        assert_eq!(
+            pick(&sources, &screen("DP-3", 0, 0, 1600, 2560), Some(&layout)),
+            Some(0)
+        );
+    }
+
+    /// The layout's size is what the portal reports, so a unit either way still
+    /// pairs; a position is exact, since two monitors can sit a unit apart.
+    #[test]
+    fn a_rounded_size_pairs_but_a_shifted_position_does_not() {
+        let layout = layout(vec![output("DP-2", 1920, 0, 1920, 1080)]);
+        let second = screen("DP-2", 1920, 0, 1920, 1080);
+        assert_eq!(
+            pick(&[stream(1920, 0, 1919, 1079)], &second, Some(&layout)),
+            Some(0)
+        );
+        assert_eq!(
+            pick(&[stream(1921, 0, 1920, 1080)], &second, Some(&layout)),
+            None
+        );
+    }
+
+    /// A desktop the two spaces disagree about, with no layout to settle it,
+    /// stays unmatched: the caller reports it instead of capturing a monitor
+    /// that may be someone else's screen.
+    #[test]
+    fn a_scaled_desktop_without_a_layout_is_not_guessed_at() {
+        let sources = [stream(0, 0, 1920, 1080), stream(3840, 0, 1920, 1080)];
+        let wanted = screen("DP-2", 3840, 0, 3840, 2160);
+        assert_eq!(pick(&sources, &wanted, None), None);
+        // XWayland before 23.1 names every output `XWAYLAND0…` instead of the
+        // connector, so there is nothing to look up.
+        let layout = layout(vec![output("DP-1", 0, 0, 1920, 1080)]);
+        assert_eq!(
+            pick(
+                &sources,
+                &screen("XWAYLAND1", 3840, 0, 3840, 2160),
+                Some(&layout)
+            ),
+            None
+        );
+    }
+
+    /// A single shared monitor the portal left without geometry can only be the
+    /// one that was asked for; two of them are ambiguous.
+    #[test]
+    fn a_lone_stream_without_geometry_is_the_monitor_asked_for() {
+        let wanted = screen("DP-1", 1000, 0, 5120, 2160);
+        let only = [Source {
+            node: 0,
+            position: None,
+            size: None,
+        }];
+        assert_eq!(pick(&only, &wanted, None), Some(0));
+        let two = [
+            Source {
+                node: 0,
+                position: None,
+                size: None,
+            },
+            Source {
+                node: 1,
+                position: None,
+                size: None,
+            },
+        ];
+        assert_eq!(pick(&two, &wanted, None), None);
     }
 }

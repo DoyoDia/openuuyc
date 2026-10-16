@@ -21,6 +21,16 @@ pub(crate) fn compositor_layout() -> Option<std::sync::Arc<crate::platform::Comp
     wayland::layout()
 }
 
+/// [`compositor_layout`], waiting for the first description to arrive.
+///
+/// For a caller that cannot go on without the layout and is not in anyone's hot
+/// path: the watcher starts lazily, so the first snapshot of a process is only
+/// published a round trip after the first ask.
+pub(crate) fn compositor_layout_soon() -> Option<std::sync::Arc<crate::platform::CompositorLayout>>
+{
+    wayland::layout_soon()
+}
+
 pub fn detect_local_display() -> Result<LocalDisplayInfo> {
     let displays = DisplayInfo::all().context("failed to enumerate local displays")?;
     let display = displays

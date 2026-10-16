@@ -36,6 +36,8 @@ const SETUP_TIMEOUT: Duration = Duration::from_secs(3);
 /// The pause before asking again after a failure, doubled up to the maximum.
 const RETRY_FIRST: Duration = Duration::from_secs(2);
 const RETRY_MAX: Duration = Duration::from_secs(60);
+/// How often [`layout_soon`] looks while it waits.
+const WAIT_POLL: Duration = Duration::from_millis(100);
 
 static SNAPSHOT: RwLock<Option<Arc<CompositorLayout>>> = RwLock::new(None);
 
@@ -44,8 +46,39 @@ static SNAPSHOT: RwLock<Option<Arc<CompositorLayout>>> = RwLock::new(None);
 /// `None` outside a Wayland session, before the first description arrives,
 /// and while the compositor cannot describe its layout.
 pub(crate) fn layout() -> Option<Arc<CompositorLayout>> {
+    if !watching() {
+        return None;
+    }
+    SNAPSHOT.read().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// [`layout`], waiting up to [`SETUP_TIMEOUT`] for the first description.
+///
+/// A caller that cannot go on without the layout, and is not in anyone's hot
+/// path, asks this way; the wait is bounded so a compositor that never answers
+/// costs it one pause rather than hanging. Without a Wayland session there is
+/// nothing to wait for at all.
+pub(crate) fn layout_soon() -> Option<Arc<CompositorLayout>> {
+    if !watching() {
+        return None;
+    }
+    let deadline = Instant::now() + SETUP_TIMEOUT;
+    loop {
+        if let Some(layout) = layout() {
+            return Some(layout);
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return None;
+        }
+        std::thread::sleep(WAIT_POLL.min(left));
+    }
+}
+
+/// Whether the watcher thread is running, starting it on the first ask.
+fn watching() -> bool {
     static WATCHER: OnceLock<bool> = OnceLock::new();
-    let watching = *WATCHER.get_or_init(|| {
+    *WATCHER.get_or_init(|| {
         if std::env::var_os("WAYLAND_DISPLAY").is_none() {
             return false;
         }
@@ -54,11 +87,7 @@ pub(crate) fn layout() -> Option<Arc<CompositorLayout>> {
             .spawn(watch)
             .inspect_err(|error| tracing::warn!(%error, "无法启动合成器布局监视线程"))
             .is_ok()
-    });
-    if !watching {
-        return None;
-    }
-    SNAPSHOT.read().unwrap_or_else(|e| e.into_inner()).clone()
+    })
 }
 
 fn publish(layout: Option<CompositorLayout>) {
