@@ -11,6 +11,7 @@ use crate::{
         drag_drop::{Stage, Ticket, controller::Controller},
         stream_control::StreamControlHandle,
     },
+    platform::linux::drag_drop::linked::Linked,
     protocol::drag_drop::{COPY, Point},
 };
 use std::{path::PathBuf, sync::Arc, time::Duration};
@@ -20,6 +21,9 @@ use x11rb::protocol::xproto::ConnectionExt as _;
 
 pub(super) struct WindowDrag {
     owner: u64,
+    /// Wayland 会话里本机拖动的那一半：坐标和文件清单都只有它给得了。
+    /// X11 会话（或者拿不到它）走下面那套 winit + X 服务器的老路。
+    linked: Option<Arc<Linked>>,
     controller: Controller,
     control: StreamControlHandle,
     /// Files over the window, and whether the gesture has been offered yet.
@@ -36,9 +40,10 @@ pub(super) struct WindowDrag {
     pointer: Option<(x11rb::rust_connection::RustConnection, u32)>,
 }
 impl WindowDrag {
-    pub fn new(owner: u64, control: &StreamControlHandle) -> Self {
+    pub fn new(owner: u64, control: &StreamControlHandle, linked: Option<Arc<Linked>>) -> Self {
         Self {
             owner,
+            linked,
             controller: control.drag_drop().clone(),
             control: control.clone(),
             paths: Vec::new(),
@@ -54,7 +59,13 @@ impl WindowDrag {
         }
     }
     /// Take the window's drop events; true for one of them.
+    ///
+    /// Wayland 会话里这些事件由我们自己那个 `wl_data_device` 收（见 [`Linked`]），
+    /// winit 报的同一份就不要再算一次：它没有位置，也没有清单。
     pub fn event(&mut self, event: &WindowEvent) -> bool {
+        if self.linked.is_some() {
+            return false;
+        }
         match event {
             WindowEvent::HoveredFile(path) => {
                 if !self.hovering {
@@ -100,6 +111,10 @@ impl WindowDrag {
         available: bool,
         point: impl Fn(PhysicalPosition<f64>) -> Option<Point>,
     ) {
+        if let Some(linked) = self.linked.clone() {
+            self.tick_wayland(&linked, ctx, available, point);
+            return;
+        }
         if !self.dropped.is_empty() {
             let position = self.local_pointer(window);
             let target = position.and_then(&point).filter(|_| available);
@@ -127,6 +142,50 @@ impl WindowDrag {
         }
         self.over(target);
     }
+    /// 本机拖动的 Wayland 版本：位置和清单都从 `wl_data_device` 来。
+    ///
+    /// 拖动期间合成器把指针交给了拖动源，winit 一个 `CursorMoved` 都收不到，
+    /// 所以位置只能这么要；清单也一样——winit 报的 `HoveredFile` 只有路径，
+    /// 而且是另一条 `wl_data_device` 上的同一份事件，不带上位置就没法用。
+    fn tick_wayland(
+        &mut self,
+        linked: &Linked,
+        ctx: &egui::Context,
+        available: bool,
+        point: impl Fn(PhysicalPosition<f64>) -> Option<Point>,
+    ) {
+        let Some(hover) = linked.hovering(self.owner) else {
+            if self.hovering {
+                self.leave();
+            }
+            return;
+        };
+        ctx.request_repaint_after(Duration::from_millis(30));
+        let position = PhysicalPosition::new(hover.position.0, hover.position.1);
+        let target = point(position).filter(|_| available);
+        if !self.hovering {
+            // `leave` 会把上一份清单清掉，所以清单要在它之后再补。
+            self.leave();
+            self.hovering = true;
+        }
+        self.paths = hover.paths.clone();
+        if hover.dropped {
+            // 落点是终点：交给同一个 `drop_at`，官方的 `drop_files` 那条路
+            // 也是从这里走的。
+            self.hovering = false;
+            self.entered = false;
+            self.drop_at(target);
+            linked.drop_taken(self.owner);
+            return;
+        }
+        if !self.entered {
+            self.entered = true;
+            self.native = self.controller.is_native();
+            self.error = None;
+        }
+        self.over(target);
+    }
+
     pub fn show(&mut self, ctx: &egui::Context) {
         let reverse = self.controller.take_reverse(self.owner);
         self.transfers.extend(reverse);

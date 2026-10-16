@@ -727,6 +727,9 @@ impl ApplicationHandler<UiEvent> for ConnectingWindowsRunner {
         }
         if let Stage::Playing(player) = &mut self.stage {
             let mut redraw = player.poll_pending();
+            // 拖放那条通道读 socket 的仍然是 winit，这里只把已经读进来的事件
+            // 分发给它自己的队列——拖动期间指针不在我们手上，晚一轮就少一格坐标。
+            player.pump_drag();
             // 屏目录每 250 ms 对一次：切屏期间没有画面要画，但轮询交给它自己，
             // 不再把 UI 线程按在「立刻重画」上（那样会绕开帧率节拍一直占满一个核）。
             if let Some(window) = self.window.clone() {
@@ -878,6 +881,9 @@ struct Player {
     shortcuts: Option<super::linux_shortcuts::Shortcuts>,
     /// Files dropped on the window, and drags carried out of it.
     drag: super::linux_drag::WindowDrag,
+    /// 拖放借用的第二条 Wayland 通道（serial 与拖动落点都只有它给得了）。
+    /// X11 会话里没有，拖放退回 winit + X 服务器那套。
+    linked: Option<Arc<crate::platform::linux::drag_drop::linked::Linked>>,
     /// Mouse mode of the previous frame, to notice control being dropped.
     last_mouse_mode: MouseMode,
 }
@@ -901,10 +907,29 @@ impl Player {
         let owner = u64::from(window.id());
         let window_id = window.id();
         let wake = FrameWakeBridge::install(&session, proxy.clone(), window_id)?;
-        let drag = super::linux_drag::WindowDrag::new(owner, &session.stream_control);
+        // 挂在 winit 的 display 上的第二个客户端。进程里只建一次，之后的窗口
+        // 只是在它那儿登记一下自己那块 surface。
+        let linked = match crate::platform::linux::drag_drop::linked::Linked::attach(window) {
+            Ok(linked) => {
+                if let Err(error) = linked.watch(window) {
+                    tracing::debug!(%error, "无法登记观看窗口的拖放通道");
+                }
+                Some(linked)
+            }
+            Err(error) => {
+                tracing::debug!(%error, "没有可用的 Wayland 拖放通道");
+                None
+            }
+        };
+        let drag = super::linux_drag::WindowDrag::new(
+            owner,
+            &session.stream_control,
+            linked.clone(),
+        );
         Ok(Self {
             shortcuts: super::linux_shortcuts::Shortcuts::new(window),
             drag,
+            linked,
             _shortcuts: crate::application::viewer_shortcuts::Watcher::new()?,
             session,
             initial,
@@ -2757,8 +2782,20 @@ mod input_tests {
     }
 }
 
+impl Player {
+    /// 把拖放通道上已经读到的事件分发给它自己的队列。
+    pub(super) fn pump_drag(&self) {
+        if let Some(linked) = &self.linked {
+            linked.pump();
+        }
+    }
+}
+
 impl Drop for Player {
     fn drop(&mut self) {
+        if let Some(linked) = &self.linked {
+            linked.unwatch(self.owner);
+        }
         // 顺序和 Windows 的 `ScreenWindows::drop` 一致：先丢掉正在打开的那块屏
         // （abort 掉 open 任务），再关掉每条解码会话、取消这个窗口的任务域，别的屏的
         // 解码线程因此马上收到停止信号，而不是等到最后一个 `ScreenPlayback` 克隆
