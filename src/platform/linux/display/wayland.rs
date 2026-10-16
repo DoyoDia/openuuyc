@@ -128,7 +128,7 @@ fn watch() {
         // The same failure every minute is one message, not a log full of it.
         let message = format!("{error:#}");
         if reported.as_ref() != Some(&message) {
-            tracing::warn!(error = %message, "合成器输出布局不可用，绝对定位改用相对移动");
+            tracing::warn!(error = %message, "合成器输出布局不可用：绝对定位改用相对移动，缩放的桌面上门户采集无法认屏");
             reported = Some(message);
         }
         std::thread::sleep(pause);
