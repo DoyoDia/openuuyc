@@ -295,20 +295,19 @@ fn capture_setting() -> i32 {
     6
 }
 
-/// 见上。两件事都要成立才报 5：辅助程序装了，而且当前桌面接得住新输出。
+/// 见上。辅助程序装了、当前桌面接得住新输出、内核的 VKMS 有 configfs 接口，三件事
+/// 都成立才报 5（见 `virtual_display::ready`）。
 ///
 /// 只看文件在不在是不够的——deb 包总会把辅助程序装上，于是 GNOME、KDE、sway 和所有
 /// Xorg 会话都会报 5，主控那边「添加虚拟屏」的按钮点亮，点下去必然失败（而且是先插
-/// 一块屏再拔掉，本机用户能看到布局跳一下）。中途装上辅助程序要重开程序才会对外
-/// 改口，这比在握手时去连一个 root 服务（那会顺手把它拉起来）划算。
+/// 一块屏再拔掉，本机用户能看到布局跳一下）；6.19 以前的内核上 niri 也一样。中途装上
+/// 辅助程序要重开程序才会对外改口，这比在握手时去连一个 root 服务（那会顺手把它拉
+/// 起来）划算。
 #[cfg(not(windows))]
 fn capture_setting() -> i32 {
     use std::sync::OnceLock;
     static READY: OnceLock<bool> = OnceLock::new();
-    if *READY.get_or_init(|| {
-        crate::platform::virtual_display::helper_installed()
-            && crate::platform::display::compositor::available()
-    }) {
+    if *READY.get_or_init(crate::platform::virtual_display::ready) {
         5
     } else {
         4

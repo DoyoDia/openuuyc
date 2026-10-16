@@ -6,9 +6,79 @@
 //! 它是按合成器报出来的输出枚举的，新屏自然就在里面。
 use anyhow::{Context, Result};
 
-/// 辅助程序装没装。查文件，不连它——握手时连一次会顺手把那个 root 服务拉起来。
-pub(crate) fn helper_installed() -> bool {
+/// 能不能对主控说「这台机器能加虚拟屏」。
+///
+/// 三件事都要成立：辅助程序装了、当前桌面接得住新输出、内核的 VKMS 有 configfs 接口。
+/// 全都只看本地文件和命令，不连辅助程序——握手时连一次会顺手把那个 root 服务拉起来。
+/// 内核那一项查不出来（没有 modinfo）时不拦，交给辅助程序在建屏时说明原因。
+pub(crate) fn ready() -> bool {
     openuuyc_vkms::installed()
+        && super::display::compositor::available()
+        && !matches!(kernel_support(), Kernel::Unsupported(_))
+}
+
+/// 内核的 VKMS 能不能经 configfs 现造设备。
+#[derive(Debug, PartialEq, Eq)]
+enum Kernel {
+    Supported,
+    /// 确定不行，带着给用户看的原因。
+    Unsupported(String),
+    /// 查不出来。
+    Unknown,
+}
+
+/// 不需要 root、也不加载模块地判断内核的 VKMS 有没有 configfs 接口。
+///
+/// 和辅助程序启动时的检查（`crates/vkms` 的 `ensure_supported`）看的是同一组东西：
+/// configfs 接口和 `create_default_dev` 参数是同一组补丁带进 Linux 6.19 的，模块加载
+/// 了就看 sysfs，没加载就问 `modinfo`（普通用户也能跑，只是 Debian 系的 PATH 里没有
+/// /usr/sbin）。
+fn kernel_support() -> Kernel {
+    const TOO_OLD: &str = "VKMS 不支持 configfs，虚拟屏需要 Linux 6.19 或更新的内核";
+    let release = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .map(|text| text.trim().to_owned())
+        .unwrap_or_else(|_| "未知版本".into());
+    if std::path::Path::new("/sys/kernel/config/vkms").exists() {
+        return Kernel::Supported;
+    }
+    if std::path::Path::new("/sys/module/vkms").exists() {
+        // 模块已经加载、却没有 configfs 接口：要么是老模块，要么 configfs 没挂载。
+        // 后者交给辅助程序去说。
+        return if std::path::Path::new("/sys/module/vkms/parameters/create_default_dev").exists() {
+            Kernel::Supported
+        } else {
+            Kernel::Unsupported(format!("本机内核 {release} 加载的 {TOO_OLD}"))
+        };
+    }
+    for program in ["modinfo", "/usr/sbin/modinfo", "/sbin/modinfo"] {
+        let Ok(output) = std::process::Command::new(program)
+            .args(["-F", "parm", "vkms"])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+        else {
+            continue;
+        };
+        if !output.status.success() {
+            // modinfo 跑起来了却找不到模块：内核根本没编 VKMS。
+            return Kernel::Unsupported(format!(
+                "本机内核 {release} 没有 VKMS 模块（CONFIG_DRM_VKMS），无法添加虚拟屏"
+            ));
+        }
+        return if lists_default_dev_parameter(&String::from_utf8_lossy(&output.stdout)) {
+            Kernel::Supported
+        } else {
+            Kernel::Unsupported(format!("本机内核 {release} 的 {TOO_OLD}"))
+        };
+    }
+    Kernel::Unknown
+}
+
+/// `modinfo -F parm vkms` 的输出里有没有 `create_default_dev`。
+fn lists_default_dev_parameter(parameters: &str) -> bool {
+    parameters
+        .lines()
+        .any(|line| line.trim().starts_with("create_default_dev:"))
 }
 
 /// 一次被控会话里的虚拟显示器。持有一条到辅助程序的连接。
@@ -209,6 +279,13 @@ pub(crate) fn availability() -> Availability {
             detail: Some(super::display::compositor::unavailable_reason()),
         };
     }
+    // 内核不够新的话不必去连辅助程序（那会把一个 root 服务拉起来）就能说清楚。
+    if let Kernel::Unsupported(reason) = kernel_support() {
+        return Availability {
+            label: "内核不支持".into(),
+            detail: Some(reason),
+        };
+    }
     match openuuyc_vkms::probe() {
         Ok(status) => Availability {
             label: match status.capacity {
@@ -243,6 +320,25 @@ mod tests {
     use openuuyc_vkms::{Reply, Request, Status};
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixListener;
+
+    /// 6.8 的 vkms 只有这三个参数；6.19 起多了 `create_default_dev`。
+    #[test]
+    fn the_configfs_parameter_marks_a_new_enough_vkms() {
+        let old = "enable_cursor:Enable/Disable cursor support (bool)\n\
+                   enable_writeback:Enable/Disable writeback connector support (bool)\n\
+                   enable_overlay:Enable/Disable overlay support (bool)\n";
+        assert!(!lists_default_dev_parameter(old));
+        let new = format!("{old}create_default_dev:Create or not the default VKMS device (bool)\n");
+        assert!(lists_default_dev_parameter(&new));
+        assert!(!lists_default_dev_parameter(""));
+    }
+
+    /// 真机：在这台机器上实际问一次（只读 sysfs、跑 modinfo，不加载模块）。
+    #[test]
+    #[ignore = "结果取决于本机内核"]
+    fn asks_the_running_kernel() {
+        println!("{:?}", kernel_support());
+    }
 
     /// 一个假的辅助程序：按顺序接 `connections` 条连接，每条请求交给 `answer`
     /// （参数是第几条连接、请求），它返回 `None` 就当场断开这条连接，模拟辅助程序重启。
