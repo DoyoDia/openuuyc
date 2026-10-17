@@ -8,6 +8,21 @@ use anyhow::Context as _;
 mod displays;
 pub(crate) use displays::{receive_session, screen_states};
 
+/// The terminal session list changed.
+///
+/// The official host broadcasts this empty message when sessions appear,
+/// vanish or are renamed. The controller reacts by sending its own
+/// `listSessionsReq`; it only accepts the first list response after a request
+/// it made, so pushing the list proactively would be dropped.
+pub(crate) fn terminal_session_changed() -> Vec<u8> {
+    PbControlMessage {
+        seq: 0,
+        timestamp: 0,
+        payload: Some(PbPayload::TerminalSessionChanged(Vec::new())),
+    }
+    .encode_to_vec()
+}
+
 pub(crate) struct DrawRequest {
     pub command: super::annotation::wire::PbDrawRequestKind,
     sequence: i64,
