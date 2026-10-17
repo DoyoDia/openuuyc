@@ -57,6 +57,8 @@ pub(crate) struct Card {
     pub connected: bool,
     /// The connection is a terminal, not a screen; see `ConnectionInfo`.
     pub terminal: bool,
+    /// That terminal is in a shell the local user opened on this machine.
+    pub local_terminal: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Verb {
@@ -390,6 +392,7 @@ impl Center {
                         busy: p.responding,
                         connected: false,
                         terminal: false,
+                        local_terminal: false,
                         transfer: None,
                     },
                     Some(p),
@@ -412,6 +415,7 @@ impl Center {
                         busy: false,
                         connected: false,
                         terminal: false,
+                        local_terminal: false,
                         transfer: None,
                     },
                     None,
@@ -425,12 +429,16 @@ impl Center {
                     .map(|c| format!("active:{}:{}:{}", c.client_id, c.device_id, c.session_id))
                     .unwrap_or_else(|| "active".into());
                 let terminal = status.connection.as_ref().is_some_and(|c| c.terminal);
+                let local_terminal =
+                    terminal && status.connection.as_ref().is_some_and(|c| c.local_terminal);
                 let title = if status
                     .connection
                     .as_ref()
                     .is_some_and(|c| c.observation_lost)
                 {
                     "正在确认被控状态"
+                } else if status.connected && local_terminal {
+                    "对方接入了你本机的终端会话"
                 } else if status.connected && terminal {
                     "正在被远程访问终端"
                 } else if status.connected {
@@ -440,7 +448,9 @@ impl Center {
                 };
                 // A terminal is not a screen being watched: say what the
                 // other side can do, next to how long it has been connected.
-                let detail = if terminal {
+                let detail = if local_terminal {
+                    format!("对方能看到并操作你在本机打开的终端 · {}", caption.duration)
+                } else if terminal {
                     format!("终端访问，对方可在本机执行命令 · {}", caption.duration)
                 } else {
                     caption.duration
@@ -466,6 +476,7 @@ impl Center {
                         busy: false,
                         connected: status.connected,
                         terminal,
+                        local_terminal,
                         transfer: None,
                     },
                     None,
@@ -497,6 +508,7 @@ impl Center {
                     busy: false,
                     connected: false,
                     terminal: false,
+                    local_terminal: false,
                     transfer: None,
                 },
                 None,
@@ -726,6 +738,7 @@ impl DeviceCenterApp {
                         busy: false,
                         connected: false,
                         terminal: false,
+                        local_terminal: false,
                         transfer: None,
                     },
                 }
