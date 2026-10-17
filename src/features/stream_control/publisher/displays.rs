@@ -234,8 +234,14 @@ pub(crate) async fn receive_session(
                     let result = if lease.terminal_allowed() {
                         let sessions = session.terminal();
                         let mut sessions = sessions.lock().unwrap_or_else(|e| e.into_inner());
+                        // The shells opened on this machine are renamed only
+                        // by a controller allowed to reach them.
+                        let owner = crate::features::host::terminal::Owner::new(
+                            &account,
+                            lease.terminal_local_allowed(),
+                        );
                         sessions
-                            .rename(&account, request.session_id, &request.new_name)
+                            .rename(owner, request.session_id, &request.new_name)
                             .map_err(|error| error.to_string())
                     } else {
                         Err("本机未允许终端".to_owned())

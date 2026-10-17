@@ -50,6 +50,8 @@ pub(crate) enum Request {
         file_transfer: bool,
         port_mapping: bool,
         terminal: bool,
+        #[serde(default)]
+        terminal_local: bool,
         remote_power: bool,
         wol: bool,
     },
@@ -88,6 +90,8 @@ pub(crate) struct Snapshot {
     pub port_mapping: bool,
     #[serde(default)]
     pub terminal: bool,
+    #[serde(default)]
+    pub terminal_local: bool,
     #[serde(default)]
     pub remote_power: bool,
     #[serde(default)]

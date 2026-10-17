@@ -422,6 +422,9 @@ pub(crate) struct LocalSession {
     pub remote: bool,
     /// 本机是否已经有终端接上。
     pub local: bool,
+    /// 会话是本机自己开的（侧边栏或命令行），不是主控开的。只有主控获准接入
+    /// 本机会话时，主控才看得到它。
+    pub opened_here: bool,
     /// 前台正在跑的命令；空闲时为 `None`。
     pub foreground: Option<crate::platform::Foreground>,
 }
@@ -471,6 +474,37 @@ fn key(owner: &str, handle: u32) -> (String, u32) {
     (owner.to_owned(), handle)
 }
 
+/// Who a controller's request acts for: its login generation, and whether
+/// that login may also reach the shells opened on this machine.
+///
+/// The second part is the host's 「允许主控接入本机终端会话」 switch
+/// ([`crate::features::host::Lease::terminal_local_allowed`]). While it is
+/// off, a local session does not exist as far as the controller can tell:
+/// it is not listed, and every request naming its handle is answered as for
+/// a handle that was never opened.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Owner<'a> {
+    account: &'a str,
+    local: bool,
+}
+
+impl<'a> Owner<'a> {
+    pub(crate) fn new(account: &'a str, local: bool) -> Self {
+        Self { account, local }
+    }
+
+    fn sees(&self, who: &str) -> bool {
+        who == self.account || (self.local && who == LOCAL_OWNER)
+    }
+}
+
+impl<'a> From<&'a str> for Owner<'a> {
+    /// A controller that may see only its own sessions.
+    fn from(account: &'a str) -> Self {
+        Self::new(account, false)
+    }
+}
+
 impl Sessions {
     /// Opens a shell, or reattaches to one, and returns its handle, name and
     /// any output to replay. `connection` becomes the one its output goes to.
@@ -481,9 +515,9 @@ impl Sessions {
     /// handle re-uses the shell and returns its screen, which is what the
     /// controller redraws on reattach.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn open(
+    pub(crate) fn open<'a>(
         &mut self,
-        owner: &str,
+        owner: impl Into<Owner<'a>>,
         handle: u32,
         connection: u64,
         shell: &str,
@@ -491,8 +525,9 @@ impl Sessions {
         cols: u16,
         rows: u16,
     ) -> Result<(u32, String, Vec<u8>), SessionError> {
+        let owner = owner.into();
         let handle = if handle == 0 {
-            self.free_handle(owner)
+            self.free_handle(owner.account)
         } else {
             handle
         };
@@ -518,6 +553,7 @@ impl Sessions {
                 existing.screen.screen().state_formatted(),
             ));
         }
+        let owner = owner.account;
         if self.owned(owner).count() >= MAX_SESSIONS || self.sessions.len() >= MAX_TOTAL {
             return Err(SessionError::TooMany);
         }
@@ -557,9 +593,6 @@ impl Sessions {
     /// 的东西应当等用户自己关。编号从 [`LOCAL_HANDLE_BASE`] 起，与手机端
     /// 常用的小编号分开。
     pub(crate) fn create_local(&mut self, name: Option<String>) -> Result<u32, SessionError> {
-        if let Some(reason) = local_unavailable() {
-            return Err(SessionError::Unavailable(reason));
-        }
         if self.sessions.len() >= MAX_TOTAL {
             return Err(SessionError::TooMany);
         }
@@ -608,19 +641,18 @@ impl Sessions {
             .map(|((_, handle), session)| (*handle, session))
     }
 
-    /// 按编号找会话：先找这个账号自己的，再找本机开的那些。
-    ///
-    /// 本机会话对手机端可见，编号从 1000 起，与主控自己的编号不会撞。
-    fn resolve(&self, owner: &str, handle: u32) -> Option<(String, u32)> {
-        let own = key(owner, handle);
+    /// 按编号找会话：先找这个账号自己的；主控获准接入本机会话时再找本机
+    /// 开的那些（编号从 1000 起，与主控自己的小编号不会撞）。
+    fn resolve(&self, owner: Owner<'_>, handle: u32) -> Option<(String, u32)> {
+        let own = key(owner.account, handle);
         if self.sessions.contains_key(&own) {
             return Some(own);
         }
         let local = key(LOCAL_OWNER, handle);
-        self.sessions.contains_key(&local).then_some(local)
+        (owner.local && self.sessions.contains_key(&local)).then_some(local)
     }
 
-    fn get_mut(&mut self, owner: &str, handle: u32) -> Result<&mut Session, SessionError> {
+    fn get_mut(&mut self, owner: Owner<'_>, handle: u32) -> Result<&mut Session, SessionError> {
         let key = self.resolve(owner, handle).ok_or(SessionError::Gone)?;
         self.sessions.get_mut(&key).ok_or(SessionError::Gone)
     }
@@ -655,12 +687,13 @@ impl Sessions {
     }
 
     /// The sessions `owner` may see, as the objects the client parses.
-    pub(crate) fn list(&self, owner: &str) -> Vec<Value> {
-        // 本机自己开的会话也对主控可见，手机端能看到并接上。
+    pub(crate) fn list<'a>(&self, owner: impl Into<Owner<'a>>) -> Vec<Value> {
+        let owner = owner.into();
+        // 本机自己开的会话只在主控获准接入时列出。
         let mut listed: Vec<_> = self
             .sessions
             .iter()
-            .filter(|((who, _), _)| who == owner || who == LOCAL_OWNER)
+            .filter(|((who, _), _)| owner.sees(who))
             .map(|((_, handle), session)| {
                 json!({
                     "session_id": handle,
@@ -681,25 +714,25 @@ impl Sessions {
     /// Input that does not fit is refused as a whole frame. Dropping part of
     /// the queue instead would hand the shell the start of one command and
     /// the end of another, which it would then run.
-    pub(crate) fn write(
+    pub(crate) fn write<'a>(
         &mut self,
-        owner: &str,
+        owner: impl Into<Owner<'a>>,
         handle: u32,
         data: &[u8],
     ) -> Result<(), SessionError> {
-        let session = self.get_mut(owner, handle)?;
+        let session = self.get_mut(owner.into(), handle)?;
         write_to(session, data)
     }
 
     /// Applies a new size, which the shell sees as `SIGWINCH`.
-    pub(crate) fn resize(
+    pub(crate) fn resize<'a>(
         &mut self,
-        owner: &str,
+        owner: impl Into<Owner<'a>>,
         handle: u32,
         cols: u16,
         rows: u16,
     ) -> Result<(), SessionError> {
-        let session = self.get_mut(owner, handle)?;
+        let session = self.get_mut(owner.into(), handle)?;
         session.remote_size = Some((cols, rows));
         session.apply_size();
         session.last_active_ms = now_ms();
@@ -707,18 +740,17 @@ impl Sessions {
     }
 
     /// Renames one of `owner`'s sessions.
-    pub(crate) fn rename(
+    pub(crate) fn rename<'a>(
         &mut self,
-        owner: &str,
+        owner: impl Into<Owner<'a>>,
         handle: u32,
         name: &str,
     ) -> Result<(), SessionError> {
+        let owner = owner.into();
         let name = validate_name(name)?;
         let key = self.resolve(owner, handle).ok_or(SessionError::Gone)?;
         let duplicate = self.sessions.iter().any(|((who, other), session)| {
-            (who == owner || who == LOCAL_OWNER)
-                && (*other != handle || who != &key.0)
-                && session.name == name
+            owner.sees(who) && (*other != handle || who != &key.0) && session.name == name
         });
         if duplicate {
             return Err(SessionError::DuplicateName);
@@ -748,15 +780,25 @@ impl Sessions {
     }
 
     /// Removes one of `owner`'s sessions; finishing the result ends the shell.
-    pub(crate) fn kill(&mut self, owner: &str, handle: u32) -> Result<Ended, SessionError> {
-        let key = self.resolve(owner, handle).ok_or(SessionError::Gone)?;
+    pub(crate) fn kill<'a>(
+        &mut self,
+        owner: impl Into<Owner<'a>>,
+        handle: u32,
+    ) -> Result<Ended, SessionError> {
+        let key = self
+            .resolve(owner.into(), handle)
+            .ok_or(SessionError::Gone)?;
         let session = self.sessions.remove(&key).ok_or(SessionError::Gone)?;
         Ok(Ended::forced(vec![session]))
     }
 
     /// Lets go of one of `owner`'s sessions without ending the shell.
-    pub(crate) fn detach(&mut self, owner: &str, handle: u32) -> Result<(), SessionError> {
-        let session = self.get_mut(owner, handle)?;
+    pub(crate) fn detach<'a>(
+        &mut self,
+        owner: impl Into<Owner<'a>>,
+        handle: u32,
+    ) -> Result<(), SessionError> {
+        let session = self.get_mut(owner.into(), handle)?;
         let remotes: Vec<_> = session
             .output
             .keys()
@@ -835,8 +877,9 @@ impl Sessions {
         let mut listed: Vec<_> = self
             .sessions
             .iter()
-            .map(|((_, handle), session)| LocalSession {
+            .map(|((who, handle), session)| LocalSession {
                 handle: *handle,
+                opened_here: who == LOCAL_OWNER,
                 name: session.name.clone(),
                 shell: session.pty.shell().to_owned(),
                 state: session.state.as_str(),
@@ -875,6 +918,28 @@ impl Sessions {
         for session in self.sessions.values_mut() {
             session.detach(Consumer::Remote(connection));
         }
+    }
+
+    /// Takes `connection` off the shells opened on this machine, which it may
+    /// no longer reach, and returns their handles. The shells keep running:
+    /// they belong to the local user, not to the controller.
+    pub(crate) fn release_local(&mut self, connection: u64) -> Vec<u32> {
+        let mut released = Vec::new();
+        for ((who, handle), session) in self.sessions.iter_mut() {
+            if who == LOCAL_OWNER && session.output.contains_key(&Consumer::Remote(connection)) {
+                session.detach(Consumer::Remote(connection));
+                released.push(*handle);
+            }
+        }
+        released.sort_unstable();
+        released
+    }
+
+    /// Whether `connection` is attached to a shell opened on this machine.
+    pub(crate) fn on_local(&self, connection: u64) -> bool {
+        self.sessions.iter().any(|((who, _), session)| {
+            who == LOCAL_OWNER && session.output.contains_key(&Consumer::Remote(connection))
+        })
     }
 
     /// How many shells are running, for the host's settings page.
@@ -1201,7 +1266,7 @@ pub(crate) fn kill_local(handle: u32) -> bool {
         let mut sessions = lock_table(table);
         sessions
             .local_key(handle)
-            .and_then(|(owner, handle)| sessions.kill(&owner, handle).ok())
+            .and_then(|(owner, handle)| sessions.kill(owner.as_str(), handle).ok())
     };
     match ended {
         Some(ended) => {
@@ -1219,6 +1284,9 @@ pub(crate) fn foreground_supported() -> bool {
 
 /// 本机新建一个会话，返回它的编号。
 pub(crate) fn create_local(name: Option<String>) -> Result<u32, SessionError> {
+    if let Some(reason) = local_unavailable() {
+        return Err(SessionError::Unavailable(reason));
+    }
     lock_table(&shared()).create_local(name)
 }
 
@@ -1314,6 +1382,9 @@ pub(crate) fn bind(
     let table = shared();
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_millis(20));
+        // What the access notice was last told about this connection being in
+        // a local shell.
+        let mut notice_on_local = false;
         loop {
             ticker.tick().await;
             let Some(channel) = pump_channel.upgrade().filter(|_| !pump_stop.is_cancelled()) else {
@@ -1326,19 +1397,40 @@ pub(crate) fn bind(
             // (`end_login`); a lease that merely went stale (signalling
             // reconnected) only closes this connection, so the shells wait
             // for the reattach.
-            let allowed = pump_screens.lock().await.authorization().terminal_allowed();
-            if !allowed {
+            let lease = pump_screens.lock().await.authorization();
+            if !lease.terminal_allowed() {
                 tracing::info!("host terminal grant ended; closing the terminal connection");
                 pump_stop.cancel();
                 cancel.cancel();
                 let _ = channel.close().await;
                 break;
             }
-            let room = OUTPUT_HIGH_WATER.saturating_sub(channel.buffered_amount().await);
-            if room == 0 {
-                continue;
+            // The same goes for the shells opened on this machine: once the
+            // controller may no longer reach them, it lets go of them within
+            // a tick, and each is reported as ended to the controller (an
+            // error saying why, then its exit) so the phone closes the tab
+            // instead of waiting on a terminal that went quiet. The shells
+            // themselves keep running for the local user.
+            let mut frames = Vec::new();
+            if !lease.terminal_local_allowed() {
+                for handle in lock_table(&table).release_local(connection) {
+                    frames.push((
+                        handle,
+                        FrameType::Error,
+                        reply_payload(1, "本机已收回对这个本机终端会话的访问", handle),
+                    ));
+                    frames.push((handle, FrameType::Exit, b"{}".to_vec()));
+                }
             }
-            let frames = lock_table(&table).pump(connection, room.min(PUMP_BUDGET));
+            let on_local = lock_table(&table).on_local(connection);
+            if on_local != notice_on_local {
+                lease.terminal_on_local(on_local);
+                notice_on_local = on_local;
+            }
+            let room = OUTPUT_HIGH_WATER.saturating_sub(channel.buffered_amount().await);
+            if room > 0 {
+                frames.extend(lock_table(&table).pump(connection, room.min(PUMP_BUDGET)));
+            }
             let mut failed = false;
             for (handle, kind, payload) in frames {
                 let frame = Frame::encode(kind, handle, &payload);
@@ -1383,6 +1475,17 @@ fn geometry(payload: &[u8]) -> (Option<u16>, Option<u16>) {
     (None, None)
 }
 
+/// The `code`/`message`/`session_id` object the controller reads in replies
+/// and `Error` frames.
+fn reply_payload(code: i32, message: &str, session: u32) -> Vec<u8> {
+    serde_json::to_vec(&json!({
+        "code": code,
+        "message": message,
+        "session_id": session,
+    }))
+    .unwrap_or_default()
+}
+
 /// Translates a Signal frame into the terminal control character it stands for.
 ///
 /// The official controller sends JSON such as `{"sig":"SIGINT"}`. Only the
@@ -1422,23 +1525,18 @@ async fn handle_frame(
     // up to whatever ended the grant (`end_login`), because a lease that only
     // went stale in a signalling reconnect must not take the shells with it.
     // The output pump closes the connection within a tick.
-    let (allowed, account, table) = {
+    let (allowed, local, account, table) = {
         let state = screens.lock().await;
         let lease = state.authorization();
         (
             lease.terminal_allowed(),
+            lease.terminal_local_allowed(),
             lease.account().to_owned(),
             state.terminal(),
         )
     };
-    let reply = |code: i32, message: &str, session: u32| {
-        serde_json::to_vec(&json!({
-            "code": code,
-            "message": message,
-            "session_id": session,
-        }))
-        .unwrap_or_default()
-    };
+    let owner = Owner::new(&account, local);
+    let reply = reply_payload;
     let mut outgoing = Vec::new();
     if !allowed {
         tracing::warn!(kind = ?frame.kind, "host terminal frame refused");
@@ -1465,7 +1563,7 @@ async fn handle_frame(
     } else {
         match frame.kind {
             FrameType::ListSessionsReq => {
-                let listed = lock_table(&table).list(&account);
+                let listed = lock_table(&table).list(owner);
                 let payload =
                     serde_json::to_vec(&Value::Array(listed)).unwrap_or_else(|_| b"[]".into());
                 outgoing.push((FrameType::ListSessionsResp, frame.session, payload));
@@ -1486,7 +1584,7 @@ async fn handle_frame(
                     .and_then(|v| v.get("name").and_then(Value::as_str))
                     .map(str::to_owned);
                 let result = lock_table(&table).open(
-                    &account,
+                    owner,
                     frame.session,
                     connection,
                     &shell,
@@ -1541,7 +1639,7 @@ async fn handle_frame(
                 }
             }
             FrameType::Stdin => {
-                let result = lock_table(&table).write(&account, frame.session, &frame.payload);
+                let result = lock_table(&table).write(owner, frame.session, &frame.payload);
                 match result {
                     Ok(()) => {}
                     Err(SessionError::InputOverflow) => {
@@ -1564,14 +1662,13 @@ async fn handle_frame(
             FrameType::Resize => {
                 let (cols, rows) = geometry(&frame.payload);
                 if let (Some(cols), Some(rows)) = (cols, rows)
-                    && let Err(error) =
-                        lock_table(&table).resize(&account, frame.session, cols, rows)
+                    && let Err(error) = lock_table(&table).resize(owner, frame.session, cols, rows)
                 {
                     tracing::debug!(%error, session = frame.session, "host terminal resize dropped");
                 }
             }
             FrameType::Close | FrameType::KillSessionReq => {
-                let result = lock_table(&table).kill(&account, frame.session);
+                let result = lock_table(&table).kill(owner, frame.session);
                 // End the shell only once the table is released.
                 let result = result.map(Ended::finish);
                 if frame.kind == FrameType::KillSessionReq {
@@ -1583,7 +1680,7 @@ async fn handle_frame(
                 }
             }
             FrameType::Detach => {
-                if let Err(error) = lock_table(&table).detach(&account, frame.session) {
+                if let Err(error) = lock_table(&table).detach(owner, frame.session) {
                     tracing::debug!(%error, session = frame.session, "host terminal detach dropped");
                 }
             }
@@ -1622,8 +1719,7 @@ async fn handle_frame(
                 // (vim, for one, wants to ask first).
                 match signal_keystroke(&frame.payload) {
                     Some(byte) => {
-                        if let Err(error) =
-                            lock_table(&table).write(&account, frame.session, &[byte])
+                        if let Err(error) = lock_table(&table).write(owner, frame.session, &[byte])
                         {
                             tracing::debug!(
                                 %error,
@@ -2343,13 +2439,13 @@ mod tests {
                 .any(|session| session.handle == handle && session.name == "mine"),
             "the new session is listed"
         );
-        // 手机端也能看到本机自己开的会话，编号就是本机区间里的那个。
+        // 主控获准接入本机会话时能看到它，编号就是本机区间里的那个。
         assert!(
             sessions
-                .list("acct")
+                .list(Owner::new("acct", true))
                 .iter()
                 .any(|session| session["session_id"] == handle),
-            "the controller sees the local session"
+            "a controller allowed in sees the local session"
         );
         // 用户自己开的会话不参与 30 分钟空闲清扫。
         let (exited, abandoned) = sessions.sweep(std::time::Duration::ZERO);
@@ -2372,16 +2468,17 @@ mod tests {
         let handle = sessions
             .create_local(Some("shared".into()))
             .expect("create local");
-        // 主控用同一个编号 open，接上的是本机开的那个 shell，不是新的。
+        // 获准接入的主控用同一个编号 open，接上的是本机开的那个 shell，不是新的。
+        let allowed = Owner::new("acct", true);
         let (again, name, _) = sessions
-            .open("acct", handle, 1, shell(), None, 80, 24)
+            .open(allowed, handle, 1, shell(), None, 80, 24)
             .expect("open");
         assert_eq!(again, handle);
         assert_eq!(name, "shared");
         assert_eq!(sessions.count(), 1, "no second shell was started");
 
         sessions
-            .write("acct", handle, &line("echo MOBILE-TO-LOCAL"))
+            .write(allowed, handle, &line("echo MOBILE-TO-LOCAL"))
             .expect("write");
         let seen = output_until(&mut sessions, 1, "MOBILE-TO-LOCAL");
         assert!(
@@ -2395,6 +2492,77 @@ mod tests {
             .expect("attach local");
         let local = local_output_until(&mut sessions, 100, "MOBILE-TO-LOCAL");
         assert!(local.contains("MOBILE-TO-LOCAL"));
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "macos", windows)),
+        ignore = "no terminal backend on this platform"
+    )]
+    fn local_sessions_do_not_exist_for_a_controller_not_allowed_in() {
+        let mut sessions = Sessions::default();
+        let handle = sessions
+            .create_local(Some("private".into()))
+            .expect("create local");
+        assert!(sessions.list("acct").is_empty(), "not listed");
+        assert_eq!(
+            sessions.write("acct", handle, b"x"),
+            Err(SessionError::Gone)
+        );
+        assert_eq!(
+            sessions.resize("acct", handle, 100, 40),
+            Err(SessionError::Gone)
+        );
+        assert_eq!(
+            sessions.rename("acct", handle, "taken"),
+            Err(SessionError::Gone)
+        );
+        assert_eq!(sessions.detach("acct", handle), Err(SessionError::Gone));
+        assert_eq!(
+            sessions.kill("acct", handle).err(),
+            Some(SessionError::Gone)
+        );
+        // Opening its handle starts the controller's own shell, with nothing
+        // of the local one to replay.
+        let (again, name, replay) = sessions
+            .open("acct", handle, 1, shell(), None, 80, 24)
+            .expect("open");
+        assert_eq!(again, handle);
+        assert_ne!(name, "private");
+        assert!(replay.is_empty());
+        assert_eq!(sessions.count(), 2, "a second shell, not the local one");
+        assert!(!sessions.on_local(1));
+        sessions.kill_all().finish();
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "macos", windows)),
+        ignore = "no terminal backend on this platform"
+    )]
+    fn revoking_local_access_lets_go_of_the_local_shell_only() {
+        let mut sessions = Sessions::default();
+        let local = sessions
+            .create_local(Some("mine".into()))
+            .expect("create local");
+        sessions
+            .open(Owner::new("acct", true), local, 7, shell(), None, 80, 24)
+            .expect("attach to the local shell");
+        sessions
+            .open("acct", 1, 7, shell(), None, 80, 24)
+            .expect("own shell");
+        assert!(sessions.on_local(7));
+        assert_eq!(sessions.release_local(7), vec![local]);
+        assert!(!sessions.on_local(7));
+        assert_eq!(sessions.release_local(7), Vec::<u32>::new(), "only once");
+        assert_eq!(sessions.count(), 2, "the local shell keeps running");
+        // The controller's own shell is still attached.
+        assert!(
+            sessions.sessions[&key("acct", 1)]
+                .output
+                .contains_key(&Consumer::Remote(7))
+        );
+        sessions.kill_all().finish();
     }
 
     #[test]

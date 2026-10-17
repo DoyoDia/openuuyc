@@ -673,10 +673,17 @@ mod tests {
             let mut line = String::new();
             reader.read_line(&mut line).expect("read new");
             let reply: Value = serde_json::from_str(line.trim()).expect("new json");
-            assert_eq!(reply["ok"], true, "new is accepted: {reply:?}");
-            let created = reply["handle"].as_u64().expect("handle") as u32;
-            assert!(created >= 1000, "local handles start at 1000");
-            created
+            if let Some(reason) = super::super::local_unavailable() {
+                // Run as root (a CI container): the same refusal the page shows.
+                assert_eq!(reply["ok"], false);
+                assert_eq!(reply["message"], reason);
+                None
+            } else {
+                assert_eq!(reply["ok"], true, "new is accepted: {reply:?}");
+                let created = reply["handle"].as_u64().expect("handle") as u32;
+                assert!(created >= 1000, "local handles start at 1000");
+                Some(created)
+            }
         };
 
         // 命令行入口走的是同一条路。
@@ -684,7 +691,9 @@ mod tests {
         // 断开后会话还在，本机这一端也不算附着了。
         drop(stream);
         drop(reader);
-        super::super::kill_local(created);
+        if let Some(created) = created {
+            super::super::kill_local(created);
+        }
         super::super::kill_local(handle);
     }
 }
