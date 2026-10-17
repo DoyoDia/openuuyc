@@ -549,7 +549,7 @@ impl ConnectingWindowsRunner {
                 // 拖出时交出去的那块屏又回来了：主窗口如果还在等新屏，直接从
                 // 这路解码器接着看，而不是一直停在「正在等待画面」。
                 if player.frame_paused && player.session.screen_id() == id {
-                    player.frame_paused = false;
+                    player.resume_frames();
                 }
             }
             self.schedule(Instant::now());
@@ -703,9 +703,16 @@ impl ConnectingWindowsRunner {
                 player.current = None;
                 player.video_size = None;
                 player.video_rect = None;
-                if let Some(next) = player.tabs.first().copied() {
-                    let _ = player.select(next, &source);
+                if let Some(next) = player.tabs.first().copied()
+                    && let Err(error) = player.select(next, &source)
+                {
+                    player.failed_screen = Some(player.failed_screen_for(next));
+                    player.report(
+                        "显示器操作失败",
+                        format!("切到显示器 {next} 失败：{error:#}"),
+                    );
                 }
+                player.park_stranded();
             }
         }
         Ok(())
@@ -1479,6 +1486,7 @@ impl ApplicationHandler<UiEvent> for ConnectingWindowsRunner {
             // wake bridge covers the next frame, so the loop can sleep.
             // Repainting the whole UI at the display rate instead would
             // leave an arriving frame waiting for the pass in progress.
+            player.park_stranded();
             let frame = player.poll();
             // 解码器出错的弹窗也要画出来，哪怕之后再没有新帧。
             redraw |= player.error.is_some();
@@ -1650,8 +1658,10 @@ struct Player {
     window_id: WindowId,
     /// Keeps the decoder publishing frames and nudges the event loop; held for
     /// its lifetime, which is what registers this window with the session.
+    /// `None` while the window has handed its screen to a detached window and
+    /// has nothing else to show (see [`Player::park_stranded`]).
     #[allow(dead_code, reason = "Owned for its registration and its Drop.")]
-    wake: FrameWakeBridge,
+    wake: Option<FrameWakeBridge>,
     /// Identifies this window to `RemoteInput`, which arbitrates between windows.
     owner: u64,
     stream_control_ui: StreamControlUi,
@@ -1771,7 +1781,7 @@ impl Player {
             pending: None,
             proxy,
             window_id,
-            wake,
+            wake: Some(wake),
             owner,
             stream_control_ui: StreamControlUi::default(),
             performance_mode: PerformancePanelMode::Compact,
@@ -1920,8 +1930,12 @@ impl Player {
         // 对端把目标屏放到了当前这条轨道上时，拿回来的是同一个会话。这时不能再装一次
         // bridge：新 bridge 登记完之后旧的那个才 Drop，而它的 Drop 会把登记清掉，
         // 解码器随后丢掉每一帧，画面就永远停在「等待画面」。
-        if !Arc::ptr_eq(&session, &self.session) {
-            self.wake = FrameWakeBridge::install(&session, self.proxy.clone(), self.window_id)?;
+        if self.wake.is_none() || !Arc::ptr_eq(&session, &self.session) {
+            self.wake = Some(FrameWakeBridge::install(
+                &session,
+                self.proxy.clone(),
+                self.window_id,
+            )?);
         }
         self.session = session;
         self.session_failed = false;
@@ -1934,6 +1948,28 @@ impl Player {
         // 对端按「选中」的那块屏送指针与输入，换屏就得告诉它。
         self.screens.focus(screen_id);
         Ok(())
+    }
+
+    /// 当前屏交给独立窗口之后没能接上别的屏（打开失败、对端拒绝）：窗口停在等待
+    /// 画面，用户点别的标签才会再开。这期间它还登记在那块屏的唤醒上，独立窗口每来
+    /// 一帧都会把它叫起来空画一遍，所以把这份登记撤掉。
+    fn park_stranded(&mut self) {
+        if self.frame_paused && self.pending.is_none() {
+            self.wake = None;
+        }
+    }
+
+    /// 交出去的那块屏又回到这个窗口（独立窗口关了）：接着从它的解码器取帧。
+    fn resume_frames(&mut self) {
+        self.frame_paused = false;
+        if self.wake.is_none() {
+            match FrameWakeBridge::install(&self.session, self.proxy.clone(), self.window_id) {
+                Ok(wake) => self.wake = Some(wake),
+                Err(error) => {
+                    self.report("显示器操作失败", format!("无法恢复显示器画面：{error:#}"))
+                }
+            }
+        }
     }
 
     /// 等正在打开的那块屏就绪。没就绪就什么都不做，`ScreenPlayback::open` 传进去的
