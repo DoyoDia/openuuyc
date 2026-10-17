@@ -375,7 +375,12 @@ mod device {
         }
     }
 
-    pub(crate) fn create_device() -> Result<Graphics> {
+    /// Same shape as the Linux device, which is picked to suit the first
+    /// window; a D3D11 device presents to any window through DXGI.
+    pub(crate) fn create_device(
+        _event_loop: &winit::event_loop::ActiveEventLoop,
+        _window: &winit::window::Window,
+    ) -> Result<Graphics> {
         let mut last_error = None;
         for driver in [D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP] {
             let mut device = None;

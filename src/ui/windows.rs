@@ -411,7 +411,7 @@ impl Runner {
                 origin.y + (size.height as i64 - outer.height as i64).max(0) as i32 / 2,
             ));
         }
-        let graphics = create_device()?;
+        let graphics = create_device(event_loop, &window)?;
         let presenter = match retained {
             Some(retained) => retained.reuse(window.clone(), &graphics)?,
             None => UiPresenter::new(window.clone(), &graphics)?,

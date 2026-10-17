@@ -259,7 +259,7 @@ impl ConnectingWindowsRunner {
             window.theme(),
             None,
         );
-        let graphics = crate::ui::gfx::create_device()?;
+        let graphics = crate::ui::gfx::create_device(event_loop, &window)?;
         let presenter = UiPresenter::new(window.clone(), &graphics)?;
         self.ui_frame_interval = ui_frame_interval(&window);
         tracing::debug!(
