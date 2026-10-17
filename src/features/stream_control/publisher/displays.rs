@@ -196,7 +196,14 @@ pub(crate) async fn receive_session(
                     });
                     let allowed = refusal.is_none();
                     let resp = CheckEnvResp::result(refusal);
-                    tracing::info!(allowed, "host terminal environment check answered");
+                    // The controller only gets a reason code, so the readable
+                    // reason stays in the host's log.
+                    tracing::info!(
+                        allowed,
+                        reason = refusal.unwrap_or_default(),
+                        code = resp.code,
+                        "host terminal environment check answered"
+                    );
                     return Ok(response(
                         &message,
                         header,
