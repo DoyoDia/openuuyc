@@ -79,25 +79,21 @@ fn sync_tray(tray: Option<&super::tray::Tray>, controlled: bool) {
     }
 }
 
-/// 把迟到的托盘接回来，返回是否刚建出来。通知区域的主人是桌面会话里的另一个
-/// 进程，比程序先起来不是它能保证的事（systemd 那边也只能等到图形会话），而
-/// 托盘的有无决定窗口关闭是「收进托盘」还是「结束程序」，所以它得是能恢复的
-/// 状态，不是启动时的一次判定。
-fn retry_tray(tray: &mut Option<super::tray::Tray>, wanted: bool, next: &mut Instant) -> bool {
+/// 把迟到的托盘接回来。通知区域的主人是桌面会话里的另一个进程，比程序先起来
+/// 不是它能保证的事（systemd 那边也只能等到图形会话），而托盘的有无决定窗口
+/// 关闭是「收进托盘」还是「结束程序」，所以它得是能恢复的状态，不是启动时的
+/// 一次判定。第一次失败由建窗口的地方带着原因记 warn，之后每次只记 debug。
+fn retry_tray(tray: &mut Option<super::tray::Tray>, wanted: bool, next: &mut Instant) {
     if !wanted || tray.is_some() || Instant::now() < *next {
-        return false;
+        return;
     }
     *next = Instant::now() + TRAY_RETRY;
     match super::tray::Tray::new() {
         Ok(new) => {
             tracing::info!("通知区域可用了，窗口关闭改为收进托盘");
             *tray = Some(new);
-            true
         }
-        Err(error) => {
-            tracing::debug!(error = %format!("{error:#}"), "通知区域仍不可用");
-            false
-        }
+        Err(error) => tracing::debug!(error = %format!("{error:#}"), "通知区域仍不可用"),
     }
 }
 
@@ -462,10 +458,15 @@ impl Runner {
         // 没有通知区域时窗口保留普通的关闭行为，而不是藏到一个够不着的地方；
         // 但托盘可能只是还没起来，所以交给 retry_tray 接着试：它起来了，关闭
         // 就又是收进托盘。托盘建不出来不该拦着窗口本身。
-        let mut next_tray_attempt = Instant::now();
-        retry_tray(&mut tray, uses_tray, &mut next_tray_attempt);
+        let next_tray_attempt = Instant::now() + TRAY_RETRY;
         if uses_tray && tray.is_none() {
-            tracing::warn!("通知区域不可用，先按没有托盘运行");
+            match super::tray::Tray::new() {
+                Ok(new) => tray = Some(new),
+                Err(error) => tracing::warn!(
+                    error = %format!("{error:#}"),
+                    "通知区域不可用，先按没有托盘运行"
+                ),
+            }
         }
         let refresh = window
             .current_monitor()
