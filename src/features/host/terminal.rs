@@ -718,6 +718,38 @@ impl Sessions {
         listed
     }
 
+    /// A digest of what [`Sessions::list`] shows `owner`, without the
+    /// activity time that moves with every keystroke.
+    ///
+    /// Each terminal connection compares it once per tick and tells its
+    /// controller to re-list when it changes. Comparing what this controller
+    /// can see, rather than counting changes to the whole table, keeps
+    /// another login's shells and hidden local shells from showing through
+    /// the notifications, and still catches the local-session grant turning
+    /// on or off, which changes the list without touching the table.
+    pub(crate) fn listing<'a>(&self, owner: impl Into<Owner<'a>>) -> u64 {
+        use std::hash::{Hash as _, Hasher as _};
+        let owner = owner.into();
+        let mut visible: Vec<_> = self
+            .sessions
+            .iter()
+            .filter(|((who, _), _)| owner.sees(who))
+            .map(|((_, handle), session)| {
+                (
+                    *handle,
+                    session.state.as_str(),
+                    session.name.as_str(),
+                    session.created_ms,
+                    session.pty.shell(),
+                )
+            })
+            .collect();
+        visible.sort_unstable();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        visible.hash(&mut hasher);
+        hasher.finish()
+    }
+
     /// Queues keyboard input and pushes what the pty accepts right now.
     ///
     /// Input that does not fit is refused as a whole frame. Dropping part of
@@ -1421,6 +1453,9 @@ pub(crate) fn bind(
         // What the access notice was last told about this connection being in
         // a local shell.
         let mut notice_on_local = false;
+        // The session list this controller saw last; the first tick only
+        // records it, so connecting does not itself send a notification.
+        let mut listed: Option<u64> = None;
         loop {
             ticker.tick().await;
             let Some(channel) = pump_channel.upgrade().filter(|_| !pump_stop.is_cancelled()) else {
@@ -1458,6 +1493,25 @@ pub(crate) fn bind(
                     frames.push((handle, FrameType::Exit, b"{}".to_vec()));
                 }
             }
+            // The official controller only takes a list (type 10) as the
+            // answer to its own request (type 9) and drops one pushed
+            // unasked. The reference host instead sends the empty
+            // `TerminalSessionChanged` control message, and the controller
+            // re-lists. It goes out the way this channel's other control
+            // replies do.
+            let listing = lock_table(&table)
+                .listing(Owner::new(lease.account(), lease.terminal_local_allowed()));
+            if listed.is_some_and(|before| before != listing) {
+                tracing::debug!("host terminal session list changed");
+                let changed =
+                    crate::features::stream_control::publisher::terminal_session_changed();
+                if let Err(error) = channel.send(&Bytes::from(changed)).await {
+                    tracing::warn!(%error, "host terminal list notice failed");
+                    pump_stop.cancel();
+                    break;
+                }
+            }
+            listed = Some(listing);
             let on_local = lock_table(&table).on_local(connection);
             if on_local != notice_on_local {
                 lease.terminal_on_local(on_local);
@@ -2722,5 +2776,51 @@ mod tests {
         assert_eq!(signal_keystroke(br#"{"sig":"SIGTSTP"}"#), Some(0x1a));
         assert_eq!(signal_keystroke(br#"{"sig":"SIGUSR1"}"#), None);
         assert_eq!(signal_keystroke(b""), None);
+    }
+
+    #[test]
+    #[cfg_attr(not(target_os = "linux"), ignore = "local attach is Linux-only")]
+    fn the_listing_moves_only_with_what_the_controller_sees() {
+        let mut sessions = Sessions::default();
+        let empty = sessions.listing("acct");
+        sessions
+            .open("acct", 1, 1, shell(), None, 80, 24)
+            .expect("open");
+        let opened = sessions.listing("acct");
+        assert_ne!(opened, empty, "a new shell changes the list");
+        // Typing moves the activity time, which the list page does not need.
+        sessions.write("acct", 1, b"\n").expect("write");
+        assert_eq!(sessions.listing("acct"), opened, "input is not a change");
+        sessions.rename("acct", 1, "renamed").expect("rename");
+        let renamed = sessions.listing("acct");
+        assert_ne!(renamed, opened, "renaming changes the list");
+        // Another login's shells and hidden local shells do not show through.
+        sessions
+            .open("other", 1, 2, shell(), None, 80, 24)
+            .expect("other login");
+        sessions.create_local(None).expect("local");
+        assert_eq!(sessions.listing("acct"), renamed, "nothing this login sees");
+        // The local-session grant changes the list without touching the table.
+        assert_ne!(
+            sessions.listing(Owner::new("acct", true)),
+            renamed,
+            "the grant shows the local shell"
+        );
+        sessions.kill("acct", 1).expect("kill").finish();
+        assert_ne!(
+            sessions.listing("acct"),
+            renamed,
+            "ending a shell changes it"
+        );
+        sessions.kill_all().finish();
+    }
+
+    #[test]
+    fn a_session_change_is_the_control_message_field() {
+        // PbControlMessage's oneof field 28 (wire type 2), an empty message.
+        assert_eq!(
+            crate::features::stream_control::publisher::terminal_session_changed(),
+            [0xE2, 0x01, 0x00]
+        );
     }
 }
