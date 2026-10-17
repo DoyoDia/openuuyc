@@ -7,10 +7,16 @@
 //! whatever window lies under it, and a drag the local user carries out of the
 //! viewer follows the real pointer until its button comes up.
 pub(crate) mod appearance;
+pub(crate) mod linked;
 pub(crate) mod original;
 pub(crate) mod portal;
 pub(crate) mod send_target;
+pub(crate) mod wayland;
 mod xdnd;
+
+pub(crate) use wayland::Catcher;
+// 剪贴板那边读 X11 选择区时也要解析 `text/uri-list`，一模一样的一份不必再写一遍。
+pub(crate) use xdnd::parse_uri_list;
 
 use anyhow::{Context as _, Result, bail, ensure};
 use std::{
@@ -74,6 +80,7 @@ struct Desired {
     point: Position,
     phase: Phase,
 }
+#[derive(Debug)]
 pub(crate) enum Event {
     Feedback(u32),
     Released,
@@ -125,7 +132,11 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 pub(crate) struct Session {
-    shared: Arc<Shared>,
+    /// X11 的 XDND 那条：指针走哪、什么时候落下都由我们驱动。
+    xdnd: Option<Arc<Shared>>,
+    /// Wayland 那条：合成器自己接管指针，我们只握着那个数据源等它报收官，
+    /// 所以 `position`/`commit` 在这里没有对应物。
+    wayland: Option<(Arc<linked::Linked>, u64)>,
 }
 impl Session {
     /// A drag placed by the peer: the pointer goes where `position` says and
@@ -140,11 +151,32 @@ impl Session {
     }
     /// A drag the local user is holding: it follows the real pointer and drops
     /// where the left button is released.
+    ///
+    /// Wayland 上这件事压根不该由我们做：合成器只认 `start_drag` 那一次交接，
+    /// 之后指针归它管，落点也是它投递给目标窗口的。XDND 那套得自己假装按下、
+    /// 自己跟着指针走，而 Wayland 会话里 `xdnd::connect()` 直接拒绝——那条路
+    /// 只有在 X11 会话（或者拖到 XWayland 窗口上）才成立。
     pub fn physical(
         allowed: Arc<dyn Fn() -> bool + Send + Sync>,
         object: impl FnOnce() -> Result<Files> + Send + 'static,
         notify: Arc<dyn Fn(Event) + Send + Sync>,
     ) -> Result<Self> {
+        if let Some(linked) = linked::Linked::shared() {
+            // `object()` 可能要去挂载、去下载，一步都不能压在事件循环上：
+            // 交给准备线程，UI 线程只负责在文件到手之后把拖动发出去。
+            let (send, receive) = std::sync::mpsc::channel();
+            std::thread::Builder::new()
+                .name("drag files".into())
+                .spawn(move || {
+                    let _ = send.send(object());
+                })
+                .context("无法启动拖动准备线程")?;
+            let id = linked.request_drag(receive, allowed, notify);
+            return Ok(Self {
+                xdnd: None,
+                wayland: Some((linked, id)),
+            });
+        }
         let (connection, root, _) = xdnd::connect()?;
         let pointer = connection.query_pointer(root)?.reply()?;
         ensure!(
@@ -207,18 +239,29 @@ impl Session {
                     },
                 });
             })?;
-        Ok(Self { shared })
+        Ok(Self {
+            xdnd: Some(shared),
+            wayland: None,
+        })
     }
     pub fn position(&self, point: Position) {
-        let mut desired = lock(&self.shared.desired);
+        // Wayland 上指针归合成器，这里没有可推的位置。
+        let Some(shared) = &self.xdnd else {
+            return;
+        };
+        let mut desired = lock(&shared.desired);
         if desired.phase == Phase::Dragging {
             desired.point = point;
         }
     }
     pub fn commit(&self, point: Position) -> Result<()> {
-        let mut desired = lock(&self.shared.desired);
+        // 同理：落点由目标窗口自己决定，我们连等都不用等。
+        let Some(shared) = &self.xdnd else {
+            return Ok(());
+        };
+        let mut desired = lock(&shared.desired);
         ensure!(
-            desired.phase == Phase::Dragging && !self.shared.finished.load(Ordering::Acquire),
+            desired.phase == Phase::Dragging && !shared.finished.load(Ordering::Acquire),
             "拖放已结束"
         );
         desired.point = point;
@@ -226,7 +269,12 @@ impl Session {
         Ok(())
     }
     pub fn cancel(&self) {
-        lock(&self.shared.desired).phase = Phase::Cancel;
+        if let Some(shared) = &self.xdnd {
+            lock(&shared.desired).phase = Phase::Cancel;
+        }
+        if let Some((linked, id)) = &self.wayland {
+            linked.abort_drag(*id);
+        }
     }
 }
 impl Drop for Session {

@@ -114,6 +114,33 @@ pub struct ClipboardFileDescriptor {
     pub file_size: u64,
 }
 
+// UU 4.41.2.2602 C:F2D630/F32A50 sends Unix seconds; F3A7C0
+// converts received seconds to FILETIME for the Windows OLE descriptor.
+const FILETIME_EPOCH_SECONDS: u64 = 11_644_473_600;
+const TICKS_PER_SECOND: u64 = 10_000_000;
+
+/// Convert wire Unix seconds to native FILETIME. Zero/invalid stays unspecified.
+pub(super) fn wire_filetime(seconds: u64) -> u64 {
+    if seconds == 0 {
+        return 0;
+    }
+    seconds
+        .checked_add(FILETIME_EPOCH_SECONDS)
+        .and_then(|v| v.checked_mul(TICKS_PER_SECOND))
+        .filter(|&ticks| ticks <= i64::MAX as u64)
+        .unwrap_or(0)
+}
+
+/// Convert native FILETIME to the wire's whole Unix seconds, without guessing units.
+pub(super) fn wire_seconds(ticks: u64) -> u64 {
+    if ticks > i64::MAX as u64 {
+        return 0;
+    }
+    ticks
+        .checked_sub(FILETIME_EPOCH_SECONDS * TICKS_PER_SECOND)
+        .map_or(0, |elapsed| elapsed / TICKS_PER_SECOND)
+}
+
 #[derive(Clone, PartialEq, Message)]
 pub struct ClipboardFileDescriptorListRequest {
     #[prost(uint32, tag = "1")]

@@ -1,6 +1,6 @@
 [package]
 name = "openuuyc"
-version = "1.0.2-beta.1"
+version = "1.0.2-beta.5"
 edition = "2024"
 description = "Third-party Rust client for UU Remote protocol interoperability"
 license-file = "LICENSE"
@@ -31,17 +31,30 @@ depends = """$auto, fuse3, libx11-6, libx11-xcb1, libxcursor1, libxrandr2, libxi
 libxfixes3, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, \
 libvulkan1 | libegl1, \
 fonts-noto-cjk | fonts-wqy-microhei | fonts-arphic-uming"""
-recommends = "libpulse0, libpipewire-0.3-0, gnome-keyring | kwalletmanager"
+# gio (libglib2.0-bin) and rsvg-convert (librsvg2-bin) draw the host's drag
+# preview images; without them a drag goes out with no image.
+recommends = "libpulse0, libpipewire-0.3-0, gnome-keyring | kwalletmanager, libglib2.0-bin, librsvg2-bin"
 suggests = "ethtool"
 assets = [
     ["target/release/OpenUUYC", "usr/bin/", "755"],
+    # 被控端加虚拟屏要写 configfs，只有 root 能写，所以另有一个按需启动的系统服务。
+    # 它的两个单元由下面的 systemd-units 装进 /usr/lib/systemd/system。
+    ["target/release/openuuyc-vkms", "usr/bin/", "755"],
     ["packaging/linux/openuuyc.desktop", "usr/share/applications/", "644"],
     ["assets/icon-256.png", "usr/share/icons/hicolor/256x256/apps/openuuyc.png", "644"],
     ["packaging/linux/60-openuuyc-uinput.rules", "usr/lib/udev/rules.d/", "644"],
+    ["packaging/linux/openuuyc.service", "usr/lib/systemd/user/", "644"],
     ["README.md", "usr/share/doc/openuuyc/", "644"],
     ["THIRD_PARTY_NOTICES", "usr/share/doc/openuuyc/", "644"],
     ["assets/licenses/*", "usr/share/doc/openuuyc/licenses/", "644"],
 ]
+# 只为 openuuyc-vkms 的两个单元生成维护者脚本（packaging/linux 里没有自己写的脚本）：
+# 卸载时停掉套接字与服务、daemon-reload，清除时清掉 enable 留下的链接；升级时只
+# try-restart 已经在跑的。enable/start 都关着——装包不会替用户把一个 root 服务开起来，
+# 要用虚拟屏的人自己 `systemctl enable --now openuuyc-vkms.socket`；以前 enable 过的，
+# 升级后保持 enable。
+maintainer-scripts = "packaging/linux"
+systemd-units = { unit-name = "openuuyc-vkms", enable = false, start = false }
 
 [dependencies]
 anyhow = "1.0"
@@ -177,6 +190,9 @@ windows = { version = "0.62.2", default-features = false, features = [
 glow = "0.17.0"
 # Local display geometry for the viewer, on X11 and Wayland alike.
 display-info = "0.5.9"
+# 被控端加虚拟屏要写 configfs，只有 root 能写，中间隔一个专用的辅助程序
+# （crates/vkms）。这里用的是它的客户端部分。
+openuuyc-vkms = { path = "crates/vkms" }
 cros-libva = { path = "vendor/cros-libva" }
 # The H.264 syntax and its error kinds for the VA-API slice parameters; the
 # software session itself goes through openuuyc-codec like on Windows.
@@ -199,6 +215,11 @@ wayland-protocols-misc = { version = "0.3", default-features = false, features =
 # 快捷键（两者在 unstable 后面）；再次启动时用 xdg_activation_v1 凭启动令牌把
 # 已在运行的控制中心提到前台（staging）。
 wayland-protocols = { version = "0.32", default-features = false, features = ["client", "staging", "unstable"] }
+# wlr-screencopy, the compositor's own copy protocol: niri, wlroots and
+# everything built on them serve it, and unlike the portal it never asks the
+# local user for consent. The same crate also gives the layer shell, which the
+# Wayland drag-out catcher puts its transparent surface on.
+wayland-protocols-wlr = { version = "0.3", default-features = false, features = ["client"] }
 libc = "0.2"
 fuser = { version = "0.15", default-features = false }
 x11rb = { version = "0.13", features = ["dpms", "randr", "shm", "xfixes", "xtest"] }

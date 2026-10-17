@@ -4,18 +4,22 @@
 //! - NVIDIA NvFBC into CUDA (`nvfbc`): Xorg on NVIDIA, only while NVENC works,
 //!   so frames go from the display to the encoder without leaving the GPU.
 //! - X11 MIT-SHM (`x11`): Xorg sessions; no setup, no consent prompt.
+//! - wlroots screencopy (`wlr`): Wayland sessions on wlroots, niri, Sway and
+//!   their relatives; frames come through the compositor itself, and nobody is
+//!   asked for consent.
 //! - XDG ScreenCast portal + PipeWire (`portal`): Wayland sessions, and any
 //!   desktop whose portal offers it; asks the local user once.
 //!
 //! Sunshine puts KMS first; on this driver stack it finds no scanout buffer
 //! under Xorg (the NVIDIA X driver bypasses KMS), so it is not in the list
-//! yet. On Wayland only the portal can see the desktop. `OPENUUYC_CAPTURE`
-//! (for example `portal` or `nvfbc,x11`) overrides the order.
+//! yet. `OPENUUYC_CAPTURE` (for example `portal` or `nvfbc,x11`) overrides the
+//! order.
 //!
 //! Frames are BGRA, in system memory or, from NvFBC, in CUDA device memory.
 mod nvfbc;
 mod pipewire;
 mod portal;
+mod wlr_screencopy;
 mod x11;
 
 use anyhow::{Result, bail, ensure};
@@ -96,6 +100,23 @@ impl Image {
     }
 }
 
+/// A backend's picture before it is scaled: tightly packed BGRA rows, or NV12
+/// converted on the GPU.
+pub(super) struct Picture {
+    /// The size of the captured region: the BGRA `pixels` with no `nv12`, the
+    /// cropped source with one. The GPU converter may already have scaled
+    /// that frame, so its geometry is `nv12.size()`, not this.
+    pub width: u32,
+    pub height: u32,
+    /// BGRA rows of `width * 4` bytes; empty when `nv12` carries the frame.
+    pub pixels: Vec<u8>,
+    /// The frame converted on the GPU (portal stream only), at the output
+    /// geometry the worker had requested through the stream's `set_target`
+    /// when the picture arrived (the crop size before any request). A quality
+    /// change can make it stale.
+    pub nv12: Option<Arc<super::gpu_convert::OwnedNv12>>,
+}
+
 /// One captured picture, already scaled to the size the encoder was asked for.
 #[derive(Clone)]
 pub(crate) struct Frame {
@@ -142,7 +163,7 @@ pub(crate) fn screens() -> Result<Vec<Screen>> {
 }
 
 /// Whether this is a Wayland session, where X11 sees only XWayland clients.
-pub(super) fn wayland_session() -> bool {
+pub(crate) fn wayland_session() -> bool {
     std::env::var_os("WAYLAND_DISPLAY").is_some()
         || std::env::var("XDG_SESSION_TYPE").is_ok_and(|kind| kind == "wayland")
 }
@@ -161,6 +182,7 @@ pub(crate) fn refresh(selected: &Screen) -> Result<Screen> {
 enum Kind {
     NvFbc,
     X11,
+    Wlr,
     Portal,
 }
 impl Kind {
@@ -168,6 +190,7 @@ impl Kind {
         match self {
             Self::NvFbc => "NvFBC",
             Self::X11 => "X11",
+            Self::Wlr => "wlr-screencopy",
             Self::Portal => "XDG 门户",
         }
     }
@@ -181,6 +204,7 @@ fn candidates() -> Result<Vec<Kind>> {
             .map(|name| match name.trim() {
                 "nvfbc" => Ok(Kind::NvFbc),
                 "x11" => Ok(Kind::X11),
+                "wlr" => Ok(Kind::Wlr),
                 "portal" => Ok(Kind::Portal),
                 other => bail!("OPENUUYC_CAPTURE 中有未知的采集方式：{other}"),
             })
@@ -189,16 +213,37 @@ fn candidates() -> Result<Vec<Kind>> {
         return Ok(kinds);
     }
     Ok(if wayland_session() {
-        vec![Kind::Portal]
+        // The compositor's own protocol first: it is the only one that copies
+        // without asking, and the portal stays as the fallback for compositors
+        // that do not serve it.
+        vec![Kind::Wlr, Kind::Portal]
     } else {
         vec![Kind::NvFbc, Kind::X11, Kind::Portal]
     })
 }
 
+/// The candidates that can really open here, in order. A `Wlr` entry is
+/// dropped when the compositor does not serve the protocol, so whatever is
+/// behind it — on Mutter and KWin, the portal — is seen for what it is.
+fn usable(kinds: &[Kind], wlr_available: bool) -> Vec<Kind> {
+    kinds
+        .iter()
+        .copied()
+        .filter(|kind| *kind != Kind::Wlr || wlr_available)
+        .collect()
+}
+
 /// Whether opening capture now would ask the local user to share the
-/// screen: the portal comes first and has no remembered grant yet.
+/// screen: the portal comes first and has no remembered grant yet. A `Wlr`
+/// that cannot open leaves the portal first, so the question has to be asked
+/// of the list the session would really use.
 pub(crate) fn needs_consent() -> bool {
-    candidates().is_ok_and(|kinds| consent_needed(&kinds, portal::remembered()))
+    candidates().is_ok_and(|kinds| {
+        // Only a `Wlr` head can hide the portal behind it, and the probe costs
+        // a connection, so it is skipped for every other order.
+        let wlr = kinds.first() == Some(&Kind::Wlr) && wlr_screencopy::available();
+        consent_needed(&usable(&kinds, wlr), portal::remembered())
+    })
 }
 
 fn consent_needed(kinds: &[Kind], remembered: bool) -> bool {
@@ -208,6 +253,7 @@ fn consent_needed(kinds: &[Kind], remembered: bool) -> bool {
 enum Backend {
     NvFbc(nvfbc::Grab),
     X11(x11::Grab),
+    Wlr(wlr_screencopy::Grab),
     Portal(portal::Grab),
 }
 impl Backend {
@@ -216,6 +262,7 @@ impl Backend {
         Ok(match kind {
             Kind::NvFbc => Self::NvFbc(nvfbc::Grab::open(screen, cursor, size)?),
             Kind::X11 => Self::X11(x11::Grab::open(screen)?),
+            Kind::Wlr => Self::Wlr(wlr_screencopy::Grab::open(screen, cursor)?),
             Kind::Portal => Self::Portal(portal::Grab::open(screen, cursor)?),
         })
     }
@@ -223,6 +270,7 @@ impl Backend {
         match self {
             Self::NvFbc(_) => Kind::NvFbc,
             Self::X11(_) => Kind::X11,
+            Self::Wlr(_) => Kind::Wlr,
             Self::Portal(_) => Kind::Portal,
         }
     }
@@ -251,6 +299,7 @@ impl Backend {
         match self {
             Self::NvFbc(grab) => grab.name(),
             Self::X11(grab) => grab.name(),
+            Self::Wlr(grab) => grab.name(),
             Self::Portal(grab) => grab.name(),
         }
     }
@@ -335,12 +384,19 @@ impl Desktop {
                 self.last = None;
             }
         }
-        // The portal draws the cursor or leaves it out for the whole session;
-        // a change of request moves to a session with the other mode.
+        // The portal and wlr-screencopy draw the cursor or leave it out for the
+        // whole session; a change of request moves to a session with the other
+        // mode.
         if let Backend::Portal(grab) = &self.backend
             && grab.cursor() != cursor
         {
             self.backend = Backend::Portal(portal::Grab::open(&self.screen, cursor)?);
+            self.last = None;
+        }
+        if let Backend::Wlr(grab) = &self.backend
+            && grab.cursor() != cursor
+        {
+            self.backend = Backend::Wlr(wlr_screencopy::Grab::open(&self.screen, cursor)?);
             self.last = None;
         }
         // NvFBC scales and draws the cursor as it captures; both are fixed
@@ -350,6 +406,12 @@ impl Desktop {
             && !grab.matches(cursor, wanted)
         {
             self.backend = Backend::NvFbc(nvfbc::Grab::open(&self.screen, cursor, wanted)?);
+        }
+        // The portal converter derives its output from each picture's own size.
+        // Hand it the current request so a controller quality that differs from
+        // the source is scaled on the GPU instead of read back to the CPU.
+        if let Backend::Portal(grab) = &self.backend {
+            grab.set_target(Some((quality, maximum)));
         }
         self.cursor = match self.sampler.sample() {
             Ok(pointer) => Some(pointer),
@@ -385,7 +447,7 @@ impl Desktop {
                     break Err(error);
                 }
                 let size = output(self.screen.width, self.screen.height, quality, maximum);
-                let image = scale(&grab.source, (self.screen.width, self.screen.height), size);
+                let image = scale(grab.pixels(), (self.screen.width, self.screen.height), size);
                 // X11 cannot say whether anything changed; compare.
                 if self.last_size != size
                     || self
@@ -401,12 +463,30 @@ impl Desktop {
                 }
                 std::thread::sleep((deadline - now).min(Duration::from_millis(8)));
             },
+            // The compositor answers a copy request only when it next draws,
+            // so a still desktop reports no picture.
+            Backend::Wlr(grab) => grab
+                .next(deadline.saturating_duration_since(Instant::now()))
+                .map(|picture| {
+                    picture.map(|picture| {
+                        let size = output(picture.width, picture.height, quality, maximum);
+                        let image = if size == (picture.width, picture.height) {
+                            picture.pixels
+                        } else {
+                            scale(&picture.pixels, (picture.width, picture.height), size)
+                        };
+                        (size, image)
+                    })
+                }),
             // PipeWire only delivers a picture when the monitor changed.
             Backend::Portal(grab) => {
                 match grab.next(deadline.saturating_duration_since(Instant::now())) {
                     Ok(Some(picture)) => {
                         let size = output(picture.width, picture.height, quality, maximum);
                         if let Some(frame) = picture.nv12 {
+                            // The converter already produced `size`; a mismatch
+                            // would mean a stale target, so keep the GPU frame
+                            // only when it matches and fall back otherwise.
                             if size == frame.size() {
                                 self.available = true;
                                 self.last_size = size;
@@ -419,10 +499,20 @@ impl Desktop {
                                     hdr_metadata: None,
                                 }));
                             }
+                            // The converter produced a different geometry than
+                            // the current request (a stale target during a
+                            // quality change). Scale from the frame's own size,
+                            // not the source crop, and let the next frame use
+                            // the refreshed target.
                             let pixels = frame.pixels()?;
+                            let from = frame.size();
                             Ok(Some((
                                 size,
-                                scale(&pixels, (picture.width, picture.height), size),
+                                if from == size {
+                                    pixels
+                                } else {
+                                    scale(&pixels, from, size)
+                                },
                             )))
                         } else {
                             let image = if size == (picture.width, picture.height) {
@@ -476,7 +566,12 @@ fn output(width: u32, height: u32, quality: i32, maximum: (u32, u32)) -> (u32, u
 }
 
 /// Bilinear BGRA scaling, or a crop to even dimensions when the size already
-/// fits. The encoder takes exactly the size it was opened with.
+/// fits. The encoder takes exactly the size it was opened with. The output is
+/// opaque whatever the source's fourth byte held (X leaves it undefined).
+///
+/// A capture larger than the stream (a 4K-class screen at the highest
+/// quality, which caps at 3840x2160) is scaled on every frame, so the work is
+/// split by rows across the cores; each output row depends only on the source.
 fn scale(source: &[u8], from: (u32, u32), to: (u32, u32)) -> Vec<u8> {
     let (source_width, source_height) = (from.0 as usize, from.1 as usize);
     let (width, height) = (to.0 as usize, to.1 as usize);
@@ -488,47 +583,93 @@ fn scale(source: &[u8], from: (u32, u32), to: (u32, u32)) -> Vec<u8> {
     {
         for y in 0..height {
             let start = y * source_width * 4;
-            out[y * width * 4..(y + 1) * width * 4]
-                .copy_from_slice(&source[start..start + width * 4]);
+            let line = &mut out[y * width * 4..(y + 1) * width * 4];
+            line.copy_from_slice(&source[start..start + width * 4]);
+            for pixel in line.chunks_exact_mut(4) {
+                pixel[3] = 0xff;
+            }
         }
         return out;
     }
-    // 16.16 fixed point, sampling pixel centres.
-    let step_x = ((source_width as u64) << 16) / width as u64;
-    let step_y = ((source_height as u64) << 16) / height as u64;
-    let max_x = source_width - 1;
-    let max_y = source_height - 1;
-    for y in 0..height {
-        let sy = ((y as u64 * step_y) + (step_y >> 1)).saturating_sub(1 << 15);
-        let y0 = ((sy >> 16) as usize).min(max_y);
-        let y1 = (y0 + 1).min(max_y);
-        let fy = (sy & 0xffff) as u32;
-        for x in 0..width {
-            let sx = ((x as u64 * step_x) + (step_x >> 1)).saturating_sub(1 << 15);
-            let x0 = ((sx >> 16) as usize).min(max_x);
-            let x1 = (x0 + 1).min(max_x);
-            let fx = (sx & 0xffff) as u32;
-            let at = |px: usize, py: usize| (py * source_width + px) * 4;
-            let (a, b, c, d) = (at(x0, y0), at(x1, y0), at(x0, y1), at(x1, y1));
-            let o = (y * width + x) * 4;
-            for channel in 0..4 {
-                let top = u32::from(source[a + channel]) * (0x10000 - fx)
-                    + u32::from(source[b + channel]) * fx;
-                let bottom = u32::from(source[c + channel]) * (0x10000 - fx)
-                    + u32::from(source[d + channel]) * fx;
-                let value = ((u64::from(top >> 8) * u64::from(0x10000 - fy)
-                    + u64::from(bottom >> 8) * u64::from(fy))
-                    >> 24) as u32;
-                out[o + channel] = value.min(255) as u8;
+    let columns = taps(source_width, width);
+    let rows = taps(source_height, height);
+    let row_bytes = width * 4;
+    // Below about a megapixel the threads cost more than they save.
+    let threads = if width * height < 1 << 20 {
+        1
+    } else {
+        std::thread::available_parallelism().map_or(1, |n| n.get().min(8))
+    };
+    let band = height.div_ceil(threads);
+    std::thread::scope(|scope| {
+        for (index, chunk) in out.chunks_mut(band * row_bytes).enumerate() {
+            let (columns, rows) = (&columns, &rows);
+            let mut work = move || {
+                for (offset, line) in chunk.chunks_exact_mut(row_bytes).enumerate() {
+                    scale_row(
+                        source,
+                        source_width,
+                        columns,
+                        rows[index * band + offset],
+                        line,
+                    );
+                }
+            };
+            if index + 1 == threads.min(height.div_ceil(band)) {
+                work();
+            } else {
+                scope.spawn(work);
             }
         }
-    }
+    });
     out
+}
+
+/// For each output position along one axis: the two source positions it
+/// blends and the weight of the second, in 16.16 fixed point, sampling pixel
+/// centres.
+fn taps(source: usize, output: usize) -> Vec<(usize, usize, u32)> {
+    let step = ((source as u64) << 16) / output as u64;
+    let last = source - 1;
+    (0..output)
+        .map(|position| {
+            let at = ((position as u64 * step) + (step >> 1)).saturating_sub(1 << 15);
+            let first = ((at >> 16) as usize).min(last);
+            (first, (first + 1).min(last), (at & 0xffff) as u32)
+        })
+        .collect()
+}
+
+fn scale_row(
+    source: &[u8],
+    source_width: usize,
+    columns: &[(usize, usize, u32)],
+    (y0, y1, fy): (usize, usize, u32),
+    line: &mut [u8],
+) {
+    let top_row = &source[y0 * source_width * 4..(y0 + 1) * source_width * 4];
+    let bottom_row = &source[y1 * source_width * 4..(y1 + 1) * source_width * 4];
+    let (wy0, wy1) = (u64::from(0x10000 - fy), u64::from(fy));
+    for (pixel, &(x0, x1, fx)) in line.chunks_exact_mut(4).zip(columns) {
+        let (a, b) = (&top_row[x0 * 4..x0 * 4 + 4], &top_row[x1 * 4..x1 * 4 + 4]);
+        let (c, d) = (
+            &bottom_row[x0 * 4..x0 * 4 + 4],
+            &bottom_row[x1 * 4..x1 * 4 + 4],
+        );
+        let (wx0, wx1) = (0x10000 - fx, fx);
+        for channel in 0..3 {
+            let top = u32::from(a[channel]) * wx0 + u32::from(b[channel]) * wx1;
+            let bottom = u32::from(c[channel]) * wx0 + u32::from(d[channel]) * wx1;
+            let value = ((u64::from(top >> 8) * wy0 + u64::from(bottom >> 8) * wy1) >> 24) as u32;
+            pixel[channel] = value.min(255) as u8;
+        }
+        pixel[3] = 0xff;
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Kind, consent_needed, scale};
+    use super::{Kind, consent_needed, scale, usable};
 
     #[test]
     fn only_an_unremembered_portal_asks_the_user() {
@@ -542,11 +683,127 @@ mod tests {
     }
 
     #[test]
+    fn a_wlr_that_cannot_open_leaves_the_portal_in_front() {
+        // Neither Mutter nor KWin serves `zwlr_screencopy_manager_v1`: the
+        // startup probe must not fall through to the portal and pop its
+        // dialog, which is what #1's guard exists to prevent.
+        assert!(consent_needed(
+            &usable(&[Kind::Wlr, Kind::Portal], false),
+            false
+        ));
+        assert!(!consent_needed(
+            &usable(&[Kind::Wlr, Kind::Portal], true),
+            false
+        ));
+        // A grant that is already remembered stays quiet either way.
+        assert!(!consent_needed(
+            &usable(&[Kind::Wlr, Kind::Portal], false),
+            true
+        ));
+        // An X11 order has no wlr entry to drop.
+        assert!(!consent_needed(
+            &usable(&[Kind::NvFbc, Kind::X11, Kind::Portal], false),
+            false
+        ));
+    }
+
+    #[test]
     fn crop_to_even_keeps_pixels() {
         let source: Vec<u8> = (0..3 * 3 * 4).map(|v| v as u8).collect();
         let out = scale(&source, (3, 3), (2, 2));
-        assert_eq!(&out[..8], &source[..8]);
-        assert_eq!(&out[8..16], &source[12..20]);
+        let opaque = |pixels: &[u8]| -> Vec<u8> {
+            pixels
+                .chunks_exact(4)
+                .flat_map(|p| [p[0], p[1], p[2], 0xff])
+                .collect()
+        };
+        assert_eq!(&out[..8], &opaque(&source[..8])[..]);
+        assert_eq!(&out[8..16], &opaque(&source[12..20])[..]);
+    }
+
+    /// The single-threaded scaler `scale` replaced; its output is the contract.
+    fn reference(source: &[u8], from: (u32, u32), to: (u32, u32)) -> Vec<u8> {
+        let (source_width, source_height) = (from.0 as usize, from.1 as usize);
+        let (width, height) = (to.0 as usize, to.1 as usize);
+        let mut out = vec![0u8; width * height * 4];
+        if width <= source_width
+            && height <= source_height
+            && (source_width - width) <= 1
+            && (source_height - height) <= 1
+        {
+            for y in 0..height {
+                let start = y * source_width * 4;
+                out[y * width * 4..(y + 1) * width * 4]
+                    .copy_from_slice(&source[start..start + width * 4]);
+            }
+            return out;
+        }
+        // 16.16 fixed point, sampling pixel centres.
+        let step_x = ((source_width as u64) << 16) / width as u64;
+        let step_y = ((source_height as u64) << 16) / height as u64;
+        let max_x = source_width - 1;
+        let max_y = source_height - 1;
+        for y in 0..height {
+            let sy = ((y as u64 * step_y) + (step_y >> 1)).saturating_sub(1 << 15);
+            let y0 = ((sy >> 16) as usize).min(max_y);
+            let y1 = (y0 + 1).min(max_y);
+            let fy = (sy & 0xffff) as u32;
+            for x in 0..width {
+                let sx = ((x as u64 * step_x) + (step_x >> 1)).saturating_sub(1 << 15);
+                let x0 = ((sx >> 16) as usize).min(max_x);
+                let x1 = (x0 + 1).min(max_x);
+                let fx = (sx & 0xffff) as u32;
+                let at = |px: usize, py: usize| (py * source_width + px) * 4;
+                let (a, b, c, d) = (at(x0, y0), at(x1, y0), at(x0, y1), at(x1, y1));
+                let o = (y * width + x) * 4;
+                for channel in 0..4 {
+                    let top = u32::from(source[a + channel]) * (0x10000 - fx)
+                        + u32::from(source[b + channel]) * fx;
+                    let bottom = u32::from(source[c + channel]) * (0x10000 - fx)
+                        + u32::from(source[d + channel]) * fx;
+                    let value = ((u64::from(top >> 8) * u64::from(0x10000 - fy)
+                        + u64::from(bottom >> 8) * u64::from(fy))
+                        >> 24) as u32;
+                    out[o + channel] = value.min(255) as u8;
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_threaded_scaler_matches_the_reference_byte_for_byte() {
+        // A cheap deterministic noise, so every channel and weight is exercised.
+        let mut state = 0x2545_f491_u32;
+        let mut noise = |length: usize| -> Vec<u8> {
+            (0..length)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    state as u8
+                })
+                .collect()
+        };
+        for (from, to) in [
+            ((4096, 2560), (3456, 2160)),
+            ((1920, 1080), (1280, 720)),
+            ((1366, 768), (1280, 720)),
+            ((5120, 1440), (3840, 1080)),
+            ((640, 480), (1280, 960)),
+            ((7, 5), (4, 2)),
+            ((3, 3), (2, 2)),
+        ] {
+            let source = noise((from.0 * from.1 * 4) as usize);
+            let (ours, theirs) = (scale(&source, from, to), reference(&source, from, to));
+            // Colour exactly as before; alpha is now always opaque.
+            assert!(
+                ours.chunks_exact(4)
+                    .zip(theirs.chunks_exact(4))
+                    .all(|(a, b)| a[..3] == b[..3] && a[3] == 0xff),
+                "{from:?} -> {to:?}"
+            );
+        }
     }
 
     #[test]
@@ -576,5 +833,48 @@ mod session_tests {
         }
         println!("frames: {frames} size: {size:?}");
         assert!(frames > 0);
+    }
+}
+
+#[cfg(test)]
+mod stage_tests {
+    /// Needs an X session: what each step of the X11 path costs per frame at
+    /// the highest quality (a screen above 3840x2160 is scaled).
+    #[test]
+    #[ignore]
+    fn x11_capture_stages() {
+        let screens = super::screens().unwrap();
+        let screen = &screens[0];
+        let mut grab = super::x11::Grab::open(screen).unwrap();
+        let size = super::output(screen.width, screen.height, 4, (3840, 2160));
+        let n = 20u32;
+        let (mut tg, mut ts, mut tc) = (
+            std::time::Duration::ZERO,
+            std::time::Duration::ZERO,
+            std::time::Duration::ZERO,
+        );
+        let mut last: Option<Vec<u8>> = None;
+        for _ in 0..n {
+            let t = std::time::Instant::now();
+            grab.grab(screen, true).unwrap();
+            tg += t.elapsed();
+            let t = std::time::Instant::now();
+            let image = super::scale(grab.pixels(), (screen.width, screen.height), size);
+            ts += t.elapsed();
+            let t = std::time::Instant::now();
+            let _same = last.as_deref() == Some(image.as_slice());
+            tc += t.elapsed();
+            last = Some(image);
+        }
+        println!(
+            "{}x{} -> {}x{}: grab {:.1} ms, scale {:.1} ms, compare {:.1} ms",
+            screen.width,
+            screen.height,
+            size.0,
+            size.1,
+            tg.as_secs_f64() * 1000.0 / f64::from(n),
+            ts.as_secs_f64() * 1000.0 / f64::from(n),
+            tc.as_secs_f64() * 1000.0 / f64::from(n)
+        );
     }
 }

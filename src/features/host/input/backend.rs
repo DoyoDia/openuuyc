@@ -150,6 +150,14 @@ impl Backend {
             Self::Service(e) => e.apply(events, geometry, permitted),
         }
     }
+    /// 请合成器重新判定一次指针底下是谁——Wayland 的拖放接取面要靠这一下。只有
+    /// Linux 有这条：别处的合成器自己会在面上屏时重判。
+    #[cfg(target_os = "linux")]
+    pub fn realign_pointer(&mut self) -> Result<bool> {
+        match self {
+            Self::Local(native) => native.engine.realign_pointer(),
+        }
+    }
     pub fn release(&mut self) -> Result<()> {
         match self {
             Self::Local(e) => e.engine.release(),

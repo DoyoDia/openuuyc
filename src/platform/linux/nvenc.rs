@@ -191,6 +191,134 @@ mod tests {
 }
 
 #[cfg(test)]
+mod format_tests {
+    use super::*;
+    use crate::media::encoding::{Backend, Codec, QualityTarget};
+
+    /// Needs an NVIDIA GPU: `cargo test -- --ignored nvenc_encodes_every_format`.
+    /// Every format the host probe would try on NVENC (the same two gates)
+    /// must open on a GPU that has it and come out as a stream whose sequence
+    /// header names that format and size; where the controller's software
+    /// decoder takes the format, it must decode every frame. With
+    /// `OPENUUYC_NVENC_DUMP=<dir>` the streams are written there (`.h264`,
+    /// `.h265`, `.obu`) for an outside decoder to check.
+    #[test]
+    #[ignore]
+    fn nvenc_encodes_every_format_it_accepts() {
+        let context = super::super::cuda::display_context().unwrap();
+        let (width, height) = (1280u32, 720u32);
+        let rate = Rate {
+            target: 8_000_000,
+            peak: 8_000_000,
+            fps: 30,
+            quality: 4,
+            quality_target: QualityTarget {
+                bitrate: 8_000_000,
+                fps: 30,
+            },
+        };
+        let dump = std::env::var_os("OPENUUYC_NVENC_DUMP").map(std::path::PathBuf::from);
+        let mut produced = Vec::new();
+        for codec in [Codec::H264, Codec::H265, Codec::Av1] {
+            for chroma in [1u8, 3] {
+                let format = Format {
+                    codec,
+                    chroma,
+                    depth: 8,
+                };
+                if !(Backend::Nvidia.accepts(format) && Encoder::accepts(format)) {
+                    println!("{format:?}: never requested from NVENC");
+                    continue;
+                }
+                let mut encoder = match Encoder::new(&context, (width, height), format, rate) {
+                    Ok(encoder) => encoder,
+                    Err(error) => {
+                        println!("{format:?}: not offered by this GPU: {error:#}");
+                        continue;
+                    }
+                };
+                let started = std::time::Instant::now();
+                let mut stream = Vec::new();
+                let mut packets = Vec::new();
+                for index in 0..60u32 {
+                    // A moving pattern, so inter frames carry real motion.
+                    let mut pixels = Vec::with_capacity((width * height * 4) as usize);
+                    for y in 0..height {
+                        for x in 0..width {
+                            pixels.extend_from_slice(&[
+                                (x + index * 8) as u8,
+                                (y + index * 4) as u8,
+                                (x ^ y) as u8,
+                                255,
+                            ]);
+                        }
+                    }
+                    let image = Image::Cpu {
+                        pixels: Arc::new(pixels),
+                        width,
+                        height,
+                    };
+                    for encoded in encoder
+                        .encode(&image, i64::from(index) * 333_333, index == 0)
+                        .unwrap()
+                    {
+                        stream.extend_from_slice(&encoded.data);
+                        packets.push(encoded.data);
+                    }
+                }
+                let elapsed = started.elapsed();
+                let header =
+                    crate::media::video_format::parse_stream_format(codec.media(), &stream)
+                        .unwrap_or_else(|| panic!("{format:?}: no sequence header"));
+                assert_eq!(
+                    (
+                        header.chroma_format_idc,
+                        header.bit_depth_luma,
+                        header.bit_depth_chroma,
+                        header.visible_width,
+                        header.visible_height,
+                    ),
+                    (chroma, 8, 8, width, height),
+                    "{format:?}: the stream says otherwise"
+                );
+                println!(
+                    "{format:?}: 60 frames, {} KiB, {elapsed:?} with uploads",
+                    stream.len() / 1024
+                );
+                if format.software().can_decode() {
+                    let mut decoder =
+                        openuuyc_codec::decoder::Decoder::new(codec.media(), &[]).unwrap();
+                    let mut decoded = 0;
+                    for (token, packet) in packets.iter().enumerate() {
+                        for frame in decoder.push(packet, token as i64).unwrap() {
+                            assert_eq!((frame.width, frame.height), (width, height));
+                            decoded += 1;
+                        }
+                    }
+                    assert_eq!(decoded, 60, "{format:?}: the software decoder lost frames");
+                    println!("{format:?}: software decoder returned all 60 frames");
+                }
+                if let Some(directory) = &dump {
+                    let extension = match codec {
+                        Codec::H264 => "h264",
+                        Codec::H265 => "h265",
+                        Codec::Av1 => "obu",
+                    };
+                    std::fs::write(
+                        directory.join(format!("{codec:?}-{chroma}.{extension}")),
+                        &stream,
+                    )
+                    .unwrap();
+                }
+                produced.push(format);
+            }
+        }
+        println!("produced {produced:?}");
+        assert!(produced.contains(&Format::AVC));
+    }
+}
+
+#[cfg(test)]
 mod memory_tests {
     /// Stage by stage, so an outside `nvidia-smi` can attribute video memory.
     #[test]

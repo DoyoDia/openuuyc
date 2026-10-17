@@ -1,5 +1,5 @@
 //! Outgoing remote assistance and server-synchronized saved devices.
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -163,4 +163,89 @@ pub(crate) struct FavoriteItem<'a> {
     pub connect_id: &'a str,
     pub remark: &'a str,
     pub favorited_at: i64,
+}
+
+/// 官方「复制并分享」发出的协助邀请链接：
+/// `uuremote://external/assistance?deviceId=<9位设备 ID>&code=<验证码>&controlledLogin=<0|1>`
+///
+/// controlledLogin 表示被协助端生成邀请时的登录状态。4.41.2.2602
+/// C140209E20 用 QString::toInt 解析；本程序只将它作为元信息，
+/// 连接权限仍由设备 ID、验证码及既有预检决定。
+#[derive(Clone, PartialEq, Eq)]
+pub struct AssistLink {
+    pub connect_id: String,
+    /// 免密连接没有验证码，官方链接允许 `code` 缺失。
+    pub code: String,
+    pub controlled_login: bool,
+}
+impl fmt::Debug for AssistLink {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AssistLink")
+            .field("connect_id", &self.connect_id)
+            .field("code", &"REDACTED")
+            .field("controlled_login", &self.controlled_login)
+            .finish()
+    }
+}
+impl AssistLink {
+    pub const MAX_URI_BYTES: usize = 1024;
+    /// 限制外部激活载荷；原始空白和控制字符必须使用 URL 编码。
+    pub fn transportable(uri: &str) -> bool {
+        uri.len() <= Self::MAX_URI_BYTES
+            && !uri
+                .chars()
+                .any(|c| c.is_ascii_whitespace() || c.is_control())
+    }
+    pub fn parse(uri: &str) -> Result<Self> {
+        if !Self::transportable(uri) {
+            bail!("协助链接过长或包含无效字符");
+        }
+        let url = url::Url::parse(uri).map_err(|_| anyhow::anyhow!("协助链接格式不正确"))?;
+        if !url.scheme().eq_ignore_ascii_case("uuremote") {
+            bail!("不是 UU 远程的链接");
+        }
+        if !url.username().is_empty()
+            || url.password().is_some()
+            || url.port().is_some()
+            || url.fragment().is_some()
+        {
+            bail!("协助链接格式不正确");
+        }
+        let route = format!(
+            "{}{}",
+            url.host_str().unwrap_or_default(),
+            url.path().trim_end_matches('/')
+        );
+        if !route.eq_ignore_ascii_case("external/assistance") {
+            bail!("暂不支持这种 UU 远程链接");
+        }
+        let mut connect_id = None;
+        let mut code = String::new();
+        let mut controlled_login = false;
+        let mut seen = std::collections::HashSet::new();
+        for (key, value) in url.query_pairs() {
+            if matches!(key.as_ref(), "deviceId" | "code" | "controlledLogin")
+                && !seen.insert(key.to_string())
+            {
+                bail!("协助链接包含重复参数");
+            }
+            match key.as_ref() {
+                "deviceId" => connect_id = Some(normalize_connect_id(&value)?),
+                "code" => {
+                    validate_connect_code(&value)?;
+                    code = value.into_owned();
+                }
+                "controlledLogin" => {
+                    controlled_login = value.trim().parse::<i32>().ok() == Some(1);
+                }
+                // 链接还会带上系统、地区等只给官方客户端看的信息，忽略即可。
+                _ => (),
+            }
+        }
+        Ok(Self {
+            connect_id: connect_id.context("协助链接里没有设备 ID")?,
+            code,
+            controlled_login,
+        })
+    }
 }

@@ -13,6 +13,9 @@ mod protocol;
 #[cfg(not(windows))]
 #[path = "x11_offer_linux.rs"]
 mod x11_offer;
+#[cfg(not(windows))]
+#[path = "x11_read_linux.rs"]
+mod x11_read;
 use anyhow::{Result, anyhow, bail, ensure};
 pub(crate) use native::{FileOffer, FileSummary};
 use prost::Message;
@@ -834,7 +837,11 @@ impl Inner {
                             p.waiter.finish(Err("无效的剪贴板文件列表".into()));
                             break;
                         }
-                        items.extend(s.file_descs);
+                        // Normalize wire Unix seconds once for native OLE and drag consumers.
+                        items.extend(s.file_descs.into_iter().map(|mut f| {
+                            f.last_write_time = wire_filetime(f.last_write_time);
+                            f
+                        }));
                         *next += 1;
                         ok = true;
                         if (*next - 1) as usize == count.unwrap() {

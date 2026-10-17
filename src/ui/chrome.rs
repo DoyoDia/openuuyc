@@ -90,6 +90,33 @@ pub(crate) fn window_title_bar(
     window_title_bar_alert(ui, window, alias, move_state, tooltips, None)
 }
 
+/// 同 [`window_title_bar`]，只是标题那一格让调用方自己画。
+///
+/// 播放器窗口要在这儿放设备切换菜单（Windows 的 caption 也是这么做的），而设备列表
+/// 只有它自己知道。除了这一格，拖动、品牌图标、窗口按钮都照旧。
+///
+/// 目前只有 Linux 的播放器用它：Windows 播放器整条 caption 都是自己画的
+/// （`windows_presenter/chrome.rs`），不经过 [`window_title_bar`]。
+#[cfg_attr(windows, allow(dead_code, reason = "Windows 播放器自己画 caption"))]
+pub(crate) fn window_title_bar_with_identity(
+    ui: &mut egui::Ui,
+    window: &Window,
+    alias: &str,
+    move_state: Option<&mut WindowMoveState>,
+    tooltips: bool,
+    identity: &mut dyn FnMut(&mut egui::Ui),
+) -> bool {
+    window_title_bar_impl(
+        ui,
+        window,
+        alias,
+        move_state,
+        tooltips,
+        None,
+        Some(identity),
+    )
+}
+
 pub(crate) fn window_title_bar_alert(
     ui: &mut egui::Ui,
     window: &Window,
@@ -97,6 +124,18 @@ pub(crate) fn window_title_bar_alert(
     move_state: Option<&mut WindowMoveState>,
     tooltips: bool,
     alert: Option<&TitleBarAlert>,
+) -> bool {
+    window_title_bar_impl(ui, window, alias, move_state, tooltips, alert, None)
+}
+
+fn window_title_bar_impl(
+    ui: &mut egui::Ui,
+    window: &Window,
+    alias: &str,
+    move_state: Option<&mut WindowMoveState>,
+    tooltips: bool,
+    alert: Option<&TitleBarAlert>,
+    identity: Option<&mut dyn FnMut(&mut egui::Ui)>,
 ) -> bool {
     ui.set_min_height(crate::ui::theme::WINDOW_TITLE_CONTENT_HEIGHT);
     let rect = egui::Rect::from_min_size(
@@ -112,15 +151,13 @@ pub(crate) fn window_title_bar_alert(
             .enabled_buttons()
             .contains(winit::window::WindowButtons::MAXIMIZE),
     );
-    let drag = ui.interact(
-        caption_rect,
-        ui.id().with("window-title-drag"),
-        egui::Sense::click_and_drag(),
-    );
-    if let Some(state) = move_state {
-        update_nonmodal_window_move(ui.ctx(), window, &drag, state);
-    } else if handle_title_drag(window, &drag) {
-        let _ = window.drag_window();
+    // 调用方自己画标题那一格时（播放器的设备切换按钮），拖动区和 Windows 的
+    // `player-title-drag` 一样从那一格右边开始，免得按住设备按钮一拖就拖动了窗口；
+    // 那一格要先画出来才知道有多宽，所以拖动区放到后面登记（两者不重叠，先后无所谓）。
+    let mut move_state = move_state;
+    let has_identity = identity.is_some();
+    if !has_identity {
+        title_drag(ui, window, caption_rect, move_state.take());
     }
     let brand_rect = if alert.is_some() {
         egui::Rect::from_min_max(
@@ -135,6 +172,21 @@ pub(crate) fn window_title_bar_alert(
     } else {
         caption_rect
     };
+    // 让调用方画标题时（设备切换按钮），这一格也要像 Windows 的 caption 那样封顶，
+    // 否则长别名会一直画到屏标签那一行上。
+    let brand_rect = if identity.is_some() {
+        egui::Rect::from_min_max(
+            brand_rect.min,
+            egui::pos2(
+                (brand_rect.left()
+                    + crate::ui::theme::VIEWER_IDENTITY_MAX_WIDTH.min(brand_rect.width()))
+                .min(brand_rect.right()),
+                brand_rect.max.y,
+            ),
+        )
+    } else {
+        brand_rect
+    };
     let mut caption = ui.new_child(
         egui::UiBuilder::new()
             .max_rect(brand_rect)
@@ -142,14 +194,31 @@ pub(crate) fn window_title_bar_alert(
     );
     caption.set_clip_rect(brand_rect);
     paint_brand_logo(&mut caption);
-    caption.add(
-        egui::Label::new(
-            egui::RichText::new(alias)
-                .size(crate::ui::theme::SMALL)
-                .color(crate::ui::theme::TEXT),
-        )
-        .truncate(),
-    );
+    match identity {
+        Some(draw) => {
+            draw(&mut caption);
+            let start = caption
+                .min_rect()
+                .right()
+                .clamp(caption_rect.left(), caption_rect.right());
+            title_drag(
+                ui,
+                window,
+                egui::Rect::from_min_max(egui::pos2(start, caption_rect.top()), caption_rect.max),
+                move_state.take(),
+            );
+        }
+        None => {
+            caption.add(
+                egui::Label::new(
+                    egui::RichText::new(alias)
+                        .size(crate::ui::theme::SMALL)
+                        .color(crate::ui::theme::TEXT),
+                )
+                .truncate(),
+            );
+        }
+    }
     if let Some(alert) = alert {
         let margin = crate::ui::theme::WINDOW_TITLE_MARGIN;
         let centered = rect.translate(egui::vec2(
@@ -170,6 +239,25 @@ pub(crate) fn window_title_bar_alert(
     let close = window_buttons_impl(&mut controls, window, tooltips);
     ui.allocate_rect(rect, egui::Sense::hover());
     close
+}
+
+/// 标题栏上能拖动窗口的那一片。
+fn title_drag(
+    ui: &mut egui::Ui,
+    window: &Window,
+    area: egui::Rect,
+    move_state: Option<&mut WindowMoveState>,
+) {
+    let drag = ui.interact(
+        area,
+        ui.id().with("window-title-drag"),
+        egui::Sense::click_and_drag(),
+    );
+    if let Some(state) = move_state {
+        update_nonmodal_window_move(ui.ctx(), window, &drag, state);
+    } else if handle_title_drag(window, &drag) {
+        let _ = window.drag_window();
+    }
 }
 
 pub(crate) fn paint_title_alert(ui: &egui::Ui, alert: &TitleBarAlert, rect: egui::Rect) {

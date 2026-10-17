@@ -3626,7 +3626,7 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
 name = "openuuyc"
-version = "1.0.2-beta.1"
+version = "1.0.2-beta.5"
 dependencies = [
  "anyhow",
  "arboard",
@@ -3670,6 +3670,7 @@ dependencies = [
  "openuuyc-h264",
  "openuuyc-nvenc-sys",
  "openuuyc-plugin-api",
+ "openuuyc-vkms",
  "openuuyc-vpl-sys",
  "opusic-c",
  "pollster",
@@ -3697,6 +3698,7 @@ dependencies = [
  "wayland-client",
  "wayland-protocols",
  "wayland-protocols-misc",
+ "wayland-protocols-wlr",
  "webrtc",
  "webrtc-srtp",
  "wgpu",
@@ -3781,6 +3783,17 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "openuuyc-vkms"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "serde",
+ "serde_json",
+ "zbus",
 ]
 
 [[package]]

@@ -5,6 +5,7 @@ use crate::media::LocalDisplayInfo;
 use anyhow::{Context, Result, bail};
 use display_info::DisplayInfo;
 
+pub(crate) mod compositor;
 pub(crate) mod recovery;
 pub(crate) mod topology;
 pub(crate) mod virtual_driver;
@@ -19,6 +20,16 @@ pub(crate) use crate::media::capture::source_id;
 /// server's rectangles, which is what it would use anyway.
 pub(crate) fn compositor_layout() -> Option<std::sync::Arc<crate::platform::CompositorLayout>> {
     wayland::layout()
+}
+
+/// [`compositor_layout`], waiting for the first description to arrive.
+///
+/// For a caller that cannot go on without the layout and is not in anyone's hot
+/// path: the watcher starts lazily, so the first snapshot of a process is only
+/// published a round trip after the first ask.
+pub(crate) fn compositor_layout_soon() -> Option<std::sync::Arc<crate::platform::CompositorLayout>>
+{
+    wayland::layout_soon()
 }
 
 pub fn detect_local_display() -> Result<LocalDisplayInfo> {

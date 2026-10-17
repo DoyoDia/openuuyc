@@ -39,8 +39,15 @@ impl Actor {
         let Some(entry) = self.entries.get_mut(&id) else {
             return Ok(());
         };
+        // Wait for the drag image only when the peer will send one. It sends it
+        // under the test in `Command::Image`, seen from its side: we always
+        // declare `DRAG_IMAGE`, so a peer that knows the bit (and declares it
+        // itself) always sends one; an older or upstream peer sends one only
+        // when both sides can take a drag back.
+        let image_coming = self.shared.image_capable.load(Ordering::Acquire)
+            || (native::RETURN_CAPABLE && self.shared.return_capable.load(Ordering::Acquire));
         if (entry.reverse && !entry.preserve_source && !entry.source_released)
-            || (self.shared.return_capable.load(Ordering::Acquire) && entry.image.is_none())
+            || (image_coming && entry.image.is_none())
         {
             return Ok(());
         }

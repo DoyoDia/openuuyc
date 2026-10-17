@@ -21,6 +21,7 @@ use tokio::task::JoinHandle;
 use view::{CenterUi, configure_visuals};
 
 mod assist;
+pub(crate) mod assist_link;
 mod catalog;
 mod controlled_caption;
 pub(crate) mod device_status;
@@ -42,6 +43,8 @@ pub struct GuiOptions {
     pub background: bool,
     pub media: ConnectionMediaOptions,
     pub startup_warning: Option<String>,
+    /// 系统按 `uuremote://` 协议注册拉起的协助链接，原样交给界面。
+    pub link: Option<String>,
 }
 
 pub fn run(options: GuiOptions) -> Result<()> {
@@ -51,6 +54,11 @@ pub fn run(options: GuiOptions) -> Result<()> {
     let _user_backend = crate::platform::windows::host_service::user_backend::Server::start()?;
     #[cfg(windows)]
     let _migration = crate::platform::windows::components::migration::UserRecovery::start();
+    // 接管过 `uuremote://` 的话，把注册的命令改回当前这份程序（更新或换目录之后
+    // 路径会变）。没接管过就什么都不做，不能因为启动一次就去抢别人的协议。
+    // Linux 的协议登记在安装包的 .desktop 里，路径不随程序走。
+    #[cfg(windows)]
+    crate::platform::windows::assist_link::retarget_on_start();
     let _shortcuts = crate::application::viewer_shortcuts::Watcher::new()?;
     crate::features::host::displays::fallback::start_background();
     let (local_display, display_warning) = match detect_local_display() {
@@ -74,7 +82,7 @@ pub fn run(options: GuiOptions) -> Result<()> {
     let viewport = egui::ViewportBuilder::default()
         .with_visible(!options.background)
         .with_title(format!("{} · 控制中心", crate::APP_NAME))
-        .with_icon(crate::ui::branding::icon())
+        .with_icon(crate::ui::branding::icon(false))
         .with_inner_size([1180.0, 760.0])
         .with_min_inner_size([1024.0, 720.0]);
     crate::ui::run(
@@ -91,6 +99,10 @@ pub fn run(options: GuiOptions) -> Result<()> {
             if let Some(graphics) = graphics {
                 app.diagnostics.graphics.push(graphics);
             }
+            // 投递箱是进程级的，界面建好之后投；第一帧就会去取。
+            if let Some(uri) = &options.link {
+                assist_link::receive(uri);
+            }
             Box::new(app)
         }),
     )
@@ -100,7 +112,7 @@ pub fn run(options: GuiOptions) -> Result<()> {
 #[cfg(windows)]
 pub fn notification_activation(uri: &str) -> Result<()> {
     notifications::Action::parse(uri)?;
-    instance::deliver_notification(uri)
+    instance::deliver_uri(uri)
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1206,6 +1218,7 @@ impl crate::ui::App for DeviceCenterApp {
     fn ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         self.drain_events(&ctx);
+        self.tick_assist_link();
         self.tick_notifications();
         self.tick_power();
         self.draw_center(ui);

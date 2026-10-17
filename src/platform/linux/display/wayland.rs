@@ -18,9 +18,10 @@
 //! as the compositor announces them, and publishes a snapshot; readers only
 //! clone the latest one. A compositor that cannot describe its layout leaves
 //! the snapshot empty and is asked again later, with a growing pause.
-use crate::platform::{CompositorLayout, CompositorOutput};
+use crate::platform::{CompositorLayout, CompositorOutput, Rotation};
 use anyhow::{Context, Result, bail};
 use std::os::fd::AsRawFd;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 use wayland_client::protocol::{wl_callback, wl_output, wl_registry};
@@ -36,16 +37,58 @@ const SETUP_TIMEOUT: Duration = Duration::from_secs(3);
 /// The pause before asking again after a failure, doubled up to the maximum.
 const RETRY_FIRST: Duration = Duration::from_secs(2);
 const RETRY_MAX: Duration = Duration::from_secs(60);
+/// How often [`layout_soon`] looks while it waits.
+const WAIT_POLL: Duration = Duration::from_millis(100);
 
 static SNAPSHOT: RwLock<Option<Arc<CompositorLayout>>> = RwLock::new(None);
+/// Set when the watcher's latest attempt failed, cleared when it next publishes
+/// a layout: [`layout_soon`] does not wait on a compositor that has already
+/// said it cannot describe one.
+static UNAVAILABLE: AtomicBool = AtomicBool::new(false);
 
 /// The latest layout the compositor described, without waiting for it.
 ///
 /// `None` outside a Wayland session, before the first description arrives,
 /// and while the compositor cannot describe its layout.
 pub(crate) fn layout() -> Option<Arc<CompositorLayout>> {
+    if !watching() {
+        return None;
+    }
+    SNAPSHOT.read().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// [`layout`], waiting up to [`SETUP_TIMEOUT`] for the first description.
+///
+/// A caller that cannot go on without the layout, and is not in anyone's hot
+/// path, asks this way; the wait is bounded so a compositor that never answers
+/// costs one pause rather than hanging. Once the watcher has failed, later
+/// calls return at once until it describes the layout again, so that pause is
+/// paid by the process, not by every call. Without a Wayland session there is
+/// nothing to wait for at all.
+pub(crate) fn layout_soon() -> Option<Arc<CompositorLayout>> {
+    if !watching() {
+        return None;
+    }
+    let deadline = Instant::now() + SETUP_TIMEOUT;
+    loop {
+        if let Some(layout) = layout() {
+            return Some(layout);
+        }
+        if UNAVAILABLE.load(Ordering::Acquire) {
+            return None;
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return None;
+        }
+        std::thread::sleep(WAIT_POLL.min(left));
+    }
+}
+
+/// Whether the watcher thread is running, starting it on the first ask.
+fn watching() -> bool {
     static WATCHER: OnceLock<bool> = OnceLock::new();
-    let watching = *WATCHER.get_or_init(|| {
+    *WATCHER.get_or_init(|| {
         if std::env::var_os("WAYLAND_DISPLAY").is_none() {
             return false;
         }
@@ -54,15 +97,14 @@ pub(crate) fn layout() -> Option<Arc<CompositorLayout>> {
             .spawn(watch)
             .inspect_err(|error| tracing::warn!(%error, "无法启动合成器布局监视线程"))
             .is_ok()
-    });
-    if !watching {
-        return None;
-    }
-    SNAPSHOT.read().unwrap_or_else(|e| e.into_inner()).clone()
+    })
 }
 
 fn publish(layout: Option<CompositorLayout>) {
     let mut snapshot = SNAPSHOT.write().unwrap_or_else(|e| e.into_inner());
+    if layout.is_some() {
+        UNAVAILABLE.store(false, Ordering::Release);
+    }
     if snapshot.as_deref() != layout.as_ref() {
         tracing::info!(?layout, "合成器输出布局");
         *snapshot = layout.map(Arc::new);
@@ -79,13 +121,14 @@ fn watch() {
             Ok(never) => match never {},
         };
         publish(None);
+        UNAVAILABLE.store(true, Ordering::Release);
         if described {
             pause = RETRY_FIRST;
         }
         // The same failure every minute is one message, not a log full of it.
         let message = format!("{error:#}");
         if reported.as_ref() != Some(&message) {
-            tracing::warn!(error = %message, "合成器输出布局不可用，绝对定位改用相对移动");
+            tracing::warn!(error = %message, "合成器输出布局不可用：绝对定位改用相对移动，缩放的桌面上门户采集无法认屏");
             reported = Some(message);
         }
         std::thread::sleep(pause);
@@ -202,6 +245,8 @@ struct Entry {
     name: Option<String>,
     position: Option<(i32, i32)>,
     size: Option<(i32, i32)>,
+    /// How far the compositor turned this panel; only the touch path reads it.
+    rotation: Rotation,
 }
 
 impl State {
@@ -221,6 +266,7 @@ impl State {
                         top,
                         width: width as u32,
                         height: height as u32,
+                        rotation: entry.rotation,
                     })
                 })
                 .collect(),
@@ -271,6 +317,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                         name: None,
                         position: None,
                         size: None,
+                        rotation: Rotation::default(),
                     });
                     state.describe(name, handle);
                 }
@@ -307,10 +354,33 @@ impl Dispatch<wl_output::WlOutput, u32> for State {
         };
         match event {
             wl_output::Event::Name { name } => entry.name = Some(name),
+            wl_output::Event::Geometry { transform, .. } => {
+                entry.rotation = rotation(
+                    transform
+                        .into_result()
+                        .unwrap_or(wl_output::Transform::Normal),
+                );
+            }
             // From xdg_output 3 on, a finished description ends here.
             wl_output::Event::Done => state.changed = true,
             _ => {}
         }
+    }
+}
+
+/// `wl_output.transform` names the same turns this side does, so the mapping is
+/// only the error case turning into "not rotated".
+fn rotation(transform: wl_output::Transform) -> Rotation {
+    match transform {
+        wl_output::Transform::Normal => Rotation::Normal,
+        wl_output::Transform::_90 => Rotation::Rotate90,
+        wl_output::Transform::_180 => Rotation::Rotate180,
+        wl_output::Transform::_270 => Rotation::Rotate270,
+        wl_output::Transform::Flipped => Rotation::Flipped,
+        wl_output::Transform::Flipped90 => Rotation::Flipped90,
+        wl_output::Transform::Flipped180 => Rotation::Flipped180,
+        wl_output::Transform::Flipped270 => Rotation::Flipped270,
+        _ => Rotation::Normal,
     }
 }
 

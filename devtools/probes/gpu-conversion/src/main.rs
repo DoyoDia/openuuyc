@@ -133,7 +133,7 @@ fn main() -> anyhow::Result<()> {
     }
     drop(image);
     let (cx, cy, cw, ch) = (7u32, 5u32, w - 16, h - 12);
-    let snapshot = gpu.convert(&rgb, (cx, cy, cw, ch))?;
+    let snapshot = gpu.convert(&rgb, (cx, cy, cw, ch), (cw, ch))?;
     let mut image = cros_libva::Image::derive_from(&source, (w, h))?;
     image.as_mut().fill(0);
     drop(image);
@@ -228,7 +228,7 @@ fn main() -> anyhow::Result<()> {
             drop(image);
             let started = std::time::Instant::now();
             let nv = if mode == "gpu" {
-                Some(gpu.convert(&rgb, (0, 0, w, h))?)
+                Some(gpu.convert(&rgb, (0, 0, w, h), (w, h))?)
             } else {
                 None
             };

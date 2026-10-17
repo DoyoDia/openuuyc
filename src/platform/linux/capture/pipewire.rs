@@ -9,6 +9,7 @@
 //! Frames are requested in shared memory (MemPtr/MemFd), read on PipeWire's
 //! loop thread into BGRA and handed to the capture thread as the latest
 //! picture; DMA-BUF import belongs with a GPU encoder.
+use super::Picture;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -486,6 +487,7 @@ fn read_dmabuf_picture(
     buffer: &SpaBuffer,
     data: &SpaData,
     format: NegotiatedFormat,
+    target: Option<(i32, (u32, u32))>,
 ) -> Result<Picture> {
     ensure!(
         buffer.n_datas == 1 && data.fd >= 0 && !data.chunk.is_null(),
@@ -554,10 +556,21 @@ fn read_dmabuf_picture(
                 static GPU: std::cell::OnceCell<Result<super::super::gpu_convert::Converter, String>> = const { std::cell::OnceCell::new() };
             }
             let crop = picture_crop(buffer, format.width, format.height);
+            // The converter writes the final geometry directly, so a controller
+            // quality that differs from the source is scaled on the GPU rather
+            // than read back to the CPU. Without a request the cropped source
+            // size is kept, which is the exact pass the baseline used.
+            let target = match target {
+                Some((quality, maximum)) => {
+                    let size = crate::media::geometry::output_size(crop.2, crop.3, quality);
+                    crate::media::geometry::fit_size(size.0, size.1, maximum)
+                }
+                None => (crop.2, crop.3),
+            };
             let result = GPU.with(|cell| {
                 let converter=cell.get_or_init(||super::super::gpu_convert::Converter::new(display.clone()).map_err(|e|e.to_string()));
                 match converter {
-                    Ok(converter)=>converter.convert(&super::super::gpu_convert::RgbDma { fd:data.fd as i32,width:format.width,height:format.height,pitch:chunk.stride as u32,offset:chunk.offset,fourcc:drm_fourcc,modifier },crop),
+                    Ok(converter)=>converter.convert(&super::super::gpu_convert::RgbDma { fd:data.fd as i32,width:format.width,height:format.height,pitch:chunk.stride as u32,offset:chunk.offset,fourcc:drm_fourcc,modifier },crop,target),
                     Err(e)=>Err(anyhow!("{e}")),
                 }
             });
@@ -676,14 +689,6 @@ impl cros_libva::SurfaceMemoryDescriptor for CaptureImport {
 
 // --- Stream ----------------------------------------------------------------------
 
-/// One captured picture as the stream delivered it, converted to BGRA.
-pub(super) struct Picture {
-    pub width: u32,
-    pub height: u32,
-    pub pixels: Vec<u8>,
-    pub nv12: Option<Arc<super::super::gpu_convert::OwnedNv12>>,
-}
-
 #[derive(Default)]
 struct State {
     picture: Option<Picture>,
@@ -692,6 +697,12 @@ struct State {
     streaming: bool,
     error: Option<String>,
     buffers_sent: bool,
+    /// Output geometry request from the capture worker: `(quality, maximum)`.
+    /// The GPU converter derives the final size from the picture's own
+    /// dimensions, exactly as the CPU path's `output()` does, so a controller
+    /// quality that differs from the source is scaled on the GPU instead of by
+    /// a CPU readback. `None` keeps the native size.
+    target: Option<(i32, (u32, u32))>,
 }
 
 struct Shared {
@@ -788,8 +799,12 @@ unsafe extern "C" fn on_process(data: *mut c_void) {
     if newest.is_null() {
         return;
     }
-    let format = lock(&callbacks.shared.state).format;
-    let picture = format.and_then(|format| unsafe { read_picture((*newest).buffer, format) });
+    let (format, target) = {
+        let state = lock(&callbacks.shared.state);
+        (state.format, state.target)
+    };
+    let picture =
+        format.and_then(|format| unsafe { read_picture((*newest).buffer, format, target) });
     unsafe { (api.stream_queue_buffer)(callbacks.stream, newest) };
     if let Some(picture) = picture {
         let mut state = lock(&callbacks.shared.state);
@@ -804,7 +819,11 @@ unsafe extern "C" fn on_process(data: *mut c_void) {
 ///
 /// # Safety
 /// `buffer` must be a buffer the stream just dequeued.
-unsafe fn read_picture(buffer: *mut SpaBuffer, negotiated: NegotiatedFormat) -> Option<Picture> {
+unsafe fn read_picture(
+    buffer: *mut SpaBuffer,
+    negotiated: NegotiatedFormat,
+    target: Option<(i32, (u32, u32))>,
+) -> Option<Picture> {
     let NegotiatedFormat {
         format,
         width,
@@ -817,7 +836,7 @@ unsafe fn read_picture(buffer: *mut SpaBuffer, negotiated: NegotiatedFormat) -> 
     }
     let data = unsafe { &*buffer.datas };
     if data.kind == DATA_MEM_DMABUF {
-        return match read_dmabuf_picture(buffer, data, negotiated) {
+        return match read_dmabuf_picture(buffer, data, negotiated, target) {
             Ok(picture) => Some(picture),
             Err(error) => {
                 tracing::warn!(%error, "DMA-BUF 导入失败");
@@ -1061,6 +1080,14 @@ impl Stream {
             (api.thread_loop_unlock)(thread_loop);
             result.map(|()| this)
         }
+    }
+
+    /// Set the output geometry request. The worker calls this when the
+    /// negotiated quality changes, so a mismatch is handled on the GPU instead
+    /// of by a CPU readback and scale.
+    pub fn set_target(&self, target: Option<(i32, (u32, u32))>) {
+        let mut state = lock(&self.shared.state);
+        state.target = target;
     }
 
     /// The next picture newer than the last one returned, waiting up to

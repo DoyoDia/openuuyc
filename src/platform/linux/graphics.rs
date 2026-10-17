@@ -6,6 +6,7 @@
 use anyhow::{Context, Result};
 use std::sync::Arc;
 use winit::dpi::PhysicalSize;
+use winit::event_loop::ActiveEventLoop;
 use winit::window::Window;
 
 /// Where the video layer lands in the window, which the player decides.
@@ -74,21 +75,30 @@ impl Graphics {
 
 /// One adapter and device for the whole process: windows open and close, but
 /// re-creating a Vulkan device per window would stall each one on startup.
-pub(crate) fn create_device() -> Result<Graphics> {
+///
+/// The first window picks it: only an adapter that can present to that
+/// window qualifies. On a hybrid laptop the X screen belongs to the iGPU, and
+/// a Vulkan device of the other GPU (or an EGL device opened without the
+/// window's display) enumerates fine but cannot present there.
+pub(crate) fn create_device(event_loop: &ActiveEventLoop, window: &Window) -> Result<Graphics> {
     static SHARED: std::sync::OnceLock<std::result::Result<Graphics, String>> =
         std::sync::OnceLock::new();
     SHARED
-        .get_or_init(|| create_graphics().map_err(|error| format!("{error:#}")))
+        .get_or_init(|| create_graphics(event_loop, window).map_err(|error| format!("{error:#}")))
         .clone()
         .map_err(anyhow::Error::msg)
 }
 
-fn create_graphics() -> Result<Graphics> {
+fn create_graphics(event_loop: &ActiveEventLoop, window: &Window) -> Result<Graphics> {
     // Vulkan first, GL as the fallback for drivers or VMs without it.
     // OPENUUYC_BACKEND=gl 可强制 OpenGL：作为 Vulkan 不可用时的备用后端。
     // 注意 new_without_display_handle_from_env() 内部会调 with_env()，
     // 必须在其后覆盖 backends，否则 WGPU_BACKEND 会失效。
-    let mut desc = wgpu::InstanceDescriptor::new_without_display_handle_from_env();
+    // GL needs the window system's display: without it EGL opens a device of
+    // its own choosing that cannot present to X11 or Wayland windows.
+    let mut desc = wgpu::InstanceDescriptor::new_with_display_handle_from_env(Box::new(
+        event_loop.owned_display_handle(),
+    ));
     desc.backends = match std::env::var("OPENUUYC_BACKEND").as_deref() {
         Ok("gl") | Ok("gles") | Ok("opengl") => wgpu::Backends::GL,
         Ok("vulkan") | Ok("vk") => wgpu::Backends::VULKAN,
@@ -105,12 +115,24 @@ fn create_graphics() -> Result<Graphics> {
         desc.flags |= wgpu::InstanceFlags::ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER;
     }
     let instance = wgpu::Instance::new(desc);
+    let probe = instance
+        .create_surface(window)
+        .context("创建窗口绘制表面失败")?;
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::HighPerformance,
+        compatible_surface: Some(&probe),
         ..Default::default()
     }))
-    .context("没有可用的 GPU 适配器（需要 Vulkan 或 OpenGL）")?;
+    .context("没有能在这个窗口上绘制的 GPU 适配器（需要 Vulkan 或 OpenGL）")?;
+    drop(probe);
     let info = adapter.get_info();
+    tracing::info!(
+        adapter = %info.name,
+        backend = ?info.backend,
+        device_type = ?info.device_type,
+        driver = %info.driver,
+        "UI GPU adapter selected"
+    );
     // The zero-copy path imports VA-API dmabufs as Vulkan images; without the
     // feature the renderer falls back to the CPU upload.
     let mut required_features = wgpu::Features::empty();
@@ -466,6 +488,13 @@ fn create_surface(
         .instance
         .create_surface(Arc::clone(window))
         .context("创建窗口绘制表面失败")?;
+    // The device was chosen for the first window; a window on a screen that
+    // GPU cannot reach would otherwise abort in configure().
+    anyhow::ensure!(
+        graphics.adapter.is_surface_supported(&surface),
+        "所选 GPU（{}）无法在这个窗口上绘制",
+        graphics.label
+    );
     let capabilities = surface.get_capabilities(&graphics.adapter);
     let config = wgpu::SurfaceConfiguration {
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
