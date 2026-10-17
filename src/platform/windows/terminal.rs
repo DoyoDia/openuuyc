@@ -172,10 +172,7 @@ unsafe impl Sync for Session {}
 impl Session {
     /// Starts `shell` on a new pseudo console of `cols` x `rows`.
     pub(crate) fn open(shell: &str, cols: u16, rows: u16) -> Result<Self> {
-        let size = COORD {
-            X: cols.max(1) as i16,
-            Y: rows.max(1) as i16,
-        };
+        let size = coord(cols, rows);
         // Two anonymous pipes: we write to `input`, the console reads it; the
         // console writes `output`, we read it. `CreatePipe` hands back both
         // ends of each, and the child inherits the ends it needs.
@@ -279,10 +276,7 @@ impl Session {
 
     /// Applies a new size, which the console reports to the shell.
     pub(crate) fn resize(&self, cols: u16, rows: u16) -> Result<()> {
-        let size = COORD {
-            X: cols.max(1) as i16,
-            Y: rows.max(1) as i16,
-        };
+        let size = coord(cols, rows);
         // SAFETY: the console is live for the life of `self`.
         unsafe { ResizePseudoConsole(self.console, size) }.context("调整伪控制台尺寸失败")
     }
@@ -338,6 +332,16 @@ impl Drop for Session {
             ClosePseudoConsole(self.console);
             let _ = CloseHandle(self.process);
         }
+    }
+}
+
+/// A console size. The shared layer already bounds it; this only keeps a
+/// value past `i16::MAX` from wrapping negative.
+fn coord(cols: u16, rows: u16) -> COORD {
+    let side = |value: u16| i16::try_from(value.max(1)).unwrap_or(i16::MAX);
+    COORD {
+        X: side(cols),
+        Y: side(rows),
     }
 }
 

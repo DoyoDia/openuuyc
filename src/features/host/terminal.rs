@@ -72,6 +72,19 @@ const OUTPUT_HIGH_WATER: usize = 2 * 1024 * 1024;
 const IDLE_LIMIT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 /// How often detached shells are checked against [`IDLE_LIMIT`].
 const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+/// The largest terminal a controller may ask for. The screen model allocates
+/// every cell up front (32 bytes each, twice while a full-screen program uses
+/// the alternate screen), so an unchecked 65535 x 65535 would ask for 128 GiB
+/// and take the whole host down. 512 columns is wider than a 4K screen at a
+/// 7-pixel font; 512 x 256 is 4 MiB a screen. The bound also keeps the size
+/// inside the signed 16-bit `COORD` ConPTY takes.
+const MAX_COLS: u16 = 512;
+const MAX_ROWS: u16 = 256;
+
+/// The size the pty and the model actually get for a requested one.
+fn clamp_size(cols: u16, rows: u16) -> (u16, u16) {
+    (cols.clamp(1, MAX_COLS), rows.clamp(1, MAX_ROWS))
+}
 
 /// Frame kinds, in the declaration order the shipped enum uses.
 ///
@@ -238,10 +251,11 @@ impl Session {
     /// old size wraps lines where the shell did not, and a reattach then
     /// replays a screen cut at the old width.
     fn resize(&mut self, cols: u16, rows: u16) -> Result<(), SessionError> {
+        let (cols, rows) = clamp_size(cols, rows);
         self.pty
             .resize(cols, rows)
             .map_err(|_| SessionError::Gone)?;
-        self.screen.screen_mut().set_size(rows.max(1), cols.max(1));
+        self.screen.screen_mut().set_size(rows, cols);
         Ok(())
     }
 
@@ -409,6 +423,7 @@ impl Sessions {
         if self.owned(owner).any(|(_, session)| session.name == name) {
             return Err(SessionError::DuplicateName);
         }
+        let (cols, rows) = clamp_size(cols, rows);
         let pty = crate::platform::terminal::Session::open(shell, cols, rows)
             .map_err(|_| SessionError::Gone)?;
         let stamp = now_ms();
@@ -420,7 +435,7 @@ impl Sessions {
                 state: SessionState::Running,
                 created_ms: stamp,
                 last_active_ms: stamp,
-                screen: vt100::Parser::new(rows.max(1), cols.max(1), 0),
+                screen: vt100::Parser::new(rows, cols, 0),
                 pending: Vec::new(),
                 attached: Some(connection),
                 detached_since: None,
@@ -1745,6 +1760,36 @@ mod tests {
             .filter(|c| !c.is_whitespace())
             .collect();
         assert!(drawn.contains(&wide), "the replay lost the line: {drawn:?}");
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "macos", windows)),
+        ignore = "no terminal backend on this platform"
+    )]
+    fn an_oversized_terminal_is_clamped() {
+        let mut sessions = Sessions::default();
+        // Unclamped, this model alone would ask for 128 GiB.
+        let (handle, _, _) = sessions
+            .open("acct", 0, 1, shell(), None, u16::MAX, u16::MAX)
+            .expect("open");
+        let size = |sessions: &Sessions| {
+            sessions.sessions[&key("acct", handle)]
+                .screen
+                .screen()
+                .size()
+        };
+        assert_eq!(size(&sessions), (MAX_ROWS, MAX_COLS));
+        sessions.resize("acct", handle, 100, 40).expect("resize");
+        assert_eq!(size(&sessions), (40, 100));
+        sessions
+            .resize("acct", handle, u16::MAX, 0)
+            .expect("resize");
+        assert_eq!(size(&sessions), (1, MAX_COLS));
+        sessions
+            .open("acct", handle, 1, shell(), None, 0, u16::MAX)
+            .expect("reattach");
+        assert_eq!(size(&sessions), (MAX_ROWS, 1));
     }
 
     #[test]
