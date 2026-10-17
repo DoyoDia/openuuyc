@@ -11,8 +11,9 @@
 //! wait on a single shell.
 
 use anyhow::{Context, Result, bail};
-use std::sync::Mutex;
-use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
+use std::sync::{Arc, Mutex};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_FAILED, WAIT_OBJECT_0};
 use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows::Win32::System::Console::{
@@ -142,6 +143,10 @@ impl Drop for Job {
     }
 }
 
+/// How much input may wait for the writer thread, like a pty's input buffer.
+/// Past this, `write` takes nothing and the shared layer holds the rest.
+const INPUT_QUEUE: usize = 64 * 1024;
+
 /// A handle handed to a worker thread.
 ///
 /// [`HANDLE`] wraps a raw pointer and so is not `Send`; ownership is moved to
@@ -158,6 +163,8 @@ pub(crate) struct Session {
     job: Job,
     /// Input queued for the writer thread; `None` once it has stopped.
     input: Mutex<Option<SyncSender<Vec<u8>>>>,
+    /// Bytes queued for the writer thread and not yet in the console.
+    queued: Arc<AtomicUsize>,
     /// Output the reader thread has produced but the frame layer has not
     /// taken yet.
     output: Mutex<Output>,
@@ -210,13 +217,16 @@ impl Session {
         std::thread::spawn(move || read_output(output_read, output_tx));
         let (input_tx, input_rx) = sync_channel(64);
         let input_write = SendHandle(input_write);
-        std::thread::spawn(move || write_input(input_write, input_rx));
+        let queued = Arc::new(AtomicUsize::new(0));
+        let drained = Arc::clone(&queued);
+        std::thread::spawn(move || write_input(input_write, input_rx, drained));
 
         Ok(Self {
             console,
             process,
             job,
             input: Mutex::new(Some(input_tx)),
+            queued,
             output: Mutex::new(Output {
                 channel: Some(output_rx),
                 carry: Vec::new(),
@@ -261,16 +271,34 @@ impl Session {
 
     /// Queues keyboard input for the writer thread.
     ///
-    /// The caller counts the bytes as written because the queue is what
-    /// actually holds them; the writer drains it as the console accepts.
+    /// Behaves like a non-blocking pty write: it takes what fits in the
+    /// writer's queue and reports how much, and `Ok(0)` when the queue is
+    /// full. The caller holds the rest, so the shared layer's own input limit
+    /// and its overflow answer apply here as they do on POSIX, and a shell
+    /// that stopped reading never blocks the caller, which holds the lock of
+    /// every session.
     pub(crate) fn write(&self, data: &[u8]) -> Result<usize> {
         let channel = self.input.lock().unwrap_or_else(|e| e.into_inner());
-        match channel.as_ref() {
-            Some(sender) => sender
-                .send(data.to_vec())
-                .map(|()| data.len())
-                .context("写入伪控制台失败"),
-            None => bail!("伪控制台已关闭"),
+        let Some(sender) = channel.as_ref() else {
+            bail!("伪控制台已关闭");
+        };
+        let room = INPUT_QUEUE.saturating_sub(self.queued.load(Ordering::Acquire));
+        let take = data.len().min(room);
+        if take == 0 {
+            return Ok(0);
+        }
+        // Counted before the send so the writer can never subtract first.
+        self.queued.fetch_add(take, Ordering::AcqRel);
+        match sender.try_send(data[..take].to_vec()) {
+            Ok(()) => Ok(take),
+            Err(TrySendError::Full(_)) => {
+                self.queued.fetch_sub(take, Ordering::AcqRel);
+                Ok(0)
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                self.queued.fetch_sub(take, Ordering::AcqRel);
+                bail!("伪控制台已关闭")
+            }
         }
     }
 
@@ -467,22 +495,27 @@ fn read_output(handle: SendHandle, out: SyncSender<Vec<u8>>) {
 }
 
 /// Writes queued input to the console until the channel closes.
-fn write_input(handle: SendHandle, input: Receiver<Vec<u8>>) {
+fn write_input(handle: SendHandle, input: Receiver<Vec<u8>>, queued: Arc<AtomicUsize>) {
     let handle = handle.0;
-    while let Ok(data) = input.recv() {
-        let mut written = 0u32;
-        // SAFETY: the handle is live and the slice is valid for reads.
-        let ok = unsafe {
-            WriteFile(
-                handle,
-                Some(&data),
-                Some(std::ptr::from_mut(&mut written)),
-                None,
-            )
-        };
-        if ok.is_err() {
-            break;
+    'chunks: while let Ok(data) = input.recv() {
+        let mut rest = data.as_slice();
+        while !rest.is_empty() {
+            let mut written = 0u32;
+            // SAFETY: the handle is live and the slice is valid for reads.
+            let ok = unsafe {
+                WriteFile(
+                    handle,
+                    Some(rest),
+                    Some(std::ptr::from_mut(&mut written)),
+                    None,
+                )
+            };
+            if ok.is_err() || written == 0 {
+                break 'chunks;
+            }
+            rest = &rest[written as usize..];
         }
+        queued.fetch_sub(data.len(), Ordering::AcqRel);
     }
     // SAFETY: the write end is ours and is not used again.
     unsafe {
