@@ -2686,7 +2686,7 @@ impl Player {
             rect.min,
             egui::pos2((row.min_rect().left() - 6.0).max(rect.min.x), rect.max.y),
         );
-        self.title_bar_screens(ui, free, window);
+        self.title_bar_screens(ui, free, bar, window);
     }
 
     /// 这台播放器能切到哪些设备。连接时由 controller 装进来，和 Windows 那份是同一个。
@@ -2697,7 +2697,15 @@ impl Player {
     /// 顶栏中间的屏标签与码流信息：每块远端屏一个 tab（点一下切过去，右键是这块
     /// 屏的显示器设置，虚拟屏可以关掉），右边一格写当前画面的「分辨率 · 帧率 ·
     /// 编码」。Windows 的 caption 是同一套内容，只是那边的按钮是图标。
-    fn title_bar_screens(&mut self, ui: &mut egui::Ui, rect: egui::Rect, window: &Arc<Window>) {
+    ///
+    /// `bar` 是整条标题栏（全屏时是浮动栏），拖动标签松手还在它里面就不算拖出。
+    fn title_bar_screens(
+        &mut self,
+        ui: &mut egui::Ui,
+        rect: egui::Rect,
+        bar: egui::Rect,
+        window: &Arc<Window>,
+    ) {
         // 与 Windows 同一个宽度，够放 "3840×1620 · 35 FPS · H.265"。
         const METRICS_WIDTH: f32 = 184.0;
         const MINIMUM: f32 = 60.0;
@@ -2831,8 +2839,14 @@ impl Player {
                             );
                         } else if response.clicked() {
                             open = Some(id);
-                        } else if response.drag_stopped() && detachable {
-                            // 把标签拖出去：新窗口落在松手的位置（Wayland 交给合成器）。
+                        } else if response.drag_stopped()
+                            && detachable
+                            && released_off_bar(
+                                ui.ctx().input(|input| input.pointer.latest_pos()),
+                                bar,
+                            )
+                        {
+                            // 把标签拖出标题栏：新窗口落在松手的位置（Wayland 交给合成器）。
                             request_detach(&requests, &proxy, window, ui.ctx(), id);
                         }
                         response.context_menu(|ui| {
@@ -3788,6 +3802,13 @@ fn request_detach(
     }));
 }
 
+/// 标签拖动松手的地方是否已经出了标题栏。egui 把手抖一下、按住不放都算拖动；
+/// 和 Windows `detach_tab` 一样，松手还在原窗口标题栏里就什么都不做。指针在拖动中
+/// 离开了窗口时 egui 不再有它的位置（`None`），那一定已经在栏外了。
+fn released_off_bar(release: Option<egui::Pos2>, bar: egui::Rect) -> bool {
+    release.is_none_or(|point| !bar.contains(point))
+}
+
 /// 指针此刻的全局物理位置。Wayland 不给窗口位置，返回 `None`，新窗口由合成器摆放。
 fn global_pointer(window: &Window, context: &egui::Context) -> Option<PhysicalPosition<i32>> {
     let local = context.input(|input| input.pointer.latest_pos())?;
@@ -4144,6 +4165,17 @@ mod screen_tests {
             replacement_target(&window, &actual, 1, playing(&actual[1]), None),
             None
         );
+    }
+
+    #[test]
+    fn a_tab_released_on_the_bar_is_not_detached() {
+        let bar = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1280.0, 36.0));
+        // A shaky click or a long press ends on the bar.
+        assert!(!released_off_bar(Some(egui::pos2(300.0, 20.0)), bar));
+        assert!(released_off_bar(Some(egui::pos2(300.0, 200.0)), bar));
+        assert!(released_off_bar(Some(egui::pos2(-40.0, 20.0)), bar));
+        // The pointer left the window during the drag.
+        assert!(released_off_bar(None, bar));
     }
 
     #[test]
