@@ -124,6 +124,15 @@ pub(crate) struct ConnectingWindowsRunner {
         bool,
         Option<winit::window::Fullscreen>,
     )>,
+    /// 所有播放窗口共享的屏目录与解码器池，从第一条 Playing 会话取出来。
+    screens: Option<super::screens::ScreenPlayback>,
+    /// 播放窗口发给 runner 的窗口级请求。
+    requests: std_mpsc::Sender<WindowRequest>,
+    request_rx: std_mpsc::Receiver<WindowRequest>,
+    /// 把屏拖出得到的独立窗口。窗口创建与销毁都留在事件循环线程上。
+    detached: Vec<DetachedWindow>,
+    /// 主窗口要求关闭。还有屏窗口在播时它只是关掉自己，由其中一个接替。
+    primary_close: bool,
 }
 
 enum Stage {
@@ -149,6 +158,7 @@ impl ConnectingWindowsRunner {
         self.window
             .as_ref()
             .is_some_and(|window| window.has_focus())
+            || self.detached.iter().any(|slot| slot.window.has_focus())
     }
 
     pub(crate) fn new(
@@ -157,6 +167,7 @@ impl ConnectingWindowsRunner {
         proxy: EventLoopProxy<UiEvent>,
         embedded: bool,
     ) -> Self {
+        let (requests, request_rx) = std_mpsc::channel();
         Self {
             attributes: WindowAttributes::default()
                 .with_visible(false)
@@ -185,6 +196,11 @@ impl ConnectingWindowsRunner {
             generation: 1,
             audio: None,
             audio_restore_geometry: None,
+            screens: None,
+            requests,
+            request_rx,
+            detached: Vec::new(),
+            primary_close: false,
         }
     }
 
@@ -198,6 +214,7 @@ impl ConnectingWindowsRunner {
 
     pub(crate) fn owns(&self, id: WindowId) -> bool {
         self.window.as_ref().is_some_and(|window| window.id() == id)
+            || self.detached.iter().any(|slot| slot.window.id() == id)
     }
 
     pub(crate) fn focus(&self) {
@@ -211,6 +228,7 @@ impl ConnectingWindowsRunner {
     fn exit(&mut self, event_loop: &ActiveEventLoop) {
         self.close_requested = true;
         self.stage = Stage::Finished;
+        self.close_detached_all();
         if !self.embedded {
             event_loop.exit();
         }
@@ -232,13 +250,43 @@ impl ConnectingWindowsRunner {
         );
         crate::ui::branding::set_taskbar_icon(&window);
         configure_dwm_window(&window);
+        let (shell, interval) =
+            Self::build_shell(event_loop, &window, &self.proxy, self.generation)?;
+        self.ui_frame_interval = interval;
+        tracing::debug!(
+            interval_ms = self.ui_frame_interval.as_secs_f64() * 1000.0,
+            scale = window.scale_factor(),
+            "player window created"
+        );
+        self.shell = Some(shell);
+        // Only the D3D11 path can hand a decoder its own surfaces; a Linux
+        // session always decodes into CPU frames, so the handle stays empty.
+        if let Some(sender) = self.display_sender.take() {
+            let _ = sender.send(ViewerDisplayHandle::default());
+        }
+        if let Some(receiver) = self.progress.take() {
+            self.stage = Stage::Connecting(Box::new(ConnectionProgressApp::new(
+                self.alias.clone(),
+                receiver,
+            )));
+        }
+        self.window = Some(window);
+        Ok(())
+    }
+
+    /// 建一个窗口的 egui 上下文、输入状态、wgpu 表面与浮条状态。主窗口和独立窗口共用。
+    fn build_shell(
+        event_loop: &ActiveEventLoop,
+        window: &Arc<Window>,
+        proxy: &EventLoopProxy<UiEvent>,
+        generation: u64,
+    ) -> Result<(Shell, Duration)> {
         let context = egui::Context::default();
         context.set_embed_viewports(true);
         crate::ui::fonts::install(&context);
         configure_viewer_visuals(&context);
         let window_id = window.id();
-        let proxy = self.proxy.clone();
-        let generation = self.generation;
+        let proxy = proxy.clone();
         context.set_request_repaint_callback(move |info| {
             if info.viewport_id == egui::ViewportId::ROOT
                 && let Some(when) = Instant::now().checked_add(info.delay)
@@ -254,41 +302,25 @@ impl ConnectingWindowsRunner {
         let input = egui_winit::State::new(
             context.clone(),
             egui::ViewportId::ROOT,
-            &window,
+            window,
             Some(window.scale_factor() as f32),
             window.theme(),
             None,
         );
-        let graphics = crate::ui::gfx::create_device(event_loop, &window)?;
+        let graphics = crate::ui::gfx::create_device(event_loop, window)?;
         let presenter = UiPresenter::new(window.clone(), &graphics)?;
-        self.ui_frame_interval = ui_frame_interval(&window);
-        tracing::debug!(
-            interval_ms = self.ui_frame_interval.as_secs_f64() * 1000.0,
-            scale = window.scale_factor(),
-            "player window created"
-        );
-        self.shell = Some(Shell {
-            context,
-            input,
-            presenter,
-            move_state: WindowMoveState::default(),
-            resize_state: WindowResizeState::default(),
-            fullscreen_chrome: Default::default(),
-            timing_audit: None,
-        });
-        // Only the D3D11 path can hand a decoder its own surfaces; a Linux
-        // session always decodes into CPU frames, so the handle stays empty.
-        if let Some(sender) = self.display_sender.take() {
-            let _ = sender.send(ViewerDisplayHandle::default());
-        }
-        if let Some(receiver) = self.progress.take() {
-            self.stage = Stage::Connecting(Box::new(ConnectionProgressApp::new(
-                self.alias.clone(),
-                receiver,
-            )));
-        }
-        self.window = Some(window);
-        Ok(())
+        Ok((
+            Shell {
+                context,
+                input,
+                presenter,
+                move_state: WindowMoveState::default(),
+                resize_state: WindowResizeState::default(),
+                fullscreen_chrome: Default::default(),
+                timing_audit: None,
+            },
+            ui_frame_interval(window),
+        ))
     }
 
     /// Session hand-offs arrive on a channel: play, close, or reconnect.
@@ -339,7 +371,33 @@ impl ConnectingWindowsRunner {
                     {
                         let _ = window.request_inner_size(LogicalSize::new(1280.0, 760.0));
                     }
-                    match Player::new(*session, &window, self.proxy.clone()) {
+                    let mut session = *session;
+                    let screens = match self.screens.clone() {
+                        Some(screens) => screens,
+                        None => match session.take_screen_playback() {
+                            Some(screens) => screens,
+                            None => {
+                                self.fail(
+                                    event_loop,
+                                    &anyhow!("screen playback owner unavailable"),
+                                );
+                                return;
+                            }
+                        },
+                    };
+                    self.screens = Some(screens.clone());
+                    let tabs = screens.screens().iter().map(|screen| screen.id).collect();
+                    match Player::new(
+                        Arc::new(session),
+                        screens,
+                        &window,
+                        self.proxy.clone(),
+                        PlayerWindow {
+                            tabs,
+                            requests: self.requests.clone(),
+                            input_owns_connection: true,
+                        },
+                    ) {
                         Ok(player) => {
                             window.set_visible(true);
                             self.stage = Stage::Playing(Box::new(player));
@@ -356,6 +414,8 @@ impl ConnectingWindowsRunner {
                     progress,
                     display,
                 } => {
+                    self.close_detached_all();
+                    self.screens = None;
                     self.alias = alias.clone();
                     self.generation += 1;
                     self.audio = None;
@@ -388,6 +448,643 @@ impl ConnectingWindowsRunner {
     /// it most of a refresh interval on the way to the screen.
     fn schedule_now(&mut self) {
         self.next_repaint = Some(Instant::now());
+    }
+
+    /// 独立窗口的重画下限与主窗口同一套节流。
+    fn schedule_window(&mut self, id: WindowId, when: Instant) {
+        if self.window.as_ref().is_some_and(|window| window.id() == id) {
+            self.schedule(when);
+            return;
+        }
+        if let Some(slot) = self.detached.iter_mut().find(|slot| slot.window.id() == id) {
+            let when = slot
+                .last_frame
+                .map_or(when, |last| when.max(last + slot.interval));
+            slot.next_repaint = Some(slot.next_repaint.map_or(when, |old| old.min(when)));
+        }
+    }
+
+    /// 连接结束或重连：独立窗口全部作废，屏归还主窗口。
+    fn close_detached_all(&mut self) {
+        while !self.detached.is_empty() {
+            self.close_detached(self.detached.len() - 1);
+        }
+    }
+
+    /// 关掉主窗口：还有屏窗口在播时，把「主窗口」这个角色交给其中一个，连接
+    /// 继续；一个都不剩才真正结束。Windows 那边所有观看窗口本来就是平级的，
+    /// 关掉任意一个都只是合并，这里跟着它走。
+    fn close_primary(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(index) = self
+            .detached
+            .iter()
+            .position(|slot| matches!(slot.stage, DetachedStage::Playing(_)))
+        else {
+            self.exit(event_loop);
+            return;
+        };
+        // 旧主窗口的屏交给接替者，别让它们随着窗口一起消失。
+        let mut tabs = Vec::new();
+        if let Stage::Playing(player) = &mut self.stage {
+            // 它已经交出了正在直播的那块屏，析构时不能再关整个解码器池。
+            player.input_owns_connection = false;
+            tabs = std::mem::take(&mut player.tabs);
+        }
+        let DetachedWindow {
+            stage,
+            pending,
+            shell,
+            window,
+            tabs: _,
+            close: _,
+            next_repaint,
+            last_frame,
+            interval,
+        } = self.detached.remove(index);
+        drop(pending);
+        let DetachedStage::Playing(mut player) = stage else {
+            self.exit(event_loop);
+            return;
+        };
+        player.input_owns_connection = true;
+        for id in tabs {
+            if !player.tabs.contains(&id) {
+                player.tabs.push(id);
+            }
+        }
+        // 旧主窗口离场。Player 的唤醒只撤销自己那份登记。
+        if let Some(old) = self.window.take() {
+            old.set_visible(false);
+        }
+        let old_stage = std::mem::replace(&mut self.stage, Stage::Playing(player));
+        let old_shell = self.shell.take();
+        drop(old_stage);
+        drop(old_shell);
+        self.window = Some(window);
+        self.shell = Some(shell);
+        self.last_frame = last_frame;
+        self.ui_frame_interval = interval;
+        self.next_repaint = earliest(self.next_repaint, next_repaint);
+        // 音频视图属于被关掉的那个窗口，多窗口时本来也不会在。
+        self.audio = None;
+        self.audio_restore_geometry = None;
+        self.schedule(Instant::now());
+        tracing::debug!("主窗口已关闭，由一个屏窗口接替");
+    }
+
+    fn close_detached(&mut self, index: usize) {
+        if index >= self.detached.len() {
+            return;
+        }
+        let mut slot = self.detached.remove(index);
+        slot.close = true;
+        slot.window.set_visible(false);
+        slot.pending = None;
+        let tabs = std::mem::take(&mut slot.tabs);
+        if let Stage::Playing(player) = &mut self.stage {
+            for id in tabs {
+                if !player.tabs.contains(&id) {
+                    player.tabs.push(id);
+                }
+                // 拖出时交出去的那块屏又回来了：主窗口如果还在等新屏，直接从
+                // 这路解码器接着看，而不是一直停在「正在等待画面」。
+                if player.frame_paused && player.session.screen_id() == id {
+                    player.frame_paused = false;
+                }
+            }
+            self.schedule(Instant::now());
+        }
+    }
+
+    /// 播放窗口请求把一块屏拖出成独立窗口，或关掉自己。
+    fn handle_requests(&mut self, event_loop: &ActiveEventLoop) {
+        while let Ok(request) = self.request_rx.try_recv() {
+            let result = match request {
+                WindowRequest::Detach {
+                    screen_id,
+                    position,
+                } => self.detach_screen(event_loop, screen_id, position),
+                WindowRequest::Close { window } => {
+                    if self
+                        .window
+                        .as_ref()
+                        .is_some_and(|primary| primary.id() == window)
+                    {
+                        self.primary_close = true;
+                    } else if let Some(index) = self
+                        .detached
+                        .iter()
+                        .position(|slot| slot.window.id() == window)
+                    {
+                        self.close_detached(index);
+                    }
+                    Ok(())
+                }
+            };
+            if let Err(error) = result {
+                tracing::warn!(%error, "无法把显示器拖出成独立窗口");
+                if let Stage::Playing(player) = &mut self.stage {
+                    player.report("显示器操作失败", format!("{error:#}"));
+                }
+            }
+        }
+    }
+
+    /// 建一个新窗口，把这块屏从主窗口挪过去。窗口先画连接进度，解码器就绪后换成播放器。
+    fn detach_screen(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        screen_id: i32,
+        position: Option<PhysicalPosition<i32>>,
+    ) -> Result<()> {
+        let screens = self.screens.clone().context("屏幕目录尚未就绪")?;
+        let source = self.window.clone().context("播放窗口尚未创建")?;
+        let Stage::Playing(player) = &mut self.stage else {
+            bail!("连接尚未就绪");
+        };
+        anyhow::ensure!(player.tabs.contains(&screen_id), "显示器不在这个窗口里");
+        anyhow::ensure!(player.tabs.len() > 1, "这个窗口只剩一块显示器，不能再拖出");
+        anyhow::ensure!(
+            !player.session.is_software(),
+            "软解仅允许一个播放窗口，请使用标签切换屏幕"
+        );
+        anyhow::ensure!(
+            !self
+                .detached
+                .iter()
+                .any(|slot| slot.tabs.contains(&screen_id)),
+            "显示器已经在独立窗口里"
+        );
+        let catalog = screens.screens();
+        anyhow::ensure!(
+            catalog.iter().any(|screen| screen.id == screen_id),
+            "显示器已断开"
+        );
+        let label = catalog
+            .iter()
+            .find(|screen| screen.id == screen_id)
+            .map_or_else(String::new, |screen| screen.label(&catalog));
+
+        let attributes = WindowAttributes::default()
+            .with_visible(false)
+            .with_title(format!("{}{}", crate::VIEWER_TITLE_PREFIX, self.alias))
+            .with_window_icon(Some(crate::ui::branding::window_icon()))
+            .with_decorations(false)
+            .with_inner_size(source.inner_size())
+            .with_min_inner_size(LogicalSize::new(760.0, 520.0));
+        let window = Arc::new(
+            event_loop
+                .create_window(attributes)
+                .context("创建独立播放窗口")?,
+        );
+        crate::ui::branding::set_taskbar_icon(&window);
+        configure_dwm_window(&window);
+        if let Some(position) = position {
+            // 抓取点大致落在新窗口的标题栏上。Wayland 上这个请求会被忽略，
+            // 位置交给合成器决定。
+            window.set_outer_position(PhysicalPosition::new(position.x - 100, position.y - 18));
+        }
+        let (shell, interval) =
+            Self::build_shell(event_loop, &window, &self.proxy, self.generation)?;
+
+        let (progress, progress_rx) = std_mpsc::channel();
+        let _ = progress.send(ConnectionProgress::working(10, "正在打开显示器", label));
+        let app = ConnectionProgressApp::new(self.alias.clone(), progress_rx);
+        let repaint_window = window.id();
+        let proxy = self.proxy.clone();
+        let repaint = move || {
+            let _ = proxy.send_event(UiEvent::Repaint(UiRepaintEvent {
+                window: repaint_window,
+                generation: 0,
+                pass: 0,
+                when: Instant::now(),
+            }));
+        };
+        let (task, result) = screens.open(
+            screen_id,
+            ViewerDisplayHandle::default(),
+            None,
+            None,
+            repaint,
+        );
+        self.detached.push(DetachedWindow {
+            stage: DetachedStage::Opening(Box::new(app)),
+            pending: Some(DetachedPending {
+                screen_id,
+                task,
+                result,
+            }),
+            shell,
+            window: window.clone(),
+            tabs: vec![screen_id],
+            close: false,
+            next_repaint: Some(Instant::now()),
+            last_frame: None,
+            interval,
+        });
+        window.request_redraw();
+
+        if let Stage::Playing(player) = &mut self.stage {
+            player.tabs.retain(|id| *id != screen_id);
+            if player.session.screen_id() == screen_id {
+                // 这块解码器已经交给新窗口了。新屏接上之前主窗口不要再从同一个
+                // 队列取帧，否则两个窗口会互相抢帧，两边都停住。
+                player.frame_paused = true;
+                player.current = None;
+                player.video_size = None;
+                player.video_rect = None;
+                if let Some(next) = player.tabs.first().copied() {
+                    let _ = player.select(next, &source);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// 独立窗口的解码器就绪、取帧、目录核对。
+    fn poll_detached(&mut self) {
+        let Some(screens) = self.screens.clone() else {
+            return;
+        };
+        let mut close = Vec::new();
+        for (index, slot) in self.detached.iter_mut().enumerate() {
+            let ready = slot
+                .pending
+                .as_mut()
+                .and_then(|pending| match pending.result.try_recv() {
+                    Ok(result) => Some((pending.screen_id, result)),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                        Some((pending.screen_id, Err(anyhow!("屏幕加载已取消"))))
+                    }
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty) => None,
+                });
+            if let Some((id, result)) = ready {
+                slot.pending = None;
+                let installed = match result {
+                    Ok(session)
+                        if !screen_mapped(
+                            &screens.screens(),
+                            id,
+                            session.track_index,
+                            session.screen_binding(),
+                        ) =>
+                    {
+                        tracing::debug!(screen_id = id, "打开期间屏的映射变了，放弃这个独立窗口");
+                        false
+                    }
+                    Ok(session) => match Player::new(
+                        session,
+                        screens.clone(),
+                        &slot.window,
+                        self.proxy.clone(),
+                        PlayerWindow {
+                            tabs: vec![id],
+                            requests: self.requests.clone(),
+                            input_owns_connection: false,
+                        },
+                    ) {
+                        Ok(player) => {
+                            slot.tabs.clone_from(&player.tabs);
+                            slot.stage = DetachedStage::Playing(Box::new(player));
+                            slot.next_repaint = Some(Instant::now());
+                            true
+                        }
+                        Err(error) => {
+                            tracing::error!(%error, "独立窗口播放器初始化失败");
+                            false
+                        }
+                    },
+                    Err(error) => {
+                        tracing::warn!(%error, "打开独立窗口的显示器失败");
+                        false
+                    }
+                };
+                if !installed {
+                    slot.close = true;
+                    if let Stage::Playing(player) = &mut self.stage {
+                        player.report("显示器操作失败", format!("无法在独立窗口打开显示器 {id}"));
+                    }
+                }
+            }
+            if let DetachedStage::Playing(player) = &mut slot.stage {
+                let mut redraw = player.poll_pending();
+                player.pump_drag();
+                redraw |= player.refresh_catalog(&slot.window);
+                let frame = player.poll();
+                redraw |= player.error.is_some();
+                if frame || redraw {
+                    slot.next_repaint = Some(Instant::now());
+                }
+                if player.connection_ended() {
+                    self.close_requested = true;
+                }
+                slot.tabs.clone_from(&player.tabs);
+                // 这块屏从对端目录里没了：窗口没有别的屏可显示，和 Windows 一样关掉。
+                if player.tabs.is_empty() {
+                    slot.close = true;
+                }
+            }
+            if slot.close {
+                close.push(index);
+            }
+        }
+        for index in close.into_iter().rev() {
+            self.close_detached(index);
+        }
+    }
+
+    fn render_detached(&mut self, index: usize) -> Result<()> {
+        let Some(slot) = self.detached.get_mut(index) else {
+            return Ok(());
+        };
+        let window = slot.window.clone();
+        slot.next_repaint = None;
+        slot.last_frame = Some(Instant::now());
+        let mut close_requested = false;
+        let mut placement = None;
+        if let DetachedStage::Opening(app) = &mut slot.stage {
+            app.drain();
+        }
+        let input = slot.shell.input.take_egui_input(&window);
+        let shell = &mut slot.shell;
+        let stage = &mut slot.stage;
+        let title = self.alias.clone();
+        let output = shell.context.run_ui(input, |ui| {
+            let ctx = ui.ctx().clone();
+            resize_regions(ui, &window, |response, direction| {
+                update_nonmodal_window_resize(
+                    &ctx,
+                    &window,
+                    response,
+                    direction,
+                    &mut shell.resize_state,
+                    None,
+                );
+            });
+            let fullscreen = window.fullscreen().is_some();
+            shell.fullscreen_chrome.sync(fullscreen);
+            if !fullscreen {
+                let switcher = match stage {
+                    DetachedStage::Playing(player) => player.device_switch(),
+                    _ => None,
+                };
+                title_bar_panel(ui, "detached-window-chrome", title_bar_height(), |ui| {
+                    let bar = ui.available_rect_before_wrap();
+                    close_requested |= match switcher.as_ref() {
+                        Some(switcher) => crate::ui::chrome::window_title_bar_with_identity(
+                            ui,
+                            &window,
+                            &title,
+                            Some(&mut shell.move_state),
+                            true,
+                            &mut |ui: &mut egui::Ui| {
+                                let response = crate::ui::controls::viewer_device_button(
+                                    ui,
+                                    title.trim_start_matches(crate::VIEWER_TITLE_PREFIX),
+                                );
+                                switcher.menu(&response, window.id());
+                            },
+                        ),
+                        None => {
+                            window_title_bar(ui, &window, &title, Some(&mut shell.move_state), true)
+                        }
+                    };
+                    if let DetachedStage::Playing(player) = stage {
+                        player.title_bar_controls(ui, bar, &window);
+                    }
+                });
+            } else if let DetachedStage::Playing(player) = stage {
+                let relative = player.input().relative_mode();
+                let menu_open = player.stream_control_ui.open;
+                let pending = player.is_pending();
+                let switcher = player.device_switch();
+                close_requested |=
+                    shell
+                        .fullscreen_chrome
+                        .show(&ctx, relative, menu_open, pending, |ui| {
+                            let bar = ui.available_rect_before_wrap();
+                            let close = match switcher.as_ref() {
+                                Some(switcher) => {
+                                    crate::ui::chrome::window_title_bar_with_identity(
+                                        ui,
+                                        &window,
+                                        &title,
+                                        None,
+                                        true,
+                                        &mut |ui: &mut egui::Ui| {
+                                            let response =
+                                                crate::ui::controls::viewer_device_button(
+                                                    ui,
+                                                    title.trim_start_matches(
+                                                        crate::VIEWER_TITLE_PREFIX,
+                                                    ),
+                                                );
+                                            switcher.menu(&response, window.id());
+                                        },
+                                    )
+                                }
+                                None => window_title_bar(ui, &window, &title, None, true),
+                            };
+                            player.title_bar_controls(ui, bar, &window);
+                            close
+                        });
+            }
+            let menu_inset = shell.fullscreen_chrome.menu_inset(&ctx);
+            match stage {
+                DetachedStage::Opening(app) => app.draw(ui),
+                DetachedStage::Playing(player) => placement = player.draw(ui, &window, menu_inset),
+            }
+            crate::ui::controls::show_notices(ui.ctx());
+        });
+        let drawing = window.is_minimized() != Some(true);
+        if let DetachedStage::Playing(player) = stage
+            && let Some(frame) = player.take_frame()
+        {
+            let upload = Instant::now();
+            if drawing {
+                match &frame.surface {
+                    RenderSurface::CpuNv12 { data, color } => shell.presenter.upload_video_nv12(
+                        frame.width,
+                        frame.height,
+                        data,
+                        color.transform(8),
+                    )?,
+                    RenderSurface::Dmabuf {
+                        frame: dmabuf,
+                        color,
+                    } => shell.presenter.upload_video_dmabuf(
+                        frame.width,
+                        frame.height,
+                        dmabuf,
+                        color.transform(8),
+                    )?,
+                    RenderSurface::CpuRgba8(pixels) => shell.presenter.upload_video(
+                        frame.width,
+                        frame.height,
+                        bytemuck::cast_slice(pixels),
+                    )?,
+                    RenderSurface::D3D11(surface) => match *surface {},
+                }
+            }
+            player.publish(&frame, upload.elapsed());
+            player.current = Some(frame);
+        }
+        if let DetachedStage::Playing(player) = stage {
+            player.publish_error(&shell.context);
+        }
+        let placement = placement.filter(|_| shell.presenter.has_video());
+        shell.presenter.set_video_placement(placement);
+        let (ui_output, platform, viewports) = split_output(output);
+        shell.input.handle_platform_output(&window, platform);
+        close_requested |= viewports
+            .get(&egui::ViewportId::ROOT)
+            .is_some_and(|viewport| {
+                viewport
+                    .commands
+                    .iter()
+                    .any(|command| matches!(command, egui::ViewportCommand::Close))
+            });
+        let repaint_at = viewports
+            .get(&egui::ViewportId::ROOT)
+            .and_then(|viewport| Instant::now().checked_add(viewport.repaint_delay));
+        if !drawing {
+            shell.presenter.defer_output(ui_output);
+        } else {
+            let presented = shell
+                .presenter
+                .render(&shell.context, ui_output, false)?
+                .presented();
+            if presented && window.is_visible() == Some(false) {
+                window.set_visible(true);
+            }
+        }
+        if close_requested {
+            slot.close = true;
+        }
+        if let Some(when) = repaint_at {
+            let when = slot
+                .last_frame
+                .map_or(when, |last| when.max(last + slot.interval));
+            slot.next_repaint = Some(slot.next_repaint.map_or(when, |old| old.min(when)));
+        }
+        Ok(())
+    }
+
+    fn detached_window_event(&mut self, index: usize, event: WindowEvent) {
+        let Some(slot) = self.detached.get_mut(index) else {
+            return;
+        };
+        let window = slot.window.clone();
+        let shell = &mut slot.shell;
+        let previous_events = shell.input.egui_input_mut().events.len();
+        let response = shell.input.on_window_event(&window, &event);
+        let consumed = response.consumed;
+        if let DetachedStage::Playing(player) = &mut slot.stage {
+            let forwarded = player.on_window_event(&window, &shell.context, &event, consumed);
+            if matches!(
+                event,
+                WindowEvent::KeyboardInput { .. } | WindowEvent::MouseInput { .. }
+            ) {
+                player.update_shortcuts(&shell.context, &window);
+            }
+            if forwarded && matches!(event, WindowEvent::KeyboardInput { .. }) {
+                shell
+                    .input
+                    .egui_input_mut()
+                    .events
+                    .truncate(previous_events);
+            }
+        }
+        let mut close = false;
+        let mut render = false;
+        match event {
+            WindowEvent::CloseRequested | WindowEvent::Destroyed => close = true,
+            WindowEvent::Focused(focused) => {
+                if !focused {
+                    cancel_pointer_operation(&mut shell.move_state, &mut shell.resize_state);
+                }
+                if let DetachedStage::Playing(player) = &mut slot.stage {
+                    player.on_focus_changed(&window, focused);
+                    player.update_shortcuts(&shell.context, &window);
+                    if focused {
+                        // 对端按聚焦窗口的那块屏送指针与输入。
+                        player.screens.focus(player.session.screen_id());
+                    }
+                }
+                crate::application::viewer_shortcuts::set_focused_window(if focused {
+                    u64::from(window.id())
+                } else {
+                    0
+                });
+                slot.next_repaint = Some(Instant::now());
+            }
+            WindowEvent::Resized(size) => {
+                if let Err(error) = shell.presenter.resize(size) {
+                    tracing::error!(%error, "独立窗口的表面缩放失败");
+                    close = true;
+                }
+                slot.next_repaint = Some(Instant::now());
+            }
+            WindowEvent::RedrawRequested => render = true,
+            _ => {
+                if response.repaint {
+                    slot.next_repaint = Some(Instant::now());
+                }
+            }
+        }
+        if close {
+            self.close_detached(index);
+        } else if render && let Err(error) = self.render_detached(index) {
+            tracing::error!(%error, "独立窗口渲染失败");
+            self.close_detached(index);
+        }
+    }
+
+    /// 把每个窗口要看的那几块屏合并起来交给共享的解码器池。
+    fn sync_visible(&self) {
+        let Some(screens) = &self.screens else {
+            return;
+        };
+        let mut visible = match &self.stage {
+            Stage::Playing(player) => player.visible_screens(),
+            _ => Vec::new(),
+        };
+        for slot in &self.detached {
+            match &slot.stage {
+                DetachedStage::Playing(player) => visible.extend(player.visible_screens()),
+                // 解码器还没交回来时，`open` 已经把这屏放进去了；这里保住它，
+                // 免得聚合结果把它覆盖掉。
+                DetachedStage::Opening(_) => visible.extend(&slot.tabs),
+            }
+        }
+        visible.sort_unstable();
+        visible.dedup();
+        screens.set_visible(visible);
+    }
+
+    /// 把目录里还没分给任何窗口的屏补进主窗口。独立窗口只留它自己那一块，
+    /// 和 Windows 的 `refresh_catalog` 把新屏交给 owner 窗口是同一条规则。
+    fn sync_tabs(&mut self) -> bool {
+        let mut assigned: Vec<i32> = self
+            .detached
+            .iter()
+            .flat_map(|slot| slot.tabs.iter().copied())
+            .collect();
+        let Stage::Playing(player) = &mut self.stage else {
+            return false;
+        };
+        assigned.extend(player.tabs.iter().copied());
+        let missing: Vec<i32> = player
+            .catalog
+            .iter()
+            .map(|screen| screen.id)
+            .filter(|id| !assigned.contains(id))
+            .collect();
+        if missing.is_empty() {
+            return false;
+        }
+        player.tabs.extend(missing);
+        true
     }
 
     fn render(&mut self) -> Result<()> {
@@ -598,7 +1295,7 @@ impl ConnectingWindowsRunner {
                 presented,
             );
         }
-        self.close_requested |= close_requested;
+        self.primary_close |= close_requested;
         if let Some(when) = repaint_at {
             self.schedule(when);
         }
@@ -624,6 +1321,10 @@ impl ApplicationHandler<UiEvent> for ConnectingWindowsRunner {
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
         if !self.owns(id) {
+            return;
+        }
+        if let Some(index) = self.detached.iter().position(|slot| slot.window.id() == id) {
+            self.detached_window_event(index, event);
             return;
         }
         let (Some(window), Some(shell)) = (self.window.clone(), self.shell.as_mut()) else {
@@ -653,7 +1354,7 @@ impl ApplicationHandler<UiEvent> for ConnectingWindowsRunner {
         }
         match event {
             WindowEvent::CloseRequested | WindowEvent::Destroyed => {
-                self.exit(event_loop);
+                self.primary_close = true;
                 return;
             }
             WindowEvent::Focused(focused) => {
@@ -701,6 +1402,19 @@ impl ApplicationHandler<UiEvent> for ConnectingWindowsRunner {
         device: DeviceId,
         event: DeviceEvent,
     ) {
+        // 原始运动事件没有窗口号，只派给有焦点的那个窗口。
+        if let Some(slot) = self
+            .detached
+            .iter_mut()
+            .find(|slot| slot.window.has_focus())
+        {
+            if let DetachedStage::Playing(player) = &mut slot.stage
+                && player.on_device_event(device, &event)
+            {
+                slot.next_repaint = Some(Instant::now());
+            }
+            return;
+        }
         // Raw motion is the only pointer source once the pointer is locked.
         if let Stage::Playing(player) = &mut self.stage
             && player.on_device_event(device, &event)
@@ -716,7 +1430,7 @@ impl ApplicationHandler<UiEvent> for ConnectingWindowsRunner {
         if !self.owns(event.window) {
             return;
         }
-        self.schedule(event.when);
+        self.schedule_window(event.window, event.when);
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
@@ -725,6 +1439,16 @@ impl ApplicationHandler<UiEvent> for ConnectingWindowsRunner {
             self.exit(event_loop);
             return;
         }
+        self.handle_requests(event_loop);
+        if self.primary_close {
+            self.primary_close = false;
+            self.close_primary(event_loop);
+            if self.close_requested {
+                return;
+            }
+        }
+        self.poll_detached();
+        self.sync_visible();
         if let Stage::Playing(player) = &mut self.stage {
             let mut redraw = player.poll_pending();
             // 拖放那条通道读 socket 的仍然是 winit，这里只把已经读进来的事件
@@ -753,6 +1477,31 @@ impl ApplicationHandler<UiEvent> for ConnectingWindowsRunner {
                 self.schedule(Instant::now());
             }
         }
+        if self.sync_tabs() {
+            self.schedule(Instant::now());
+        }
+        let now = Instant::now();
+        let due: Vec<usize> = self
+            .detached
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| slot.next_repaint.is_some_and(|when| when <= now))
+            .map(|(index, _)| index)
+            .collect();
+        for index in due {
+            if self.detached.get(index).is_none() {
+                continue;
+            }
+            if let Err(error) = self.render_detached(index) {
+                tracing::error!(%error, "独立窗口渲染失败");
+                if let Some(slot) = self.detached.get_mut(index) {
+                    slot.close = true;
+                }
+            }
+        }
+        while let Some(index) = self.detached.iter().position(|slot| slot.close) {
+            self.close_detached(index);
+        }
         match self.next_repaint {
             Some(when) if when <= Instant::now() => {
                 if let Err(error) = self.render() {
@@ -762,23 +1511,84 @@ impl ApplicationHandler<UiEvent> for ConnectingWindowsRunner {
             }
             _ => {}
         }
-        // 目录核对也有自己的节拍，和重画一样要能把事件循环叫醒。
-        let catalog = match &self.stage {
-            Stage::Playing(player) => Some(player.next_refresh),
-            _ => None,
-        };
-        let wake = match (self.next_repaint, catalog) {
-            (Some(repaint), Some(catalog)) => Some(repaint.min(catalog)),
-            (repaint, catalog) => repaint.or(catalog),
-        };
+        // 目录核对与独立窗口的重画都有自己的节拍，和重画一样要能把事件循环叫醒。
+        let mut wake = self.next_repaint;
+        if let Stage::Playing(player) = &self.stage {
+            wake = earliest(wake, Some(player.next_refresh));
+        }
+        for slot in &self.detached {
+            wake = earliest(wake, slot.next_repaint);
+            if let DetachedStage::Playing(player) = &slot.stage {
+                wake = earliest(wake, Some(player.next_refresh));
+            }
+        }
         event_loop.set_control_flow(wake.map_or(ControlFlow::Wait, ControlFlow::WaitUntil));
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        self.close_detached_all();
         self.stage = Stage::Finished;
         self.shell = None;
         self.window = None;
     }
+}
+
+/// 拖出去的一块屏：自己的窗口与 egui/wgpu 表面，共享同一个连接和解码器池。
+struct DetachedWindow {
+    /// 字段顺序即析构顺序：先丢播放器和进度页，再丢表面，最后才是窗口。
+    stage: DetachedStage,
+    pending: Option<DetachedPending>,
+    shell: Shell,
+    window: Arc<Window>,
+    /// 这个窗口分到的屏。独立窗口只有一块；拖进新屏等于再开一个窗口。
+    tabs: Vec<i32>,
+    close: bool,
+    next_repaint: Option<Instant>,
+    last_frame: Option<Instant>,
+    interval: Duration,
+}
+
+enum DetachedStage {
+    /// 解码器还没就绪，先画连接进度。
+    Opening(Box<ConnectionProgressApp>),
+    Playing(Box<Player>),
+}
+
+/// 正在为独立窗口打开的那块屏。
+struct DetachedPending {
+    screen_id: i32,
+    /// 让 `ScreenPlayback` 申请对端开始推这块屏；取消时 abort 掉这次等待。
+    task: Option<tokio::task::AbortHandle>,
+    result: tokio::sync::oneshot::Receiver<Result<Arc<NativeViewerSession>>>,
+}
+
+impl Drop for DetachedPending {
+    fn drop(&mut self) {
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
+}
+
+/// 构造播放器时要和窗口绑在一起的一组东西。
+struct PlayerWindow {
+    /// 这个窗口分到的屏。
+    tabs: Vec<i32>,
+    /// 把屏拖出成独立窗口的请求通道。
+    requests: std_mpsc::Sender<WindowRequest>,
+    /// 主窗口负责整个连接的键鼠控制与解码器池；独立窗口关闭时不能动它们。
+    input_owns_connection: bool,
+}
+
+/// 播放窗口向 runner 提的窗口级请求：把一块屏拖出成独立窗口、或关掉自己。
+enum WindowRequest {
+    Detach {
+        screen_id: i32,
+        /// 松手时的全局位置（X11 才有）；Wayland 交给合成器摆放。
+        position: Option<PhysicalPosition<i32>>,
+    },
+    /// 独立窗口请求关闭自己（主窗口关闭等于结束连接，走它原来的路径）。
+    Close { window: WindowId },
 }
 
 /// 正在打开的一块屏：解码器还没就绪，tab 先显示等待态。
@@ -886,21 +1696,31 @@ struct Player {
     linked: Option<Arc<crate::platform::linux::drag_drop::linked::Linked>>,
     /// Mouse mode of the previous frame, to notice control being dropped.
     last_mouse_mode: MouseMode,
+    /// 这块屏已经交给独立窗口，新屏接上之前不要再从同一个解码队列取帧。
+    frame_paused: bool,
+    /// 这个窗口分到的屏。主窗口默认持有全部，拖出成独立窗口的屏从它这里移过去。
+    tabs: Vec<i32>,
+    /// 把屏拖出成独立窗口、或关闭自己的请求交给 runner（窗口操作只能在事件循环里做）。
+    requests: std_mpsc::Sender<WindowRequest>,
+    /// 主窗口负责整个连接的键鼠控制与解码器池；独立窗口关闭时不能动它们。
+    input_owns_connection: bool,
 }
 
 impl Player {
     fn new(
-        mut session: NativeViewerSession,
+        session: Arc<NativeViewerSession>,
+        screens: super::screens::ScreenPlayback,
         window: &Arc<Window>,
         proxy: EventLoopProxy<UiEvent>,
+        PlayerWindow {
+            tabs,
+            requests,
+            input_owns_connection,
+        }: PlayerWindow,
     ) -> Result<Self> {
         session.ensure_running()?;
         // 屏目录与每屏的解码器由 `ScreenPlayback` 统一持有：同一个设备连接上的
-        // 所有窗口共用它，才不会两块窗口各推一份同样的屏。
-        let screens = session
-            .take_screen_playback()
-            .context("screen playback owner unavailable")?;
-        let session = Arc::new(session);
+        // 所有窗口共用它，才不会两块窗口各推一份同样的屏。它由 runner 持有并传进来。
         screens.register(Arc::clone(&session));
         let initial = Arc::clone(&session);
         let catalog = screens.screens();
@@ -968,6 +1788,10 @@ impl Player {
             diagnostics_at: [None; 2],
             hidden_since: None,
             last_mouse_mode: MouseMode::View,
+            frame_paused: false,
+            tabs,
+            requests,
+            input_owns_connection,
         })
     }
 
@@ -1031,7 +1855,6 @@ impl Player {
     fn select(&mut self, screen_id: i32, window: &Arc<Window>) -> Result<()> {
         if screen_id == self.session.screen_id() {
             self.pending.take();
-            self.sync_screens();
             return Ok(());
         }
         self.begin_screen(screen_id, window)
@@ -1077,7 +1900,6 @@ impl Player {
             task,
             result,
         });
-        self.sync_screens();
         Ok(())
     }
 
@@ -1092,6 +1914,7 @@ impl Player {
         }
         self.session = session;
         self.session_failed = false;
+        self.frame_paused = false;
         self.pending = None;
         self.current = None;
         self.video_size = None;
@@ -1145,7 +1968,6 @@ impl Player {
                 self.report("显示器操作失败", format!("无法打开显示器 {id}：{error:#}"));
             }
         }
-        self.sync_screens();
         true
     }
 
@@ -1183,6 +2005,9 @@ impl Player {
                 self.catalog.push(screen.clone());
             }
         }
+        // 分给别的窗口的屏不在本窗口的 tabs 里；这里只丢掉已经消失的。
+        self.tabs
+            .retain(|id| self.catalog.iter().any(|screen| screen.id == *id));
         if self.catalog.is_empty() {
             return;
         }
@@ -1194,7 +2019,6 @@ impl Player {
             .is_some_and(|pending| !actual.iter().any(|screen| screen.id == pending.id))
         {
             self.pending = None;
-            self.sync_screens();
         }
         // 对端拓扑刚选中的那块屏（刚加好的虚拟屏），和 Windows 的 `topology_selection`
         // 一样只是换掉核对的对象，要不要真的切由 `replacement_target` 判断。
@@ -1215,7 +2039,6 @@ impl Player {
                 .is_some_and(|pending| pending.id != selected)
             {
                 self.pending = None;
-                self.sync_screens();
             }
             self.topology_focused = Some(selected);
             self.failed_screen = None;
@@ -1224,8 +2047,14 @@ impl Player {
         if self.pending.is_some() {
             return;
         }
+        let window_catalog: Vec<RemoteScreen> = self
+            .catalog
+            .iter()
+            .filter(|screen| self.tabs.contains(&screen.id))
+            .cloned()
+            .collect();
         let target = replacement_target(
-            &self.catalog,
+            &window_catalog,
             &actual,
             focus.unwrap_or_else(|| self.session.screen_id()),
             (self.session.track_index, self.session.screen_binding()),
@@ -1250,16 +2079,19 @@ impl Player {
             .map_or((screen_id, -1, -1), screen_key)
     }
 
-    /// 告诉对端现在要看哪几块屏：本窗口正在显示的那块，加上正在打开的那块。软解一次
+    /// 这个窗口现在要看哪几块屏：正在显示的那块，加上正在打开的那块。软解一次
     /// 只跟得上一条流，换屏期间就不再要原来那块（与 Windows 侧同一条规则）。
-    fn sync_screens(&self) {
+    ///
+    /// 多个窗口的这份列表由 runner 合并后交给 `ScreenPlayback`（`sync_visible`）：
+    /// 每个窗口各调一次 `set_visible` 会互相覆盖。
+    fn visible_screens(&self) -> Vec<i32> {
         let switching = self.pending.as_ref().map(|pending| pending.id);
         let mut visible = Vec::new();
         if !(switching.is_some() && self.session.is_software()) {
             visible.push(self.session.screen_id());
         }
         visible.extend(switching);
-        self.screens.set_visible(visible);
+        visible
     }
 
     /// 记下一条待显示的错误，下一帧由 [`Player::publish_error`] 做成弹窗。
@@ -1312,6 +2144,10 @@ impl Player {
     /// 「显示器操作失败」，但不关窗口，用户还能切到别的屏。
     fn poll(&mut self) -> bool {
         self.confirm_neutral();
+        if self.frame_paused {
+            // 这条会话已经交给独立窗口了，它的错误由那边报告。
+            return false;
+        }
         let failure = if self.session_failed {
             None
         } else {
@@ -1332,6 +2168,9 @@ impl Player {
     /// Take the newest decoded frame; the decoder already replaced any the
     /// UI cadence skipped.
     fn take_frame(&mut self) -> Option<DecodedVideoFrame> {
+        if self.frame_paused {
+            return None;
+        }
         take_next_frame(
             &mut mutex_lock(&self.session.frame_queue),
             &self.session.performance,
@@ -1376,6 +2215,19 @@ impl Player {
     }
 
     /// `menu_inset` moves the stream menu under the floating fullscreen bar.
+    /// 请 runner 撤掉这个窗口。窗口创建与销毁都只能由事件循环做。
+    fn request_close(&self, window: &Arc<Window>) {
+        let _ = self.requests.send(WindowRequest::Close {
+            window: window.id(),
+        });
+        let _ = self.proxy.send_event(UiEvent::Repaint(UiRepaintEvent {
+            window: window.id(),
+            generation: 0,
+            pass: 0,
+            when: Instant::now(),
+        }));
+    }
+
     fn draw(
         &mut self,
         ui: &mut egui::Ui,
@@ -1883,11 +2735,22 @@ impl Player {
             return;
         }
         let catalog = self.catalog.clone();
+        let tab_ids = self.tabs.clone();
         let control = self.session.stream_control.clone();
         let snapshot = control.snapshot();
         let selected = self.session.screen_id();
         let pending = self.pending.as_ref().map(|pending| pending.id);
         let software = self.session.is_software();
+        // 拖出成独立窗口：软解一次只跟得上一条流，和 Windows 一样禁止；
+        // 只剩一块屏时拖出去会让原窗口空掉，也不允许。
+        let detachable = !software && tab_ids.len() > 1;
+        let detach_hint = if software {
+            "软解仅允许一个播放窗口，请使用标签切换屏幕"
+        } else {
+            "这个窗口只剩一块显示器，不能再拖出"
+        };
+        let requests = self.requests.clone();
+        let proxy = self.proxy.clone();
         let mut open = None;
         let mut message = None;
         let mut tabs = ui.new_child(
@@ -1906,8 +2769,10 @@ impl Player {
             .show(&mut tabs, |ui| {
                 ui.horizontal_centered(|ui| {
                     ui.spacing_mut().item_spacing.x = 3.0;
-                    for screen in &catalog {
-                        let id = screen.id;
+                    for id in tab_ids.iter().copied() {
+                        let Some(screen) = catalog.iter().find(|screen| screen.id == id) else {
+                            continue;
+                        };
                         // 只有 UU 虚拟屏能这样关掉，物理屏要留着，否则等于拔掉
                         // 对端的显示器。类型按对端报的屏来看（和 Windows 一样），
                         // 拓扑里还没落定的瞬态屏不给关。
@@ -1944,6 +2809,9 @@ impl Player {
                             );
                         } else if response.clicked() {
                             open = Some(id);
+                        } else if response.drag_stopped() && detachable {
+                            // 把标签拖出去：新窗口落在松手的位置（Wayland 交给合成器）。
+                            request_detach(&requests, &proxy, window, ui.ctx(), id);
                         }
                         response.context_menu(|ui| {
                             super::stream_menu::menu_style(ui);
@@ -1959,17 +2827,19 @@ impl Player {
                                 message = Some(error);
                             }
                             ui.separator();
-                            // Windows 这一项能把一块屏挪到独立窗口里，Linux 还没有独立
-                            // 窗口，所以照 PR 里那几个图标的做法画成禁用并说明原因。
-                            crate::ui::controls::menu_row(
+                            let row = crate::ui::controls::menu_row(
                                 ui,
                                 "在独立窗口打开",
                                 "",
                                 None,
-                                false,
+                                detachable,
                                 false,
                             )
-                            .on_disabled_hover_text("Linux 主控还没有独立窗口，请用标签切换屏幕");
+                            .on_disabled_hover_text(detach_hint);
+                            if row.clicked() {
+                                request_detach(&requests, &proxy, window, ui.ctx(), id);
+                                ui.close();
+                            }
                         });
                     }
                     if snapshot.topology_support.create_visible
@@ -2395,8 +3265,8 @@ impl Player {
             ViewerShortcut::Fullscreen => toggle_fullscreen(window),
             ViewerShortcut::Close => {
                 self.release_keys();
-                window.set_visible(false);
-                self.session.close_handle().close();
+                // 和窗口按钮一样只关这个窗口；连接还有别的窗口在播就留着。
+                self.request_close(window);
             }
             ViewerShortcut::Performance => {
                 self.set_performance_mode(self.performance_mode.next());
@@ -2799,8 +3669,13 @@ impl Drop for Player {
         // 释放时在 tokio worker 上 join。
         self.pending.take();
         self.release_keys();
-        self.input().disable();
-        self.screens.close_decoders();
+        if self.input_owns_connection {
+            self.input().disable();
+            self.screens.close_decoders();
+        } else {
+            // 独立窗口只交回自己持有的输入；别的窗口还在用这个连接。
+            self.input().pause_owner(self.owner);
+        }
     }
 }
 
@@ -2828,10 +3703,17 @@ fn replacement_target(
             return None;
         }
         Some(screen) => screen.id,
-        None => catalog
-            .iter()
-            .find(|screen| actual.iter().any(|real| real.id == screen.id))
-            .map(|screen| screen.id)?,
+        // 目录按窗口分过之后，`focus`（比如对端拓扑选中的屏）可能属于别的窗口。
+        // 这时退回本窗口的第一块屏，但如果那就是正在显示的这一路，就不动它。
+        None => {
+            let screen = catalog
+                .iter()
+                .find(|screen| actual.iter().any(|real| real.id == screen.id))?;
+            if track == screen.video_track_index && binding == screen_binding(screen) {
+                return None;
+            }
+            screen.id
+        }
     };
     if actual
         .iter()
@@ -2850,6 +3732,45 @@ fn screen_mapped(actual: &[RemoteScreen], screen_id: i32, track: i32, binding: u
             && screen.video_track_index == track
             && screen_binding(screen) == binding
     })
+}
+
+/// 请 runner 把这块屏挪到独立窗口。请求带唤醒，免得事件循环闲着等到下次输入。
+fn request_detach(
+    requests: &std_mpsc::Sender<WindowRequest>,
+    proxy: &EventLoopProxy<UiEvent>,
+    window: &Window,
+    context: &egui::Context,
+    screen_id: i32,
+) {
+    let _ = requests.send(WindowRequest::Detach {
+        screen_id,
+        position: global_pointer(window, context),
+    });
+    let _ = proxy.send_event(UiEvent::Repaint(UiRepaintEvent {
+        window: window.id(),
+        generation: 0,
+        pass: 0,
+        when: Instant::now(),
+    }));
+}
+
+/// 指针此刻的全局物理位置。Wayland 不给窗口位置，返回 `None`，新窗口由合成器摆放。
+fn global_pointer(window: &Window, context: &egui::Context) -> Option<PhysicalPosition<i32>> {
+    let local = context.input(|input| input.pointer.latest_pos())?;
+    let origin = window.outer_position().ok()?;
+    let scale = window.scale_factor();
+    Some(PhysicalPosition::new(
+        origin.x + (f64::from(local.x) * scale) as i32,
+        origin.y + (f64::from(local.y) * scale) as i32,
+    ))
+}
+
+/// 两个唤醒时刻里更早的那个，任一为空就取另一个。
+fn earliest(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        _ => a.or(b),
+    }
 }
 
 /// 一块屏在会话里的绑定值，和 `NativeViewerSession::bind_screen` 写进去的是同一套。
@@ -2914,15 +3835,12 @@ impl FrameWakeBridge {
 
 impl Drop for FrameWakeBridge {
     fn drop(&mut self) {
-        // Stop the decoder queueing frames nothing will draw, then release the
-        // registration before the thread goes away.
-        self.wake
-            .visible
-            .store(false, std::sync::atomic::Ordering::Release);
-        *mutex_lock(&self.wake.render_thread) = None;
-        self.running
-            .store(false, std::sync::atomic::Ordering::Release);
+        // 只撤销这一份登记：这一路解码器可能已经交给独立窗口了，不能连别人的
+        // 唤醒一起清掉。
         if let Some(thread) = self.thread.take() {
+            self.wake.remove_render_thread(thread.thread());
+            self.running
+                .store(false, std::sync::atomic::Ordering::Release);
             thread.thread().unpark();
             let _ = thread.join();
         }

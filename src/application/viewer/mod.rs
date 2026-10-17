@@ -279,17 +279,33 @@ fn take_next_frame(
 struct FrameWake {
     visible: Arc<AtomicBool>,
 
-    render_thread: Arc<Mutex<Option<std::thread::Thread>>>,
+    /// 同一路解码器可能同时被多个窗口持有：屏被拖出成独立窗口之后，原窗口
+    /// 还没接上新屏的那一小段时间里，两边都看着同一个会话。
+    render_threads: Arc<Mutex<Vec<std::thread::Thread>>>,
 }
 
 impl FrameWake {
     fn install_render_thread(&self, thread: std::thread::Thread) {
-        *mutex_lock(&self.render_thread) = Some(thread);
+        let mut threads = mutex_lock(&self.render_threads);
+        if !threads.iter().any(|known| known.id() == thread.id()) {
+            threads.push(thread);
+        }
+        drop(threads);
         self.visible.store(true, Ordering::Release);
     }
 
+    /// 撤销这一个窗口的登记。最后一个窗口走了才把 `visible` 置回去，
+    /// 否则别的窗口就再也收不到解码帧了。
+    fn remove_render_thread(&self, thread: &std::thread::Thread) {
+        let mut threads = mutex_lock(&self.render_threads);
+        threads.retain(|known| known.id() != thread.id());
+        if threads.is_empty() {
+            self.visible.store(false, Ordering::Release);
+        }
+    }
+
     fn notify(&self) {
-        if let Some(thread) = mutex_lock(&self.render_thread).as_ref() {
+        for thread in mutex_lock(&self.render_threads).iter() {
             thread.unpark();
         }
     }
