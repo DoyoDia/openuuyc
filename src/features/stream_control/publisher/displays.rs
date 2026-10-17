@@ -195,20 +195,7 @@ pub(crate) async fn receive_session(
                         (!session.authorization().terminal_allowed()).then_some("本机未允许终端")
                     });
                     let allowed = refusal.is_none();
-                    #[derive(Clone, PartialEq, prost::Message)]
-                    struct CheckEnvResp {
-                        #[prost(int32, tag = "1")]
-                        code: i32,
-                        #[prost(string, tag = "2")]
-                        detail: String,
-                    }
-                    // 0 is the success code the other RPCs use; a refusal is
-                    // reported so the client can show its own message rather
-                    // than waiting for a reply that never comes.
-                    let resp = CheckEnvResp {
-                        code: if allowed { 0 } else { 1 },
-                        detail: refusal.unwrap_or_default().to_owned(),
-                    };
+                    let resp = CheckEnvResp::result(refusal);
                     tracing::info!(allowed, "host terminal environment check answered");
                     return Ok(response(
                         &message,
@@ -709,6 +696,41 @@ async fn apply_setting(
     Ok(errors)
 }
 
+/// The terminal environment check reply.
+///
+/// The controller requires `code == 0` **and** `message` to be exactly `"ok"`
+/// (a length-2 byte comparison); replying with only `code = 0` always takes
+/// its failure branch. The string is part of the wire contract, not a note
+/// for humans.
+#[derive(Clone, PartialEq, prost::Message)]
+struct CheckEnvResp {
+    #[prost(int32, tag = "1")]
+    code: i32,
+    #[prost(string, tag = "2")]
+    message: String,
+}
+
+impl CheckEnvResp {
+    /// The three answers the reference host gives: terminal available, no
+    /// terminal component on this machine, or the environment check failed.
+    fn result(refusal: Option<&'static str>) -> Self {
+        match refusal {
+            None => Self {
+                code: 0,
+                message: "ok".to_owned(),
+            },
+            Some(_) if crate::features::host::terminal::unavailable().is_some() => Self {
+                code: 5,
+                message: "terminal_component_unavailable".to_owned(),
+            },
+            Some(_) => Self {
+                code: 6,
+                message: "environment_check_failed".to_owned(),
+            },
+        }
+    }
+}
+
 /// The terminal rename reply, in the reference server's own descriptor:
 ///
 /// ```text
@@ -792,5 +814,30 @@ mod tests {
         }
         .encode_to_vec();
         assert_eq!(encoded, [0x08, 7, 0x10, 1, 0x1a, 1, b'x']);
+    }
+
+    /// proto3 drops the default `code = 0`, so the success reply is only the
+    /// `message` field: `12 02 6f 6b`. The controller compares those two bytes
+    /// literally and treats anything else as a failed environment check.
+    #[test]
+    fn the_environment_check_success_reply_is_the_literal_ok() {
+        assert_eq!(
+            CheckEnvResp::result(None).encode_to_vec(),
+            [0x12, 0x02, b'o', b'k']
+        );
+    }
+
+    /// A refusal carries a machine-readable reason. `code = 5` means this
+    /// machine has no terminal backend; every other refusal is `code = 6`.
+    #[test]
+    fn a_refusal_names_the_reason() {
+        let encoded = CheckEnvResp::result(Some("本机未允许终端")).encode_to_vec();
+        if crate::features::host::terminal::unavailable().is_some() {
+            assert_eq!(encoded[..2], [0x08, 5]);
+            assert!(encoded.ends_with(b"terminal_component_unavailable"));
+        } else {
+            assert_eq!(encoded[..2], [0x08, 6]);
+            assert!(encoded.ends_with(b"environment_check_failed"));
+        }
     }
 }
