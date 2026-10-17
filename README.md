@@ -232,7 +232,7 @@ sudo pacman -S --needed xdg-desktop-portal-gnome   # KDE 为 xdg-desktop-portal-
 
 #### 硬件解码 / 编码
 
-- **解码**：H.264 走 VA-API。AMD 用 `mesa`，Intel 用 `intel-media-driver`，NVIDIA 用 `libva-nvidia-driver`（Ubuntu 23.04 起为 `nvidia-vaapi-driver`；22.04 的源里没有，需按[上游说明](https://github.com/elFarto/nvidia-vaapi-driver)从源码编译，依赖 `meson libva-dev libgstreamer-plugins-bad1.0-dev libffmpeg-nvenc-dev`，把 `nvidia_drv_video.so` 装到 `/usr/lib/x86_64-linux-gnu/dri/`；当前版本默认 direct 后端，旧版需设 `NVD_BACKEND=direct`）。Intel 核显比 `intel-media-driver` 新时（如 Ubuntu 22.04 的 22.3 遇上 Arrow Lake）驱动初始化失败，混合显卡笔记本上会改用 NVIDIA 解码；libva 2.15 以前认不出 NVIDIA 显卡对应的驱动，程序会自行指定，无需设置 `LIBVA_DRIVER_NAME`。
+- **解码**：H.264 走 VA-API。AMD 用 `mesa`，Intel 用 `intel-media-driver`，NVIDIA 用 `libva-nvidia-driver`（Ubuntu 为 `nvidia-vaapi-driver`；并设 `NVD_BACKEND=direct`）；libva 2.15 以前认不出 NVIDIA 显卡对应的驱动，程序会自行指定，无需设置 `LIBVA_DRIVER_NAME`。
 - **编码**（被控）：NVIDIA 用 NVENC；AMD 与 Intel 经 VA-API 编码 H.264（Intel 需 `intel-media-driver` 或 `libva-intel-driver`，AMD 用 `mesa`），都不可用时回退软件编码。
 - **老 Intel GPU / 虚拟机**：Haswell/Broadwell 的 Vulkan 驱动未通过一致性认证，程序仍会使用它（设 `WGPU_ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER=0` 恢复 wgpu 默认的隐藏行为）；驱动无法向 Wayland surface 呈现时，可安装 `vulkan-swrast`（lavapipe）并用 `OPENUUYC_BACKEND=gl` 或 `OPENUUYC_BACKEND=vulkan` 指定界面后端。
 
