@@ -921,11 +921,8 @@ impl Player {
                 None
             }
         };
-        let drag = super::linux_drag::WindowDrag::new(
-            owner,
-            &session.stream_control,
-            linked.clone(),
-        );
+        let drag =
+            super::linux_drag::WindowDrag::new(owner, &session.stream_control, linked.clone());
         Ok(Self {
             shortcuts: super::linux_shortcuts::Shortcuts::new(window),
             drag,

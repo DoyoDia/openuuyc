@@ -35,8 +35,8 @@ use wayland_client::{
     Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum,
     backend::{Backend, ObjectId},
     protocol::{
-        wl_buffer, wl_compositor, wl_data_device, wl_data_device_manager, wl_data_offer,
-        wl_data_source, wl_pointer, wl_registry, wl_seat, wl_shm, wl_shm_pool, wl_surface,
+        wl_buffer, wl_data_device, wl_data_device_manager, wl_data_offer, wl_data_source,
+        wl_pointer, wl_registry, wl_seat, wl_shm, wl_shm_pool, wl_surface,
     },
 };
 use winit::{
@@ -54,6 +54,21 @@ const LIST_LIMIT: usize = 1 << 20;
 const PREPARE_WAIT: Duration = Duration::from_secs(30);
 /// 一次悬停超过这么久没动静就丢掉（合成器偶尔漏 `leave`）。
 const HOVER_LIMIT: Duration = Duration::from_secs(30);
+/// 落下之后等清单写完的上限；源一直不写完就按已经读到的那些算。
+const DROP_LIST_WAIT: Duration = Duration::from_secs(5);
+
+/// 一份 `wl_data_offer` 自己报过的东西：对端挂了哪些类型、合成器最后协商出的
+/// 动作。`finish` 只在「收的类型对端真有、动作是复制」时才合法，否则是协议错误，
+/// 会连同 winit 那条连接一起断掉。
+#[derive(Default)]
+struct OfferInfo {
+    mimes: Vec<String>,
+    action: Option<wl_data_device_manager::DndAction>,
+}
+
+fn offer_info(offer: &wl_data_offer::WlDataOffer) -> Option<&Mutex<OfferInfo>> {
+    offer.data::<Mutex<OfferInfo>>()
+}
 
 /// 本机的一次拖动，此刻悬停在这个观看窗口上的样子。
 #[derive(Clone, Debug, PartialEq)]
@@ -128,6 +143,11 @@ impl Listing {
 struct Hover {
     owner: u64,
     position: (f64, f64),
+    /// `enter` 的 serial：改口（收 / 不收）时 `accept` 要带上它。
+    serial: u32,
+    /// 现在是不是告诉了合成器「这里收」。观看窗口此刻不能收（没开拖放、指针在
+    /// 画面外）时要改口，否则源以为落下会被收下。
+    accepting: bool,
     offer: Option<wl_data_offer::WlDataOffer>,
     listing: Option<Listing>,
     paths: Vec<PathBuf>,
@@ -135,11 +155,32 @@ struct Hover {
     dropped: bool,
     since: Instant,
 }
+impl Drop for Hover {
+    /// 这次拖动用完了：落下过的告诉源「收完了」，然后把 offer 还回去。
+    /// 不还的话每拖进一次就多一个永远不销毁的对象；落下后不 `finish`，有的
+    /// 合成器会把这次拖动当成取消，源（Nautilus 之类）还会一直等。
+    fn drop(&mut self) {
+        let Some(offer) = self.offer.take() else {
+            return;
+        };
+        let finishable = self.dropped
+            && self.accepting
+            && offer.version() >= 3
+            && offer_info(&offer).is_some_and(|info| {
+                let info = lock(info);
+                info.mimes.iter().any(|mime| mime == LIST_MIME)
+                    && info.action == Some(wl_data_device_manager::DndAction::Copy)
+            });
+        if finishable {
+            offer.finish();
+        }
+        offer.destroy();
+    }
+}
 
 #[derive(Default)]
 struct State {
     handle: Option<QueueHandle<State>>,
-    compositor: Option<wl_compositor::WlCompositor>,
     shm: Option<wl_shm::WlShm>,
     seat: Option<wl_seat::WlSeat>,
     manager: Option<wl_data_device_manager::WlDataDeviceManager>,
@@ -148,8 +189,12 @@ struct State {
     device: Option<wl_data_device::WlDataDevice>,
     /// 观看窗口的 surface（协议 id）→ 窗口标识。
     windows: HashMap<u32, u64>,
-    /// 最近一次左键按下的 serial；松手就没了，它只在按着的时候管用。
-    press: Option<u32>,
+    /// 指针此刻所在的我们自己的 surface。
+    focus: Option<wl_surface::WlSurface>,
+    /// 最近一次左键按下的 serial 和按在哪块 surface 上；松手就没了，它只在按着
+    /// 的时候管用。`start_drag` 的 origin 必须是这块 surface：GNOME、wlroots 一系
+    /// 都会核对「origin 就是握着这次 implicit grab 的 surface」，对不上就不发起。
+    press: Option<(u32, wl_surface::WlSurface)>,
     hover: Option<Hover>,
     request: Option<Request>,
     sending: Option<Sending>,
@@ -240,7 +285,9 @@ impl Linked {
             handle: Some(handle.clone()),
             ..State::default()
         };
-        // 这里会阻塞读 socket：此刻 winit 还没进它自己的循环，不冲突。
+        // 这里会阻塞读 socket，但只在这条事件队列上：libwayland 的
+        // prepare_read/read_events 让 winit 那条队列照常收到它的事件，等这一轮
+        // 回调返回、winit 下次进 poll 之前自己会把它们分发掉。
         queue
             .roundtrip(&mut state)
             .context("读取 Wayland 全局对象失败")?;
@@ -252,10 +299,7 @@ impl Linked {
         state.pointer = Some(seat.get_pointer(&handle, ()));
         state.device = Some(manager.get_data_device(&seat, &handle, ()));
         connection.flush().context("发送 Wayland 请求失败")?;
-        tracing::info!(
-            compositor = state.compositor.is_some(),
-            "viewer attached a second wayland client for drag and drop"
-        );
+        tracing::info!("viewer attached a second wayland client for drag and drop");
         Ok(Self {
             inner: Mutex::new(Inner {
                 connection,
@@ -281,7 +325,12 @@ impl Linked {
     pub fn unwatch(&self, owner: u64) {
         let mut inner = lock(&self.inner);
         inner.state.windows.retain(|_, watched| *watched != owner);
-        if inner.state.hover.as_ref().is_some_and(|hover| hover.owner == owner) {
+        if inner
+            .state
+            .hover
+            .as_ref()
+            .is_some_and(|hover| hover.owner == owner)
+        {
             inner.state.hover = None;
         }
     }
@@ -313,22 +362,66 @@ impl Linked {
         Some(Hovering {
             position: hover.position,
             paths: hover.paths.clone(),
-            dropped: hover.dropped,
+            // 清单读完之前不报落下：drop 常常比清单先到，这时交出去的是空的。
+            dropped: hover.dropped && hover.listing.is_none(),
         })
     }
 
     /// 本机拖动是不是已经落下并交完了（落点那边等它收尾）。
     pub fn drop_taken(&self, owner: u64) -> bool {
         let mut inner = lock(&self.inner);
-        let taken = inner
-            .state
-            .hover
-            .as_ref()
-            .is_some_and(|hover| hover.owner == owner && hover.dropped);
+        let taken =
+            inner.state.hover.as_ref().is_some_and(|hover| {
+                hover.owner == owner && hover.dropped && hover.listing.is_none()
+            });
         if taken {
             inner.state.hover = None;
         }
         taken
+    }
+
+    /// 观看窗口此刻能不能收下这次拖动（拖放开着、指针落在画面上）。合成器据此
+    /// 决定松手时是投递还是取消，源也据此显示能不能放。
+    pub fn set_accepting(&self, owner: u64, accepting: bool) {
+        let mut inner = lock(&self.inner);
+        let Inner {
+            connection, state, ..
+        } = &mut *inner;
+        let Some(hover) = state.hover.as_mut().filter(|hover| hover.owner == owner) else {
+            return;
+        };
+        if hover.dropped || hover.accepting == accepting {
+            return;
+        }
+        let Some(offer) = hover.offer.as_ref() else {
+            return;
+        };
+        hover.accepting = accepting;
+        Self::offer_actions(offer, hover.serial, accepting);
+        let _ = connection.flush();
+    }
+
+    /// 对一份 offer 说收还是不收：收的话只认文件清单、只做复制。
+    fn offer_actions(offer: &wl_data_offer::WlDataOffer, serial: u32, accepting: bool) {
+        let has_list = offer_info(offer)
+            .is_some_and(|info| lock(info).mimes.iter().any(|mime| mime == LIST_MIME));
+        if accepting && has_list {
+            offer.accept(serial, Some(LIST_MIME.to_owned()));
+            if offer.version() >= 3 {
+                offer.set_actions(
+                    wl_data_device_manager::DndAction::Copy,
+                    wl_data_device_manager::DndAction::Copy,
+                );
+            }
+        } else {
+            offer.accept(serial, None);
+            if offer.version() >= 3 {
+                offer.set_actions(
+                    wl_data_device_manager::DndAction::empty(),
+                    wl_data_device_manager::DndAction::empty(),
+                );
+            }
+        }
     }
 
     /// 从任意线程登记一次本地拖动：文件备好之后由 UI 线程发出去。
@@ -377,13 +470,14 @@ impl Linked {
         let Some(hover) = state.hover.as_mut() else {
             return;
         };
-        if let Some(listing) = hover.listing.as_mut()
-            && listing.drain()
-        {
-            hover.paths = listing.paths();
-            hover.listing = None;
+        if let Some(listing) = hover.listing.as_mut() {
+            let done = listing.drain();
+            if done || (hover.dropped && hover.since.elapsed() > DROP_LIST_WAIT) {
+                hover.paths = listing.paths();
+                hover.listing = None;
+            }
         }
-        if hover.listing.is_none() && hover.since.elapsed() > HOVER_LIMIT {
+        if hover.since.elapsed() > HOVER_LIMIT {
             state.hover = None;
         }
     }
@@ -396,10 +490,12 @@ impl Linked {
                     Ok(files) => {
                         // 用户可能已经松手了；没有按着就没有 implicit grab，
                         // 这个 serial 发出去只会被合成器丢掉。
-                        match (files, state.press) {
-                            (Ok(files), Some(serial)) => {
+                        match (files, state.press.clone()) {
+                            (Ok(files), Some((serial, origin))) => {
                                 let request = state.request.take().unwrap();
-                                if let Err(error) = Self::start(state, request, files, serial) {
+                                if let Err(error) =
+                                    Self::start(state, request, files, serial, &origin)
+                                {
                                     tracing::warn!(%error, "无法发起本地文件拖动");
                                 }
                             }
@@ -457,18 +553,21 @@ impl Linked {
         }
     }
 
-    /// 真正发起一次 Wayland 拖动。origin 用自己建的 surface：它只是 icon 和坐标
-    /// 的参照，不必、也不该占着某个观看窗口。
-    fn start(state: &mut State, request: Request, files: Files, serial: u32) -> Result<()> {
-        let (compositor, manager, device, handle) = (
-            state.compositor.clone(),
+    /// 真正发起一次 Wayland 拖动。origin 是用户按着的那块观看窗口的 surface：
+    /// 合成器核对的正是「这次 implicit grab 属于它」。
+    fn start(
+        state: &mut State,
+        request: Request,
+        files: Files,
+        serial: u32,
+        origin: &wl_surface::WlSurface,
+    ) -> Result<()> {
+        let (manager, device, handle) = (
             state.manager.clone(),
             state.device.clone(),
             state.handle.clone(),
         );
-        let (Some(compositor), Some(manager), Some(device), Some(handle)) =
-            (compositor, manager, device, handle)
-        else {
+        let (Some(manager), Some(device), Some(handle)) = (manager, device, handle) else {
             bail!("拖放连接尚未就绪");
         };
         if files.paths.is_empty() {
@@ -481,12 +580,11 @@ impl Linked {
         }
         // 上一次还没收尾就再来一次：先把旧的收掉，别把它的通知漏了。
         State::stop_sending(state, false, Some("被新的拖动顶掉了".into()));
-        let origin = compositor.create_surface(&handle, ());
         let source = manager.create_data_source(&handle, ());
         source.offer(LIST_MIME.to_owned());
         source.offer("text/plain;charset=utf-8".to_owned());
         source.set_actions(wl_data_device_manager::DndAction::Copy);
-        device.start_drag(Some(&source), &origin, None, serial);
+        device.start_drag(Some(&source), origin, None, serial);
         tracing::info!(
             drag = request.id,
             selections = files.paths.len(),
@@ -502,7 +600,6 @@ impl Linked {
         });
         Ok(())
     }
-
 }
 
 impl Dispatch<wl_registry::WlRegistry, ()> for State {
@@ -524,9 +621,6 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
         };
         state.registry = Some(registry.clone());
         match interface.as_str() {
-            "wl_compositor" => {
-                state.compositor = Some(registry.bind(name, version.min(6), handle, ()));
-            }
             "wl_seat" => {
                 state.seat = Some(registry.bind(name, version.min(8), handle, ()));
             }
@@ -546,18 +640,6 @@ impl Dispatch<wl_seat::WlSeat, ()> for State {
         _: &mut Self,
         _: &wl_seat::WlSeat,
         _: wl_seat::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-    }
-}
-
-impl Dispatch<wl_compositor::WlCompositor, ()> for State {
-    fn event(
-        _: &mut Self,
-        _: &wl_compositor::WlCompositor,
-        _: wl_compositor::Event,
         _: &(),
         _: &Connection,
         _: &QueueHandle<Self>,
@@ -634,21 +716,24 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        // 只关心左键那一次按住：`start_drag` 要的正是它的 serial。按下的窗口
-        // 必然是这台机器的某个观看窗口，否则事件不会落到我们头上。
-        if let wl_pointer::Event::Button {
-            serial,
-            button,
-            state: which,
-            ..
-        } = event
-            && button == BTN_LEFT
-        {
-            match which {
-                WEnum::Value(wl_pointer::ButtonState::Pressed) => state.press = Some(serial),
+        // 只关心左键那一次按住：`start_drag` 要的正是它的 serial 和按住的那块
+        // surface。事件只会落在这个进程自己的窗口上。
+        match event {
+            wl_pointer::Event::Enter { surface, .. } => state.focus = Some(surface),
+            wl_pointer::Event::Leave { .. } => state.focus = None,
+            wl_pointer::Event::Button {
+                serial,
+                button: BTN_LEFT,
+                state: which,
+                ..
+            } => match which {
+                WEnum::Value(wl_pointer::ButtonState::Pressed) => {
+                    state.press = state.focus.clone().map(|surface| (serial, surface));
+                }
                 WEnum::Value(wl_pointer::ButtonState::Released) => state.press = None,
                 _ => {}
-            }
+            },
+            _ => {}
         }
     }
 }
@@ -659,7 +744,7 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for State {
         handle: &QueueHandle<Self>,
     ) -> Arc<dyn wayland_client::backend::ObjectData> {
         assert_eq!(opcode, wl_data_device::EVT_DATA_OFFER_OPCODE);
-        handle.make_data::<wl_data_offer::WlDataOffer, ()>(())
+        handle.make_data::<wl_data_offer::WlDataOffer, Mutex<OfferInfo>>(Mutex::default())
     }
 
     fn event(
@@ -682,15 +767,22 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for State {
                 id,
             } => {
                 let key = surface.id().protocol_id();
+                // 上一次没收尾的（漏了 leave）在这里还掉。
+                state.hover = None;
                 let Some(owner) = state.windows.get(&key).copied() else {
-                    // 不是观看窗口，别去接别人的拖动。
+                    // 不是观看窗口，别去接别人的拖动；offer 也还回去。
                     tracing::debug!(surface = key, "拖动落在没登记的 surface 上");
+                    if let Some(offer) = id {
+                        offer.destroy();
+                    }
                     return;
                 };
                 tracing::debug!(surface = key, owner, x, y, "本机拖动进了观看窗口");
                 let mut hover = Hover {
                     owner,
                     position: (f64::from(x), f64::from(y)),
+                    serial,
+                    accepting: true,
                     offer: id,
                     listing: None,
                     paths: Vec::new(),
@@ -698,22 +790,27 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for State {
                     since: Instant::now(),
                 };
                 if let Some(offer) = hover.offer.as_ref() {
-                    // 接下这一次拖动：不 accept 的话合成器会把落点当成不收，
-                    // 松手时源等到的就是 cancelled。
-                    offer.set_actions(
-                        wl_data_device_manager::DndAction::Copy,
-                        wl_data_device_manager::DndAction::Copy,
-                    );
-                    offer.accept(serial, Some(LIST_MIME.to_owned()));
+                    // 先按「收」接下：不 accept 的话合成器会把落点当成不收，松手时
+                    // 源等到的就是 cancelled。此刻收不了的话观看窗口下一轮会改口
+                    // （`set_accepting`）。没挂文件清单的拖动（纯文字之类）不收。
+                    Linked::offer_actions(offer, serial, true);
+                    let has_list = offer_info(offer)
+                        .is_some_and(|info| lock(info).mimes.iter().any(|mime| mime == LIST_MIME));
+                    hover.accepting = has_list;
                     // 悬停期间就问一次清单：落点要据此决定收不收，预览也靠它。
-                    hover.listing = Self::ask(offer, LIST_MIME);
+                    if has_list {
+                        hover.listing = Self::ask(offer, LIST_MIME);
+                    }
                     let _ = connection.flush();
                 }
                 state.hover = Some(hover);
             }
             wl_data_device::Event::Motion { x, y, .. } => {
-                if let Some(hover) = state.hover.as_mut() {
+                if let Some(hover) = state.hover.as_mut()
+                    && !hover.dropped
+                {
                     hover.position = (f64::from(x), f64::from(y));
+                    hover.since = Instant::now();
                 }
             }
             wl_data_device::Event::Leave => {
@@ -731,12 +828,17 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for State {
                 hover.since = Instant::now();
                 // 悬停那份可能还没写完（drop 常常先到），落点这里再要一次。
                 if let Some(offer) = hover.offer.as_ref()
+                    && hover.accepting
                     && hover.paths.is_empty()
+                    && hover.listing.is_none()
                 {
                     hover.listing = Self::ask(offer, LIST_MIME);
                     let _ = connection.flush();
                 }
             }
+            // 剪贴板的 offer 也会到这个 data device 上；我们不读，立刻还回去，
+            // 否则每复制一次就多一个永远不销毁的对象。
+            wl_data_device::Event::Selection { id: Some(offer) } => offer.destroy(),
             _ => {}
         }
     }
@@ -765,16 +867,23 @@ impl State {
     }
 }
 
-impl Dispatch<wl_data_offer::WlDataOffer, ()> for State {
+impl Dispatch<wl_data_offer::WlDataOffer, Mutex<OfferInfo>> for State {
     fn event(
         _: &mut Self,
         _: &wl_data_offer::WlDataOffer,
         event: wl_data_offer::Event,
-        _: &(),
+        info: &Mutex<OfferInfo>,
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        tracing::debug!(?event, "本机拖放 offer 事件");
+        tracing::trace!(?event, "本机拖放 offer 事件");
+        match event {
+            wl_data_offer::Event::Offer { mime_type } => lock(info).mimes.push(mime_type),
+            wl_data_offer::Event::Action {
+                dnd_action: WEnum::Value(action),
+            } => lock(info).action = Some(action),
+            _ => {}
+        }
     }
 }
 
@@ -807,9 +916,19 @@ impl Dispatch<wl_data_source::WlDataSource, ()> for State {
                         .collect::<Vec<_>>()
                         .join("\n")
                 };
+                // 对端读得慢（或者干脆不读）时，写满管道会卡住 UI 线程，所以交给
+                // 一个短命的线程去写。
                 let mut pipe = std::fs::File::from(fd);
-                if let Err(error) = pipe.write_all(text.as_bytes()) {
-                    tracing::debug!(%error, "写文件清单失败");
+                let spawned =
+                    std::thread::Builder::new()
+                        .name("drag list".into())
+                        .spawn(move || {
+                            if let Err(error) = pipe.write_all(text.as_bytes()) {
+                                tracing::debug!(%error, "写文件清单失败");
+                            }
+                        });
+                if let Err(error) = spawned {
+                    tracing::debug!(%error, "无法启动写文件清单的线程");
                 }
             }
             wl_data_source::Event::Cancelled => Self::stop_sending(state, false, None),
@@ -823,7 +942,9 @@ impl Dispatch<wl_data_source::WlDataSource, ()> for State {
             }
             wl_data_source::Event::Action { dnd_action } => {
                 let effect = match dnd_action {
-                    WEnum::Value(action) if action.contains(wl_data_device_manager::DndAction::Copy) => {
+                    WEnum::Value(action)
+                        if action.contains(wl_data_device_manager::DndAction::Copy) =>
+                    {
                         super::COPY
                     }
                     _ => 0,
@@ -905,11 +1026,9 @@ impl Linked {
         };
         let size = window.inner_size();
         let (width, height) = (size.width.max(1), size.height.max(1));
-        let surface = wl_surface::WlSurface::from_id(
-            &lock(&self.inner).connection,
-            surface_id(surface)?,
-        )
-        .map_err(|_| anyhow::anyhow!("无法接管窗口的 wl_surface"))?;
+        let surface =
+            wl_surface::WlSurface::from_id(&lock(&self.inner).connection, surface_id(surface)?)
+                .map_err(|_| anyhow::anyhow!("无法接管窗口的 wl_surface"))?;
         let mut inner = lock(&self.inner);
         let Inner {
             connection,
@@ -1023,7 +1142,9 @@ mod tests {
             if self.linked.is_some() {
                 return true;
             }
-            let window = match event_loop.create_window(WindowAttributes::default().with_title(self.title)) {
+            let window = match event_loop
+                .create_window(WindowAttributes::default().with_title(self.title))
+            {
                 Ok(window) => Arc::new(window),
                 Err(error) => {
                     eprintln!("建窗口失败：{error}");
@@ -1063,7 +1184,11 @@ mod tests {
         ///
         /// 回调是在 [`Linked`] 的锁里跑的：**不要在它里面调任何加锁的方法**
         /// （`request_drag` 之类），那会死锁——真实代码里那些都是从别的线程调的。
-        fn poll(&mut self, event_loop: &ActiveEventLoop, ctx: &mut impl FnMut(&Arc<Linked>)) -> bool {
+        fn poll(
+            &mut self,
+            event_loop: &ActiveEventLoop,
+            ctx: &mut impl FnMut(&Arc<Linked>),
+        ) -> bool {
             if let Some(linked) = self.linked.clone() {
                 linked.pump();
                 ctx(&linked);
@@ -1112,7 +1237,12 @@ mod tests {
                 }
             }
 
-            fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
+            fn window_event(
+                &mut self,
+                event_loop: &ActiveEventLoop,
+                _: WindowId,
+                event: WindowEvent,
+            ) {
                 match event {
                     WindowEvent::CloseRequested => event_loop.exit(),
                     // 合成器定下尺寸之前贴的那块是最小的，configure 之后要补一块。
@@ -1189,7 +1319,12 @@ mod tests {
                 }
             }
 
-            fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
+            fn window_event(
+                &mut self,
+                event_loop: &ActiveEventLoop,
+                _: WindowId,
+                event: WindowEvent,
+            ) {
                 match event {
                     WindowEvent::CloseRequested => event_loop.exit(),
                     WindowEvent::Resized(_) => {
@@ -1211,7 +1346,11 @@ mod tests {
                 };
                 if !self.requested {
                     // 锁已经放开了才登记：`request_drag` 自己要拿那把锁。
-                    let serial = lock(&linked.inner).state.press;
+                    let serial = lock(&linked.inner)
+                        .state
+                        .press
+                        .as_ref()
+                        .map(|press| press.0);
                     if let Some(serial) = serial {
                         eprintln!("拿到按下的 serial={serial}，发起拖动");
                         self.requested = true;

@@ -167,6 +167,9 @@ impl WindowDrag {
         let scale = f64::from(window.scale_factor());
         let position = PhysicalPosition::new(hover.position.0 * scale, hover.position.1 * scale);
         let target = point(position).filter(|_| available);
+        // 收不了（拖放没开、指针在画面外）就如实告诉合成器，源那边才显示不能放、
+        // 松手也不会以为被收下了。
+        linked.set_accepting(self.owner, target.is_some());
         if !self.hovering {
             // `leave` 会把上一份清单清掉，所以清单要在它之后再补。
             self.leave();
