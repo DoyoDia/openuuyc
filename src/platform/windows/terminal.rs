@@ -159,8 +159,8 @@ pub(crate) struct Session {
     /// Input queued for the writer thread; `None` once it has stopped.
     input: Mutex<Option<SyncSender<Vec<u8>>>>,
     /// Output the reader thread has produced but the frame layer has not
-    /// taken yet.
-    output: Mutex<Receiver<Vec<u8>>>,
+    /// taken yet; `None` once the session is being torn down.
+    output: Mutex<Option<Receiver<Vec<u8>>>>,
     shell: String,
 }
 
@@ -220,7 +220,7 @@ impl Session {
             process,
             job,
             input: Mutex::new(Some(input_tx)),
-            output: Mutex::new(output_rx),
+            output: Mutex::new(Some(output_rx)),
             shell: shell.to_owned(),
         })
     }
@@ -236,6 +236,9 @@ impl Session {
     /// is how the reader reports a closed console.
     pub(crate) fn read(&self, buffer: &mut [u8]) -> Result<Option<usize>> {
         let channel = self.output.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(channel) = channel.as_ref() else {
+            return Ok(Some(0));
+        };
         match channel.try_recv() {
             Ok(chunk) => {
                 let take = chunk.len().min(buffer.len());
@@ -295,17 +298,26 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        // Closing the console hangs the shell up; the child is then killed so
-        // it cannot outlive the session, and the handles are released.
-        // SAFETY: every handle was created in `open` and is owned here.
+        // The shell and everything it started go first, so nothing is left
+        // writing to the console.
+        self.job.terminate();
+        // SAFETY: the process handle was created in `open` and is owned here.
+        unsafe {
+            let _ = TerminateProcess(self.process, 1);
+        }
+        // Then the channels. Before Windows 11 24H2, `ClosePseudoConsole`
+        // waits until the console's last output has been read; a reader stuck
+        // on a full channel (a detached or backpressured session) would never
+        // read it, and the close would hang this thread for good. Without a
+        // receiver the reader's next send fails and it closes the pipe, which
+        // ends the console's write. Dropping the sender ends the writer.
+        let _ = self.output.get_mut().unwrap_or_else(|e| e.into_inner()).take();
+        let _ = self.input.get_mut().unwrap_or_else(|e| e.into_inner()).take();
+        // SAFETY: as above; neither handle is used again.
         unsafe {
             ClosePseudoConsole(self.console);
-            let _ = TerminateProcess(self.process, 1);
             let _ = CloseHandle(self.process);
         }
-        // Dropping the sender ends the writer thread; the console close ends
-        // the reader.
-        let _ = self.input.lock().unwrap_or_else(|e| e.into_inner()).take();
     }
 }
 
@@ -517,7 +529,8 @@ impl Session {
     /// Closing the console alone only hangs the shell up and leaves whatever
     /// it spawned running; the job is what makes this mean the same thing as
     /// it does on Linux, where the shell's whole session is walked. `self`
-    /// then drops, which closes the console and the handles.
+    /// then drops, which closes the console and the handles. Dropping alone
+    /// ends the job too, so this mainly states the intent at the call site.
     pub(crate) fn terminate(self) {
         self.job.terminate();
     }
