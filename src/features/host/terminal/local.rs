@@ -831,6 +831,14 @@ mod tests {
 
         let stale = dir.join("stale.sock");
         drop(UnixListener::bind(&stale).expect("left behind"));
+        // Other tests fork shells meanwhile, and a child holds the listener
+        // until it execs; wait until nobody is listening, as for a socket a
+        // dead process left behind.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while UnixStream::connect(&stale).is_ok() {
+            assert!(std::time::Instant::now() < deadline, "the socket closes");
+            std::thread::sleep(Duration::from_millis(10));
+        }
         listen_at(&stale, table()).expect("a stale socket is replaced");
         assert_eq!(
             request(&stale, b"{\"action\":\"list\"}\n"),
