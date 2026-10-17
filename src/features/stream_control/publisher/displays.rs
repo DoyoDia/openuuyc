@@ -253,32 +253,11 @@ pub(crate) async fn receive_session(
                     if let Err(error) = &result {
                         tracing::warn!(%error, "host terminal rename rejected");
                     }
-                    // Field order and names are the server's own descriptor:
-                    //
-                    //   message RenameSessionResp {
-                    //     uint32 session_id = 1;
-                    //     int32  code       = 2;
-                    //     string message    = 3;
-                    //   }
-                    //
-                    // We had code first and the handle third, so the reply
-                    // carried sessionId on a field the client does not read.
-                    // Combined with the wrong oneof tag in `wire.rs`, the
-                    // rename landed here and vanished on its way to the phone.
-                    #[derive(Clone, PartialEq, prost::Message)]
-                    struct RenameResp {
-                        #[prost(uint32, tag = "1")]
-                        session_id: u32,
-                        #[prost(int32, tag = "2")]
-                        code: i32,
-                        #[prost(string, tag = "3")]
-                        message: String,
-                    }
                     return Ok(response(
                         &message,
                         header,
                         PbRpcResponsePayload::TerminalRenameSessionRsp(
-                            RenameResp {
+                            RenameSessionResp {
                                 session_id: request.session_id,
                                 code,
                                 message: detail,
@@ -730,6 +709,25 @@ async fn apply_setting(
     Ok(errors)
 }
 
+/// The terminal rename reply, in the reference server's own descriptor:
+///
+/// ```text
+/// message RenameSessionResp {
+///   uint32 session_id = 1;
+///   int32  code       = 2;
+///   string message    = 3;
+/// }
+/// ```
+#[derive(Clone, PartialEq, prost::Message)]
+struct RenameSessionResp {
+    #[prost(uint32, tag = "1")]
+    session_id: u32,
+    #[prost(int32, tag = "2")]
+    code: i32,
+    #[prost(string, tag = "3")]
+    message: String,
+}
+
 fn report_display_result(result: &Result<()>) {
     if let Err(error) = result {
         tracing::warn!(%error,"host display operation rejected or failed");
@@ -777,4 +775,22 @@ fn configure_media(
         }
     }
     Ok(errors)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The handle goes first, then the code and the message, as the reference
+    /// descriptor numbers them.
+    #[test]
+    fn the_rename_reply_follows_the_reference_descriptor() {
+        let encoded = RenameSessionResp {
+            session_id: 7,
+            code: 1,
+            message: "x".to_owned(),
+        }
+        .encode_to_vec();
+        assert_eq!(encoded, [0x08, 7, 0x10, 1, 0x1a, 1, b'x']);
+    }
 }

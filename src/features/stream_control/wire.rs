@@ -406,13 +406,12 @@ pub(super) enum PbRpcResponsePayload {
     EnterSuperScreenRep(Vec<u8>),
     #[prost(message, tag = "23")]
     DrawResp(annotation::PbDrawResponse),
-    // UU 4.41.2.2602 rpc_main.proto uses 24 and 26 (25 is absent).
-    // Keep opaque responses in the oneof; terminal execution is not enabled.
+    // UU 4.41.2.2602 rpc_main.proto uses 24 and 26 (25 is absent), as does
+    // the reference server's own `RpcResponse` descriptor. The terminal
+    // handlers encode the bodies themselves, so the oneof keeps them opaque.
     #[prost(bytes, tag = "24")]
     TerminalCheckEnvRsp(Vec<u8>),
-    // 26, not 25: the server's own `RpcResponse` descriptor skips 25, and a
-    // reply on a field the client does not know is dropped, which is why a
-    // rename that succeeded on this side still showed as failed on the phone.
+    // 26, not 25: a reply on a field the client does not know is dropped.
     #[prost(bytes, tag = "26")]
     TerminalRenameSessionRsp(Vec<u8>),
 }
@@ -558,8 +557,8 @@ mod terminal_rpc_tests {
 
     /// The response oneof numbers the client reads, from the reference
     /// server's own `RpcResponse` descriptor. 25 is skipped there, and a
-    /// reply on a field the client does not know is dropped: the rename
-    /// happened host-side and the phone still showed a failure.
+    /// reply on a field the client does not know is dropped, leaving the
+    /// phone waiting for an answer that never comes.
     #[test]
     fn terminal_responses_use_the_reference_field_numbers() {
         let tag_of = |payload: PbRpcResponsePayload| {
@@ -593,28 +592,5 @@ mod terminal_rpc_tests {
             tag_of(PbRpcResponsePayload::DrawResp(Default::default())),
             (23, 2)
         );
-    }
-
-    /// The rename reply's own shape, likewise from the reference descriptor:
-    /// `uint32 session_id = 1; int32 code = 2; string message = 3;`.
-    #[test]
-    fn rename_response_puts_the_session_id_first() {
-        #[derive(Clone, PartialEq, prost::Message)]
-        struct RenameResp {
-            #[prost(uint32, tag = "1")]
-            session_id: u32,
-            #[prost(int32, tag = "2")]
-            code: i32,
-            #[prost(string, tag = "3")]
-            message: String,
-        }
-        let encoded = RenameResp {
-            session_id: 7,
-            code: 0,
-            message: String::new(),
-        }
-        .encode_to_vec();
-        // field 1 varint, value 7.
-        assert_eq!(encoded, vec![0x08, 0x07]);
     }
 }
