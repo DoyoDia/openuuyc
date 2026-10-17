@@ -342,6 +342,9 @@ impl Ended {
 pub(crate) struct Sessions {
     sessions: HashMap<(String, u32), Session>,
     next_name: u64,
+    /// The version of the session list. Every change bumps it, and attached
+    /// connections use it to tell the controller to re-list.
+    generation: u64,
 }
 
 /// Why a session operation was refused.
@@ -407,11 +410,10 @@ impl Sessions {
             existing.attached = Some(connection);
             existing.detached_since = None;
             existing.last_active_ms = now_ms();
-            return Ok((
-                handle,
-                existing.name.clone(),
-                existing.screen.screen().state_formatted(),
-            ));
+            let name = existing.name.clone();
+            let replay = existing.screen.screen().state_formatted();
+            self.touch();
+            return Ok((handle, name, replay));
         }
         if self.owned(owner).count() >= MAX_SESSIONS || self.sessions.len() >= MAX_TOTAL {
             return Err(SessionError::TooMany);
@@ -441,7 +443,18 @@ impl Sessions {
                 detached_since: None,
             },
         );
+        self.touch();
         Ok((handle, name, Vec::new()))
+    }
+
+    /// The list changed.
+    fn touch(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    /// The current version of the session list.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
     }
 
     fn owned<'a>(&'a self, owner: &'a str) -> impl Iterator<Item = (u32, &'a Session)> + 'a {
@@ -559,6 +572,7 @@ impl Sessions {
             return Err(SessionError::DuplicateName);
         }
         self.get_mut(owner, handle)?.name = name;
+        self.touch();
         Ok(())
     }
 
@@ -570,16 +584,23 @@ impl Sessions {
             .filter(|(who, _)| who == owner)
             .cloned()
             .collect();
-        Ended::forced(
-            keys.iter()
-                .filter_map(|key| self.sessions.remove(key))
-                .collect(),
-        )
+        let ended: Vec<_> = keys
+            .iter()
+            .filter_map(|key| self.sessions.remove(key))
+            .collect();
+        if !ended.is_empty() {
+            self.touch();
+        }
+        Ended::forced(ended)
     }
 
     /// Ends every session, whoever opened it.
     pub(crate) fn kill_all(&mut self) -> Ended {
-        Ended::forced(self.sessions.drain().map(|(_, session)| session).collect())
+        let all: Vec<_> = self.sessions.drain().map(|(_, session)| session).collect();
+        if !all.is_empty() {
+            self.touch();
+        }
+        Ended::forced(all)
     }
 
     /// Removes one of `owner`'s sessions; finishing the result ends the shell.
@@ -588,12 +609,14 @@ impl Sessions {
             .sessions
             .remove(&key(owner, handle))
             .ok_or(SessionError::Gone)?;
+        self.touch();
         Ok(Ended::forced(vec![session]))
     }
 
     /// Lets go of one of `owner`'s sessions without ending the shell.
     pub(crate) fn detach(&mut self, owner: &str, handle: u32) -> Result<(), SessionError> {
         self.get_mut(owner, handle)?.let_go();
+        self.touch();
         Ok(())
     }
 
@@ -678,12 +701,14 @@ impl Sessions {
             })
             .map(|(key, _)| key.clone())
             .collect();
-        Ended::exited(
-            exited
-                .iter()
-                .filter_map(|key| self.sessions.remove(key))
-                .collect(),
-        )
+        let ended: Vec<_> = exited
+            .iter()
+            .filter_map(|key| self.sessions.remove(key))
+            .collect();
+        if !ended.is_empty() {
+            self.touch();
+        }
+        Ended::exited(ended)
     }
 
     /// Takes out the shells nobody is attached to that have exited, and ends
@@ -709,7 +734,12 @@ impl Sessions {
                 .filter_map(|key| self.sessions.remove(key))
                 .collect()
         };
-        (Ended::exited(take(exited)), Ended::forced(take(abandoned)))
+        let exited = take(exited);
+        let abandoned = take(abandoned);
+        if !exited.is_empty() || !abandoned.is_empty() {
+            self.touch();
+        }
+        (Ended::exited(exited), Ended::forced(abandoned))
     }
 
     #[cfg(test)]
@@ -915,6 +945,9 @@ pub(crate) fn bind(
     let pump_channel = Arc::downgrade(channel);
     let table = shared();
     tokio::spawn(async move {
+        // Start from the version seen at connect time, so establishing the
+        // connection does not itself send a notification.
+        let mut listed_generation = lock_table(&table).generation();
         let mut ticker = tokio::time::interval(std::time::Duration::from_millis(20));
         loop {
             ticker.tick().await;
@@ -935,6 +968,24 @@ pub(crate) fn bind(
                 cancel.cancel();
                 let _ = channel.close().await;
                 break;
+            }
+            // The list changed, so broadcast an empty notification; the
+            // controller re-lists on its own. Pushing type 10 does not work:
+            // it only accepts the first response after a request it made.
+            let generation = lock_table(&table).generation();
+            if generation != listed_generation {
+                let changed =
+                    crate::features::stream_control::publisher::terminal_session_changed();
+                tracing::debug!(generation, "host terminal session list changed");
+                if channel
+                    .send_text_bytes(&Bytes::from(changed))
+                    .await
+                    .is_err()
+                {
+                    pump_stop.cancel();
+                    break;
+                }
+                listed_generation = generation;
             }
             let room = OUTPUT_HIGH_WATER.saturating_sub(channel.buffered_amount().await);
             if room == 0 {
@@ -1800,5 +1851,34 @@ mod tests {
         );
         assert_eq!(geometry(&[50, 0, 20, 0]), (Some(50), Some(20)));
         assert_eq!(geometry(b""), (None, None));
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "macos", windows)),
+        ignore = "no terminal backend on this platform"
+    )]
+    fn the_list_generation_moves_with_the_table() {
+        let mut sessions = Sessions::default();
+        let before = sessions.generation();
+        sessions
+            .open("acct", 1, 1, shell(), None, 80, 24)
+            .expect("open");
+        let created = sessions.generation();
+        assert_ne!(created, before, "creating a session bumps the list");
+        sessions.rename("acct", 1, "renamed").expect("rename");
+        let renamed = sessions.generation();
+        assert_ne!(renamed, created, "renaming bumps the list");
+        sessions.kill("acct", 1).expect("kill").finish();
+        assert_ne!(sessions.generation(), renamed, "killing bumps the list");
+    }
+
+    #[test]
+    fn a_session_change_is_the_control_message_field() {
+        // PbControlMessage's oneof field 28 (wire type 2), empty message.
+        assert_eq!(
+            crate::features::stream_control::publisher::terminal_session_changed(),
+            [0xE2, 0x01, 0x00]
+        );
     }
 }
