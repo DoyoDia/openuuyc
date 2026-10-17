@@ -1,6 +1,7 @@
 //! Machine-owned headless display. It is deliberately absent from session
 //! journals/preferences: closing a connection must not unplug the only screen.
 use super::*;
+#[cfg(windows)]
 use crate::platform::display::{
     topology::VirtualProvider,
     virtual_driver::{FALLBACK_ID, Output},
@@ -32,6 +33,7 @@ fn clear_record() -> Result<()> {
         Err(e) => Err(e.into()),
     }
 }
+#[cfg(windows)]
 pub(super) fn target(output: Output, targets: &[Target]) -> Option<&Target> {
     targets.iter().find(|t| {
         t.adapter == output.adapter
@@ -41,12 +43,14 @@ pub(super) fn target(output: Output, targets: &[Target]) -> Option<&Target> {
                 .contains("#openuuycdisplay#")
     })
 }
+#[cfg(windows)]
 fn replacement(t: &Target, own: Option<Output>) -> bool {
     t.active
         && t.available
         && t.virtual_provider != Some(VirtualProvider::Uu)
         && own.is_none_or(|o| o.adapter != t.adapter || o.target != t.target)
 }
+#[cfg(windows)]
 pub(crate) fn pin() -> Result<Option<Driver>> {
     if Driver::device_instance().is_err() {
         return Ok(None);
@@ -58,6 +62,7 @@ pub(crate) fn pin() -> Result<Option<Driver>> {
     driver.pin_fallback()?;
     Ok(Some(driver))
 }
+#[cfg(windows)]
 pub(super) fn screen(driver: &Driver) -> Result<Option<capture::Screen>> {
     let Some(output) = driver.fallback()? else {
         return Ok(None);
@@ -78,6 +83,7 @@ pub(super) fn screen(driver: &Driver) -> Result<Option<capture::Screen>> {
 
 /// Caller holds DisplayMutation. `ignore` contains only its verified session
 /// targets about to be removed; no other driver's target is excluded this way.
+#[cfg(windows)]
 pub(super) fn ensure(
     driver: &Driver,
     width: u32,
@@ -181,6 +187,7 @@ pub(super) fn ensure(
     anyhow::bail!("常驻虚拟屏已建立，但尚未得到桌面画面；保留屏幕等待恢复")
 }
 
+#[cfg(windows)]
 pub(super) fn retire(driver: &Driver, replacement_identity: Option<&str>) -> Result<bool> {
     let (output, users) = driver.fallback_state()?;
     if users > u32::from(driver.owns_fallback_pin()) {
@@ -209,11 +216,13 @@ pub(super) fn retire(driver: &Driver, replacement_identity: Option<&str>) -> Res
     Ok(true)
 }
 
+#[cfg(windows)]
 #[derive(Default)]
 pub(crate) struct Maintainer {
     returning: Option<(String, Instant)>,
     protocol_retry: Option<Instant>,
 }
+#[cfg(windows)]
 impl Maintainer {
     pub(crate) fn tick(&mut self) -> Result<()> {
         if self.protocol_retry.is_some_and(|t| Instant::now() < t) {
@@ -273,6 +282,7 @@ impl Maintainer {
         Ok(())
     }
 }
+#[cfg(windows)]
 pub(crate) fn start_background() {
     // Installed mode has one account-independent service agent. A portable GUI
     // needs a local maintainer only while that service is unavailable.
@@ -307,3 +317,270 @@ pub(crate) fn start_background() {
             });
     });
 }
+
+// ---------------------------------------------------------------------------
+// Linux：兜底屏是一路 VKMS 连接器加合成器接管，不是驱动里的常驻显示器
+// ---------------------------------------------------------------------------
+
+/// Linux 上「机器所有」只能做到进程级：辅助程序把连接器租给这条连接，进程一退它
+/// 就收回去（见 `platform/linux/virtual_display.rs`）。断线不退还——连接结束时只是
+/// 放弃使用权，屏本身留到进程退出。
+#[cfg(not(windows))]
+struct Machine {
+    session: crate::platform::virtual_display::Session,
+    connector: String,
+    identity: String,
+    owners: std::collections::HashSet<String>,
+}
+
+#[cfg(not(windows))]
+static MACHINE: std::sync::LazyLock<std::sync::Mutex<Option<Machine>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+#[cfg(not(windows))]
+impl Machine {
+    fn present(&self) -> Result<Option<capture::Screen>> {
+        let screens = match capture::screens() {
+            Ok(screens) => screens,
+            // 零输出的机器上枚举本身就是失败，这里只是暂时没看见。
+            Err(_) => return Ok(None),
+        };
+        Ok(screens
+            .into_iter()
+            .find(|s| s.identity.as_deref() == Some(self.identity.as_str())))
+    }
+
+    /// 等合成器与采集都把新输出报出来。零输出时枚举会失败，等它就行。
+    fn wait(&mut self) -> Result<capture::Screen> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut last = None;
+            match capture::screens() {
+                Ok(screens) => {
+                    if let Some(screen) = screens
+                        .into_iter()
+                        .find(|s| s.identity.as_deref() == Some(self.identity.as_str()))
+                    {
+                        return Ok(screen);
+                    }
+                }
+                Err(error) => last = Some(format!("{error:#}")),
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "{}",
+                last.map_or_else(
+                    || "兜底虚拟屏创建后没有出现在桌面里".to_owned(),
+                    |error| format!("兜底虚拟屏创建后没有出现在桌面里：{error}")
+                )
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn verify_frame(screen: &capture::Screen) -> Result<()> {
+    let _runtime = crate::features::host::encoder::Runtime::new()?;
+    let mut desktop = capture::Desktop::open_selected(screen)?;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if desktop.next(20, 2, false, false, (1280, 720))?.is_some() && desktop.available {
+            tracing::info!(
+                screen = ?screen.identity,
+                backend = desktop.backend_name(),
+                "persistent headless display ready"
+            );
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    anyhow::bail!("兜底虚拟屏已建立，但尚未得到桌面画面；保留屏幕等待恢复")
+}
+
+/// 给兜底屏换分辨率。VKMS 的模式表里没有这些尺寸，只能让合成器现造一个模式；
+/// 换过的尺寸记下来，下一次按它重建。
+#[cfg(not(windows))]
+pub(super) fn resize(identity: &str, width: u32, height: u32) -> Result<capture::Screen> {
+    validate_modes(&[(width, height)])?;
+    {
+        let machine = lock(&MACHINE);
+        let current = machine.as_ref().context("兜底屏已不在")?;
+        ensure!(current.identity == identity, "不是兜底屏");
+        crate::platform::display::compositor::set_mode(
+            crate::platform::display::topology::output_name(identity),
+            width,
+            height,
+            Some(144),
+        )?;
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(screens) = capture::screens()
+            && let Some(screen) = screens
+                .into_iter()
+                .find(|s| s.identity.as_deref() == Some(identity))
+            && (screen.width, screen.height) == (width, height)
+        {
+            let mut record = store::read::<Record>(&path()?)?.unwrap_or(Record {
+                width,
+                height,
+                hz: 144,
+            });
+            record.width = width;
+            record.height = height;
+            store::write(&path()?, &record)?;
+            return Ok(screen);
+        }
+        ensure!(Instant::now() < deadline, "兜底屏没有切到请求的分辨率");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(not(windows))]
+pub(super) fn ensure(
+    token: &str,
+    width: u32,
+    height: u32,
+    verify: bool,
+) -> Result<Option<capture::Screen>> {
+    let mut machine = lock(&MACHINE);
+    let mut owners = std::collections::HashSet::new();
+    if let Some(current) = machine.as_mut() {
+        if let Some(screen) = current.present()? {
+            current.owners.insert(token.to_owned());
+            if verify {
+                verify_frame(&screen)?;
+            }
+            return Ok(Some(screen));
+        }
+        // 辅助程序重启、合成器丢了这块输出都会走到这里：旧屏已经不在桌面里，
+        // 重新建一块，正在用它的其他连接跟着搬过去。先显式还一次，免得辅助程序
+        // 还没处理完连接断开就多租了一块出去。
+        let _ = current.session.remove(&current.connector);
+        owners = std::mem::take(&mut current.owners);
+        *machine = None;
+    }
+    // 合成器接不住就别去惊动内核（见 `compositor::ensure_available`）。
+    crate::platform::display::compositor::ensure_available()?;
+    ensure!(
+        openuuyc_vkms::installed(),
+        "没有安装虚拟显示器辅助程序（openuuyc-vkms），无法为无屏的被控端添加兜底屏"
+    );
+    let saved = store::read::<Record>(&path()?)?;
+    let record = saved.unwrap_or(Record {
+        width: width.clamp(2, 16384),
+        height: height.clamp(2, 16384),
+        hz: 144,
+    });
+    validate_modes(&[(record.width, record.height)])?;
+    ensure!((1..=144).contains(&record.hz), "无效兜底屏刷新率");
+    // 先记尺寸：辅助程序或进程重启之后按同一块尺寸再建。
+    store::write(&path()?, &record)?;
+    let mut session = crate::platform::virtual_display::Session::open()?;
+    let connector = session.create(record.width, record.height, record.hz)?;
+    let identity = crate::platform::display::topology::identity(&connector);
+    let mut created = Machine {
+        session,
+        connector,
+        identity,
+        owners,
+    };
+    created.owners.insert(token.to_owned());
+    let screen = match created.wait() {
+        Ok(screen) => screen,
+        Err(error) => {
+            if let Err(rollback) = created.session.remove(&created.connector) {
+                tracing::error!(%rollback, "兜底虚拟屏回滚失败");
+            }
+            return Err(error);
+        }
+    };
+    // 和 Windows 一样：屏已经建出来就留着等恢复，别把唯一一块屏回滚掉。
+    let verified = if verify {
+        verify_frame(&screen)
+    } else {
+        Ok(())
+    };
+    *machine = Some(created);
+    verified.map(|()| Some(screen))
+}
+
+#[cfg(not(windows))]
+pub(super) fn screen() -> Result<Option<capture::Screen>> {
+    match lock(&MACHINE).as_ref() {
+        Some(current) => current.present(),
+        None => Ok(None),
+    }
+}
+
+/// 兜底屏在桌面里的 identity，`annotate` 靠它把这块屏报成虚拟屏。
+#[cfg(not(windows))]
+pub(super) fn identity() -> Option<String> {
+    lock(&MACHINE).as_ref().map(|m| m.identity.clone())
+}
+
+#[cfg(not(windows))]
+pub(super) fn allows_retirement(token: &str) -> bool {
+    lock(&MACHINE)
+        .as_ref()
+        .is_some_and(|m| m.owners.len() <= 1 && m.owners.contains(token))
+}
+
+#[cfg(not(windows))]
+pub(super) fn retire(token: &str, replacement_identity: &str) -> Result<bool> {
+    let mut machine = lock(&MACHINE);
+    let Some(current) = machine.as_mut() else {
+        return Ok(false);
+    };
+    if current.owners.len() > 1 || !current.owners.contains(token) {
+        return Ok(false);
+    }
+    // 屏其实已经不在了（辅助程序重启过、连接断过）：没有东西要还，按已回收算，
+    // 否则这条记录会一直挡着后续的回收。
+    if current.present()?.is_none() {
+        let identity = current.identity.clone();
+        *machine = None;
+        clear_record()?;
+        tracing::info!(%identity, "persistent headless display was already gone");
+        return Ok(true);
+    }
+    // 只有替代屏真的还在桌面里才回收；调用方已经确认它出过帧。
+    let Ok(screens) = capture::screens() else {
+        return Ok(false);
+    };
+    if !screens
+        .iter()
+        .any(|s| s.identity.as_deref() == Some(replacement_identity))
+    {
+        return Ok(false);
+    }
+    if let Err(error) = current.session.remove(&current.connector) {
+        tracing::warn!(%error, "兜底虚拟屏回收失败");
+        return Ok(false);
+    }
+    *machine = None;
+    clear_record()?;
+    tracing::info!(replacement = %replacement_identity, "persistent headless display retired after replacement became ready");
+    Ok(true)
+}
+
+/// 一条连接开始使用已经存在的兜底屏时登记使用权。
+#[cfg(not(windows))]
+pub(super) fn claim(token: &str) {
+    if let Some(current) = lock(&MACHINE).as_mut() {
+        current.owners.insert(token.to_owned());
+    }
+}
+
+/// 一条连接结束了：只是放弃它的使用权，屏本身要留到进程退出。
+#[cfg(not(windows))]
+pub(super) fn release(token: &str) {
+    if let Some(current) = lock(&MACHINE).as_mut() {
+        current.owners.remove(token);
+    }
+}
+
+/// Linux 的兜底屏跟着进程活，没有需要后台维护的机器级状态。
+#[cfg(not(windows))]
+pub(crate) fn start_background() {}
