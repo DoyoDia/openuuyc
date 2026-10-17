@@ -436,7 +436,6 @@ pub(crate) struct LocalSession {
 /// and end sessions but have no local attach yet.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) struct LocalOutput {
-    pub handle: u32,
     pub data: Vec<u8>,
     /// shell 已经退出；这个消费者已被摘掉，客户端应当收尾。
     pub exited: bool,
@@ -1059,7 +1058,7 @@ impl Sessions {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn pump_local(&mut self, consumer: u64, budget: usize) -> Option<LocalOutput> {
         self.drain(budget);
-        self.sessions.iter_mut().find_map(|((_, handle), session)| {
+        self.sessions.values_mut().find_map(|session| {
             let queue = session.output.get_mut(&Consumer::Local(consumer))?;
             let take = queue.len().min(budget);
             let data: Vec<u8> = queue.drain(..take).collect();
@@ -1068,11 +1067,7 @@ impl Sessions {
             if exited {
                 session.output.remove(&Consumer::Local(consumer));
             }
-            Some(LocalOutput {
-                handle: *handle,
-                data,
-                exited,
-            })
+            Some(LocalOutput { data, exited })
         })
     }
 
