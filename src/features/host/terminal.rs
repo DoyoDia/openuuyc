@@ -450,11 +450,11 @@ impl Sessions {
     }
 
     /// The default shell, matching what a terminal emulator would start.
+    ///
+    /// The platform decides: `$SHELL` (falling back to the system's login
+    /// shell) on POSIX, `ComSpec` on Windows.
     pub(crate) fn default_shell() -> String {
-        std::env::var("SHELL")
-            .ok()
-            .filter(|shell| !shell.is_empty() && std::path::Path::new(shell).exists())
-            .unwrap_or_else(|| "/bin/bash".to_owned())
+        crate::platform::terminal::default_shell()
     }
 
     /// The sessions `owner` may see, as the objects the client parses.
@@ -695,24 +695,11 @@ impl Sessions {
 /// Maps the controller's shell choice to a real program.
 ///
 /// The `open` payload names a shell *kind* (`powershell`, `cmd`, `bash`), not
-/// a path. The Windows names have no Linux equivalent, so they fall back to
-/// the user's login shell rather than failing the request; the client shows
-/// its generic creation error when `open` is refused.
+/// a path, and each platform knows which kinds it can offer. The platform
+/// layer decides; this stays as a named seam so the call sites and tests here
+/// read the same on every OS.
 fn resolve_shell(requested: &str) -> String {
-    let candidate = match requested.trim().to_ascii_lowercase().as_str() {
-        "bash" => Some("/bin/bash"),
-        "zsh" => Some("/bin/zsh"),
-        "sh" => Some("/bin/sh"),
-        "fish" => Some("/usr/bin/fish"),
-        "pwsh" => Some("/usr/bin/pwsh"),
-        // `powershell` and `cmd` are Windows-only. A POSIX shell is not a
-        // substitute for either, so fall through to the login shell.
-        _ => None,
-    };
-    match candidate {
-        Some(path) if std::path::Path::new(path).exists() => path.to_owned(),
-        _ => Sessions::default_shell(),
-    }
+    crate::platform::terminal::resolve_shell(requested)
 }
 
 /// Rejects the names the client's own validation rejects, so a rename that

@@ -239,6 +239,12 @@ pollster = "0.4"
 # cpal::default_host() picks it when the server is there, ALSA otherwise.
 cpal = { version = "0.18.2", features = ["pulseaudio"] }
 
+# Only the host terminal exists on macOS so far. It needs no driver, no
+# display server and no encoder — a pty is the whole requirement — so libc
+# is the entire dependency set until the rest of the platform lands.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
 [patch.crates-io]
 dtls = { path = "vendor/dtls" }
 interceptor = { path = "vendor/interceptor" }
