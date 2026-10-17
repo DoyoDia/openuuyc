@@ -125,15 +125,47 @@ impl DeviceCenterApp {
                             if terminal_supported {
                                 ui.checkbox(&mut terminal, "终端");
                                 ui.label(
-                                    RichText::new("终端可让主控在本机运行命令")
+                                    RichText::new("主控设备可以以当前用户身份在本机执行任意命令")
                                         .small()
                                         .color(MUTED),
                                 );
+                                let running = crate::features::host::terminal::running();
+                                if running > 0 {
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            RichText::new(format!("终端会话：{running} 个运行中"))
+                                                .small(),
+                                        );
+                                        if ui
+                                            .add(crate::ui::controls::secondary("结束全部"))
+                                            .clicked()
+                                        {
+                                            crate::features::host::terminal::end_all();
+                                        }
+                                    });
+                                }
                             }
                         }
                     });
                 });
             ui.add_space(theme::MENU_GROUP_GAP);
+        }
+        // A shell is the widest grant on this page: turning it on asks first,
+        // and only the confirmation applies it.
+        let confirm_id = egui::Id::new(("host-terminal-confirm", self.login_generation));
+        if terminal && !before.4 {
+            terminal = false;
+            ui.data_mut(|data| data.insert_temp(confirm_id, true));
+        }
+        if ui.data(|data| data.get_temp::<bool>(confirm_id).unwrap_or(false)) {
+            match terminal_confirmation(ui.ctx()) {
+                Some(true) => {
+                    terminal = true;
+                    ui.data_mut(|data| data.remove::<bool>(confirm_id));
+                }
+                Some(false) => ui.data_mut(|data| data.remove::<bool>(confirm_id)),
+                None => {}
+            }
         }
         let results = [
             (files != before.0).then(|| host.set_file_transfer_allowed(files)),
@@ -493,4 +525,41 @@ impl DeviceCenterApp {
         }
         ui.ctx().request_repaint_after(Duration::from_millis(250));
     }
+}
+
+/// Asks before the controller may run a shell here: `Some(true)` to allow,
+/// `Some(false)` to leave it off, `None` while the dialog is still open.
+fn terminal_confirmation(ctx: &egui::Context) -> Option<bool> {
+    let mut decision = None;
+    let response = egui::Modal::new(egui::Id::new("host-terminal-confirm"))
+        .frame(crate::ui::controls::dialog_frame())
+        .show(ctx, |ui| {
+            ui.set_width(410.0);
+            if crate::ui::controls::dialog_header(
+                ui,
+                "允许终端？",
+                crate::ui::controls::DialogIcon::Warning,
+                true,
+            ) {
+                decision = Some(false);
+            }
+            ui.label(
+                "已授权的主控设备将可以以当前用户身份在本机打开命令行，执行任意命令，\
+                 读取和修改这个用户能访问的所有文件。只在信任的设备上开启。",
+            );
+            let (accept, dismiss) = crate::ui::controls::dialog_actions(
+                ui,
+                Some(crate::ui::controls::DialogAction::new("允许终端").danger(true)),
+                Some("取消"),
+            );
+            if accept {
+                decision = Some(true);
+            } else if dismiss {
+                decision = Some(false);
+            }
+        });
+    if decision.is_none() && response.should_close() {
+        decision = Some(false);
+    }
+    decision
 }

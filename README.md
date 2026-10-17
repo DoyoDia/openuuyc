@@ -89,6 +89,7 @@ OpenUUYC 是用 Rust 编写的 UU 远程第三方客户端，支持 Windows 和 
 | 向官方主控发文件（队列浮窗） | — | ✅ | — | ✅ | ❌ |
 | 独立文件传输 | ✅ | ✅ 需已登录桌面 | ✅ | ✅ 根为 `\`，路径对外用反斜杠 | ✅ 同左 |
 | 端口转发 | ✅ TCP / UDP | ✅ 需开许可 | ✅ TCP / UDP | ✅ 需开许可 | ✅ 需开许可 |
+| 被控终端（UU 手机端的「终端」） | ❌ 不提供 | ❌ 未接入 ConPTY，明确拒绝 | ❌ 不提供 | ✅ 需开许可，以桌面用户身份运行 | ✅ 需开许可，以桌面用户身份运行 |
 | 批注 / 白板 | ✅ 发送 | ✅ 接收 | ❌ | ❌ 拒绝请求 | ❌ 拒绝请求 |
 | 远程关机 / 重启 | ✅ | ✅ | ✅ | ✅ logind，受 polkit 约束 | ✅ logind，受 polkit 约束 |
 | 远程开机（WoL） | ✅ | ✅ 含网卡配置 | ✅ | ⚠️ 网卡需手动 ethtool | ⚠️ 网卡需手动 ethtool |
@@ -241,6 +242,7 @@ sudo pacman -S --needed xdg-desktop-portal-gnome   # KDE 为 xdg-desktop-portal-
 - **运行环境**：登录态存在系统密钥环（Secret Service，需要 gnome-keyring、KWallet 等，没有明文回退）。托盘用 StatusNotifierItem，GNOME 需要 AppIndicator 扩展（Ubuntu 默认启用），桌面没有托盘时关闭窗口即退出；面板比程序晚起来时每 2 秒重试，托盘一出现就改回关闭收进托盘。粘贴远端文件要 `fuse3`。Wayland 会话被控也要有 XWayland（显示器列表与输入注入器都先连 X 服务器）；缩放（含分数缩放）的桌面上，门户共享的屏幕按合成器 `xdg-output` 布局里的输出名与所选显示器配对，需要 XWayland 23.1 及以上（输出以连接器命名）且程序能拿到 `WAYLAND_DISPLAY`，配不上时报错，不会采错屏。拖出文件的预览图要 `gio` 与 `rsvg-convert`。
 - **开机自启**：桌面接进 `graphical-session.target` 时是 systemd 用户单元 `openuuyc.service`（`journalctl --user -u openuuyc` 看日志），否则写 `~/.config/autostart/openuuyc.desktop`。两者都不处理的合成器（无 uwsm 的 sway、Hyprland 等）请自行启动 `OpenUUYC gui --background`。再次启动程序会经 `$XDG_RUNTIME_DIR/openuuyc/control.sock` 唤起已运行的控制中心。
 - **协助邀请链接**：安装包的 `openuuyc.desktop` 登记了 `x-scheme-handler/uuremote`，没有 Windows 那样的接管开关，可用 `xdg-mime default <程序>.desktop x-scheme-handler/uuremote` 改。便携运行时把链接作为唯一参数传给程序。
+- **被控终端**：默认关闭，在被控设置的访问权限里打开，打开时会确认一次；以 root 运行时不提供。shell 跑在 pty 上，断线后保留、重连可接回；退出或切换账号、关闭终端开关、禁止被控或在本机断开连接时结束，没有主控附着 30 分钟后也会结束。设置页显示运行中的会话数，可一键结束全部。
 - **远程开机**：配置网卡需要 root，程序内不提供，请用 `sudo ethtool -s <网卡> wol g`。远程关机与重启经 systemd-logind，受 polkit 约束。
 - **更新**：「关于」页的更新提醒指向上游的 Windows Release；Linux 版请从本 fork 的 Release 或 deb / AUR 包更新。下面的「命令行更新」只适用于 Windows。
 - **环境变量**：`OPENUUYC_CAPTURE` 指定采集后端顺序（如 `nvfbc`、`wlr`、`x11,portal`）；`OPENUUYC_ZEROCOPY=1` 让 VA-API 解码画面以 dmabuf 直接交给渲染器（只在 Intel 上验证过）；`OPENUUYC_CAPTURE_DMABUF=1` 与 `OPENUUYC_GPU_CONVERT=1` 是门户采集的试验开关；`OPENUUYC_BACKEND=gl|vulkan` 指定界面后端。
