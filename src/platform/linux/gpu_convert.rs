@@ -12,7 +12,7 @@ use std::{
 };
 
 type Handle = *mut c_void;
-type GetProc = unsafe extern "C" fn(*const i8) -> Handle;
+type GetProc = unsafe extern "C" fn(*const std::ffi::c_char) -> Handle;
 type CreateImage = unsafe extern "C" fn(Handle, Handle, u32, Handle, *const i32) -> Handle;
 type DestroyImage = unsafe extern "C" fn(Handle, Handle) -> u32;
 type BindImage = unsafe extern "C" fn(u32, Handle);
