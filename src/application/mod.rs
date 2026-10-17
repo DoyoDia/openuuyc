@@ -18,6 +18,14 @@ pub fn launch_installed(
 ) -> anyhow::Result<()> {
     crate::platform::windows::components::application::start_installed(arguments)
 }
+/// 列出或接上本机正在运行的被控终端会话（命令行入口）。
+///
+/// 会话跑在 GUI 进程里，这里只是经 Unix socket 连过去；关闭这个终端不会
+/// 结束会话。
+pub fn terminal_attach(session: Option<&str>, list: bool, new: bool) -> anyhow::Result<()> {
+    crate::features::host::terminal::local::run_client(session, list, new)
+}
+
 /// Hand the GUI to the installed copy when one exists. Linux has no
 /// installed copy: the built binary is the application.
 pub fn route_installed_gui() -> anyhow::Result<bool> {

@@ -64,6 +64,11 @@ pub(crate) struct ConnectionInfo {
     /// rather than watching the screen, and the access notice says so.
     #[serde(default)]
     pub terminal: bool,
+    /// The terminal connection is attached to a shell opened on this machine
+    /// (see `Handle::terminal_local_allowed`), so the notice says the other
+    /// side is in the local user's own terminal.
+    #[serde(default)]
+    pub local_terminal: bool,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -127,6 +132,7 @@ struct Ownership {
     file_transfer: bool,
     port_mapping: bool,
     terminal: bool,
+    terminal_local: bool,
     remote_power: bool,
     wol: bool,
     power_executing: bool,
@@ -182,6 +188,7 @@ impl Default for Handle {
                 file_transfer: true,
                 port_mapping: false,
                 terminal: false,
+                terminal_local: false,
                 remote_power: false,
                 wol: false,
                 power_executing: false,
@@ -340,6 +347,7 @@ impl Handle {
         state.file_transfer = snapshot.file_transfer;
         state.port_mapping = snapshot.port_mapping;
         state.terminal = snapshot.terminal;
+        state.terminal_local = snapshot.terminal && snapshot.terminal_local;
         state.remote_power = snapshot.remote_power;
         state.wol = snapshot.wol;
         state.status = snapshot.status;
@@ -430,6 +438,7 @@ impl Handle {
                 terminal,
                 remote_power,
                 wol,
+                terminal_local,
             )) => {
                 let _ = handle.assistance.configure(assistance);
                 handle.set_allowed(allowed);
@@ -446,6 +455,7 @@ impl Handle {
                 state.file_transfer = file_transfer;
                 state.port_mapping = port_mapping;
                 state.terminal = terminal;
+                state.terminal_local = terminal && terminal_local;
                 state.remote_power = remote_power;
                 state.wol = wol;
                 state.dirty = false;
@@ -595,6 +605,12 @@ impl Handle {
             anyhow::ensure!(state.active, "账号会话已结束");
             if state.terminal != allowed {
                 state.terminal = allowed;
+                // The local-session grant hangs off this one. It does not
+                // come back by itself when the terminal is turned on again:
+                // that asks for its own confirmation.
+                if !allowed {
+                    state.terminal_local = false;
+                }
                 state.settings_revision = state.settings_revision.wrapping_add(1);
                 state.dirty = true;
                 state.status.saving = true;
@@ -606,6 +622,34 @@ impl Handle {
         if !allowed {
             super::terminal::end_login(&self.account);
         }
+        Ok(())
+    }
+    /// Whether a controller may also see and attach to the shells the local
+    /// user opened on this machine (the sessions page, `OpenUUYC terminal`).
+    ///
+    /// A second switch under the terminal, off by default: the terminal
+    /// grant lets the controller run commands, this one lets it watch and
+    /// type into a terminal the local user is working in. Only effective
+    /// while the terminal itself is allowed.
+    pub(crate) fn terminal_local_allowed(&self) -> bool {
+        let state = lock(&self.ownership);
+        state.terminal && state.terminal_local
+    }
+    pub(crate) fn set_terminal_local_allowed(&self, allowed: bool) -> anyhow::Result<()> {
+        let mut state = lock(&self.ownership);
+        anyhow::ensure!(state.active, "账号会话已结束");
+        // Cannot be on without the terminal it extends.
+        let allowed = allowed && state.terminal;
+        if state.terminal_local != allowed {
+            state.terminal_local = allowed;
+            state.settings_revision = state.settings_revision.wrapping_add(1);
+            state.dirty = true;
+            state.status.saving = true;
+            state.status.settings_error = None;
+        }
+        // Turning it off leaves the local shells running (they are the local
+        // user's); every terminal connection lets go of them on its next
+        // pump tick (`terminal::bind`).
         Ok(())
     }
     pub(crate) fn set_port_mapping_allowed(&self, allowed: bool) -> anyhow::Result<()> {
@@ -830,6 +874,7 @@ impl Handle {
                 terminal,
                 remote_power,
                 wol,
+                terminal_local,
             ) = {
                 let state = lock(&self.ownership);
                 if !state.dirty {
@@ -849,6 +894,7 @@ impl Handle {
                     state.terminal,
                     state.remote_power,
                     state.wol,
+                    state.terminal_local,
                 )
             };
             let result = if crate::platform::host_service::resident::managed() {
@@ -865,6 +911,7 @@ impl Handle {
                         file_transfer,
                         port_mapping,
                         terminal,
+                        terminal_local,
                         remote_power,
                         wol,
                     },
@@ -886,6 +933,7 @@ impl Handle {
                         terminal,
                         remote_power,
                         wol,
+                        terminal_local,
                     )
                 })
                 .await
@@ -1268,6 +1316,25 @@ impl Lease {
     pub(crate) fn terminal_allowed(&self) -> bool {
         let state = lock(&self.handle.ownership);
         self.current(&state) && self.assistance.is_none() && !self.handle.guest && state.terminal
+    }
+    /// Whether this lease may also reach the shells opened on this machine;
+    /// see [`Handle::terminal_local_allowed`].
+    pub(crate) fn terminal_local_allowed(&self) -> bool {
+        let state = lock(&self.handle.ownership);
+        self.current(&state)
+            && self.assistance.is_none()
+            && !self.handle.guest
+            && state.terminal
+            && state.terminal_local
+    }
+    /// Records whether this terminal connection is attached to a shell opened
+    /// on this machine, for the access notice.
+    pub(crate) fn terminal_on_local(&self, attached: bool) {
+        self.modify(|state| {
+            if let Some(connection) = state.status.connection.as_mut() {
+                connection.local_terminal = attached;
+            }
+        });
     }
     pub(crate) fn port_status(&self, status: crate::features::port_mapping::host::Status) {
         self.modify(|s| s.status.ports = status);

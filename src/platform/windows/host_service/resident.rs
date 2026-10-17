@@ -692,6 +692,7 @@ async fn run_authorized_account(
                                     file_transfer: current.host.file_transfer_allowed(),
                                     port_mapping: current.host.port_mapping_allowed(),
                                     terminal: current.host.terminal_allowed(),
+                                    terminal_local: current.host.terminal_local_allowed(),
                                     remote_power: current.host.power_allowed(),
                                     wol: current.host.wol_allowed(),
                                     status: current.host.status(),
@@ -721,6 +722,7 @@ async fn run_authorized_account(
                                     file_transfer,
                                     port_mapping,
                                     terminal,
+                                    terminal_local,
                                     remote_power,
                                     wol,
                                 } => {
@@ -736,6 +738,7 @@ async fn run_authorized_account(
                                     current.host.set_file_transfer_allowed(file_transfer)?;
                                     current.host.set_port_mapping_allowed(port_mapping)?;
                                     current.host.set_terminal_allowed(terminal)?;
+                                    current.host.set_terminal_local_allowed(terminal_local)?;
                                     current.host.set_power_allowed(remote_power)?;
                                     current.host.set_wol_allowed(wol)?;
                                     current.host.set_allowed(allowed);

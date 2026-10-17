@@ -42,6 +42,11 @@ pub(crate) fn unavailable() -> Option<&'static str> {
     (unsafe { libc::geteuid() } == 0).then_some("以 root 运行时不提供终端")
 }
 
+/// 能不能报出前台命令。只有 Linux 的 `/proc/<pid>/stat` 给了前台进程组。
+pub(crate) fn foreground_supported() -> bool {
+    cfg!(target_os = "linux")
+}
+
 /// The shell a terminal emulator would start on this system.
 pub(crate) fn default_shell() -> String {
     std::env::var("SHELL")
@@ -174,6 +179,48 @@ impl Session {
         &self.shell
     }
 
+    /// 终端前台进程组里正在跑什么；shell 自己在前台时返回 `None`（空闲）。
+    ///
+    /// 不查 `tcgetpgrp(master)`：master 不是控制终端，Linux 上它拿不到前台
+    /// 进程组。改成读 shell 自己的 `/proc/<pid>/stat`，其中的 `tpgid` 正是
+    /// 这个 pty 的前台进程组。
+    #[cfg(target_os = "linux")]
+    pub(crate) fn foreground(&self) -> Option<crate::platform::Foreground> {
+        let shell = self.child.id() as i32;
+        let group = foreground_group(shell)?;
+        if group == shell {
+            return None;
+        }
+        let name = std::fs::read_to_string(format!("/proc/{group}/comm"))
+            .ok()?
+            .trim()
+            .to_owned();
+        if name.is_empty() {
+            return None;
+        }
+        let command = std::fs::read(format!("/proc/{group}/cmdline"))
+            .ok()
+            .map(|arguments| {
+                String::from_utf8_lossy(&arguments)
+                    .split('\0')
+                    .filter(|argument| !argument.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .filter(|command| !command.is_empty())
+            .unwrap_or_else(|| name.clone());
+        Some(crate::platform::Foreground {
+            name,
+            command: shorten(command, 200),
+        })
+    }
+
+    /// macOS 没有 `/proc`，拿不到前台进程组里的进程名。
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn foreground(&self) -> Option<crate::platform::Foreground> {
+        None
+    }
+
     /// Reads whatever is available. `Ok(None)` means nothing is buffered yet;
     /// `Ok(Some(0))` is end-of-file, which Linux reports as `EIO` on the
     /// master once the last slave closes.
@@ -301,6 +348,28 @@ impl Session {
         }
         // Drop reaps the shell (and kills its group if it still runs).
     }
+}
+
+/// `/proc/<pid>/stat` 里的前台进程组（`tpgid`）。
+#[cfg(target_os = "linux")]
+fn foreground_group(pid: i32) -> Option<i32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // `pid (comm) state ppid pgrp session tty_nr tpgid ...`；comm 里可能有
+    // 空格和右括号，从最后一个 `)` 往后切。
+    let (_, rest) = stat.rsplit_once(')')?;
+    let mut fields = rest.split_whitespace();
+    fields.next()?; // state
+    fields.nth(4).and_then(|value| value.parse::<i32>().ok())
+}
+
+#[cfg(target_os = "linux")]
+fn shorten(text: String, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text;
+    }
+    let mut shortened: String = text.chars().take(limit.saturating_sub(1)).collect();
+    shortened.push('…');
+    shortened
 }
 
 /// The live processes whose session id is `session`, read from /proc.
@@ -472,6 +541,40 @@ mod tests {
             }
         }
         seen
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_foreground_reports_the_running_command() {
+        let session = Session::open("/bin/sh", 80, 24).expect("open pty");
+        // 空闲时前台是 shell 自己，页面上应当显示「空闲」。
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && session.foreground().is_some() {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(session.foreground(), None, "an idle shell has no command");
+
+        session.write(b"sleep 5\n").expect("write input");
+        let mut foreground = None;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            foreground = session.foreground();
+            if foreground
+                .as_ref()
+                .is_some_and(|foreground| foreground.name == "sleep")
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let foreground = foreground.expect("the foreground command");
+        assert_eq!(foreground.name, "sleep");
+        assert!(
+            foreground.command.contains("sleep 5"),
+            "the command line is shown: {}",
+            foreground.command
+        );
+        let _ = session.write(b"\x03");
     }
 
     #[test]
