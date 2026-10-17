@@ -234,6 +234,17 @@ impl Session {
         self.screen.process(data);
     }
 
+    /// Resizes the pty and the screen model together. A model left at the
+    /// old size wraps lines where the shell did not, and a reattach then
+    /// replays a screen cut at the old width.
+    fn resize(&mut self, cols: u16, rows: u16) -> Result<(), SessionError> {
+        self.pty
+            .resize(cols, rows)
+            .map_err(|_| SessionError::Gone)?;
+        self.screen.screen_mut().set_size(rows.max(1), cols.max(1));
+        Ok(())
+    }
+
     fn let_go(&mut self) {
         self.attached = None;
         self.detached_since = Some(std::time::Instant::now());
@@ -375,21 +386,12 @@ impl Sessions {
         // Re-opening an existing handle happens on reconnect and when the
         // size changes; replacing the pty would hang up a shell in use.
         if let Some(existing) = self.sessions.get_mut(&key(owner, handle)) {
-            existing
-                .pty
-                .resize(cols, rows)
-                .map_err(|_| SessionError::Gone)?;
+            existing.resize(cols, rows)?;
             if existing.state != SessionState::Exited {
                 existing.state = SessionState::Running;
             }
             existing.attached = Some(connection);
             existing.detached_since = None;
-            // The model has to follow the pty, or the replay would describe a
-            // screen of the old size.
-            existing
-                .screen
-                .screen_mut()
-                .set_size(rows.max(1), cols.max(1));
             existing.last_active_ms = now_ms();
             return Ok((
                 handle,
@@ -519,10 +521,7 @@ impl Sessions {
         rows: u16,
     ) -> Result<(), SessionError> {
         let session = self.get_mut(owner, handle)?;
-        session
-            .pty
-            .resize(cols, rows)
-            .map_err(|_| SessionError::Gone)?;
+        session.resize(cols, rows)?;
         session.last_active_ms = now_ms();
         Ok(())
     }
@@ -1689,6 +1688,63 @@ mod tests {
             "the replay grew with the output: {} bytes",
             replay.len()
         );
+    }
+
+    #[test]
+    // A POSIX `printf`; the model is platform-independent.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn a_resize_reaches_the_replayed_screen() {
+        let mut sessions = Sessions::default();
+        let (handle, _, _) = sessions
+            .open("acct", 0, 1, "/bin/sh", None, 80, 24)
+            .expect("open");
+        // A phone rotating or raising its keyboard narrows the terminal.
+        sessions.resize("acct", handle, 40, 24).expect("resize");
+        let wide = format!("{}{}", "A".repeat(30), "B".repeat(31));
+        // The command line splits the two halves, so only the output holds
+        // the joined line.
+        sessions
+            .write(
+                "acct",
+                handle,
+                &line(&format!(
+                    "printf '%s%s\\n' {} {}",
+                    "A".repeat(30),
+                    "B".repeat(31)
+                )),
+            )
+            .expect("write");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut seen = Vec::new();
+        while std::time::Instant::now() < deadline {
+            for (_, kind, payload) in sessions.pump(1, PUMP_BUDGET) {
+                if kind == FrameType::Stdout {
+                    seen.extend_from_slice(&payload);
+                }
+            }
+            if String::from_utf8_lossy(&seen).contains(&wide) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            String::from_utf8_lossy(&seen).contains(&wide),
+            "the shell never printed the line"
+        );
+        let (_, _, replay) = sessions
+            .open("acct", handle, 1, "/bin/sh", None, 40, 24)
+            .expect("reattach");
+        // Draw the replay the way the controller would, at its width; the line
+        // wraps onto a second row there, and none of it may be missing.
+        let mut client = vt100::Parser::new(24, 40, 0);
+        client.process(&replay);
+        let drawn: String = client
+            .screen()
+            .contents()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(drawn.contains(&wide), "the replay lost the line: {drawn:?}");
     }
 
     #[test]
