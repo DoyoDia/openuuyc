@@ -123,15 +123,16 @@ jobs:
           # The LICENSE reserves all rights on original material and requires
           # attribution and third-party notices; say so before anyone downloads.
           body: |
-            Linux (x86_64) builds of the Linux port.
+            Linux builds of the Linux port (x86_64, and arm64 as a .deb).
 
-            - `openuuyc_<version>_amd64.deb` — Debian/Ubuntu package.
+            - `openuuyc_<version>_amd64.deb`, `openuuyc_<version>_arm64.deb` —
+              Debian/Ubuntu packages (22.04 and newer).
             - `OpenUUYC` — the binary, built on Arch.
             - `OpenUUYC-<version>-x86_64-linux.tar.zst` — the two binaries
               (the client and the root virtual-display helper), with the
               desktop entry, icon, uinput udev rule, systemd units, licenses
-              and `install-omarchy.sh`. Arch/Omarchy users should prefer the
-              AUR package `openuuyc-bin`, which installs this archive.
+              and `install-omarchy.sh` (x86_64). The AUR recipe
+              `packaging/aur/openuuyc-bin` installs this archive.
 
             Host (被控) input on Wayland needs `/dev/uinput` access and an XDG
             ScreenCast portal; see the README's Linux section.
@@ -139,3 +140,11 @@ jobs:
             Non-official, third-party client. Not affiliated with or endorsed by
             NetEase. Read `LICENSE` and `THIRD_PARTY_NOTICES` before
             redistributing.
+      - uses: actions/checkout@v7
+        with:
+          path: source
+          sparse-checkout: .github/scripts
+      - name: List the downloads in the release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: source/.github/scripts/release-downloads.sh "${{ github.ref_name }}"

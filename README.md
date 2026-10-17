@@ -259,7 +259,7 @@ sudo pacman -S --needed base-devel rust nasm clang pkgconf libva alsa-lib dbus \
     libxcursor libglvnd vulkan-icd-loader openssl fuse3 noto-fonts-cjk
 ```
 
-打包为 deb（GitHub Actions 的 “Linux deb” 工作流在 Ubuntu 22.04 上构建同样的包，产物见运行页面的 Artifacts，打 `v*` 标签时附到 Release）：
+打包为 deb（GitHub Actions 的 “Linux deb” 工作流在 Ubuntu 22.04 上分别为 amd64 与 arm64 原生构建同样的包，产物见运行页面的 Artifacts，打 `v*` 标签时附到 Release，Release 说明末尾的「下载地址」按附上的文件自动生成。arm64 包只做了编译与安装检查，没有在 ARM 机器上实际运行过；Release 里的压缩包与单文件程序只有 x86_64）：
 
 ```bash
 cargo install cargo-deb

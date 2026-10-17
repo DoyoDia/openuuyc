@@ -13,8 +13,18 @@ permissions:
 jobs:
   deb:
     # The oldest supported Ubuntu, so the package's glibc and library
-    # requirements hold on 22.04 and everything newer.
-    runs-on: ubuntu-22.04
+    # requirements hold on 22.04 and everything newer. Each architecture
+    # builds natively on its own runner, so the package's dependencies are
+    # resolved against that architecture's libraries.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-22.04
+          - arch: arm64
+            runner: ubuntu-22.04-arm
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
 
@@ -30,6 +40,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.arch }}
 
       - uses: taiki-e/install-action@v2
         with:
@@ -70,7 +82,7 @@ jobs:
 
       - uses: actions/upload-artifact@v7
         with:
-          name: openuuyc-deb
+          name: openuuyc-deb-${{ matrix.arch }}
           path: target/debian/*.deb
           if-no-files-found: error
 
@@ -88,7 +100,8 @@ jobs:
     steps:
       - uses: actions/download-artifact@v8
         with:
-          name: openuuyc-deb
+          pattern: openuuyc-deb-*
+          merge-multiple: true
       - uses: softprops/action-gh-release@v3
         with:
           files: "*.deb"
@@ -96,3 +109,11 @@ jobs:
           # alpha, beta or rc version is published as a pre-release like upstream.
           name: OpenUUYC ${{ github.ref_name }}
           prerelease: ${{ contains(github.ref_name, '-alpha') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-rc') }}
+      - uses: actions/checkout@v7
+        with:
+          path: source
+          sparse-checkout: .github/scripts
+      - name: List the downloads in the release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: source/.github/scripts/release-downloads.sh "${{ github.ref_name }}"
