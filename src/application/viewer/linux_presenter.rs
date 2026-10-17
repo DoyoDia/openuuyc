@@ -153,6 +153,189 @@ struct Shell {
     timing_audit: Option<UiTimingAudit>,
 }
 
+/// The chrome state a window keeps between frames, borrowed while its egui
+/// pass runs.
+struct WindowChrome<'a> {
+    move_state: &'a mut WindowMoveState,
+    resize_state: &'a mut WindowResizeState,
+    fullscreen: &'a mut super::fullscreen_chrome::FullscreenChrome,
+}
+
+/// 缩放热区和标题栏（全屏时是浮动栏），以及播放器放在栏里的屏标签与按钮。主窗口
+/// 和独立窗口画的是同一套，返回点没点关闭。`tooltips` 只有主窗口画音频视图时关掉。
+fn draw_window_chrome(
+    ui: &mut egui::Ui,
+    window: &Arc<Window>,
+    title: &str,
+    panel: &'static str,
+    tooltips: bool,
+    chrome: WindowChrome<'_>,
+    player: Option<&mut Player>,
+) -> bool {
+    let WindowChrome {
+        move_state,
+        resize_state,
+        fullscreen: floating,
+    } = chrome;
+    let ctx = ui.ctx().clone();
+    resize_regions(ui, window, |response, direction| {
+        update_nonmodal_window_resize(&ctx, window, response, direction, resize_state, None);
+    });
+    let fullscreen = window.fullscreen().is_some();
+    floating.sync(fullscreen);
+    // Windows 的 caption 里，别名那一格是可以点开的设备切换菜单；没有可切换
+    // 的设备时才是普通标签。这里跟着它走，所以标题那一格由播放器自己画。
+    // 全屏那根浮动条和平时是同一根（Windows 也是），设备切换菜单在那儿一样能点。
+    let switcher = player.as_ref().and_then(|player| player.device_switch());
+    let caption =
+        |ui: &mut egui::Ui, move_state: Option<&mut WindowMoveState>, tooltips| match switcher
+            .as_ref()
+        {
+            Some(switcher) => crate::ui::chrome::window_title_bar_with_identity(
+                ui,
+                window,
+                title,
+                move_state,
+                tooltips,
+                &mut |ui: &mut egui::Ui| {
+                    let response = crate::ui::controls::viewer_device_button(
+                        ui,
+                        title.trim_start_matches(crate::VIEWER_TITLE_PREFIX),
+                    );
+                    switcher.menu(&response, window.id());
+                },
+            ),
+            None => window_title_bar(ui, window, title, move_state, tooltips),
+        };
+    if !fullscreen {
+        return title_bar_panel(ui, panel, title_bar_height(), |ui| {
+            let bar = ui.available_rect_before_wrap();
+            let close = caption(ui, Some(move_state), tooltips);
+            if let Some(player) = player {
+                player.title_bar_controls(ui, bar, window);
+            }
+            close
+        })
+        .inner;
+    }
+    let Some(player) = player else {
+        return false;
+    };
+    let relative = player.input().relative_mode();
+    let menu_open = player.stream_control_ui.open;
+    // 切屏、切设备期间浮动栏不收起，等待态一直看得见（Windows 传的是
+    // `screen_tabs.is_pending()`，同一个判断）。
+    let pending = player.is_pending();
+    floating.show(&ctx, relative, menu_open, pending, |ui| {
+        let bar = ui.available_rect_before_wrap();
+        let close = caption(ui, None, true);
+        player.title_bar_controls(ui, bar, window);
+        close
+    })
+}
+
+/// What a window's frame left to do after it was handed to the GPU.
+struct PresentedFrame {
+    /// The window asked to close (its close button, or a viewport command).
+    close: bool,
+    /// When egui wants the next pass.
+    repaint_at: Option<Instant>,
+    /// Time from the pass's start to the GPU submission.
+    layout: Duration,
+    presented: bool,
+}
+
+impl Shell {
+    /// 取走播放器最新的一帧交给 GPU，再把攒下的错误做成弹窗。
+    ///
+    /// A minimised window never submits, and `write_texture` only reaches the
+    /// GPU with the next submission, so uploading then would strand the
+    /// staging copy inside the device -- one video frame's worth, at the
+    /// video's frame rate, until an allocation finally fails. The frame is
+    /// still taken, to keep the decoder's queue from growing instead.
+    fn show_frame(&mut self, player: &mut Player, drawing: bool) -> Result<()> {
+        if let Some(frame) = player.take_frame() {
+            let upload = Instant::now();
+            if drawing {
+                match &frame.surface {
+                    RenderSurface::CpuNv12 { data, color } => self.presenter.upload_video_nv12(
+                        frame.width,
+                        frame.height,
+                        data,
+                        color.transform(8),
+                    )?,
+                    RenderSurface::Dmabuf {
+                        frame: dmabuf,
+                        color,
+                    } => self.presenter.upload_video_dmabuf(
+                        frame.width,
+                        frame.height,
+                        dmabuf,
+                        color.transform(8),
+                    )?,
+                    RenderSurface::CpuRgba8(pixels) => self.presenter.upload_video(
+                        frame.width,
+                        frame.height,
+                        bytemuck::cast_slice(pixels),
+                    )?,
+                    // The D3D11 surface type is uninhabited off Windows.
+                    RenderSurface::D3D11(surface) => match *surface {},
+                }
+            }
+            player.publish(&frame, upload.elapsed());
+            player.current = Some(frame);
+        }
+        // 这一帧画完之后再发错误弹窗：`notice` 自己会要求下一帧把它显示出来，
+        // 而写在标题栏里会把屏标签挤没（Windows 对同样的错误也是弹窗）。
+        player.publish_error(&self.context);
+        Ok(())
+    }
+
+    /// 视频位置、平台输出（光标、剪贴板、输入法），然后提交这一帧；窗口最小化
+    /// 时只把输出攒着。`started` 是这一轮开始的时刻，用来量排版耗时。
+    fn present(
+        &mut self,
+        window: &Arc<Window>,
+        output: egui::FullOutput,
+        placement: Option<VideoPlacement>,
+        drawing: bool,
+        started: Instant,
+    ) -> Result<PresentedFrame> {
+        let placement = placement.filter(|_| self.presenter.has_video());
+        self.presenter.set_video_placement(placement);
+        let (ui_output, platform, viewports) = split_output(output);
+        self.input.handle_platform_output(window, platform);
+        let root = viewports.get(&egui::ViewportId::ROOT);
+        let close = root.is_some_and(|viewport| {
+            viewport
+                .commands
+                .iter()
+                .any(|command| matches!(command, egui::ViewportCommand::Close))
+        });
+        let repaint_at =
+            root.and_then(|viewport| Instant::now().checked_add(viewport.repaint_delay));
+        let layout = started.elapsed();
+        let mut presented = false;
+        if !drawing {
+            self.presenter.defer_output(ui_output);
+        } else {
+            presented = self
+                .presenter
+                .render(&self.context, ui_output, false)?
+                .presented();
+            if presented && window.is_visible() == Some(false) {
+                window.set_visible(true);
+            }
+        }
+        Ok(PresentedFrame {
+            close,
+            repaint_at,
+            layout,
+            presented,
+        })
+    }
+}
+
 impl ConnectingWindowsRunner {
     pub(crate) fn has_focus(&self) -> bool {
         self.window
@@ -831,7 +1014,8 @@ impl ConnectingWindowsRunner {
         };
         let window = slot.window.clone();
         slot.next_repaint = None;
-        slot.last_frame = Some(Instant::now());
+        let started = Instant::now();
+        slot.last_frame = Some(started);
         let mut close_requested = false;
         let mut placement = None;
         if let DetachedStage::Opening(app) = &mut slot.stage {
@@ -842,86 +1026,24 @@ impl ConnectingWindowsRunner {
         let stage = &mut slot.stage;
         let title = self.alias.clone();
         let output = shell.context.run_ui(input, |ui| {
-            let ctx = ui.ctx().clone();
-            resize_regions(ui, &window, |response, direction| {
-                update_nonmodal_window_resize(
-                    &ctx,
-                    &window,
-                    response,
-                    direction,
-                    &mut shell.resize_state,
-                    None,
-                );
-            });
-            let fullscreen = window.fullscreen().is_some();
-            shell.fullscreen_chrome.sync(fullscreen);
-            if !fullscreen {
-                let switcher = match stage {
-                    DetachedStage::Playing(player) => player.device_switch(),
-                    _ => None,
-                };
-                title_bar_panel(ui, "detached-window-chrome", title_bar_height(), |ui| {
-                    let bar = ui.available_rect_before_wrap();
-                    close_requested |= match switcher.as_ref() {
-                        Some(switcher) => crate::ui::chrome::window_title_bar_with_identity(
-                            ui,
-                            &window,
-                            &title,
-                            Some(&mut shell.move_state),
-                            true,
-                            &mut |ui: &mut egui::Ui| {
-                                let response = crate::ui::controls::viewer_device_button(
-                                    ui,
-                                    title.trim_start_matches(crate::VIEWER_TITLE_PREFIX),
-                                );
-                                switcher.menu(&response, window.id());
-                            },
-                        ),
-                        None => {
-                            window_title_bar(ui, &window, &title, Some(&mut shell.move_state), true)
-                        }
-                    };
-                    if let DetachedStage::Playing(player) = stage {
-                        player.title_bar_controls(ui, bar, &window);
-                    }
-                });
-            } else if let DetachedStage::Playing(player) = stage {
-                let relative = player.input().relative_mode();
-                let menu_open = player.stream_control_ui.open;
-                let pending = player.is_pending();
-                let switcher = player.device_switch();
-                close_requested |=
-                    shell
-                        .fullscreen_chrome
-                        .show(&ctx, relative, menu_open, pending, |ui| {
-                            let bar = ui.available_rect_before_wrap();
-                            let close = match switcher.as_ref() {
-                                Some(switcher) => {
-                                    crate::ui::chrome::window_title_bar_with_identity(
-                                        ui,
-                                        &window,
-                                        &title,
-                                        None,
-                                        true,
-                                        &mut |ui: &mut egui::Ui| {
-                                            let response =
-                                                crate::ui::controls::viewer_device_button(
-                                                    ui,
-                                                    title.trim_start_matches(
-                                                        crate::VIEWER_TITLE_PREFIX,
-                                                    ),
-                                                );
-                                            switcher.menu(&response, window.id());
-                                        },
-                                    )
-                                }
-                                None => window_title_bar(ui, &window, &title, None, true),
-                            };
-                            player.title_bar_controls(ui, bar, &window);
-                            close
-                        });
-            }
-            let menu_inset = shell.fullscreen_chrome.menu_inset(&ctx);
+            let player = match stage {
+                DetachedStage::Playing(player) => Some(&mut **player),
+                DetachedStage::Opening(_) => None,
+            };
+            close_requested |= draw_window_chrome(
+                ui,
+                &window,
+                &title,
+                "detached-window-chrome",
+                true,
+                WindowChrome {
+                    move_state: &mut shell.move_state,
+                    resize_state: &mut shell.resize_state,
+                    fullscreen: &mut shell.fullscreen_chrome,
+                },
+                player,
+            );
+            let menu_inset = shell.fullscreen_chrome.menu_inset(ui.ctx());
             match stage {
                 DetachedStage::Opening(app) => app.draw(ui),
                 DetachedStage::Playing(player) => placement = player.draw(ui, &window, menu_inset),
@@ -929,67 +1051,12 @@ impl ConnectingWindowsRunner {
             crate::ui::controls::show_notices(ui.ctx());
         });
         let drawing = window.is_minimized() != Some(true);
-        if let DetachedStage::Playing(player) = stage
-            && let Some(frame) = player.take_frame()
-        {
-            let upload = Instant::now();
-            if drawing {
-                match &frame.surface {
-                    RenderSurface::CpuNv12 { data, color } => shell.presenter.upload_video_nv12(
-                        frame.width,
-                        frame.height,
-                        data,
-                        color.transform(8),
-                    )?,
-                    RenderSurface::Dmabuf {
-                        frame: dmabuf,
-                        color,
-                    } => shell.presenter.upload_video_dmabuf(
-                        frame.width,
-                        frame.height,
-                        dmabuf,
-                        color.transform(8),
-                    )?,
-                    RenderSurface::CpuRgba8(pixels) => shell.presenter.upload_video(
-                        frame.width,
-                        frame.height,
-                        bytemuck::cast_slice(pixels),
-                    )?,
-                    RenderSurface::D3D11(surface) => match *surface {},
-                }
-            }
-            player.publish(&frame, upload.elapsed());
-            player.current = Some(frame);
-        }
         if let DetachedStage::Playing(player) = stage {
-            player.publish_error(&shell.context);
+            shell.show_frame(player, drawing)?;
         }
-        let placement = placement.filter(|_| shell.presenter.has_video());
-        shell.presenter.set_video_placement(placement);
-        let (ui_output, platform, viewports) = split_output(output);
-        shell.input.handle_platform_output(&window, platform);
-        close_requested |= viewports
-            .get(&egui::ViewportId::ROOT)
-            .is_some_and(|viewport| {
-                viewport
-                    .commands
-                    .iter()
-                    .any(|command| matches!(command, egui::ViewportCommand::Close))
-            });
-        let repaint_at = viewports
-            .get(&egui::ViewportId::ROOT)
-            .and_then(|viewport| Instant::now().checked_add(viewport.repaint_delay));
-        if !drawing {
-            shell.presenter.defer_output(ui_output);
-        } else {
-            let presented = shell
-                .presenter
-                .render(&shell.context, ui_output, false)?
-                .presented();
-            if presented && window.is_visible() == Some(false) {
-                window.set_visible(true);
-            }
-        }
+        let frame = shell.present(&window, output, placement, drawing, started)?;
+        close_requested |= frame.close;
+        let repaint_at = frame.repaint_at;
         if close_requested {
             slot.close = true;
         }
@@ -1132,96 +1199,24 @@ impl ConnectingWindowsRunner {
         let stage = &mut self.stage;
         let audio = &mut self.audio;
         let output = shell.context.run_ui(input, |ui| {
-            let ctx = ui.ctx().clone();
-            resize_regions(ui, &window, |response, direction| {
-                update_nonmodal_window_resize(
-                    &ctx,
-                    &window,
-                    response,
-                    direction,
-                    &mut shell.resize_state,
-                    None,
-                );
-            });
-            let fullscreen = window.fullscreen().is_some();
-            shell.fullscreen_chrome.sync(fullscreen);
-            if !fullscreen {
-                // Windows 的 caption 里，别名那一格是可以点开的设备切换菜单；没有可切换
-                // 的设备时才是普通标签。这里跟着它走，所以标题那一格由播放器自己画。
-                let switcher = match stage {
-                    Stage::Playing(player) => player.device_switch(),
-                    _ => None,
-                };
-                title_bar_panel(ui, "player-window-chrome", title_bar_height(), |ui| {
-                    let bar = ui.available_rect_before_wrap();
-                    close_requested |= match switcher.as_ref() {
-                        Some(switcher) => crate::ui::chrome::window_title_bar_with_identity(
-                            ui,
-                            &window,
-                            &title,
-                            Some(&mut shell.move_state),
-                            audio.is_none(),
-                            &mut |ui: &mut egui::Ui| {
-                                let response = crate::ui::controls::viewer_device_button(
-                                    ui,
-                                    title.trim_start_matches(crate::VIEWER_TITLE_PREFIX),
-                                );
-                                switcher.menu(&response, window.id());
-                            },
-                        ),
-                        None => window_title_bar(
-                            ui,
-                            &window,
-                            &title,
-                            Some(&mut shell.move_state),
-                            audio.is_none(),
-                        ),
-                    };
-                    if let Stage::Playing(player) = stage {
-                        player.title_bar_controls(ui, bar, &window);
-                    }
-                });
-            } else if let Stage::Playing(player) = stage {
-                let relative = player.input().relative_mode();
-                let menu_open = player.stream_control_ui.open;
-                // 切屏、切设备期间浮动栏不收起，等待态一直看得见（Windows 传的是
-                // `screen_tabs.is_pending()`，同一个判断）。
-                let pending = player.is_pending();
-                // 全屏那根浮动条和平时是同一根（Windows 也是），所以设备切换菜单
-                // 在这儿一样能点。
-                let switcher = player.device_switch();
-                close_requested |=
-                    shell
-                        .fullscreen_chrome
-                        .show(&ctx, relative, menu_open, pending, |ui| {
-                            let bar = ui.available_rect_before_wrap();
-                            let close = match switcher.as_ref() {
-                                Some(switcher) => {
-                                    crate::ui::chrome::window_title_bar_with_identity(
-                                        ui,
-                                        &window,
-                                        &title,
-                                        None,
-                                        true,
-                                        &mut |ui: &mut egui::Ui| {
-                                            let response =
-                                                crate::ui::controls::viewer_device_button(
-                                                    ui,
-                                                    title.trim_start_matches(
-                                                        crate::VIEWER_TITLE_PREFIX,
-                                                    ),
-                                                );
-                                            switcher.menu(&response, window.id());
-                                        },
-                                    )
-                                }
-                                None => window_title_bar(ui, &window, &title, None, true),
-                            };
-                            player.title_bar_controls(ui, bar, &window);
-                            close
-                        });
-            }
-            let menu_inset = shell.fullscreen_chrome.menu_inset(&ctx);
+            let player = match stage {
+                Stage::Playing(player) => Some(&mut **player),
+                _ => None,
+            };
+            close_requested |= draw_window_chrome(
+                ui,
+                &window,
+                &title,
+                "player-window-chrome",
+                audio.is_none(),
+                WindowChrome {
+                    move_state: &mut shell.move_state,
+                    resize_state: &mut shell.resize_state,
+                    fullscreen: &mut shell.fullscreen_chrome,
+                },
+                player,
+            );
+            let menu_inset = shell.fullscreen_chrome.menu_inset(ui.ctx());
             match stage {
                 Stage::Connecting(app) => match audio.as_mut() {
                     Some(audio) => close_requested |= audio.show(ui),
@@ -1232,11 +1227,6 @@ impl ConnectingWindowsRunner {
             }
             crate::ui::controls::show_notices(ui.ctx());
         });
-        // A minimised window never submits, and `write_texture` only reaches the
-        // GPU with the next submission, so uploading here would strand the
-        // staging copy inside the device -- one video frame's worth, at the
-        // video's frame rate, until an allocation finally fails. The frame is
-        // still taken, to keep the decoder's queue from growing instead.
         if let Some(compact) = self
             .audio
             .as_mut()
@@ -1245,79 +1235,19 @@ impl ConnectingWindowsRunner {
             configure_audio_window(&window, compact);
         }
         let drawing = window.is_minimized() != Some(true);
-        if let Stage::Playing(player) = &mut self.stage
-            && let Some(frame) = player.take_frame()
-        {
-            let upload = Instant::now();
-            if drawing {
-                match &frame.surface {
-                    RenderSurface::CpuNv12 { data, color } => shell.presenter.upload_video_nv12(
-                        frame.width,
-                        frame.height,
-                        data,
-                        color.transform(8),
-                    )?,
-                    RenderSurface::Dmabuf {
-                        frame: dmabuf,
-                        color,
-                    } => shell.presenter.upload_video_dmabuf(
-                        frame.width,
-                        frame.height,
-                        dmabuf,
-                        color.transform(8),
-                    )?,
-                    RenderSurface::CpuRgba8(pixels) => shell.presenter.upload_video(
-                        frame.width,
-                        frame.height,
-                        bytemuck::cast_slice(pixels),
-                    )?,
-                    // The D3D11 surface type is uninhabited off Windows.
-                    RenderSurface::D3D11(surface) => match *surface {},
-                }
-            }
-            player.publish(&frame, upload.elapsed());
-            player.current = Some(frame);
-        }
-        // 这一帧画完之后再发错误弹窗：`notice` 自己会要求下一帧把它显示出来，
-        // 而写在标题栏里会把屏标签挤没（Windows 对同样的错误也是弹窗）。
         if let Stage::Playing(player) = &mut self.stage {
-            player.publish_error(&shell.context);
+            shell.show_frame(player, drawing)?;
         }
-        let placement = placement.filter(|_| shell.presenter.has_video());
-        shell.presenter.set_video_placement(placement);
-        let (ui_output, platform, viewports) = split_output(output);
-        shell.input.handle_platform_output(&window, platform);
-        close_requested |= viewports
-            .get(&egui::ViewportId::ROOT)
-            .is_some_and(|viewport| {
-                viewport
-                    .commands
-                    .iter()
-                    .any(|command| matches!(command, egui::ViewportCommand::Close))
-            });
-        let repaint_at = viewports
-            .get(&egui::ViewportId::ROOT)
-            .and_then(|viewport| Instant::now().checked_add(viewport.repaint_delay));
-        let layout = started.elapsed();
-        let mut presented = false;
-        if !drawing {
-            shell.presenter.defer_output(ui_output);
-        } else {
-            presented = shell
-                .presenter
-                .render(&shell.context, ui_output, false)?
-                .presented();
-            if presented && window.is_visible() == Some(false) {
-                window.set_visible(true);
-            }
-        }
+        let frame = shell.present(&window, output, placement, drawing, started)?;
+        close_requested |= frame.close;
+        let repaint_at = frame.repaint_at;
         if let Some(audit) = UiTimingAudit::active(&mut shell.timing_audit, started) {
             audit.record(
                 started,
-                layout,
-                started.elapsed().saturating_sub(layout),
+                frame.layout,
+                started.elapsed().saturating_sub(frame.layout),
                 repaint_at.is_some_and(|when| when <= started),
-                presented,
+                frame.presented,
             );
         }
         self.primary_close |= close_requested;
