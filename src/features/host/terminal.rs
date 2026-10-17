@@ -540,6 +540,16 @@ impl Sessions {
                 existing.state = SessionState::Running;
             }
             existing.remote_size = Some((cols, rows));
+            // A reopen is a takeover, as it always was: the controller
+            // reconnected (or moved the tab to another connection), and the
+            // old connection's queue would otherwise stay until its channel
+            // finally closes, tens of seconds on a lost network. Reaching the
+            // high-water mark there stops the shell for everyone. A local
+            // terminal attached to the same shell stays.
+            existing.output.retain(|consumer, _| match consumer {
+                Consumer::Remote(other) => *other == connection,
+                Consumer::Local(_) => true,
+            });
             existing
                 .output
                 .entry(Consumer::Remote(connection))
@@ -2083,6 +2093,40 @@ mod tests {
             .expect("reattach");
         assert_eq!(sessions.list("acct")[0]["state"], "running");
         assert!(output_until(&mut sessions, 9, "LATER").contains("LATER"));
+    }
+
+    #[test]
+    #[cfg_attr(not(target_os = "linux"), ignore = "needs a pty, which only Linux has")]
+    fn a_reopen_takes_the_shell_over_from_a_stalled_connection() {
+        let mut sessions = Sessions::default();
+        sessions
+            .open("acct", 1, 7, shell(), None, 80, 24)
+            .expect("open");
+        // The phone reconnects while the old channel is still open and no
+        // longer drained: only the new connection is pumped.
+        sessions
+            .open("acct", 1, 9, shell(), None, 80, 24)
+            .expect("reopen");
+        sessions
+            .write("acct", 1, b"yes | head -c 3000000; echo DONE-$((40+2))\n")
+            .expect("write");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let mut seen = Vec::new();
+        while std::time::Instant::now() < deadline {
+            for (_, kind, payload) in sessions.pump(9, PUMP_BUDGET) {
+                if kind == FrameType::Stdout {
+                    seen.extend_from_slice(&payload);
+                }
+            }
+            if seen.windows(7).any(|window| window == b"DONE-42") {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!(
+            "the new connection stalled after {} bytes behind the old one",
+            seen.len()
+        );
     }
 
     #[test]
