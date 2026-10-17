@@ -137,6 +137,8 @@ impl Peer {
         clipboard_level: i32,
         file_capabilities: crate::features::file_transfer::host::Capabilities,
         data_only: bool,
+        // `CT_TERMINAL`: this session may open a shell on this machine.
+        terminal: bool,
         update_resume: Option<super::update_resume::Context>,
     ) -> Result<Self> {
         let audio_only = deferred.is_some() && !data_only;
@@ -742,6 +744,17 @@ impl Peer {
                 if let Some(previous) = lock(&diagnostics_binding).replace(token) {
                     previous.cancel();
                 }
+                return Box::pin(async {});
+            }
+            // The terminal rides the same low-priority BINARY channel the
+            // diagnostics transfer uses; when the controller did not ask for
+            // diagnostics, that channel carries the terminal requests.
+            if terminal && !diagnostics_extension && channel.label() == "BINARY_DATA_CHANNEL" {
+                crate::features::host::terminal::bind(
+                    &channel,
+                    channel_screens.clone(),
+                    channel_cancel.clone(),
+                );
                 return Box::pin(async {});
             }
             let screens = channel_screens.clone();

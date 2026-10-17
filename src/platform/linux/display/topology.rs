@@ -14,14 +14,16 @@ use x11rb::protocol::randr::{
 use x11rb::protocol::xproto::{ConnectionExt as _, Window};
 use x11rb::rust_connection::RustConnection;
 
+/// A display mode the server refused to apply.
+///
 /// Windows tests a mode with the driver before changing anything and reports
-/// a refusal with this. RandR has no such test-only call, so on X11 no mode is
-/// ever rejected this way.
+/// a refusal with this. Xwayland rejects mode changes outright, so it reports
+/// the same value: the connection keeps the current mode instead of failing.
 #[derive(Debug)]
-pub(crate) enum ModeTestRejected {}
+pub(crate) struct ModeTestRejected;
 impl std::fmt::Display for ModeTestRejected {
-    fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match *self {}
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("显示器拒绝该模式")
     }
 }
 impl std::error::Error for ModeTestRejected {}
@@ -200,6 +202,19 @@ fn sideways(rotation: Rotation) -> bool {
 }
 
 impl Topology {
+    /// Whether the X server is Xwayland rather than a real X server.
+    ///
+    /// Xwayland advertises itself through an extension of the same name. Its
+    /// RandR is a shim over the Wayland compositor, whose modes cannot be
+    /// changed from X, so callers must not treat a refused mode as fatal.
+    pub(crate) fn xwayland(&self) -> bool {
+        self.connection
+            .query_extension(b"XWAYLAND")
+            .ok()
+            .and_then(|cookie| cookie.reply().ok())
+            .is_some_and(|reply| reply.present)
+    }
+
     pub(crate) fn query(active_only: bool) -> Result<Self> {
         let (connection, root) = connect()?;
         let resources = connection
@@ -599,6 +614,14 @@ impl Target {
     ) -> Result<()> {
         let target = self.revalidate()?;
         ensure!(target.active, "目标显示器未启用");
+        // Xwayland presents RandR as a shim over the Wayland compositor, which
+        // owns the real modes; switching one there always fails with BadMatch
+        // and can leave CRTCs switched off. Treat the mode as refused so the
+        // connection keeps the current one, which is what the controller gets
+        // anyway on a compositor that will not resize.
+        if Topology::query(false)?.xwayland() {
+            return Err(ModeTestRejected.into());
+        }
         ensure!(
             target
                 .modes

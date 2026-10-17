@@ -60,6 +60,10 @@ pub(crate) struct ConnectionInfo {
     pub client_id: String,
     pub elapsed_seconds: Option<u64>,
     pub observation_lost: bool,
+    /// A terminal connection (`kind = 8`): the controller runs a shell here
+    /// rather than watching the screen, and the access notice says so.
+    #[serde(default)]
+    pub terminal: bool,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -122,6 +126,7 @@ struct Ownership {
     clipboard: super::clipboard::Settings,
     file_transfer: bool,
     port_mapping: bool,
+    terminal: bool,
     remote_power: bool,
     wol: bool,
     power_executing: bool,
@@ -176,6 +181,7 @@ impl Default for Handle {
                 clipboard: Default::default(),
                 file_transfer: true,
                 port_mapping: false,
+                terminal: false,
                 remote_power: false,
                 wol: false,
                 power_executing: false,
@@ -333,6 +339,7 @@ impl Handle {
         state.clipboard = snapshot.clipboard;
         state.file_transfer = snapshot.file_transfer;
         state.port_mapping = snapshot.port_mapping;
+        state.terminal = snapshot.terminal;
         state.remote_power = snapshot.remote_power;
         state.wol = snapshot.wol;
         state.status = snapshot.status;
@@ -420,6 +427,7 @@ impl Handle {
                 clipboard,
                 file_transfer,
                 port_mapping,
+                terminal,
                 remote_power,
                 wol,
             )) => {
@@ -437,6 +445,7 @@ impl Handle {
                 state.clipboard = clipboard;
                 state.file_transfer = file_transfer;
                 state.port_mapping = port_mapping;
+                state.terminal = terminal;
                 state.remote_power = remote_power;
                 state.wol = wol;
                 state.dirty = false;
@@ -572,6 +581,32 @@ impl Handle {
     }
     pub(crate) fn port_mapping_allowed(&self) -> bool {
         lock(&self.ownership).port_mapping
+    }
+    /// Whether the controller may open a shell on this machine.
+    ///
+    /// Off by default: a terminal is an interactive shell, so it is a larger
+    /// grant than screen control and must be turned on deliberately.
+    pub(crate) fn terminal_allowed(&self) -> bool {
+        lock(&self.ownership).terminal
+    }
+    pub(crate) fn set_terminal_allowed(&self, allowed: bool) -> anyhow::Result<()> {
+        {
+            let mut state = lock(&self.ownership);
+            anyhow::ensure!(state.active, "账号会话已结束");
+            if state.terminal != allowed {
+                state.terminal = allowed;
+                state.settings_revision = state.settings_revision.wrapping_add(1);
+                state.dirty = true;
+                state.status.saving = true;
+                state.status.settings_error = None;
+            }
+        }
+        // Turning the terminal off ends the shells it granted, connected or
+        // not; the live terminal connection closes on its next pump tick.
+        if !allowed {
+            super::terminal::end_login(&self.account);
+        }
+        Ok(())
     }
     pub(crate) fn set_port_mapping_allowed(&self, allowed: bool) -> anyhow::Result<()> {
         let mut state = lock(&self.ownership);
@@ -733,6 +768,8 @@ impl Handle {
     }
     pub(crate) fn set_allowed(&self, allowed: bool) {
         if !allowed {
+            // A shell is remote control too; it does not outlive the switch.
+            super::terminal::end_login(&self.account);
             self.power.invalidate();
             if !crate::platform::host_service::resident::managed() {
                 if let Err(error) = super::update_resume::clear(&self.scope) {
@@ -790,6 +827,7 @@ impl Handle {
                 clipboard,
                 file_transfer,
                 port_mapping,
+                terminal,
                 remote_power,
                 wol,
             ) = {
@@ -808,6 +846,7 @@ impl Handle {
                     state.clipboard,
                     state.file_transfer,
                     state.port_mapping,
+                    state.terminal,
                     state.remote_power,
                     state.wol,
                 )
@@ -825,6 +864,7 @@ impl Handle {
                         clipboard,
                         file_transfer,
                         port_mapping,
+                        terminal,
                         remote_power,
                         wol,
                     },
@@ -843,6 +883,7 @@ impl Handle {
                         clipboard,
                         file_transfer,
                         port_mapping,
+                        terminal,
                         remote_power,
                         wol,
                     )
@@ -894,6 +935,10 @@ impl Handle {
         state.status.message = "本机离线".into();
         self.desired.send_replace(None);
         drop(state);
+        // Every way a login generation ends (sign-out, another account,
+        // unbinding, an expired credential) comes through here; its shells
+        // end with it rather than outliving the login that opened them.
+        super::terminal::end_login(&self.account);
         if clear_update {
             if let Err(error) = super::update_resume::clear(&self.scope) {
                 tracing::warn!(%error, "retired update media handoff cleanup failed");
@@ -924,7 +969,12 @@ impl Handle {
     }
     pub(crate) fn disconnect_session(&self, session: &str) -> bool {
         let managed = crate::platform::host_service::resident::managed();
-        disconnect_session(&mut lock(&self.ownership), session, managed)
+        let disconnected = disconnect_session(&mut lock(&self.ownership), session, managed);
+        // The local user sent the controller away; its shells go with it.
+        if disconnected {
+            super::terminal::end_login(&self.account);
+        }
+        disconnected
     }
     pub(crate) fn requested(&self) -> bool {
         let state = lock(&self.ownership);
@@ -998,7 +1048,7 @@ impl Drop for SessionLease {
     }
 }
 impl Lease {
-    pub(crate) fn controller(&self, device_id: &str, client_id: &str) {
+    pub(crate) fn controller(&self, device_id: &str, client_id: &str, terminal: bool) {
         self.modify(|state| {
             let session_id = state
                 .status
@@ -1014,6 +1064,7 @@ impl Lease {
                     String::new()
                 },
                 client_id: client_id.to_owned(),
+                terminal,
                 ..Default::default()
             });
         });
@@ -1053,6 +1104,11 @@ impl Lease {
     }
     pub(crate) fn display_scope(&self) -> &str {
         &self.handle.scope
+    }
+    /// The account this lease acts for. Terminal sessions are scoped to it so
+    /// a second account controlling the same machine cannot reach them.
+    pub(crate) fn account(&self) -> &str {
+        &self.handle.account
     }
     pub(crate) fn begin_stream(&self, track: usize) -> anyhow::Result<Self> {
         let mut state = lock(&self.handle.ownership);
@@ -1203,6 +1259,15 @@ impl Lease {
                 && state.port_mapping,
             state.port_revision,
         )
+    }
+    /// Whether this lease may open a shell on the controlled machine.
+    ///
+    /// A terminal is a shell, so it is refused for guest assistance and for
+    /// a controller that is not currently the active one, exactly like the
+    /// other privileged grants.
+    pub(crate) fn terminal_allowed(&self) -> bool {
+        let state = lock(&self.handle.ownership);
+        self.current(&state) && self.assistance.is_none() && !self.handle.guest && state.terminal
     }
     pub(crate) fn port_status(&self, status: crate::features::port_mapping::host::Status) {
         self.modify(|s| s.status.ports = status);

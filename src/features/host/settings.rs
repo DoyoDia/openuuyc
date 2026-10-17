@@ -29,6 +29,8 @@ struct Record {
     #[serde(default)]
     port_mapping: bool,
     #[serde(default)]
+    terminal: bool,
+    #[serde(default)]
     remote_power: bool,
     #[serde(default)]
     wol: bool,
@@ -73,6 +75,7 @@ impl Store {
         bool,
         bool,
         bool,
+        bool,
     )> {
         let bytes = match self.0.get_secret() {
             Ok(bytes) => bytes,
@@ -86,6 +89,7 @@ impl Store {
                     Default::default(),
                     Default::default(),
                     true,
+                    false,
                     false,
                     false,
                     false,
@@ -111,6 +115,7 @@ impl Store {
             record.clipboard,
             record.file_transfer,
             record.port_mapping,
+            record.terminal,
             record.remote_power,
             record.wol,
         ))
@@ -126,6 +131,7 @@ impl Store {
         clipboard: super::clipboard::Settings,
         file_transfer: bool,
         port_mapping: bool,
+        terminal: bool,
         remote_power: bool,
         wol: bool,
     ) -> Result<()> {
@@ -147,6 +153,7 @@ impl Store {
                 clipboard,
                 file_transfer,
                 port_mapping,
+                terminal,
                 remote_power,
                 wol,
             })?)

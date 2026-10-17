@@ -62,19 +62,26 @@ impl DeviceCenterApp {
         let mut ports = host.port_mapping_allowed();
         let mut power = host.power_allowed();
         let mut wol = host.wol_allowed();
+        // Only where this platform can actually run a shell.
+        let terminal_supported = crate::platform::terminal::unavailable().is_none();
+        let mut terminal = host.terminal_allowed();
         let mut clipboard = host.clipboard_settings();
-        let before = (files, ports, power, wol, clipboard);
+        let before = (files, ports, power, wol, terminal, clipboard);
         let enabled = usize::from(clipboard.enabled)
             + usize::from(clipboard.enabled && clipboard.files)
             + if guest {
                 0
             } else {
-                [files, ports, power, wol]
+                [files, ports, power, wol, terminal && terminal_supported]
                     .into_iter()
                     .filter(|v| *v)
                     .count()
             };
-        let total = if guest { 2 } else { 6 };
+        let total = if guest {
+            2
+        } else {
+            6 + usize::from(terminal_supported)
+        };
         let id = egui::Id::new(("host-access-settings", self.login_generation));
         let mut open = ui.data(|data| data.get_temp::<bool>(id).unwrap_or(false));
         form_row(
@@ -115,17 +122,58 @@ impl DeviceCenterApp {
                             ui.checkbox(&mut power, "关机和重启");
                             ui.checkbox(&mut ports, "端口转发");
                             ui.checkbox(&mut wol, "局域网唤醒协助");
+                            if terminal_supported {
+                                ui.checkbox(&mut terminal, "终端");
+                                ui.label(
+                                    RichText::new("主控设备可以以当前用户身份在本机执行任意命令")
+                                        .small()
+                                        .color(MUTED),
+                                );
+                                let running = crate::features::host::terminal::running();
+                                if running > 0 {
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            RichText::new(format!("终端会话：{running} 个运行中"))
+                                                .small(),
+                                        );
+                                        if ui
+                                            .add(crate::ui::controls::secondary("结束全部"))
+                                            .clicked()
+                                        {
+                                            crate::features::host::terminal::end_all();
+                                        }
+                                    });
+                                }
+                            }
                         }
                     });
                 });
             ui.add_space(theme::MENU_GROUP_GAP);
+        }
+        // A shell is the widest grant on this page: turning it on asks first,
+        // and only the confirmation applies it.
+        let confirm_id = egui::Id::new(("host-terminal-confirm", self.login_generation));
+        if terminal && !before.4 {
+            terminal = false;
+            ui.data_mut(|data| data.insert_temp(confirm_id, true));
+        }
+        if ui.data(|data| data.get_temp::<bool>(confirm_id).unwrap_or(false)) {
+            match terminal_confirmation(ui.ctx()) {
+                Some(true) => {
+                    terminal = true;
+                    ui.data_mut(|data| data.remove::<bool>(confirm_id));
+                }
+                Some(false) => ui.data_mut(|data| data.remove::<bool>(confirm_id)),
+                None => {}
+            }
         }
         let results = [
             (files != before.0).then(|| host.set_file_transfer_allowed(files)),
             (ports != before.1).then(|| host.set_port_mapping_allowed(ports)),
             (power != before.2).then(|| host.set_power_allowed(power)),
             (wol != before.3).then(|| host.set_wol_allowed(wol)),
-            (clipboard != before.4).then(|| host.set_clipboard_settings(clipboard)),
+            (terminal != before.4).then(|| host.set_terminal_allowed(terminal)),
+            (clipboard != before.5).then(|| host.set_clipboard_settings(clipboard)),
         ];
         let mut changed = false;
         for result in results.into_iter().flatten() {
@@ -477,4 +525,41 @@ impl DeviceCenterApp {
         }
         ui.ctx().request_repaint_after(Duration::from_millis(250));
     }
+}
+
+/// Asks before the controller may run a shell here: `Some(true)` to allow,
+/// `Some(false)` to leave it off, `None` while the dialog is still open.
+fn terminal_confirmation(ctx: &egui::Context) -> Option<bool> {
+    let mut decision = None;
+    let response = egui::Modal::new(egui::Id::new("host-terminal-confirm"))
+        .frame(crate::ui::controls::dialog_frame())
+        .show(ctx, |ui| {
+            ui.set_width(410.0);
+            if crate::ui::controls::dialog_header(
+                ui,
+                "允许终端？",
+                crate::ui::controls::DialogIcon::Warning,
+                true,
+            ) {
+                decision = Some(false);
+            }
+            ui.label(
+                "已授权的主控设备将可以以当前用户身份在本机打开命令行，执行任意命令，\
+                 读取和修改这个用户能访问的所有文件。只在信任的设备上开启。",
+            );
+            let (accept, dismiss) = crate::ui::controls::dialog_actions(
+                ui,
+                Some(crate::ui::controls::DialogAction::new("允许终端").danger(true)),
+                Some("取消"),
+            );
+            if accept {
+                decision = Some(true);
+            } else if dismiss {
+                decision = Some(false);
+            }
+        });
+    if decision.is_none() && response.should_close() {
+        decision = Some(false);
+    }
+    decision
 }
