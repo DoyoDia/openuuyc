@@ -22,6 +22,9 @@ use winit::window::{Window, WindowId};
 const HIDDEN_TICK: Duration = Duration::from_millis(250);
 /// The shortest, so an animation request cannot spin a window-less pass.
 const HIDDEN_MIN_TICK: Duration = Duration::from_millis(50);
+/// 通知区域的主人（面板、状态栏）常常比程序晚起来，服务随会话启动时尤其如此，
+/// 所以托盘没建出来就按这个间隔接着试，直到它出现。
+const TRAY_RETRY: Duration = Duration::from_secs(2);
 
 pub(super) fn run(config: WindowConfig, factory: AppFactory) -> Result<()> {
     #[cfg_attr(not(windows), allow(unused_mut))]
@@ -73,6 +76,24 @@ pub(super) fn run(config: WindowConfig, factory: AppFactory) -> Result<()> {
 fn sync_tray(tray: Option<&super::tray::Tray>, controlled: bool) {
     if let Some(tray) = tray {
         tray.set_controlled(controlled);
+    }
+}
+
+/// 把迟到的托盘接回来。通知区域的主人是桌面会话里的另一个进程，比程序先起来
+/// 不是它能保证的事（systemd 那边也只能等到图形会话），而托盘的有无决定窗口
+/// 关闭是「收进托盘」还是「结束程序」，所以它得是能恢复的状态，不是启动时的
+/// 一次判定。第一次失败由建窗口的地方带着原因记 warn，之后每次只记 debug。
+fn retry_tray(tray: &mut Option<super::tray::Tray>, wanted: bool, next: &mut Instant) {
+    if !wanted || tray.is_some() || Instant::now() < *next {
+        return;
+    }
+    *next = Instant::now() + TRAY_RETRY;
+    match super::tray::Tray::new() {
+        Ok(new) => {
+            tracing::info!("通知区域可用了，窗口关闭改为收进托盘");
+            *tray = Some(new);
+        }
+        Err(error) => tracing::debug!(error = %format!("{error:#}"), "通知区域仍不可用"),
     }
 }
 
@@ -214,6 +235,9 @@ struct DesktopWindow {
     /// Only where the window cannot be hidden in place (Wayland).
     hide_requested: bool,
     tray: Option<super::tray::Tray>,
+    /// 托盘还没建出来时在这里接着试，见 [`retry_tray`]。
+    wants_tray: bool,
+    next_tray_attempt: Instant,
     exiting: bool,
     show_after_present: bool,
     /// Read only on Windows; see its use after the first present.
@@ -302,7 +326,7 @@ impl Runner {
             return Ok(());
         }
         // 收进托盘过的主窗口沿用原来的应用、egui 上下文与绘制资源重建，其余才新建。
-        let (context, app, tray, retained, restore) = match self.hidden.take() {
+        let (context, app, mut tray, retained, restore) = match self.hidden.take() {
             Some(Hidden {
                 app,
                 context,
@@ -427,20 +451,23 @@ impl Runner {
             }
         };
         let uses_tray = self.root && app.0.uses_tray();
-        // Without a notification area the window keeps its ordinary close
-        // behaviour rather than hiding where it cannot be reached.
-        let tray = match tray {
-            Some(tray) => Some(tray),
-            None if uses_tray => {
-                crate::application::app::instance::register_window(&window)?;
-                super::tray::Tray::new()
-                    .inspect_err(
-                        |error| tracing::warn!(error = %format!("{error:#}"), "tray unavailable"),
-                    )
-                    .ok()
+        // 再点一次图标要能找到这个窗口（Windows 按 HWND 找进程）。
+        if uses_tray && tray.is_none() {
+            crate::application::app::instance::register_window(&window)?;
+        }
+        // 没有通知区域时窗口保留普通的关闭行为，而不是藏到一个够不着的地方；
+        // 但托盘可能只是还没起来，所以交给 retry_tray 接着试：它起来了，关闭
+        // 就又是收进托盘。托盘建不出来不该拦着窗口本身。
+        let next_tray_attempt = Instant::now() + TRAY_RETRY;
+        if uses_tray && tray.is_none() {
+            match super::tray::Tray::new() {
+                Ok(new) => tray = Some(new),
+                Err(error) => tracing::warn!(
+                    error = %format!("{error:#}"),
+                    "通知区域不可用，先按没有托盘运行"
+                ),
             }
-            None => None,
-        };
+        }
         let refresh = window
             .current_monitor()
             .and_then(|monitor| monitor.refresh_rate_millihertz())
@@ -458,6 +485,8 @@ impl Runner {
             close_requested: false,
             hide_requested: false,
             tray,
+            wants_tray: uses_tray,
+            next_tray_attempt,
             exiting: false,
             // 重建出来的窗口总是要显示的。
             show_after_present: restore.is_some() || self.config.viewport.visible.unwrap_or(true),
@@ -562,6 +591,7 @@ impl DesktopWindow {
         // 标题栏提示与托盘角标共用这一次判定。
         let alert = self.app.0.title_bar_alert();
         let controlled = alert.is_some();
+        retry_tray(&mut self.tray, self.wants_tray, &mut self.next_tray_attempt);
         let output = self.context.run_ui(input, |ui| {
             let ctx = ui.ctx().clone();
             super::chrome::resize_regions(ui, &self.window, |response, direction| {
