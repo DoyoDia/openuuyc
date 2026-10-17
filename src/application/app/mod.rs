@@ -61,6 +61,9 @@ pub fn run(options: GuiOptions) -> Result<()> {
     crate::platform::windows::assist_link::retarget_on_start();
     let _shortcuts = crate::application::viewer_shortcuts::Watcher::new()?;
     crate::features::host::displays::fallback::start_background();
+    // 终端会话由这个进程托管。把表建起来，`gui --background` 这种连窗口都
+    // 不建的实例也要能提供本机 attach 的 socket。
+    crate::features::host::terminal::shared();
     let (local_display, display_warning) = match detect_local_display() {
         Ok(display) => (display, None),
         Err(error) => (
