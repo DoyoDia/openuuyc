@@ -17,6 +17,15 @@ pub(crate) use linux::{
     drag_drop, encoder, file_locations, graphics, host_service, loopback, notifications,
     power_request, surface, system_power, terminal, transfer, virtual_audio, virtual_display, wol,
 };
+// The pty half of the terminal is identical on both, so it lives in one place
+// and each platform re-exports it. The rest of the macOS platform does not
+// exist yet, which is why only `terminal` is selected here.
+#[cfg(target_os = "macos")]
+pub(crate) mod macos;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) mod posix;
+#[cfg(target_os = "macos")]
+pub(crate) use macos::terminal;
 /// One output as the compositor lays it out, in the global space it resolves
 /// an absolute pointer position in. X11 and Windows have no such thing: their
 /// display rectangles are already the space a pointer is named in.

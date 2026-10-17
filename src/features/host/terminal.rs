@@ -58,10 +58,6 @@ const MAX_SESSIONS: usize = 16;
 /// matching the limit keeps the two in agreement instead of failing at the
 /// client after the server already accepted it.
 const MAX_NAME: usize = 64;
-/// Output kept per shell so a reattach can replay the screen the controller
-/// last saw. The client keeps its own scrollback, so a screenful and a little
-/// history is enough.
-const SCROLLBACK_LIMIT: usize = 128 * 1024;
 /// Shells all logins together may hold, on top of [`MAX_SESSIONS`] each.
 const MAX_TOTAL: usize = 64;
 /// Input a session may hold when the pty will not take it yet. A frame that
@@ -76,6 +72,19 @@ const OUTPUT_HIGH_WATER: usize = 2 * 1024 * 1024;
 const IDLE_LIMIT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 /// How often detached shells are checked against [`IDLE_LIMIT`].
 const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+/// The largest terminal a controller may ask for. The screen model allocates
+/// every cell up front (32 bytes each, twice while a full-screen program uses
+/// the alternate screen), so an unchecked 65535 x 65535 would ask for 128 GiB
+/// and take the whole host down. 512 columns is wider than a 4K screen at a
+/// 7-pixel font; 512 x 256 is 4 MiB a screen. The bound also keeps the size
+/// inside the signed 16-bit `COORD` ConPTY takes.
+const MAX_COLS: u16 = 512;
+const MAX_ROWS: u16 = 256;
+
+/// The size the pty and the model actually get for a requested one.
+fn clamp_size(cols: u16, rows: u16) -> (u16, u16) {
+    (cols.clamp(1, MAX_COLS), rows.clamp(1, MAX_ROWS))
+}
 
 /// Frame kinds, in the declaration order the shipped enum uses.
 ///
@@ -195,9 +204,15 @@ struct Session {
     state: SessionState,
     created_ms: i64,
     last_active_ms: i64,
-    /// Output the shell has produced, so a reattach can replay the screen the
-    /// controller last saw instead of showing it blank.
-    scrollback: Vec<u8>,
+    /// The shell's screen, kept as a terminal model rather than a byte log.
+    ///
+    /// A reattach replays this, so what the controller draws is what was on
+    /// screen. Re-feeding a byte log instead runs the output through the
+    /// client's parser a second time, which is wrong the moment the log is
+    /// cut: byte N of a terminal stream has no meaning on its own, and a
+    /// full-screen program that never emits a newline has no safe cut at all —
+    /// the byte cap left a `top` replay truncated in the middle of one.
+    screen: vt100::Parser,
     /// Input the pty would not take yet. A paste or a slow shell fills the
     /// pty buffer; dropping the rest would lose keystrokes silently.
     pending: Vec<u8>,
@@ -222,14 +237,26 @@ impl Session {
         }
     }
 
-    /// Records output for a later reattach, dropping the oldest bytes once the
-    /// limit is reached so a chatty shell cannot grow without bound.
-    fn push_scrollback(&mut self, data: &[u8]) {
-        self.scrollback.extend_from_slice(data);
-        if self.scrollback.len() > SCROLLBACK_LIMIT {
-            let excess = self.scrollback.len() - SCROLLBACK_LIMIT;
-            self.scrollback.drain(..excess);
-        }
+    /// Feeds output to the session's screen model.
+    ///
+    /// The model applies the terminal's own rules — cursor motion, scrolling,
+    /// the alternate screen — so what a reattach replays is a screen rather
+    /// than a byte log. No scrollback is kept: a reattach shows the visible
+    /// screen, which is what `capture-pane` gives the reference server.
+    fn record(&mut self, data: &[u8]) {
+        self.screen.process(data);
+    }
+
+    /// Resizes the pty and the screen model together. A model left at the
+    /// old size wraps lines where the shell did not, and a reattach then
+    /// replays a screen cut at the old width.
+    fn resize(&mut self, cols: u16, rows: u16) -> Result<(), SessionError> {
+        let (cols, rows) = clamp_size(cols, rows);
+        self.pty
+            .resize(cols, rows)
+            .map_err(|_| SessionError::Gone)?;
+        self.screen.screen_mut().set_size(rows, cols);
+        Ok(())
     }
 
     fn let_go(&mut self) {
@@ -352,7 +379,7 @@ impl Sessions {
     /// The controller normally picks the handle, but its `open` frame may
     /// carry zero when it wants the host to allocate one; the returned handle
     /// is what later `stdin`/`resize` frames must use. Re-opening an existing
-    /// handle re-uses the shell and returns its scrollback, which is what the
+    /// handle re-uses the shell and returns its screen, which is what the
     /// controller redraws on reattach.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn open(
@@ -373,17 +400,18 @@ impl Sessions {
         // Re-opening an existing handle happens on reconnect and when the
         // size changes; replacing the pty would hang up a shell in use.
         if let Some(existing) = self.sessions.get_mut(&key(owner, handle)) {
-            existing
-                .pty
-                .resize(cols, rows)
-                .map_err(|_| SessionError::Gone)?;
+            existing.resize(cols, rows)?;
             if existing.state != SessionState::Exited {
                 existing.state = SessionState::Running;
             }
             existing.attached = Some(connection);
             existing.detached_since = None;
             existing.last_active_ms = now_ms();
-            return Ok((handle, existing.name.clone(), existing.scrollback.clone()));
+            return Ok((
+                handle,
+                existing.name.clone(),
+                existing.screen.screen().state_formatted(),
+            ));
         }
         if self.owned(owner).count() >= MAX_SESSIONS || self.sessions.len() >= MAX_TOTAL {
             return Err(SessionError::TooMany);
@@ -395,6 +423,7 @@ impl Sessions {
         if self.owned(owner).any(|(_, session)| session.name == name) {
             return Err(SessionError::DuplicateName);
         }
+        let (cols, rows) = clamp_size(cols, rows);
         let pty = crate::platform::terminal::Session::open(shell, cols, rows)
             .map_err(|_| SessionError::Gone)?;
         let stamp = now_ms();
@@ -406,7 +435,7 @@ impl Sessions {
                 state: SessionState::Running,
                 created_ms: stamp,
                 last_active_ms: stamp,
-                scrollback: Vec::new(),
+                screen: vt100::Parser::new(rows, cols, 0),
                 pending: Vec::new(),
                 attached: Some(connection),
                 detached_since: None,
@@ -450,11 +479,11 @@ impl Sessions {
     }
 
     /// The default shell, matching what a terminal emulator would start.
+    ///
+    /// The platform decides: `$SHELL` (falling back to the system's login
+    /// shell) on POSIX, `ComSpec` on Windows.
     pub(crate) fn default_shell() -> String {
-        std::env::var("SHELL")
-            .ok()
-            .filter(|shell| !shell.is_empty() && std::path::Path::new(shell).exists())
-            .unwrap_or_else(|| "/bin/bash".to_owned())
+        crate::platform::terminal::default_shell()
     }
 
     /// The sessions `owner` may see, as the objects the client parses.
@@ -507,10 +536,7 @@ impl Sessions {
         rows: u16,
     ) -> Result<(), SessionError> {
         let session = self.get_mut(owner, handle)?;
-        session
-            .pty
-            .resize(cols, rows)
-            .map_err(|_| SessionError::Gone)?;
+        session.resize(cols, rows)?;
         session.last_active_ms = now_ms();
         Ok(())
     }
@@ -624,7 +650,7 @@ impl Sessions {
                 match session.pty.read(&mut buffer[..want]) {
                     Ok(Some(0)) | Err(_) => break,
                     Ok(Some(read)) => {
-                        session.push_scrollback(&buffer[..read]);
+                        session.record(&buffer[..read]);
                         out.push((handle, FrameType::Stdout, buffer[..read].to_vec()));
                         budget -= read;
                         left -= read;
@@ -695,24 +721,11 @@ impl Sessions {
 /// Maps the controller's shell choice to a real program.
 ///
 /// The `open` payload names a shell *kind* (`powershell`, `cmd`, `bash`), not
-/// a path. The Windows names have no Linux equivalent, so they fall back to
-/// the user's login shell rather than failing the request; the client shows
-/// its generic creation error when `open` is refused.
+/// a path, and each platform knows which kinds it can offer. The platform
+/// layer decides; this stays as a named seam so the call sites and tests here
+/// read the same on every OS.
 fn resolve_shell(requested: &str) -> String {
-    let candidate = match requested.trim().to_ascii_lowercase().as_str() {
-        "bash" => Some("/bin/bash"),
-        "zsh" => Some("/bin/zsh"),
-        "sh" => Some("/bin/sh"),
-        "fish" => Some("/usr/bin/fish"),
-        "pwsh" => Some("/usr/bin/pwsh"),
-        // `powershell` and `cmd` are Windows-only. A POSIX shell is not a
-        // substitute for either, so fall through to the login shell.
-        _ => None,
-    };
-    match candidate {
-        Some(path) if std::path::Path::new(path).exists() => path.to_owned(),
-        _ => Sessions::default_shell(),
-    }
+    crate::platform::terminal::resolve_shell(requested)
 }
 
 /// Rejects the names the client's own validation rejects, so a rename that
@@ -802,6 +815,20 @@ pub(crate) fn end_all() {
     if let Some(table) = SESSIONS.get() {
         lock_table(table).kill_all().finish();
     }
+}
+
+/// Why this host cannot serve a terminal; `None` when it can.
+///
+/// The platform answers for this process (root on POSIX, LocalSystem on
+/// Windows). In unattended mode the shell would come from the SYSTEM service
+/// rather than from this process, so the settings page, which runs as the
+/// user, is told the same thing the service would answer and does not offer
+/// a switch every connection would refuse.
+pub(crate) fn unavailable() -> Option<&'static str> {
+    crate::platform::terminal::unavailable().or_else(|| {
+        crate::platform::host_service::resident::managed()
+            .then_some("无人值守模式以 SYSTEM 身份运行，不提供终端")
+    })
 }
 
 /// How many shells this process is running, for the host's settings page.
@@ -1090,11 +1117,12 @@ async fn handle_frame(
                     serde_json::to_vec(&payload).unwrap_or_default(),
                 ));
                 if !replay.is_empty() {
-                    // Redraw what the screen last held. Clearing first stops a
-                    // reattach from appending the history to what is already
-                    // there.
-                    let mut redraw = Vec::with_capacity(replay.len() + 12);
-                    redraw.extend_from_slice(b"\x1b[2J\x1b[3J\x1b[H");
+                    // Redraw what the screen last held. The reset and the
+                    // clear come first so the replay lands on a blank screen:
+                    // the formatted state positions the cursor and sets
+                    // attributes itself, but assumes it draws onto one.
+                    let mut redraw = Vec::with_capacity(replay.len() + 16);
+                    redraw.extend_from_slice(b"\x1b[0m\x1b[2J\x1b[3J\x1b[H");
                     redraw.extend_from_slice(&replay);
                     outgoing.push((FrameType::Stdout, session, redraw));
                 }
@@ -1248,12 +1276,27 @@ mod tests {
         assert!(Frame::parse(&encoded).is_none());
     }
 
+    /// The shell the pty tests drive. `cmd.exe` is present on every Windows
+    /// install; `/bin/sh` is on every POSIX one.
     fn shell() -> &'static str {
-        "/bin/sh"
+        if cfg!(windows) { "cmd.exe" } else { "/bin/sh" }
+    }
+
+    /// One command line for that shell. `cmd.exe` reads a bare `\n` as part of
+    /// the command in some cases, so Windows gets the CRLF it expects.
+    fn line(command: &str) -> Vec<u8> {
+        if cfg!(windows) {
+            format!("{command}\r\n").into_bytes()
+        } else {
+            format!("{command}\n").into_bytes()
+        }
     }
 
     #[test]
-    #[cfg_attr(not(target_os = "linux"), ignore = "needs a pty, which only Linux has")]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "macos", windows)),
+        ignore = "no terminal backend on this platform"
+    )]
     fn sessions_are_keyed_by_the_controller_handle() {
         let mut sessions = Sessions::default();
         sessions
@@ -1263,12 +1306,15 @@ mod tests {
             .open("acct", 22, 1, shell(), None, 80, 24)
             .expect("open");
         assert_eq!(sessions.list("acct").len(), 2);
-        assert!(sessions.write("acct", 11, b"echo A\n").is_ok());
-        assert!(sessions.write("acct", 33, b"echo B\n").is_err());
+        assert!(sessions.write("acct", 11, &line("echo A")).is_ok());
+        assert!(sessions.write("acct", 33, &line("echo B")).is_err());
     }
 
     #[test]
-    #[cfg_attr(not(target_os = "linux"), ignore = "needs a pty, which only Linux has")]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "macos", windows)),
+        ignore = "no terminal backend on this platform"
+    )]
     fn a_duplicate_name_is_refused() {
         let mut sessions = Sessions::default();
         sessions
@@ -1306,14 +1352,19 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(not(target_os = "linux"), ignore = "needs a pty, which only Linux has")]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "macos", windows)),
+        ignore = "no terminal backend on this platform"
+    )]
     fn write_and_resize_reach_the_shell() {
         let mut sessions = Sessions::default();
         sessions
             .open("acct", 1, 1, shell(), None, 80, 24)
             .expect("open");
         sessions.resize("acct", 1, 120, 40).expect("resize");
-        sessions.write("acct", 1, b"echo READY\n").expect("write");
+        sessions
+            .write("acct", 1, &line("echo READY"))
+            .expect("write");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let mut seen = Vec::new();
         while std::time::Instant::now() < deadline {
@@ -1331,7 +1382,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(not(target_os = "linux"), ignore = "needs a pty, which only Linux has")]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "macos", windows)),
+        ignore = "no terminal backend on this platform"
+    )]
     fn a_reattach_replays_the_screen() {
         let mut sessions = Sessions::default();
         let (handle, _, replay) = sessions
@@ -1339,7 +1393,7 @@ mod tests {
             .expect("open");
         assert!(replay.is_empty(), "a fresh session has nothing to replay");
         sessions
-            .write("acct", handle, b"echo HISTORY\n")
+            .write("acct", handle, &line("echo HISTORY"))
             .expect("write");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while std::time::Instant::now() < deadline {
@@ -1365,13 +1419,16 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(not(target_os = "linux"), ignore = "needs a pty, which only Linux has")]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "macos", windows)),
+        ignore = "no terminal backend on this platform"
+    )]
     fn an_exited_shell_reports_once() {
         let mut sessions = Sessions::default();
         sessions
             .open("acct", 1, 1, shell(), None, 80, 24)
             .expect("open");
-        sessions.write("acct", 1, b"exit\n").expect("write");
+        sessions.write("acct", 1, &line("exit")).expect("write");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while std::time::Instant::now() < deadline {
             if sessions
@@ -1389,7 +1446,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(not(target_os = "linux"), ignore = "needs a pty, which only Linux has")]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "macos", windows)),
+        ignore = "no terminal backend on this platform"
+    )]
     fn killing_removes_a_session_and_a_second_kill_is_gone() {
         let mut sessions = Sessions::default();
         sessions
@@ -1401,10 +1461,15 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(not(target_os = "linux"), ignore = "needs a pty, which only Linux has")]
-    fn windows_shell_kinds_fall_back_to_a_posix_shell() {
-        // The Android client always asks for `powershell`; refusing it is what
-        // made the phone report a failed session creation.
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "macos", windows)),
+        ignore = "no terminal backend on this platform"
+    )]
+    fn every_requested_shell_kind_resolves_to_a_real_program() {
+        // The Android client always asks for `powershell`. On Windows that is
+        // the program itself; elsewhere it falls back to the login shell.
+        // Either way the answer has to be a path that exists, because refusing
+        // it is what made the phone report a failed session creation.
         assert!(std::path::Path::new(&resolve_shell("powershell")).exists());
         assert!(std::path::Path::new(&resolve_shell("cmd")).exists());
         assert!(std::path::Path::new(&resolve_shell("bash")).exists());
@@ -1553,7 +1618,7 @@ mod tests {
         sessions
             .open("acct", 2, 1, shell(), None, 80, 24)
             .expect("open");
-        sessions.write("acct", 1, b"exit\n").expect("write");
+        sessions.write("acct", 1, &line("exit")).expect("write");
         std::thread::sleep(std::time::Duration::from_millis(300));
         sessions.release(1);
         let (exited, abandoned) = sessions.sweep(std::time::Duration::from_secs(3600));
@@ -1581,6 +1646,150 @@ mod tests {
         assert!(lock_table(&table).list("ending-login").is_empty());
         assert_eq!(lock_table(&table).list("staying-login").len(), 1);
         lock_table(&table).kill_owned("staying-login").finish();
+    }
+
+    #[test]
+    // The bulk producer below is a POSIX shell loop. The model itself is
+    // platform-independent, so Linux coverage of this property is enough.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn a_reattach_replays_the_screen_not_the_output_log() {
+        let mut sessions = Sessions::default();
+        let (handle, _, _) = sessions
+            .open("acct", 0, 1, "/bin/sh", None, 80, 24)
+            .expect("open");
+        // Far more output than the byte log we used to keep, then a marker. A
+        // log cut at 128 KiB can land inside an escape sequence and leave the
+        // client printing the tail of it; a screen cannot be cut at all.
+        sessions
+            .write(
+                "acct",
+                handle,
+                &line("for i in $(seq 1 4000); do echo FILLER-FILLER-FILLER-$i; done"),
+            )
+            .expect("write");
+        sessions
+            .write("acct", handle, &line("echo THE-LAST-LINE"))
+            .expect("write");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut seen = Vec::new();
+        while std::time::Instant::now() < deadline {
+            for (_, kind, payload) in sessions.pump(1, usize::MAX) {
+                if kind == FrameType::Stdout {
+                    seen.extend_from_slice(&payload);
+                }
+            }
+            if String::from_utf8_lossy(&seen).contains("THE-LAST-LINE") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            String::from_utf8_lossy(&seen).contains("THE-LAST-LINE"),
+            "the shell never finished"
+        );
+        let (again, _, replay) = sessions
+            .open("acct", handle, 1, "/bin/sh", None, 80, 24)
+            .expect("reattach");
+        assert_eq!(again, handle, "reattach keeps the same shell");
+        let text = String::from_utf8_lossy(&replay);
+        assert!(
+            text.contains("THE-LAST-LINE"),
+            "the replay is not the current screen"
+        );
+        // The property the model gives us: the replay describes one screen, so
+        // it does not grow with how much the shell has printed.
+        assert!(
+            replay.len() < 16 * 1024,
+            "the replay grew with the output: {} bytes",
+            replay.len()
+        );
+    }
+
+    #[test]
+    // A POSIX `printf`; the model is platform-independent.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn a_resize_reaches_the_replayed_screen() {
+        let mut sessions = Sessions::default();
+        let (handle, _, _) = sessions
+            .open("acct", 0, 1, "/bin/sh", None, 80, 24)
+            .expect("open");
+        // A phone rotating or raising its keyboard narrows the terminal.
+        sessions.resize("acct", handle, 40, 24).expect("resize");
+        let wide = format!("{}{}", "A".repeat(30), "B".repeat(31));
+        // The command line splits the two halves, so only the output holds
+        // the joined line.
+        sessions
+            .write(
+                "acct",
+                handle,
+                &line(&format!(
+                    "printf '%s%s\\n' {} {}",
+                    "A".repeat(30),
+                    "B".repeat(31)
+                )),
+            )
+            .expect("write");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut seen = Vec::new();
+        while std::time::Instant::now() < deadline {
+            for (_, kind, payload) in sessions.pump(1, PUMP_BUDGET) {
+                if kind == FrameType::Stdout {
+                    seen.extend_from_slice(&payload);
+                }
+            }
+            if String::from_utf8_lossy(&seen).contains(&wide) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            String::from_utf8_lossy(&seen).contains(&wide),
+            "the shell never printed the line"
+        );
+        let (_, _, replay) = sessions
+            .open("acct", handle, 1, "/bin/sh", None, 40, 24)
+            .expect("reattach");
+        // Draw the replay the way the controller would, at its width; the line
+        // wraps onto a second row there, and none of it may be missing.
+        let mut client = vt100::Parser::new(24, 40, 0);
+        client.process(&replay);
+        let drawn: String = client
+            .screen()
+            .contents()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(drawn.contains(&wide), "the replay lost the line: {drawn:?}");
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "macos", windows)),
+        ignore = "no terminal backend on this platform"
+    )]
+    fn an_oversized_terminal_is_clamped() {
+        let mut sessions = Sessions::default();
+        // Unclamped, this model alone would ask for 128 GiB.
+        let (handle, _, _) = sessions
+            .open("acct", 0, 1, shell(), None, u16::MAX, u16::MAX)
+            .expect("open");
+        let size = |sessions: &Sessions| {
+            sessions.sessions[&key("acct", handle)]
+                .screen
+                .screen()
+                .size()
+        };
+        assert_eq!(size(&sessions), (MAX_ROWS, MAX_COLS));
+        sessions.resize("acct", handle, 100, 40).expect("resize");
+        assert_eq!(size(&sessions), (40, 100));
+        sessions
+            .resize("acct", handle, u16::MAX, 0)
+            .expect("resize");
+        assert_eq!(size(&sessions), (1, MAX_COLS));
+        sessions
+            .open("acct", handle, 1, shell(), None, 0, u16::MAX)
+            .expect("reattach");
+        assert_eq!(size(&sessions), (MAX_ROWS, 1));
     }
 
     #[test]

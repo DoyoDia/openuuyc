@@ -62,8 +62,10 @@ impl DeviceCenterApp {
         let mut ports = host.port_mapping_allowed();
         let mut power = host.power_allowed();
         let mut wol = host.wol_allowed();
-        // Only where this platform can actually run a shell.
-        let terminal_supported = crate::platform::terminal::unavailable().is_none();
+        // Only where this host can actually run a shell; elsewhere the switch
+        // stays visible, off, with the reason.
+        let terminal_refusal = crate::features::host::terminal::unavailable();
+        let terminal_supported = terminal_refusal.is_none();
         let mut terminal = host.terminal_allowed();
         let mut clipboard = host.clipboard_settings();
         let before = (files, ports, power, wol, terminal, clipboard);
@@ -122,7 +124,10 @@ impl DeviceCenterApp {
                             ui.checkbox(&mut power, "关机和重启");
                             ui.checkbox(&mut ports, "端口转发");
                             ui.checkbox(&mut wol, "局域网唤醒协助");
-                            if terminal_supported {
+                            if let Some(reason) = terminal_refusal {
+                                ui.add_enabled(false, egui::Checkbox::new(&mut false, "终端"));
+                                ui.label(RichText::new(reason).small().color(MUTED));
+                            } else {
                                 ui.checkbox(&mut terminal, "终端");
                                 ui.label(
                                     RichText::new("主控设备可以以当前用户身份在本机执行任意命令")
