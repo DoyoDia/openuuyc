@@ -331,65 +331,87 @@ mod tests {
 
 #[cfg(test)]
 mod throughput_tests {
-    /// Needs a desktop and an NVIDIA GPU: capture and encode at full size.
+    /// Needs a desktop and an NVIDIA GPU: capture and encode at full size, in
+    /// every 4:2:0 format NVENC offers here.
     #[test]
     #[ignore]
     fn capture_and_encode_throughput() {
-        use crate::media::encoding::{Color, Format, Rate};
+        use crate::media::encoding::{Codec, Color, Format, Rate};
+        const QUALITY: i32 = 4;
         let screens = super::super::capture::screens().unwrap();
         let mut desktop = super::Desktop::open_selected(&screens[0]).unwrap();
-        let size = (screens[0].width & !1, screens[0].height & !1);
+        // The highest quality caps the stream at 3840x2160 like the official
+        // client; a larger screen is scaled to fit, as in a session.
+        let size =
+            crate::media::geometry::output_size(screens[0].width, screens[0].height, QUALITY);
         let rate = Rate {
             target: 20_000_000,
             peak: 20_000_000,
             fps: 60,
-            quality: 4,
+            quality: QUALITY,
             quality_target: crate::media::encoding::QualityTarget {
                 bitrate: 20_000_000,
                 fps: 60,
             },
         };
-        let mut encoder = super::Encoder::hardware_format(
-            &desktop.device,
-            crate::media::encoding::Backend::Nvidia,
-            size,
-            Format::AVC,
-            rate,
-            Color::Sdr,
-        )
-        .unwrap();
-        let started = std::time::Instant::now();
-        let (mut frames, mut capture, mut encode, mut bytes) = (
-            0u32,
-            std::time::Duration::ZERO,
-            std::time::Duration::ZERO,
-            0usize,
-        );
-        let mut cached = None;
-        while started.elapsed() < std::time::Duration::from_secs(3) {
-            let t = std::time::Instant::now();
-            if let Some(frame) = desktop.next(16, 4, false, false, (3840, 2160)).unwrap() {
-                cached = Some(frame);
+        let mut measured = 0;
+        for codec in [Codec::H264, Codec::H265, Codec::Av1] {
+            let format = Format {
+                codec,
+                chroma: 1,
+                depth: 8,
+            };
+            let mut encoder = match super::Encoder::hardware_format(
+                &desktop.device,
+                crate::media::encoding::Backend::Nvidia,
+                size,
+                format,
+                rate,
+                Color::Sdr,
+            ) {
+                Ok(encoder) => encoder,
+                Err(error) => {
+                    println!("{codec:?}: not offered here: {error:#}");
+                    continue;
+                }
+            };
+            let started = std::time::Instant::now();
+            let (mut frames, mut capture, mut encode, mut bytes) = (
+                0u32,
+                std::time::Duration::ZERO,
+                std::time::Duration::ZERO,
+                0usize,
+            );
+            let mut cached = None;
+            while started.elapsed() < std::time::Duration::from_secs(3) {
+                let t = std::time::Instant::now();
+                if let Some(frame) = desktop.next(16, QUALITY, false, false, size).unwrap() {
+                    cached = Some(frame);
+                }
+                capture += t.elapsed();
+                let Some(frame) = &cached else { continue };
+                let t = std::time::Instant::now();
+                for out in encoder
+                    .encode(&frame.image, i64::from(frames) * 166_666, frames == 0)
+                    .unwrap()
+                {
+                    bytes += out.data.len();
+                }
+                encode += t.elapsed();
+                frames += 1;
             }
-            capture += t.elapsed();
-            let Some(frame) = &cached else { continue };
-            let t = std::time::Instant::now();
-            for out in encoder
-                .encode(&frame.image, i64::from(frames) * 166_666, frames == 0)
-                .unwrap()
-            {
-                bytes += out.data.len();
-            }
-            encode += t.elapsed();
-            frames += 1;
+            println!(
+                "{} {codec:?} {}x{}: {frames} frames in 3s ({:.0} fps), capture {:.2} ms/frame, encode {:.2} ms/frame, {} KiB",
+                desktop.backend_name(),
+                size.0,
+                size.1,
+                f64::from(frames) / 3.0,
+                capture.as_secs_f64() * 1000.0 / f64::from(frames.max(1)),
+                encode.as_secs_f64() * 1000.0 / f64::from(frames.max(1)),
+                bytes / 1024
+            );
+            measured += 1;
         }
-        println!(
-            "{}: {frames} frames in 3s ({:.0} fps), capture {:.2} ms/frame, encode {:.2} ms/frame, {} KiB",
-            desktop.backend_name(),
-            f64::from(frames) / 3.0,
-            capture.as_secs_f64() * 1000.0 / f64::from(frames.max(1)),
-            encode.as_secs_f64() * 1000.0 / f64::from(frames.max(1)),
-            bytes / 1024
-        );
+        assert!(measured > 0, "NVENC offered no format here");
     }
 }

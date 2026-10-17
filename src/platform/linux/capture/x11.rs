@@ -57,6 +57,12 @@ impl Segment {
         // the server has answered the request that filled it.
         unsafe { std::slice::from_raw_parts(self.address, self.size) }
     }
+
+    fn pixels_mut(&mut self) -> &mut [u8] {
+        // SAFETY: as above; the server writes only while a request is pending,
+        // and the cursor is drawn after the reply.
+        unsafe { std::slice::from_raw_parts_mut(self.address, self.size) }
+    }
 }
 
 impl Drop for Segment {
@@ -75,8 +81,10 @@ pub(super) struct Grab {
     root: Window,
     grabber: Grabber,
     cursor_available: bool,
-    /// The latest picture of the monitor, BGRA at its full size.
-    pub source: Vec<u8>,
+    /// Without MIT-SHM, the latest picture as the server sent it.
+    plain: Vec<u8>,
+    /// The byte length of the latest picture.
+    length: usize,
 }
 
 impl Grab {
@@ -129,7 +137,8 @@ impl Grab {
             root,
             grabber,
             cursor_available,
-            source: Vec::with_capacity(size),
+            plain: Vec::new(),
+            length: 0,
         })
     }
 
@@ -140,8 +149,10 @@ impl Grab {
         }
     }
 
-    /// Read the monitor's rectangle into `self.source`, cursor included when
-    /// asked for.
+    /// Read the monitor's rectangle, cursor included when asked for; the
+    /// picture is then [`Grab::pixels`]. It is read where the server left it
+    /// (the shared segment) rather than copied out, and the padding byte X
+    /// leaves undefined is the reader's to ignore: the scaler writes alpha.
     pub fn grab(&mut self, screen: &Screen, cursor: bool) -> Result<()> {
         let (x, y) = (
             i16::try_from(screen.left).context("显示器坐标超出 X11 范围")?,
@@ -152,7 +163,7 @@ impl Grab {
             u16::try_from(screen.height).context("显示器高度超出 X11 范围")?,
         );
         let length = usize::from(width) * usize::from(height) * 4;
-        self.source.clear();
+        self.length = 0;
         match &self.grabber {
             Grabber::Shm(segment) => {
                 ensure!(segment.size >= length, "共享内存小于所选显示器");
@@ -170,7 +181,6 @@ impl Grab {
                     )?
                     .reply()
                     .context("读取屏幕画面失败")?;
-                self.source.extend_from_slice(&segment.pixels()[..length]);
             }
             Grabber::Plain => {
                 let reply = self
@@ -179,19 +189,31 @@ impl Grab {
                     .reply()
                     .context("读取屏幕画面失败")?;
                 ensure!(reply.data.len() >= length, "屏幕画面数据不完整");
-                self.source.extend_from_slice(&reply.data[..length]);
+                self.plain = reply.data;
             }
         }
-        // X leaves the padding byte undefined; an opaque alpha keeps every
-        // consumer of BGRA honest about what it is looking at.
-        for pixel in self.source.chunks_exact_mut(4) {
-            pixel[3] = 0xff;
-        }
+        self.length = length;
         if cursor && self.cursor_available {
             // A cursor that cannot be read is simply left out of this frame.
             let _ = self.draw_cursor(screen);
         }
         Ok(())
+    }
+
+    /// The latest picture, BGRA at the monitor's full size; the alpha byte is
+    /// whatever X left in the padding.
+    pub fn pixels(&self) -> &[u8] {
+        match &self.grabber {
+            Grabber::Shm(segment) => &segment.pixels()[..self.length],
+            Grabber::Plain => &self.plain[..self.length],
+        }
+    }
+
+    fn pixels_mut(&mut self) -> &mut [u8] {
+        match &mut self.grabber {
+            Grabber::Shm(segment) => &mut segment.pixels_mut()[..self.length],
+            Grabber::Plain => &mut self.plain[..self.length],
+        }
     }
 
     fn draw_cursor(&mut self, screen: &Screen) -> Result<()> {
@@ -204,6 +226,7 @@ impl Grab {
         let origin_x = i32::from(image.x) - i32::from(image.xhot) - screen.left;
         let origin_y = i32::from(image.y) - i32::from(image.yhot) - screen.top;
         let (screen_width, screen_height) = (screen.width as i32, screen.height as i32);
+        let pixels = self.pixels_mut();
         for row in 0..height {
             let y = origin_y + row;
             if !(0..screen_height).contains(&y) {
@@ -221,7 +244,7 @@ impl Grab {
                     continue;
                 }
                 let offset = ((y * screen_width + x) * 4) as usize;
-                let pixel = &mut self.source[offset..offset + 4];
+                let pixel = &mut pixels[offset..offset + 4];
                 let inverse = 255 - alpha;
                 for (channel, shift) in [(0usize, 0u32), (1, 8), (2, 16)] {
                     let over = (argb >> shift) & 0xff;

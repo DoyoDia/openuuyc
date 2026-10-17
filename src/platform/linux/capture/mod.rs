@@ -447,7 +447,7 @@ impl Desktop {
                     break Err(error);
                 }
                 let size = output(self.screen.width, self.screen.height, quality, maximum);
-                let image = scale(&grab.source, (self.screen.width, self.screen.height), size);
+                let image = scale(grab.pixels(), (self.screen.width, self.screen.height), size);
                 // X11 cannot say whether anything changed; compare.
                 if self.last_size != size
                     || self
@@ -566,7 +566,12 @@ fn output(width: u32, height: u32, quality: i32, maximum: (u32, u32)) -> (u32, u
 }
 
 /// Bilinear BGRA scaling, or a crop to even dimensions when the size already
-/// fits. The encoder takes exactly the size it was opened with.
+/// fits. The encoder takes exactly the size it was opened with. The output is
+/// opaque whatever the source's fourth byte held (X leaves it undefined).
+///
+/// A capture larger than the stream (a 4K-class screen at the highest
+/// quality, which caps at 3840x2160) is scaled on every frame, so the work is
+/// split by rows across the cores; each output row depends only on the source.
 fn scale(source: &[u8], from: (u32, u32), to: (u32, u32)) -> Vec<u8> {
     let (source_width, source_height) = (from.0 as usize, from.1 as usize);
     let (width, height) = (to.0 as usize, to.1 as usize);
@@ -578,42 +583,88 @@ fn scale(source: &[u8], from: (u32, u32), to: (u32, u32)) -> Vec<u8> {
     {
         for y in 0..height {
             let start = y * source_width * 4;
-            out[y * width * 4..(y + 1) * width * 4]
-                .copy_from_slice(&source[start..start + width * 4]);
+            let line = &mut out[y * width * 4..(y + 1) * width * 4];
+            line.copy_from_slice(&source[start..start + width * 4]);
+            for pixel in line.chunks_exact_mut(4) {
+                pixel[3] = 0xff;
+            }
         }
         return out;
     }
-    // 16.16 fixed point, sampling pixel centres.
-    let step_x = ((source_width as u64) << 16) / width as u64;
-    let step_y = ((source_height as u64) << 16) / height as u64;
-    let max_x = source_width - 1;
-    let max_y = source_height - 1;
-    for y in 0..height {
-        let sy = ((y as u64 * step_y) + (step_y >> 1)).saturating_sub(1 << 15);
-        let y0 = ((sy >> 16) as usize).min(max_y);
-        let y1 = (y0 + 1).min(max_y);
-        let fy = (sy & 0xffff) as u32;
-        for x in 0..width {
-            let sx = ((x as u64 * step_x) + (step_x >> 1)).saturating_sub(1 << 15);
-            let x0 = ((sx >> 16) as usize).min(max_x);
-            let x1 = (x0 + 1).min(max_x);
-            let fx = (sx & 0xffff) as u32;
-            let at = |px: usize, py: usize| (py * source_width + px) * 4;
-            let (a, b, c, d) = (at(x0, y0), at(x1, y0), at(x0, y1), at(x1, y1));
-            let o = (y * width + x) * 4;
-            for channel in 0..4 {
-                let top = u32::from(source[a + channel]) * (0x10000 - fx)
-                    + u32::from(source[b + channel]) * fx;
-                let bottom = u32::from(source[c + channel]) * (0x10000 - fx)
-                    + u32::from(source[d + channel]) * fx;
-                let value = ((u64::from(top >> 8) * u64::from(0x10000 - fy)
-                    + u64::from(bottom >> 8) * u64::from(fy))
-                    >> 24) as u32;
-                out[o + channel] = value.min(255) as u8;
+    let columns = taps(source_width, width);
+    let rows = taps(source_height, height);
+    let row_bytes = width * 4;
+    // Below about a megapixel the threads cost more than they save.
+    let threads = if width * height < 1 << 20 {
+        1
+    } else {
+        std::thread::available_parallelism().map_or(1, |n| n.get().min(8))
+    };
+    let band = height.div_ceil(threads);
+    std::thread::scope(|scope| {
+        for (index, chunk) in out.chunks_mut(band * row_bytes).enumerate() {
+            let (columns, rows) = (&columns, &rows);
+            let mut work = move || {
+                for (offset, line) in chunk.chunks_exact_mut(row_bytes).enumerate() {
+                    scale_row(
+                        source,
+                        source_width,
+                        columns,
+                        rows[index * band + offset],
+                        line,
+                    );
+                }
+            };
+            if index + 1 == threads.min(height.div_ceil(band)) {
+                work();
+            } else {
+                scope.spawn(work);
             }
         }
-    }
+    });
     out
+}
+
+/// For each output position along one axis: the two source positions it
+/// blends and the weight of the second, in 16.16 fixed point, sampling pixel
+/// centres.
+fn taps(source: usize, output: usize) -> Vec<(usize, usize, u32)> {
+    let step = ((source as u64) << 16) / output as u64;
+    let last = source - 1;
+    (0..output)
+        .map(|position| {
+            let at = ((position as u64 * step) + (step >> 1)).saturating_sub(1 << 15);
+            let first = ((at >> 16) as usize).min(last);
+            (first, (first + 1).min(last), (at & 0xffff) as u32)
+        })
+        .collect()
+}
+
+fn scale_row(
+    source: &[u8],
+    source_width: usize,
+    columns: &[(usize, usize, u32)],
+    (y0, y1, fy): (usize, usize, u32),
+    line: &mut [u8],
+) {
+    let top_row = &source[y0 * source_width * 4..(y0 + 1) * source_width * 4];
+    let bottom_row = &source[y1 * source_width * 4..(y1 + 1) * source_width * 4];
+    let (wy0, wy1) = (u64::from(0x10000 - fy), u64::from(fy));
+    for (pixel, &(x0, x1, fx)) in line.chunks_exact_mut(4).zip(columns) {
+        let (a, b) = (&top_row[x0 * 4..x0 * 4 + 4], &top_row[x1 * 4..x1 * 4 + 4]);
+        let (c, d) = (
+            &bottom_row[x0 * 4..x0 * 4 + 4],
+            &bottom_row[x1 * 4..x1 * 4 + 4],
+        );
+        let (wx0, wx1) = (0x10000 - fx, fx);
+        for channel in 0..3 {
+            let top = u32::from(a[channel]) * wx0 + u32::from(b[channel]) * wx1;
+            let bottom = u32::from(c[channel]) * wx0 + u32::from(d[channel]) * wx1;
+            let value = ((u64::from(top >> 8) * wy0 + u64::from(bottom >> 8) * wy1) >> 24) as u32;
+            pixel[channel] = value.min(255) as u8;
+        }
+        pixel[3] = 0xff;
+    }
 }
 
 #[cfg(test)]
@@ -660,8 +711,99 @@ mod tests {
     fn crop_to_even_keeps_pixels() {
         let source: Vec<u8> = (0..3 * 3 * 4).map(|v| v as u8).collect();
         let out = scale(&source, (3, 3), (2, 2));
-        assert_eq!(&out[..8], &source[..8]);
-        assert_eq!(&out[8..16], &source[12..20]);
+        let opaque = |pixels: &[u8]| -> Vec<u8> {
+            pixels
+                .chunks_exact(4)
+                .flat_map(|p| [p[0], p[1], p[2], 0xff])
+                .collect()
+        };
+        assert_eq!(&out[..8], &opaque(&source[..8])[..]);
+        assert_eq!(&out[8..16], &opaque(&source[12..20])[..]);
+    }
+
+    /// The single-threaded scaler `scale` replaced; its output is the contract.
+    fn reference(source: &[u8], from: (u32, u32), to: (u32, u32)) -> Vec<u8> {
+        let (source_width, source_height) = (from.0 as usize, from.1 as usize);
+        let (width, height) = (to.0 as usize, to.1 as usize);
+        let mut out = vec![0u8; width * height * 4];
+        if width <= source_width
+            && height <= source_height
+            && (source_width - width) <= 1
+            && (source_height - height) <= 1
+        {
+            for y in 0..height {
+                let start = y * source_width * 4;
+                out[y * width * 4..(y + 1) * width * 4]
+                    .copy_from_slice(&source[start..start + width * 4]);
+            }
+            return out;
+        }
+        // 16.16 fixed point, sampling pixel centres.
+        let step_x = ((source_width as u64) << 16) / width as u64;
+        let step_y = ((source_height as u64) << 16) / height as u64;
+        let max_x = source_width - 1;
+        let max_y = source_height - 1;
+        for y in 0..height {
+            let sy = ((y as u64 * step_y) + (step_y >> 1)).saturating_sub(1 << 15);
+            let y0 = ((sy >> 16) as usize).min(max_y);
+            let y1 = (y0 + 1).min(max_y);
+            let fy = (sy & 0xffff) as u32;
+            for x in 0..width {
+                let sx = ((x as u64 * step_x) + (step_x >> 1)).saturating_sub(1 << 15);
+                let x0 = ((sx >> 16) as usize).min(max_x);
+                let x1 = (x0 + 1).min(max_x);
+                let fx = (sx & 0xffff) as u32;
+                let at = |px: usize, py: usize| (py * source_width + px) * 4;
+                let (a, b, c, d) = (at(x0, y0), at(x1, y0), at(x0, y1), at(x1, y1));
+                let o = (y * width + x) * 4;
+                for channel in 0..4 {
+                    let top = u32::from(source[a + channel]) * (0x10000 - fx)
+                        + u32::from(source[b + channel]) * fx;
+                    let bottom = u32::from(source[c + channel]) * (0x10000 - fx)
+                        + u32::from(source[d + channel]) * fx;
+                    let value = ((u64::from(top >> 8) * u64::from(0x10000 - fy)
+                        + u64::from(bottom >> 8) * u64::from(fy))
+                        >> 24) as u32;
+                    out[o + channel] = value.min(255) as u8;
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_threaded_scaler_matches_the_reference_byte_for_byte() {
+        // A cheap deterministic noise, so every channel and weight is exercised.
+        let mut state = 0x2545_f491_u32;
+        let mut noise = |length: usize| -> Vec<u8> {
+            (0..length)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    state as u8
+                })
+                .collect()
+        };
+        for (from, to) in [
+            ((4096, 2560), (3456, 2160)),
+            ((1920, 1080), (1280, 720)),
+            ((1366, 768), (1280, 720)),
+            ((5120, 1440), (3840, 1080)),
+            ((640, 480), (1280, 960)),
+            ((7, 5), (4, 2)),
+            ((3, 3), (2, 2)),
+        ] {
+            let source = noise((from.0 * from.1 * 4) as usize);
+            let (ours, theirs) = (scale(&source, from, to), reference(&source, from, to));
+            // Colour exactly as before; alpha is now always opaque.
+            assert!(
+                ours.chunks_exact(4)
+                    .zip(theirs.chunks_exact(4))
+                    .all(|(a, b)| a[..3] == b[..3] && a[3] == 0xff),
+                "{from:?} -> {to:?}"
+            );
+        }
     }
 
     #[test]
@@ -691,5 +833,48 @@ mod session_tests {
         }
         println!("frames: {frames} size: {size:?}");
         assert!(frames > 0);
+    }
+}
+
+#[cfg(test)]
+mod stage_tests {
+    /// Needs an X session: what each step of the X11 path costs per frame at
+    /// the highest quality (a screen above 3840x2160 is scaled).
+    #[test]
+    #[ignore]
+    fn x11_capture_stages() {
+        let screens = super::screens().unwrap();
+        let screen = &screens[0];
+        let mut grab = super::x11::Grab::open(screen).unwrap();
+        let size = super::output(screen.width, screen.height, 4, (3840, 2160));
+        let n = 20u32;
+        let (mut tg, mut ts, mut tc) = (
+            std::time::Duration::ZERO,
+            std::time::Duration::ZERO,
+            std::time::Duration::ZERO,
+        );
+        let mut last: Option<Vec<u8>> = None;
+        for _ in 0..n {
+            let t = std::time::Instant::now();
+            grab.grab(screen, true).unwrap();
+            tg += t.elapsed();
+            let t = std::time::Instant::now();
+            let image = super::scale(grab.pixels(), (screen.width, screen.height), size);
+            ts += t.elapsed();
+            let t = std::time::Instant::now();
+            let _same = last.as_deref() == Some(image.as_slice());
+            tc += t.elapsed();
+            last = Some(image);
+        }
+        println!(
+            "{}x{} -> {}x{}: grab {:.1} ms, scale {:.1} ms, compare {:.1} ms",
+            screen.width,
+            screen.height,
+            size.0,
+            size.1,
+            tg.as_secs_f64() * 1000.0 / f64::from(n),
+            ts.as_secs_f64() * 1000.0 / f64::from(n),
+            tc.as_secs_f64() * 1000.0 / f64::from(n)
+        );
     }
 }

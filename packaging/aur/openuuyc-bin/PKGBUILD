@@ -9,11 +9,14 @@
 # then commit. See packaging/aur/README.md.
 
 pkgname=openuuyc-bin
-pkgver=1.0.1.linux.2
+pkgver=1.0.2_beta.5.1
 pkgrel=1
-# Releases are tagged v<Cargo version>-linux.<n>; pkgver may not contain the
-# hyphen: 1.0.1.linux.1 -> v1.0.1-linux.1
-_tag=v${pkgver/.linux./-linux.}
+# Releases are tagged v<Cargo version>-linux.<n>. pkgver may not contain a
+# hyphen: it is the Cargo version with `-` as `_`, then `.<n>`, so that
+# pacman sorts a pre-release before its release (an alpha segment loses to a
+# number): 1.0.1.2 -> v1.0.1-linux.2, 1.0.2_beta.5.1 -> v1.0.2-beta.5-linux.1
+_tag=v${pkgver%.*}-linux.${pkgver##*.}
+_tag=${_tag//_/-}
 pkgdesc="Third-party UU Remote client (Linux port, X11 and Wayland)"
 arch=('x86_64')
 url="https://github.com/DoyoDia/openuuyc-linux"
