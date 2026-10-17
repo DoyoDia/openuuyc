@@ -26,12 +26,12 @@ use windows::Win32::System::JobObjects::{
 };
 use windows::Win32::System::Pipes::CreatePipe;
 use windows::Win32::System::Threading::{
-    CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
+    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
     EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, InitializeProcThreadAttributeList,
     LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION,
-    STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
+    ResumeThread, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
 };
-use windows::core::PWSTR;
+use windows::core::{PCWSTR, PWSTR};
 
 /// Why this process cannot serve a terminal; `None` when it can.
 ///
@@ -395,6 +395,9 @@ fn pipe() -> Result<(HANDLE, HANDLE)> {
 
 /// Starts `shell` attached to `console`.
 fn spawn(shell: &str, console: HPCON) -> Result<(HANDLE, Job)> {
+    // The job exists before the shell does, so the shell joins it before it
+    // runs a single instruction and nothing it starts escapes.
+    let job = Job::create()?;
     // `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` carries the console handle; the
     // attribute list has to be sized first, then filled.
     let mut size = 0usize;
@@ -426,7 +429,20 @@ fn spawn(shell: &str, console: HPCON) -> Result<(HANDLE, Job)> {
         return Err(error).context("设置伪控制台属性失败");
     }
 
-    let mut command: Vec<u16> = shell.encode_utf16().chain(std::iter::once(0)).collect();
+    // Quoted, so a shell under a path with spaces (a `ComSpec` in
+    // `Program Files`) is not split into a program and arguments.
+    let mut command: Vec<u16> = format!("\"{}\"", shell.trim_matches('"'))
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    // The shell starts in the user's profile, as the POSIX one starts in
+    // `$HOME`, rather than in whatever directory the host was launched from.
+    let directory: Option<Vec<u16>> = std::env::var_os("USERPROFILE")
+        .filter(|home| std::path::Path::new(home).is_dir())
+        .map(|home| {
+            use std::os::windows::ffi::OsStrExt;
+            home.encode_wide().chain(std::iter::once(0)).collect()
+        });
     let mut info = STARTUPINFOEXW::default();
     info.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
     info.lpAttributeList = list;
@@ -440,9 +456,11 @@ fn spawn(shell: &str, console: HPCON) -> Result<(HANDLE, Job)> {
             None,
             None,
             false,
-            EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+            EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED,
             None,
-            None,
+            directory
+                .as_ref()
+                .map_or(PCWSTR::null(), |directory| PCWSTR(directory.as_ptr())),
             &info.StartupInfo,
             &mut process,
         )
@@ -452,16 +470,25 @@ fn spawn(shell: &str, console: HPCON) -> Result<(HANDLE, Job)> {
     unsafe { DeleteProcThreadAttributeList(list) };
     created.context("启动 shell 失败")?;
 
-    // The thread handle is not needed; the process handle is.
-    // SAFETY: the thread handle came back from `CreateProcessW` and is ours.
+    // The shell is still suspended: put it in the job, then let it run. A
+    // shell that cannot be contained is not started at all.
+    let started = job.assign(process.hProcess).and_then(|()| {
+        // SAFETY: the thread handle came back from `CreateProcessW` and is
+        // live; `u32::MAX` is the documented failure value.
+        (unsafe { ResumeThread(process.hThread) } != u32::MAX)
+            .then_some(())
+            .context("启动 shell 失败")
+    });
+    // SAFETY: the thread handle is ours and not used again; on failure the
+    // process handle is too.
     unsafe {
         let _ = CloseHandle(process.hThread);
-    };
-    // The job has to exist before the shell can start anything of its own, so
-    // it is assigned the moment the process does.
-    let job = Job::create()?;
-    job.assign(process.hProcess)?;
-    Ok((process.hProcess, job))
+        if started.is_err() {
+            let _ = TerminateProcess(process.hProcess, 1);
+            let _ = CloseHandle(process.hProcess);
+        }
+    }
+    started.map(|()| (process.hProcess, job))
 }
 
 /// Reads the console's output into `out` until it closes.
