@@ -599,8 +599,9 @@ impl Sessions {
 
     /// 本机主动开一个会话，不经过主控。
     ///
-    /// 这类会话没有远程消费者，也不在 30 分钟空闲清扫的范围里：用户自己开
-    /// 的东西应当等用户自己关。编号从 [`LOCAL_HANDLE_BASE`] 起，与手机端
+    /// 这类会话不在 30 分钟空闲清扫的范围里，接上再断开也一样：用户自己开
+    /// 的东西应当等用户自己关。shell 自己退出后，清扫会把它收走（见
+    /// [`Sessions::sweep`]）。编号从 [`LOCAL_HANDLE_BASE`] 起，与手机端
     /// 常用的小编号分开。
     pub(crate) fn create_local(&mut self, name: Option<String>) -> Result<u32, SessionError> {
         if self.sessions.len() >= MAX_TOTAL {
@@ -637,7 +638,6 @@ impl Sessions {
                 output: BTreeMap::new(),
                 remote_size: None,
                 local_size: None,
-                // 用户主动开的会话不参与空闲清扫。
                 detached_since: None,
             },
         );
@@ -1099,17 +1099,26 @@ impl Sessions {
     }
 
     /// Takes out the shells nobody is attached to that have exited, and ends
-    /// those left alone longer than `idle`.
+    /// those a controller opened and nobody has attached to for `idle`.
+    ///
+    /// The shells opened on this machine are never ended for being idle, even
+    /// after a local terminal attached and left: the local user closes them.
+    /// Once one exits it is taken out like any other, so it does not sit in
+    /// the list as exited, holding a slot, until someone presses 结束.
     pub(crate) fn sweep(&mut self, idle: std::time::Duration) -> (Ended, Ended) {
         let mut exited = Vec::new();
         let mut abandoned = Vec::new();
         for (key, session) in self.sessions.iter_mut() {
-            let Some(since) = session.detached_since.filter(|_| session.output.is_empty()) else {
+            if !session.output.is_empty() {
                 continue;
-            };
+            }
             if session.pty.exited() {
                 exited.push(key.clone());
-            } else if since.elapsed() >= idle {
+            } else if key.0 != LOCAL_OWNER
+                && session
+                    .detached_since
+                    .is_some_and(|since| since.elapsed() >= idle)
+            {
                 abandoned.push(key.clone());
             }
         }
@@ -2554,15 +2563,39 @@ mod tests {
                 .any(|session| session["session_id"] == handle),
             "a controller allowed in sees the local session"
         );
-        // 用户自己开的会话不参与 30 分钟空闲清扫。
+        // 用户自己开的会话不参与 30 分钟空闲清扫，本机接上再断开后也一样。
         let (exited, abandoned) = sessions.sweep(std::time::Duration::ZERO);
         assert!(exited.sessions.is_empty());
         assert!(abandoned.sessions.is_empty());
+        sessions
+            .attach_local(handle, 100, 80, 24)
+            .expect("attach local");
+        sessions.detach_local(100);
+        let (exited, abandoned) = sessions.sweep(std::time::Duration::ZERO);
+        assert!(exited.sessions.is_empty());
+        assert!(abandoned.sessions.is_empty(), "kept after a local detach");
         assert_eq!(
             sessions.create_local(Some("mine".into())).err(),
             Some(SessionError::DuplicateName)
         );
-        sessions.kill(LOCAL_OWNER, handle).expect("kill").finish();
+        // Once its shell exits, the sweep takes it out of the list.
+        sessions.write_local(handle, &line("exit")).expect("exit");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let (exited, abandoned) = sessions.sweep(std::time::Duration::ZERO);
+            assert!(abandoned.sessions.is_empty());
+            let taken = exited.sessions.len();
+            exited.finish();
+            if taken == 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the exited shell stayed"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(sessions.is_empty());
     }
 
     #[test]
