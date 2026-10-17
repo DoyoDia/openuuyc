@@ -492,7 +492,6 @@ mod tests {
         }
         assert!(!default_shell().is_empty());
     }
-
 }
 
 impl Session {

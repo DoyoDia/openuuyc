@@ -58,10 +58,6 @@ const MAX_SESSIONS: usize = 16;
 /// matching the limit keeps the two in agreement instead of failing at the
 /// client after the server already accepted it.
 const MAX_NAME: usize = 64;
-/// Output kept per shell so a reattach can replay the screen the controller
-/// last saw. The client keeps its own scrollback, so a screenful and a little
-/// history is enough.
-const SCROLLBACK_LIMIT: usize = 128 * 1024;
 /// Shells all logins together may hold, on top of [`MAX_SESSIONS`] each.
 const MAX_TOTAL: usize = 64;
 /// Input a session may hold when the pty will not take it yet. A frame that
@@ -195,9 +191,15 @@ struct Session {
     state: SessionState,
     created_ms: i64,
     last_active_ms: i64,
-    /// Output the shell has produced, so a reattach can replay the screen the
-    /// controller last saw instead of showing it blank.
-    scrollback: Vec<u8>,
+    /// The shell's screen, kept as a terminal model rather than a byte log.
+    ///
+    /// A reattach replays this, so what the controller draws is what was on
+    /// screen. Re-feeding a byte log instead runs the output through the
+    /// client's parser a second time, which is wrong the moment the log is
+    /// cut: byte N of a terminal stream has no meaning on its own, and a
+    /// full-screen program that never emits a newline has no safe cut at all —
+    /// the byte cap left a `top` replay truncated in the middle of one.
+    screen: vt100::Parser,
     /// Input the pty would not take yet. A paste or a slow shell fills the
     /// pty buffer; dropping the rest would lose keystrokes silently.
     pending: Vec<u8>,
@@ -222,14 +224,14 @@ impl Session {
         }
     }
 
-    /// Records output for a later reattach, dropping the oldest bytes once the
-    /// limit is reached so a chatty shell cannot grow without bound.
-    fn push_scrollback(&mut self, data: &[u8]) {
-        self.scrollback.extend_from_slice(data);
-        if self.scrollback.len() > SCROLLBACK_LIMIT {
-            let excess = self.scrollback.len() - SCROLLBACK_LIMIT;
-            self.scrollback.drain(..excess);
-        }
+    /// Feeds output to the session's screen model.
+    ///
+    /// The model applies the terminal's own rules — cursor motion, scrolling,
+    /// the alternate screen — so what a reattach replays is a screen rather
+    /// than a byte log. No scrollback is kept: a reattach shows the visible
+    /// screen, which is what `capture-pane` gives the reference server.
+    fn record(&mut self, data: &[u8]) {
+        self.screen.process(data);
     }
 
     fn let_go(&mut self) {
@@ -352,7 +354,7 @@ impl Sessions {
     /// The controller normally picks the handle, but its `open` frame may
     /// carry zero when it wants the host to allocate one; the returned handle
     /// is what later `stdin`/`resize` frames must use. Re-opening an existing
-    /// handle re-uses the shell and returns its scrollback, which is what the
+    /// handle re-uses the shell and returns its screen, which is what the
     /// controller redraws on reattach.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn open(
@@ -382,8 +384,18 @@ impl Sessions {
             }
             existing.attached = Some(connection);
             existing.detached_since = None;
+            // The model has to follow the pty, or the replay would describe a
+            // screen of the old size.
+            existing
+                .screen
+                .screen_mut()
+                .set_size(rows.max(1), cols.max(1));
             existing.last_active_ms = now_ms();
-            return Ok((handle, existing.name.clone(), existing.scrollback.clone()));
+            return Ok((
+                handle,
+                existing.name.clone(),
+                existing.screen.screen().state_formatted(),
+            ));
         }
         if self.owned(owner).count() >= MAX_SESSIONS || self.sessions.len() >= MAX_TOTAL {
             return Err(SessionError::TooMany);
@@ -406,7 +418,7 @@ impl Sessions {
                 state: SessionState::Running,
                 created_ms: stamp,
                 last_active_ms: stamp,
-                scrollback: Vec::new(),
+                screen: vt100::Parser::new(rows.max(1), cols.max(1), 0),
                 pending: Vec::new(),
                 attached: Some(connection),
                 detached_since: None,
@@ -624,7 +636,7 @@ impl Sessions {
                 match session.pty.read(&mut buffer[..want]) {
                     Ok(Some(0)) | Err(_) => break,
                     Ok(Some(read)) => {
-                        session.push_scrollback(&buffer[..read]);
+                        session.record(&buffer[..read]);
                         out.push((handle, FrameType::Stdout, buffer[..read].to_vec()));
                         budget -= read;
                         left -= read;
@@ -1077,11 +1089,12 @@ async fn handle_frame(
                     serde_json::to_vec(&payload).unwrap_or_default(),
                 ));
                 if !replay.is_empty() {
-                    // Redraw what the screen last held. Clearing first stops a
-                    // reattach from appending the history to what is already
-                    // there.
-                    let mut redraw = Vec::with_capacity(replay.len() + 12);
-                    redraw.extend_from_slice(b"\x1b[2J\x1b[3J\x1b[H");
+                    // Redraw what the screen last held. The reset and the
+                    // clear come first so the replay lands on a blank screen:
+                    // the formatted state positions the cursor and sets
+                    // attributes itself, but assumes it draws onto one.
+                    let mut redraw = Vec::with_capacity(replay.len() + 16);
+                    redraw.extend_from_slice(b"\x1b[0m\x1b[2J\x1b[3J\x1b[H");
                     redraw.extend_from_slice(&replay);
                     outgoing.push((FrameType::Stdout, session, redraw));
                 }
@@ -1321,7 +1334,9 @@ mod tests {
             .open("acct", 1, 1, shell(), None, 80, 24)
             .expect("open");
         sessions.resize("acct", 1, 120, 40).expect("resize");
-        sessions.write("acct", 1, &line("echo READY")).expect("write");
+        sessions
+            .write("acct", 1, &line("echo READY"))
+            .expect("write");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let mut seen = Vec::new();
         while std::time::Instant::now() < deadline {
@@ -1603,6 +1618,63 @@ mod tests {
         assert!(lock_table(&table).list("ending-login").is_empty());
         assert_eq!(lock_table(&table).list("staying-login").len(), 1);
         lock_table(&table).kill_owned("staying-login").finish();
+    }
+
+    #[test]
+    // The bulk producer below is a POSIX shell loop. The model itself is
+    // platform-independent, so Linux coverage of this property is enough.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn a_reattach_replays_the_screen_not_the_output_log() {
+        let mut sessions = Sessions::default();
+        let (handle, _, _) = sessions
+            .open("acct", 0, 1, "/bin/sh", None, 80, 24)
+            .expect("open");
+        // Far more output than the byte log we used to keep, then a marker. A
+        // log cut at 128 KiB can land inside an escape sequence and leave the
+        // client printing the tail of it; a screen cannot be cut at all.
+        sessions
+            .write(
+                "acct",
+                handle,
+                &line("for i in $(seq 1 4000); do echo FILLER-FILLER-FILLER-$i; done"),
+            )
+            .expect("write");
+        sessions
+            .write("acct", handle, &line("echo THE-LAST-LINE"))
+            .expect("write");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut seen = Vec::new();
+        while std::time::Instant::now() < deadline {
+            for (_, kind, payload) in sessions.pump(1, usize::MAX) {
+                if kind == FrameType::Stdout {
+                    seen.extend_from_slice(&payload);
+                }
+            }
+            if String::from_utf8_lossy(&seen).contains("THE-LAST-LINE") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            String::from_utf8_lossy(&seen).contains("THE-LAST-LINE"),
+            "the shell never finished"
+        );
+        let (again, _, replay) = sessions
+            .open("acct", handle, 1, "/bin/sh", None, 80, 24)
+            .expect("reattach");
+        assert_eq!(again, handle, "reattach keeps the same shell");
+        let text = String::from_utf8_lossy(&replay);
+        assert!(
+            text.contains("THE-LAST-LINE"),
+            "the replay is not the current screen"
+        );
+        // The property the model gives us: the replay describes one screen, so
+        // it does not grow with how much the shell has printed.
+        assert!(
+            replay.len() < 16 * 1024,
+            "the replay grew with the output: {} bytes",
+            replay.len()
+        );
     }
 
     #[test]

@@ -112,6 +112,12 @@ winit = { version = "0.30.13", default-features = false, features = ["rwh_06"] }
 zip = { version = "8.6.0", default-features = false, features = ["zstd"] }
 regex = "1.13.1"
 
+# The host terminal keeps each session's screen as a terminal model rather
+# than a byte log, so a reattach replays what was on screen instead of
+# re-feeding raw output that may be cut mid-sequence. This is the upstream
+# crate the reference server's `vt100-psmux` fork is based on.
+vt100 = "0.16"
+
 [build-dependencies]
 cc = "1.2"
 embed-resource = "3.0.11"
