@@ -19,11 +19,16 @@ struct Record {
 fn path() -> Result<PathBuf> {
     // Display recovery is independent from account login/authorization. SYSTEM
     // keeps using the machine directory even after the account vault is disabled.
+    // Linux 没有这台机器级服务，vault::sid 会直接报「尚未提供后台被控服务」，
+    // 所以这条判断只在 Windows 上做。
+    #[cfg(windows)]
     let root = if crate::platform::host_service::vault::sid(std::process::id())? == "S-1-5-18" {
         crate::platform::host_service::vault::root()?.join("displays")
     } else {
         store::root()?
     };
+    #[cfg(not(windows))]
+    let root = store::root()?;
     Ok(root.join("fallback.json"))
 }
 fn clear_record() -> Result<()> {
