@@ -423,6 +423,12 @@ impl ConnectingWindowsRunner {
             });
             let fullscreen = window.fullscreen().is_some();
             shell.fullscreen_chrome.sync(fullscreen);
+            if let Stage::Playing(player) = stage {
+                // 用上一帧的浮动栏矩形判断，和 Windows 的 display_transition 一样；
+                // 指针在栏上时本机接管输入，按键不再发给远端。
+                let relative = player.input().relative_mode();
+                player.chrome_hovered = shell.fullscreen_chrome.owns_pointer(&ctx, relative);
+            }
             if !fullscreen {
                 // Windows 的 caption 里，别名那一格是可以点开的设备切换菜单；没有可切换
                 // 的设备时才是普通标签。这里跟着它走，所以标题那一格由播放器自己画。
@@ -866,6 +872,8 @@ struct Player {
     focused: bool,
     /// A local menu, text field or modal temporarily owns input.
     local_input_blocked: bool,
+    /// 指针上一帧是否落在全屏浮动栏上。
+    chrome_hovered: bool,
     /// Sub-pixel motion carried between raw events.
     motion_remainder: [f64; 2],
     /// Report rate per physical mouse, for the high polling-rate notice.
@@ -962,6 +970,7 @@ impl Player {
             pointer_locked: false,
             focused: window.has_focus(),
             local_input_blocked: false,
+            chrome_hovered: false,
             motion_remainder: [0.0, 0.0],
             polling: Default::default(),
             polling_origin: Instant::now(),
@@ -1008,6 +1017,9 @@ impl Player {
         if self.focused
             && window.is_minimized() != Some(true)
             && !control.drag_drop().interactive()
+            // 菜单、浮动栏等本机界面占着输入时不要抢回来，否则会和
+            // `update_input_gate` 的暂停每帧互相抵消。
+            && !self.local_input_blocked
             && !self.stream_control_ui.open
             && !self.is_pending()
             && !ctx.any_popup_open()
@@ -2163,6 +2175,8 @@ impl Player {
             || context.any_popup_open()
             || context.text_edit_focused()
             || context.memory(|memory| memory.top_modal_layer().is_some())
+            // 全屏时指针落在浮动栏上：鼠标在操作栏上，按键不该落到远端。
+            || self.chrome_hovered
     }
 
     fn update_input_gate(&mut self, context: &egui::Context, window: &Arc<Window>) {
