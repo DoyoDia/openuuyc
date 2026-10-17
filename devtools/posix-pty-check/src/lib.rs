@@ -14,5 +14,8 @@
 //! changes. The module is deliberately dependency-light (`anyhow` and `libc`)
 //! precisely so this stays possible.
 
+// The app calls these `pub(crate)` items; here only the module's own tests
+// do, so everything else would read as dead code.
+#[allow(dead_code)]
 #[path = "../../../src/platform/posix/terminal.rs"]
-pub mod terminal;
+mod terminal;
