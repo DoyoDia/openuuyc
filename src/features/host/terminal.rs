@@ -55,7 +55,7 @@ pub(crate) mod local {
     /// 这个平台能不能把会话接到本机终端里。
     pub(crate) const SUPPORTED: bool = false;
     pub(crate) const UNSUPPORTED: &str = "本机终端接入暂只支持 Linux";
-    pub(crate) fn serve() {}
+    pub(crate) fn serve(_table: std::sync::Arc<std::sync::Mutex<super::Sessions>>) {}
     pub(crate) fn run_client(
         _session: Option<&str>,
         _list: bool,
@@ -1176,8 +1176,12 @@ pub(crate) fn shared() -> Arc<std::sync::Mutex<Sessions>> {
         {
             tracing::warn!(%error, "terminal idle sweep could not start");
         }
-        // 本机终端要能接上这些会话，socket 服务随表一起起来（Linux）。
-        local::serve();
+        // 本机终端要能接上这些会话，socket 服务随表一起起来（Linux）。Unit
+        // tests use this table too, and must not replace the socket of an
+        // OpenUUYC running on the same machine; they serve a private path.
+        if !cfg!(test) {
+            local::serve(Arc::clone(&table));
+        }
         table
     }))
 }

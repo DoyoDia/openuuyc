@@ -15,18 +15,22 @@
 //! 负载。输出（1）与服务端到客户端，输入（2）与 resize（3）反向，退出（4）
 //! 只在 shell 结束时报一次。
 //!
-//! socket 放在 0700 的运行时目录里，文件本身设 0600，只有同一个用户能连；
-//! 这本来也就是「本机用户可以直接操作这些 shell」的意思。
+//! socket 放在 0700 的 `$XDG_RUNTIME_DIR/openuuyc` 里，文件本身设 0600，
+//! 连上来的对端还要是同一个用户（`SO_PEERCRED`）；这本来也就是「本机用户
+//! 可以直接操作这些 shell」的意思。
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
-use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+use super::Sessions;
 
 /// 这个平台能不能把会话接到本机终端里。
 pub(crate) const SUPPORTED: bool = true;
@@ -44,6 +48,13 @@ const FRAME_EXIT: u8 = 4;
 /// pump 与尺寸轮询的间隔。
 const TICK: Duration = Duration::from_millis(20);
 const SIZE_TICK: Duration = Duration::from_millis(200);
+/// 请求行的上限。真正的请求只有几十个字节；不带换行一直发的连接到这里就
+/// 断开，不会让控制中心的内存跟着涨。
+const MAX_REQUEST: u64 = 64 * 1024;
+/// 等请求行的时间。连上不说话的连接到时就断开，不会一直占着一个线程。
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// 同时服务的本机连接数。一个 attach 会一直连着，正常用不到这么多。
+const MAX_CLIENTS: usize = 32;
 
 fn socket_path() -> Option<PathBuf> {
     std::env::var_os("XDG_RUNTIME_DIR")
@@ -53,59 +64,140 @@ fn socket_path() -> Option<PathBuf> {
 }
 
 /// 起监听线程。没有 `XDG_RUNTIME_DIR` 时本机 attach 不可用，其余功能照常。
-pub(crate) fn serve() {
+pub(crate) fn serve(table: Arc<Mutex<Sessions>>) {
     let Some(path) = socket_path() else {
         tracing::debug!("XDG_RUNTIME_DIR 未设置，本机终端接入不可用");
         return;
     };
-    if let Some(parent) = path.parent()
-        && let Err(error) = std::fs::create_dir_all(parent)
-    {
-        tracing::warn!(%error, "无法创建终端通道目录");
-        return;
-    }
-    // 上一个进程若没来得及清掉，绑定会失败；先移走独占的旧文件。
-    let _ = std::fs::remove_file(&path);
-    let listener = match UnixListener::bind(&path) {
-        Ok(listener) => listener,
-        Err(error) => {
-            tracing::warn!(%error, path = %path.display(), "终端通道监听失败");
-            return;
-        }
-    };
-    if let Err(error) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)) {
-        tracing::warn!(%error, "无法收紧终端通道权限");
-    }
-    if let Err(error) = std::thread::Builder::new()
-        .name("terminal attach".into())
-        .spawn(move || {
-            // 一个 attach 会连着到会话结束，不能占住 accept：每个连接自己
-            // 一个线程。
-            for stream in listener.incoming().flatten() {
-                let _ = std::thread::Builder::new()
-                    .name("terminal attach client".into())
-                    .spawn(move || {
-                        if let Err(error) = handle_client(stream) {
-                            tracing::debug!(%error, "本机终端通道的请求结束");
-                        }
-                    });
-            }
-        })
-    {
-        tracing::warn!(%error, "终端通道线程没能启动");
+    if let Err(error) = listen_at(&path, table) {
+        tracing::warn!(error = %format!("{error:#}"), "本机终端接入不可用");
     }
 }
 
-fn handle_client(mut stream: UnixStream) -> Result<()> {
+/// 在 `path` 上监听，照 `ui/control_linux.rs` 的做法：目录 0700，只清理
+/// 没人监听的残留 socket；路径上是别的东西或者已经有实例在听，就报错不动。
+fn listen_at(path: &Path, table: Arc<Mutex<Sessions>>) -> Result<()> {
+    if let Some(directory) = path.parent() {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(directory)
+            .context("创建终端通道目录失败")?;
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
+            .context("设置终端通道目录权限失败")?;
+    }
+    clear_stale(path)?;
+    let listener = UnixListener::bind(path)
+        .with_context(|| format!("建立终端通道失败：{}", path.display()))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .context("设置终端通道权限失败")?;
+    std::thread::Builder::new()
+        .name("terminal attach".into())
+        .spawn(move || accept(&listener, &table))
+        .context("启动终端通道线程失败")?;
+    Ok(())
+}
+
+/// 上一个进程没来得及清掉的 socket 会挡住绑定。只有连上去得到
+/// `ECONNREFUSED` 的 socket 才算残留；别的文件或者有人在听都原样留着。
+fn clear_stale(path: &Path) -> Result<()> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("读取终端通道 {} 失败", path.display()));
+        }
+    };
+    if !metadata.file_type().is_socket() {
+        bail!("终端通道位置 {} 被其他文件占用", path.display());
+    }
+    match UnixStream::connect(path) {
+        Ok(_) => bail!("已经有实例占着终端通道 {}", path.display()),
+        Err(error) if error.kind() == ErrorKind::ConnectionRefused => std::fs::remove_file(path)
+            .with_context(|| format!("清理残留的终端通道 {} 失败", path.display())),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => {
+            Err(error).with_context(|| format!("无法确认终端通道 {} 是否残留", path.display()))
+        }
+    }
+}
+
+fn accept(listener: &UnixListener, table: &Arc<Mutex<Sessions>>) {
+    let clients = Arc::new(AtomicUsize::new(0));
+    for stream in listener.incoming() {
+        let Ok(stream) = stream else {
+            continue;
+        };
+        if let Err(error) = same_user(&stream) {
+            tracing::warn!(%error, "拒绝了别的用户的终端通道连接");
+            continue;
+        }
+        if clients.fetch_add(1, Ordering::AcqRel) >= MAX_CLIENTS {
+            clients.fetch_sub(1, Ordering::AcqRel);
+            tracing::warn!("本机终端连接过多，拒绝新的连接");
+            continue;
+        }
+        // 一个 attach 会连着到会话结束，不能占住 accept：每个连接自己一个
+        // 线程。
+        let table = Arc::clone(table);
+        let done = Arc::clone(&clients);
+        let spawned = std::thread::Builder::new()
+            .name("terminal attach client".into())
+            .spawn(move || {
+                if let Err(error) = handle_client(stream, table) {
+                    tracing::debug!(error = %format!("{error:#}"), "本机终端通道的请求结束");
+                }
+                done.fetch_sub(1, Ordering::AcqRel);
+            });
+        if let Err(error) = spawned {
+            clients.fetch_sub(1, Ordering::AcqRel);
+            tracing::warn!(%error, "无法处理本机终端连接");
+        }
+    }
+}
+
+/// 对端必须是同一个用户。目录与 socket 的权限已经挡住了别人，这里再核对
+/// 一次，免得 `XDG_RUNTIME_DIR` 被指到共享目录时门户大开。
+fn same_user(stream: &UnixStream) -> Result<()> {
+    let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: `getsockopt` 只往我们给的 ucred 里写，长度如实传入。
+    let read = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut credentials as *mut libc::ucred).cast(),
+            &mut length,
+        )
+    };
+    if read != 0 {
+        return Err(std::io::Error::last_os_error()).context("读取终端通道对端身份失败");
+    }
+    // SAFETY: `geteuid` 没有参数也不会失败。
+    let own = unsafe { libc::geteuid() };
+    anyhow::ensure!(
+        credentials.uid == own,
+        "对端用户 {} 不是本用户 {own}",
+        credentials.uid
+    );
+    Ok(())
+}
+
+fn handle_client(mut stream: UnixStream, table: Arc<Mutex<Sessions>>) -> Result<()> {
+    stream.set_read_timeout(Some(REQUEST_TIMEOUT))?;
     let mut reader = BufReader::new(stream.try_clone().context("复制终端通道失败")?);
     let mut line = String::new();
-    reader
+    (&mut reader)
+        .take(MAX_REQUEST)
         .read_line(&mut line)
         .context("读取终端通道请求失败")?;
+    anyhow::ensure!(line.ends_with('\n'), "终端通道请求过长或不完整");
+    // 请求之后是 attach 的交互，用户可以很久不敲键盘。
+    stream.set_read_timeout(None)?;
     let request: Value = serde_json::from_str(line.trim()).context("终端通道请求不是 JSON")?;
     match request.get("action").and_then(Value::as_str) {
         Some("list") => {
-            let table = super::shared();
             let listed: Vec<_> = super::lock_table(&table)
                 .list_local()
                 .into_iter()
@@ -135,7 +227,11 @@ fn handle_client(mut stream: UnixStream) -> Result<()> {
                 .get("name")
                 .and_then(Value::as_str)
                 .map(str::to_owned);
-            let handle = match super::create_local(name) {
+            let created = match super::local_unavailable() {
+                Some(reason) => Err(super::SessionError::Unavailable(reason)),
+                None => super::lock_table(&table).create_local(name),
+            };
+            let handle = match created {
                 Ok(handle) => handle,
                 Err(error) => {
                     let mut answer =
@@ -149,9 +245,9 @@ fn handle_client(mut stream: UnixStream) -> Result<()> {
             let mut attach_request = request.clone();
             attach_request["action"] = Value::from("attach");
             attach_request["session"] = Value::from(handle);
-            attach(stream, reader, &attach_request)
+            attach(stream, reader, &table, &attach_request)
         }
-        Some("attach") => attach(stream, reader, &request),
+        Some("attach") => attach(stream, reader, &table, &request),
         other => bail!("未知的终端通道请求 {other:?}"),
     }
 }
@@ -159,9 +255,9 @@ fn handle_client(mut stream: UnixStream) -> Result<()> {
 fn attach(
     mut stream: UnixStream,
     mut reader: BufReader<UnixStream>,
+    table: &Arc<Mutex<Sessions>>,
     request: &Value,
 ) -> Result<()> {
-    let table = super::shared();
     let handle = match request.get("session") {
         Some(Value::Number(number)) => number
             .as_u64()
@@ -169,7 +265,7 @@ fn attach(
             .context("会话编号无效")?,
         Some(Value::String(name)) => {
             let name = name.trim();
-            super::lock_table(&table)
+            super::lock_table(table)
                 .list_local()
                 .into_iter()
                 .find(|session| session.name == name)
@@ -189,8 +285,7 @@ fn attach(
         .and_then(|value| u16::try_from(value).ok())
         .unwrap_or(24);
     let consumer = super::next_local_consumer();
-    let (name, replay) = match super::lock_table(&table).attach_local(handle, consumer, cols, rows)
-    {
+    let (name, replay) = match super::lock_table(table).attach_local(handle, consumer, cols, rows) {
         Ok(attached) => attached,
         Err(error) => {
             let mut answer =
@@ -214,7 +309,7 @@ fn attach(
     // shutdown 这把 socket，另一头会跟着醒。
     let stop = Arc::new(AtomicBool::new(false));
     let read_stop = stop.clone();
-    let read_table = table.clone();
+    let read_table = Arc::clone(table);
     // 请求行后面可能已经跟着输入帧，读线程必须接着用同一个 BufReader，
     // 不能重新包一层，否则缓冲里的字节会丢。
     let reader_thread = std::thread::Builder::new()
@@ -239,7 +334,7 @@ fn attach(
 
     while !stop.load(Ordering::Relaxed) {
         std::thread::sleep(TICK);
-        let Some(output) = super::lock_table(&table).pump_local(consumer, PUMP_BUDGET) else {
+        let Some(output) = super::lock_table(table).pump_local(consumer, PUMP_BUDGET) else {
             break;
         };
         if !output.data.is_empty() && write_frame(&mut stream, FRAME_OUTPUT, &output.data).is_err()
@@ -253,7 +348,7 @@ fn attach(
     }
     let _ = stream.shutdown(std::net::Shutdown::Both);
     let _ = reader_thread.join();
-    super::lock_table(&table).detach_local(consumer);
+    super::lock_table(table).detach_local(consumer);
     Ok(())
 }
 
@@ -622,78 +717,140 @@ mod tests {
         );
     }
 
-    /// 走一遍真实的 socket：列出一个会话，再接上它。
+    /// A private socket under a fresh directory, served from its own table:
+    /// tests never touch `$XDG_RUNTIME_DIR` or a running OpenUUYC's socket.
+    fn private_socket(name: &str) -> (PathBuf, Arc<Mutex<Sessions>>) {
+        let dir =
+            std::env::temp_dir().join(format!("openuuyc-terminal-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("openuuyc/terminal.sock");
+        let table = Arc::new(Mutex::new(Sessions::default()));
+        listen_at(&path, Arc::clone(&table)).expect("listen");
+        (path, table)
+    }
+
+    fn request(path: &Path, line: &[u8]) -> Value {
+        let mut stream = UnixStream::connect(path).expect("connect");
+        stream.write_all(line).expect("request");
+        let mut reader = BufReader::new(stream);
+        let mut answer = String::new();
+        reader.read_line(&mut answer).expect("answer");
+        serde_json::from_str(answer.trim()).expect("json")
+    }
+
+    /// 走一遍真实的 socket：列出一个会话，再接上它，再新建一个。
     #[test]
     fn the_socket_lists_and_attaches_sessions() {
-        let dir = std::env::temp_dir().join(format!("openuuyc-terminal-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        // SAFETY: 这个测试是进程里唯一读写 XDG_RUNTIME_DIR 的地方。
-        unsafe { std::env::set_var("XDG_RUNTIME_DIR", &dir) };
-        serve();
-        let table = super::super::shared();
-        let shell = super::super::Sessions::default_shell();
+        let (path, table) = private_socket("attach");
+        let directory = path.parent().expect("directory");
+        assert_eq!(
+            std::fs::metadata(directory)
+                .expect("dir")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&path)
+                .expect("socket")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        let shell = Sessions::default_shell();
         let (handle, _, _) = super::super::lock_table(&table)
             .open("acct", 1, 99, &shell, Some("socket-test".into()), 80, 24)
             .expect("open");
 
-        let path = socket_path().expect("socket path");
-        let mut stream = UnixStream::connect(&path).expect("connect");
-        stream.write_all(b"{\"action\":\"list\"}\n").expect("list");
-        let mut reader = BufReader::new(stream.try_clone().expect("clone"));
-        let mut line = String::new();
-        reader.read_line(&mut line).expect("read list");
-        let listed: Vec<Value> = serde_json::from_str(line.trim()).expect("list json");
+        let listed = request(&path, b"{\"action\":\"list\"}\n");
         assert!(
             listed
+                .as_array()
+                .expect("array")
                 .iter()
                 .any(|session| session["name"] == "socket-test" && session["handle"] == handle),
             "the list carries the session: {listed:?}"
         );
-
-        let mut stream = UnixStream::connect(&path).expect("connect");
-        stream
-            .write_all(b"{\"action\":\"attach\",\"session\":1,\"cols\":80,\"rows\":24}\n")
-            .expect("attach");
-        let mut reader = BufReader::new(stream.try_clone().expect("clone"));
-        let mut line = String::new();
-        reader.read_line(&mut line).expect("read attach");
-        let reply: Value = serde_json::from_str(line.trim()).expect("attach json");
+        let reply = request(
+            &path,
+            b"{\"action\":\"attach\",\"session\":1,\"cols\":80,\"rows\":24}\n",
+        );
         assert_eq!(reply["ok"], true, "attach is accepted: {reply:?}");
         assert_eq!(reply["name"], "socket-test");
-        // 新建：不经过手机端，编号落在本机区间。
-        let created = {
-            let mut stream = UnixStream::connect(&path).expect("connect");
-            stream
-                .write_all(
-                    b"{\"action\":\"new\",\"name\":\"made-by-cli\",\"cols\":80,\"rows\":24}\n",
-                )
-                .expect("new");
-            let mut reader = BufReader::new(stream.try_clone().expect("clone"));
-            let mut line = String::new();
-            reader.read_line(&mut line).expect("read new");
-            let reply: Value = serde_json::from_str(line.trim()).expect("new json");
-            if let Some(reason) = super::super::local_unavailable() {
-                // Run as root (a CI container): the same refusal the page shows.
+        // 新建：不经过手机端，编号落在本机区间；以 root 运行时（CI 容器）
+        // 得到的是页面上同一句拒绝。
+        let reply = request(
+            &path,
+            b"{\"action\":\"new\",\"name\":\"made-by-cli\",\"cols\":80,\"rows\":24}\n",
+        );
+        match super::super::local_unavailable() {
+            Some(reason) => {
                 assert_eq!(reply["ok"], false);
                 assert_eq!(reply["message"], reason);
-                None
-            } else {
+            }
+            None => {
                 assert_eq!(reply["ok"], true, "new is accepted: {reply:?}");
-                let created = reply["handle"].as_u64().expect("handle") as u32;
-                assert!(created >= 1000, "local handles start at 1000");
-                Some(created)
+                assert!(reply["handle"].as_u64().expect("handle") >= 1000);
+            }
+        }
+        // 命令行入口走的是同一条路。
+        list_sessions(&path).expect("the client lists");
+        super::super::lock_table(&table).kill_all().finish();
+        let _ = std::fs::remove_dir_all(directory.parent().expect("temp"));
+    }
+
+    /// Only a socket nobody listens on is cleared; a file, or a running
+    /// instance's socket, is left where it is.
+    #[test]
+    fn only_a_stale_socket_is_replaced() {
+        let dir = std::env::temp_dir().join(format!("openuuyc-stale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let table = || Arc::new(Mutex::new(Sessions::default()));
+
+        let file = dir.join("file.sock");
+        std::fs::write(&file, b"not a socket").expect("file");
+        assert!(listen_at(&file, table()).is_err());
+        assert_eq!(std::fs::read(&file).expect("kept"), b"not a socket");
+
+        let live = dir.join("live.sock");
+        let _running = UnixListener::bind(&live).expect("running instance");
+        assert!(listen_at(&live, table()).is_err(), "a live socket is kept");
+        assert!(UnixStream::connect(&live).is_ok(), "and still answers");
+
+        let stale = dir.join("stale.sock");
+        drop(UnixListener::bind(&stale).expect("left behind"));
+        listen_at(&stale, table()).expect("a stale socket is replaced");
+        assert_eq!(
+            request(&stale, b"{\"action\":\"list\"}\n"),
+            Value::Array(Vec::new())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A request line that never ends is cut off at the limit instead of
+    /// growing the host's memory.
+    #[test]
+    fn an_endless_request_is_cut_off() {
+        let (path, _table) = private_socket("endless");
+        let mut stream = UnixStream::connect(&path).expect("connect");
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        let chunk = vec![b'x'; 16 * 1024];
+        let mut sent = 0usize;
+        let cut = loop {
+            match stream.write_all(&chunk) {
+                Ok(()) => sent += chunk.len(),
+                Err(_) => break true,
+            }
+            if sent > 8 * MAX_REQUEST as usize {
+                break false;
             }
         };
-
-        // 命令行入口走的是同一条路。
-        run_client(None, true, false).expect("the client lists");
-        // 断开后会话还在，本机这一端也不算附着了。
-        drop(stream);
-        drop(reader);
-        if let Some(created) = created {
-            super::super::kill_local(created);
-        }
-        super::super::kill_local(handle);
+        assert!(cut, "the server kept reading {sent} bytes of one request");
+        let _ = std::fs::remove_dir_all(path.parent().and_then(Path::parent).expect("temp"));
     }
 }
