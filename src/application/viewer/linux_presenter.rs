@@ -1364,6 +1364,12 @@ impl ApplicationHandler<UiEvent> for ConnectingWindowsRunner {
                 if let Stage::Playing(player) = &mut self.stage {
                     player.on_focus_changed(&window, focused);
                     player.update_shortcuts(&shell.context, &window);
+                    // 和独立窗口、和 Windows 的每个屏窗口一样：对端按聚焦窗口的那块屏
+                    // 送指针与输入。从独立窗口点回来时不说，键鼠会落到那边的屏上。
+                    // 当前屏刚交给独立窗口、新屏还没接上时，这个窗口没有自己的屏。
+                    if focused && !player.frame_paused {
+                        player.screens.focus(player.session.screen_id());
+                    }
                 }
                 crate::application::viewer_shortcuts::set_focused_window(if focused {
                     u64::from(id)
