@@ -963,27 +963,36 @@ impl Sessions {
     /// 数据。任一个消费者的积压到了上限就不再读这个会话，让 pty 的缓冲
     /// 反压 shell，而不是把内存堆爆。
     fn drain(&mut self, budget: usize) {
+        fn readable(session: &Session) -> bool {
+            !session.output.is_empty()
+                && session.state != SessionState::Exited
+                && !session
+                    .output
+                    .values()
+                    .any(|queue| queue.len() >= OUTPUT_HIGH_WATER)
+        }
         let mut buffer = [0u8; 8192];
-        let mut left = budget;
+        // Split the budget between the shells someone is reading, so one that
+        // floods output cannot starve the others.
+        let readers = self.sessions.values().filter(|s| readable(s)).count();
+        if readers == 0 {
+            return;
+        }
+        let share = (budget / readers).max(1);
         for session in self.sessions.values_mut() {
-            if left == 0 {
-                break;
-            }
-            if session.output.is_empty() || session.state == SessionState::Exited {
-                continue;
-            }
-            if session
-                .output
-                .values()
-                .any(|queue| queue.len() >= OUTPUT_HIGH_WATER)
-            {
+            if !readable(session) {
                 continue;
             }
             session.flush_pending();
+            let mut left = share;
+            let mut dry = false;
             while left > 0 {
                 let want = left.min(buffer.len());
                 match session.pty.read(&mut buffer[..want]) {
-                    Ok(Some(0)) | Err(_) => break,
+                    Ok(Some(0)) | Ok(None) | Err(_) => {
+                        dry = true;
+                        break;
+                    }
                     Ok(Some(read)) => {
                         session.record(&buffer[..read]);
                         for queue in session.output.values_mut() {
@@ -992,10 +1001,11 @@ impl Sessions {
                         left -= read;
                         session.last_active_ms = now_ms();
                     }
-                    Ok(None) => break,
                 }
             }
-            if session.pty.exited() {
+            // Only a pty read dry counts: a shell that ran out of budget this
+            // tick may still hold the last of its output.
+            if dry && session.pty.exited() {
                 session.state = SessionState::Exited;
             }
         }
@@ -1027,15 +1037,17 @@ impl Sessions {
         // Split the budget so one busy shell cannot starve the others.
         let share = (budget / attached.len().max(1)).max(1);
         for (handle, session) in attached {
-            if let Some(queue) = session.output.get_mut(&consumer) {
-                if !queue.is_empty() {
-                    let take = queue.len().min(share);
-                    out.push((handle, FrameType::Stdout, queue.drain(..take).collect()));
-                }
+            let Some(queue) = session.output.get_mut(&consumer) else {
+                continue;
+            };
+            if !queue.is_empty() {
+                let take = queue.len().min(share);
+                out.push((handle, FrameType::Stdout, queue.drain(..take).collect()));
             }
-            if session.state == SessionState::Exited {
-                // Report the exit once, then drop this consumer so `reap`
-                // can recover the session after every other one saw it too.
+            if session.state == SessionState::Exited && queue.is_empty() {
+                // Report the exit once everything before it went out, then
+                // drop this consumer so `reap` can recover the session after
+                // every other one saw it too.
                 session.output.remove(&consumer);
                 out.push((handle, FrameType::Exit, b"{}".to_vec()));
             }
@@ -1051,7 +1063,8 @@ impl Sessions {
             let queue = session.output.get_mut(&Consumer::Local(consumer))?;
             let take = queue.len().min(budget);
             let data: Vec<u8> = queue.drain(..take).collect();
-            let exited = session.state == SessionState::Exited;
+            // The exit goes out after the last of the output, not with it.
+            let exited = session.state == SessionState::Exited && queue.is_empty();
             if exited {
                 session.output.remove(&Consumer::Local(consumer));
             }
@@ -2131,6 +2144,52 @@ mod tests {
             "the new connection stalled after {} bytes behind the old one",
             seen.len()
         );
+    }
+
+    #[test]
+    #[cfg_attr(not(target_os = "linux"), ignore = "local attach is Linux-only")]
+    fn the_exit_follows_the_last_output_to_every_end() {
+        let mut sessions = Sessions::default();
+        sessions
+            .open("acct", 1, 1, shell(), None, 80, 24)
+            .expect("open");
+        sessions.attach_local(1, 100, 80, 24).expect("attach local");
+        sessions
+            .write(
+                "acct",
+                1,
+                b"yes | head -c 600000; echo TAIL-$((40+2)); exit\n",
+            )
+            .expect("write");
+        let mut remote = Vec::new();
+        let mut local = Vec::new();
+        let (mut remote_done, mut local_done) = (false, false);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !(remote_done && local_done) && std::time::Instant::now() < deadline {
+            // A small budget, as a busy data channel gives.
+            for (_, kind, payload) in sessions.pump(1, 64 * 1024) {
+                match kind {
+                    FrameType::Stdout => remote.extend_from_slice(&payload),
+                    FrameType::Exit => remote_done = true,
+                    _ => {}
+                }
+            }
+            if let Some(output) = sessions.pump_local(100, 64 * 1024) {
+                local.extend_from_slice(&output.data);
+                local_done |= output.exited;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(remote_done && local_done, "both ends saw the exit");
+        for (end, seen) in [("remote", &remote), ("local", &local)] {
+            assert!(
+                seen.windows(7).any(|window| window == b"TAIL-42"),
+                "{end} lost the tail: got {} bytes",
+                seen.len()
+            );
+        }
+        sessions.reap().finish();
+        assert!(sessions.is_empty());
     }
 
     #[test]
