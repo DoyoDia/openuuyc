@@ -644,9 +644,19 @@ impl ConnectingWindowsRunner {
         crate::ui::branding::set_taskbar_icon(&window);
         configure_dwm_window(&window);
         if let Some(position) = position {
-            // 抓取点大致落在新窗口的标题栏上。Wayland 上这个请求会被忽略，
-            // 位置交给合成器决定。
-            window.set_outer_position(PhysicalPosition::new(position.x - 100, position.y - 18));
+            // 抓取点大致落在新窗口的标题栏上，标题栏整条留在松手的那块显示器里。
+            // Wayland 上这个请求会被忽略，位置交给合成器决定。
+            let monitors: Vec<_> = event_loop
+                .available_monitors()
+                .map(|monitor| (monitor.position(), monitor.size()))
+                .collect();
+            window.set_outer_position(constrain_to_monitor(
+                PhysicalPosition::new(position.x - 100, position.y - 18),
+                position,
+                window.outer_size(),
+                crate::ui::chrome::title_bar_height_pixels(&window),
+                &monitors,
+            ));
         }
         let (shell, interval) =
             Self::build_shell(event_loop, &window, &self.proxy, self.generation)?;
@@ -3862,6 +3872,37 @@ fn released_off_bar(release: Option<egui::Pos2>, bar: egui::Rect) -> bool {
     release.is_none_or(|point| !bar.contains(point))
 }
 
+/// 新窗口的左上角夹进松手点所在（不在任何一块上就取最近）的显示器，和 Windows
+/// `constrain_drag_position` 一样以指针的目标显示器为准。Windows 只管上沿（任务栏
+/// 在工作区里扣掉了）；这里拿不到工作区，就让整条标题栏留在显示器里，免得在屏幕
+/// 边缘松手后窗口抓不回来。
+fn constrain_to_monitor(
+    position: PhysicalPosition<i32>,
+    cursor: PhysicalPosition<i32>,
+    size: winit::dpi::PhysicalSize<u32>,
+    title: u32,
+    monitors: &[(PhysicalPosition<i32>, winit::dpi::PhysicalSize<u32>)],
+) -> PhysicalPosition<i32> {
+    let distance = |(origin, extent): &(PhysicalPosition<i32>, winit::dpi::PhysicalSize<u32>)| {
+        let right = origin.x + extent.width as i32 - 1;
+        let bottom = origin.y + extent.height as i32 - 1;
+        let dx = (origin.x - cursor.x).max(cursor.x - right).max(0);
+        let dy = (origin.y - cursor.y).max(cursor.y - bottom).max(0);
+        i64::from(dx) * i64::from(dx) + i64::from(dy) * i64::from(dy)
+    };
+    let Some((origin, extent)) = monitors.iter().min_by_key(|monitor| distance(monitor)) else {
+        return position;
+    };
+    let width = extent.width.min(i32::MAX as u32) as i32;
+    let height = extent.height.min(i32::MAX as u32) as i32;
+    let max_x = origin.x + (width - size.width.min(width as u32) as i32);
+    let max_y = origin.y + (height - title.min(height as u32) as i32);
+    PhysicalPosition::new(
+        position.x.clamp(origin.x, max_x),
+        position.y.clamp(origin.y, max_y),
+    )
+}
+
 /// 指针此刻的全局物理位置。Wayland 不给窗口位置，返回 `None`，新窗口由合成器摆放。
 fn global_pointer(window: &Window, context: &egui::Context) -> Option<PhysicalPosition<i32>> {
     let local = context.input(|input| input.pointer.latest_pos())?;
@@ -4229,6 +4270,49 @@ mod screen_tests {
         assert!(released_off_bar(Some(egui::pos2(-40.0, 20.0)), bar));
         // The pointer left the window during the drag.
         assert!(released_off_bar(None, bar));
+    }
+
+    #[test]
+    fn a_detached_window_is_kept_on_the_drop_monitor() {
+        use winit::dpi::PhysicalSize;
+        let monitors = [
+            (PhysicalPosition::new(0, 0), PhysicalSize::new(1920, 1080)),
+            (
+                PhysicalPosition::new(1920, -200),
+                PhysicalSize::new(1280, 1024),
+            ),
+        ];
+        let size = PhysicalSize::new(1280, 760);
+        let place = |x: i32, y: i32| {
+            constrain_to_monitor(
+                PhysicalPosition::new(x - 100, y - 18),
+                PhysicalPosition::new(x, y),
+                size,
+                36,
+                &monitors,
+            )
+        };
+        // Released inside the first monitor: kept where it was dropped.
+        assert_eq!(place(400, 300), PhysicalPosition::new(300, 282));
+        // At the top-left corner the title bar would leave the screen.
+        assert_eq!(place(20, 5), PhysicalPosition::new(0, 0));
+        // At the right edge the window stays within the monitor.
+        assert_eq!(place(1900, 500), PhysicalPosition::new(640, 482));
+        // The second monitor sits higher; its own top edge applies.
+        assert_eq!(place(2000, -190), PhysicalPosition::new(1920, -200));
+        // Dropped below every monitor: the nearest one takes it.
+        assert_eq!(place(400, 1500), PhysicalPosition::new(300, 1044));
+        // No monitor information: unchanged.
+        assert_eq!(
+            constrain_to_monitor(
+                PhysicalPosition::new(-50, -50),
+                PhysicalPosition::new(50, -32),
+                size,
+                36,
+                &[],
+            ),
+            PhysicalPosition::new(-50, -50)
+        );
     }
 
     #[test]
