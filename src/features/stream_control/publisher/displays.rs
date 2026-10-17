@@ -189,9 +189,9 @@ pub(crate) async fn receive_session(
                         retry: u64,
                     }
                     let _ = CheckEnvReq::decode(bytes.as_slice())?;
-                    // A platform without a terminal backend says so; otherwise
+                    // A host that cannot serve a terminal says so; otherwise
                     // the answer is the host's permission.
-                    let refusal = crate::platform::terminal::unavailable().or_else(|| {
+                    let refusal = crate::features::host::terminal::unavailable().or_else(|| {
                         (!session.authorization().terminal_allowed()).then_some("本机未允许终端")
                     });
                     let allowed = refusal.is_none();

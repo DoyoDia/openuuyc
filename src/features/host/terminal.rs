@@ -803,6 +803,20 @@ pub(crate) fn end_all() {
     }
 }
 
+/// Why this host cannot serve a terminal; `None` when it can.
+///
+/// The platform answers for this process (root on POSIX, LocalSystem on
+/// Windows). In unattended mode the shell would come from the SYSTEM service
+/// rather than from this process, so the settings page, which runs as the
+/// user, is told the same thing the service would answer and does not offer
+/// a switch every connection would refuse.
+pub(crate) fn unavailable() -> Option<&'static str> {
+    crate::platform::terminal::unavailable().or_else(|| {
+        crate::platform::host_service::resident::managed()
+            .then_some("无人值守模式以 SYSTEM 身份运行，不提供终端")
+    })
+}
+
 /// How many shells this process is running, for the host's settings page.
 pub(crate) fn running() -> usize {
     SESSIONS.get().map_or(0, |table| lock_table(table).count())

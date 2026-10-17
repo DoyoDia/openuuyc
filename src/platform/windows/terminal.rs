@@ -32,9 +32,26 @@ use windows::Win32::System::Threading::{
 };
 use windows::core::PWSTR;
 
-/// Windows can serve a terminal; Linux states why it cannot here.
+/// Why this process cannot serve a terminal; `None` when it can.
+///
+/// The unattended service runs the host as LocalSystem. A shell started from
+/// there would hand the controller SYSTEM on a machine whose owner only
+/// granted "open a terminal as me", the same widening the POSIX backend
+/// refuses for root. An identity that cannot be read is refused too: a shell
+/// must not start under an account nobody checked.
 pub(crate) fn unavailable() -> Option<&'static str> {
-    None
+    /// LocalSystem's well-known SID.
+    const LOCAL_SYSTEM: &str = "S-1-5-18";
+    static REFUSAL: std::sync::OnceLock<Option<&'static str>> = std::sync::OnceLock::new();
+    *REFUSAL.get_or_init(
+        || match super::host_service::vault::sid(std::process::id()) {
+            Ok(sid) if sid == LOCAL_SYSTEM => {
+                Some("以 SYSTEM 身份运行（无人值守模式）时不提供终端")
+            }
+            Ok(_) => None,
+            Err(_) => Some("无法确认运行身份，不提供终端"),
+        },
+    )
 }
 
 /// Maps the controller's shell choice to a program.

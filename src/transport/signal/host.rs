@@ -433,10 +433,11 @@ impl Session {
                     !ports_only || authorization.port_policy().0,
                     "本机未允许端口转发"
                 );
-                // A platform without a terminal backend refuses with its own
+                // A host that cannot serve a terminal refuses with its own
                 // reason before the permission is considered.
-                if let Some(reason) =
-                    crate::platform::terminal::unavailable().filter(|_| terminal_only)
+                if let Some(reason) = terminal_only
+                    .then(crate::features::host::terminal::unavailable)
+                    .flatten()
                 {
                     anyhow::bail!(reason);
                 }
