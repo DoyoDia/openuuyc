@@ -449,7 +449,7 @@ impl Session {
                     peer.close().await;
                 }
                 let owner = authorization.peer_lease()?;
-                owner.controller(&options.device_id, &client_id);
+                owner.controller(&options.device_id, &client_id, terminal_only);
                 let cancel = tokio_util::sync::CancellationToken::new();
                 let lease = owner.with_cancellation(cancel.clone());
                 let update_resume = (!audio_only && !data_only)

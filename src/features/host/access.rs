@@ -60,6 +60,10 @@ pub(crate) struct ConnectionInfo {
     pub client_id: String,
     pub elapsed_seconds: Option<u64>,
     pub observation_lost: bool,
+    /// A terminal connection (`kind = 8`): the controller runs a shell here
+    /// rather than watching the screen, and the access notice says so.
+    #[serde(default)]
+    pub terminal: bool,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -1044,7 +1048,7 @@ impl Drop for SessionLease {
     }
 }
 impl Lease {
-    pub(crate) fn controller(&self, device_id: &str, client_id: &str) {
+    pub(crate) fn controller(&self, device_id: &str, client_id: &str, terminal: bool) {
         self.modify(|state| {
             let session_id = state
                 .status
@@ -1060,6 +1064,7 @@ impl Lease {
                     String::new()
                 },
                 client_id: client_id.to_owned(),
+                terminal,
                 ..Default::default()
             });
         });

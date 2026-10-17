@@ -54,6 +54,7 @@ pub(super) fn cards(notices: Vec<Notice>, now: i64) -> Vec<(String, Card)> {
                     confirmation: false,
                     busy: false,
                     connected: false,
+                    terminal: false,
                     transfer: Some(TransferCard { progress, folder }),
                 },
             )

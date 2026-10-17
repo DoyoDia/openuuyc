@@ -145,7 +145,9 @@ impl Worker {
                             Toast {
                                 progress: c.transfer.as_ref().and_then(|t| t.progress),
                                 key: c.ticket.clone(),
-                                title: if c.connected {
+                                title: if c.connected && c.terminal {
+                                    "终端连接已建立".into()
+                                } else if c.connected {
                                     "远程连接已建立".into()
                                 } else {
                                     c.title.clone()
@@ -153,7 +155,9 @@ impl Worker {
                                 body: format!(
                                     "{}\n{}",
                                     c.body,
-                                    if c.expires_at == 0 && c.transfer.is_none() {
+                                    if c.terminal && c.connected {
+                                        "对方可在本机执行命令，打开控制中心可断开。"
+                                    } else if c.expires_at == 0 && c.transfer.is_none() {
                                         "打开控制中心查看当前连接状态。"
                                     } else {
                                         &c.detail
