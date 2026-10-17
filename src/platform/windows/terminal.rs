@@ -159,8 +159,8 @@ pub(crate) struct Session {
     /// Input queued for the writer thread; `None` once it has stopped.
     input: Mutex<Option<SyncSender<Vec<u8>>>>,
     /// Output the reader thread has produced but the frame layer has not
-    /// taken yet; `None` once the session is being torn down.
-    output: Mutex<Option<Receiver<Vec<u8>>>>,
+    /// taken yet.
+    output: Mutex<Output>,
     shell: String,
 }
 
@@ -220,7 +220,10 @@ impl Session {
             process,
             job,
             input: Mutex::new(Some(input_tx)),
-            output: Mutex::new(Some(output_rx)),
+            output: Mutex::new(Output {
+                channel: Some(output_rx),
+                carry: Vec::new(),
+            }),
             shell: shell.to_owned(),
         })
     }
@@ -234,21 +237,29 @@ impl Session {
     ///
     /// `Ok(None)` means nothing is ready; `Ok(Some(0))` is end-of-file, which
     /// is how the reader reports a closed console.
+    ///
+    /// A chunk larger than `buffer` is handed out over several calls, the way
+    /// a pty read returns what fits and leaves the rest queued.
     pub(crate) fn read(&self, buffer: &mut [u8]) -> Result<Option<usize>> {
-        let channel = self.output.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(channel) = channel.as_ref() else {
-            return Ok(Some(0));
-        };
-        match channel.try_recv() {
-            Ok(chunk) => {
-                let take = chunk.len().min(buffer.len());
-                buffer[..take].copy_from_slice(&chunk[..take]);
-                Ok(Some(take))
-            }
-            Err(TryRecvError::Empty) => Ok(None),
-            // The reader thread ended: the console closed.
-            Err(TryRecvError::Disconnected) => Ok(Some(0)),
+        if buffer.is_empty() {
+            return Ok(None);
         }
+        let mut output = self.output.lock().unwrap_or_else(|e| e.into_inner());
+        if output.carry.is_empty() {
+            let Some(channel) = output.channel.as_ref() else {
+                return Ok(Some(0));
+            };
+            match channel.try_recv() {
+                Ok(chunk) => output.carry = chunk,
+                Err(TryRecvError::Empty) => return Ok(None),
+                // The reader thread ended: the console closed.
+                Err(TryRecvError::Disconnected) => return Ok(Some(0)),
+            }
+        }
+        let take = output.carry.len().min(buffer.len());
+        buffer[..take].copy_from_slice(&output.carry[..take]);
+        output.carry.drain(..take);
+        Ok(Some(take))
     }
 
     /// Queues keyboard input for the writer thread.
@@ -311,14 +322,32 @@ impl Drop for Session {
         // read it, and the close would hang this thread for good. Without a
         // receiver the reader's next send fails and it closes the pipe, which
         // ends the console's write. Dropping the sender ends the writer.
-        let _ = self.output.get_mut().unwrap_or_else(|e| e.into_inner()).take();
-        let _ = self.input.get_mut().unwrap_or_else(|e| e.into_inner()).take();
+        let _ = self
+            .output
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .channel
+            .take();
+        let _ = self
+            .input
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
         // SAFETY: as above; neither handle is used again.
         unsafe {
             ClosePseudoConsole(self.console);
             let _ = CloseHandle(self.process);
         }
     }
+}
+
+/// The output side of a [`Session`].
+struct Output {
+    /// Chunks from the reader thread; `None` once the session is being torn
+    /// down.
+    channel: Option<Receiver<Vec<u8>>>,
+    /// The rest of a chunk the last read had no room for.
+    carry: Vec<u8>,
 }
 
 /// A pipe pair, read end first.
@@ -498,6 +527,33 @@ mod tests {
         );
         // The controller's size must reach the console without error.
         session.resize(100, 40).expect("resize");
+    }
+
+    #[test]
+    fn output_larger_than_the_read_buffer_is_not_lost() {
+        let session = Session::open(shell(), 200, 24).expect("open");
+        let marker = format!("LONG-{}-END", "x".repeat(120));
+        session
+            .write(format!("echo {marker}\r\n").as_bytes())
+            .expect("write");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut seen = Vec::new();
+        // Far smaller than one console chunk, so every chunk is split.
+        let mut buffer = [0u8; 16];
+        while Instant::now() < deadline {
+            match session.read(&mut buffer) {
+                Ok(Some(0)) => break,
+                Ok(Some(read)) => seen.extend_from_slice(&buffer[..read]),
+                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+                Err(error) => panic!("read: {error}"),
+            }
+            // The echoed command line holds the marker too; the second copy
+            // is the output.
+            if String::from_utf8_lossy(&seen).matches(&marker).count() >= 2 {
+                return;
+            }
+        }
+        panic!("shell produced: {:?}", String::from_utf8_lossy(&seen));
     }
 
     #[test]
