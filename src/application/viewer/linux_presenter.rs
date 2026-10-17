@@ -686,6 +686,16 @@ impl ConnectingWindowsRunner {
 
         if let Stage::Playing(player) = &mut self.stage {
             player.tabs.retain(|id| *id != screen_id);
+            // 正在打开的就是这块：交给新窗口去开，原窗口放弃这次切换，否则它接上
+            // 之后两个窗口会从同一个解码队列取帧（Windows `detach_tab` 同样
+            // `pending.take()`）。
+            if player
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.id == screen_id)
+            {
+                player.pending = None;
+            }
             if player.session.screen_id() == screen_id {
                 // 这块解码器已经交给新窗口了。新屏接上之前主窗口不要再从同一个
                 // 队列取帧，否则两个窗口会互相抢帧，两边都停住。
