@@ -205,6 +205,70 @@ impl Session {
 /// How long a hung-up shell gets to exit before its process group is killed.
 const HANGUP_GRACE: Duration = Duration::from_millis(500);
 
+impl Session {
+    /// Ends the shell and everything its session still runs.
+    ///
+    /// Dropping only hangs up the shell's own process group. Job control puts
+    /// every background job (`cmd &`, a stopped `vim`) in a group of its own,
+    /// and `nohup`/`disown` keep them past the hangup, so a shell ended by
+    /// the host (killed, its grant revoked, left idle) would leave them
+    /// running as the user with nobody able to reach them. Every process
+    /// still in the shell's session (`setsid()` made the shell's pid its id)
+    /// gets the same hangup and grace, then `SIGKILL`.
+    pub(crate) fn terminate(mut self) {
+        let leader = self.child.id() as i32;
+        let members = session_members(leader);
+        for pid in &members {
+            // SAFETY: kill takes no pointers; `pid` was read from /proc as a
+            // member of this session a moment ago.
+            unsafe {
+                libc::kill(*pid, libc::SIGHUP);
+            }
+        }
+        let deadline = Instant::now() + HANGUP_GRACE;
+        while Instant::now() < deadline && !session_members(leader).is_empty() {
+            let _ = self.child.try_wait();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        for pid in session_members(leader) {
+            // SAFETY: as above, re-read from /proc just now.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+        // Drop reaps the shell (and kills its group if it still runs).
+    }
+}
+
+/// The live processes whose session id is `session`, read from /proc.
+///
+/// A session id is the pid of the process that called `setsid()`; the kernel
+/// does not hand that number to a new process while any member of the
+/// session is alive, so a match is a process the shell started. A zombie is
+/// left out: it is already dead and only waits to be reaped.
+fn session_members(session: i32) -> Vec<i32> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<i32>().ok())
+        .filter(|pid| {
+            let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+                return false;
+            };
+            // `pid (comm) state ppid pgrp session ...`; comm may hold spaces
+            // and parentheses, so split after its last ')'.
+            let Some((_, rest)) = stat.rsplit_once(')') else {
+                return false;
+            };
+            let mut fields = rest.split_whitespace();
+            let state = fields.next();
+            fields.nth(2).and_then(|sid| sid.parse::<i32>().ok()) == Some(session)
+                && state != Some("Z")
+        })
+        .collect()
+}
+
 impl Drop for Session {
     /// Hangs up the shell, then kills its process group if it is still
     /// running after [`HANGUP_GRACE`], and reaps it so it does not linger as a
@@ -372,6 +436,42 @@ mod tests {
                 "second shell holds another terminal: {target}"
             );
         }
+    }
+
+    #[test]
+    fn terminating_ends_background_jobs_in_their_own_groups() {
+        let mut session = Session::open("/bin/bash", 80, 24).expect("open pty");
+        // Job control puts the job in a process group of its own, and
+        // `nohup` makes it ignore the hangup the shell's group gets.
+        session
+            .write(b"set -m; nohup sleep 300 >/dev/null 2>&1 & echo J''OB=$!=E''ND\n")
+            .expect("write input");
+        // The quotes keep the echoed command line from matching the output.
+        let seen = read_until(&mut session, b"=END", Duration::from_secs(5));
+        let text = String::from_utf8_lossy(&seen);
+        let job: i32 = text
+            .rsplit("JOB=")
+            .next()
+            .and_then(|rest| rest.split("=END").next())
+            .and_then(|pid| pid.trim().parse().ok())
+            .unwrap_or_else(|| panic!("no job pid in {text:?}"));
+        let shell = session.child.id() as i32;
+        assert!(
+            session_members(shell).contains(&job),
+            "the job is in the shell's session"
+        );
+
+        let started = Instant::now();
+        session.terminate();
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && !session_members(shell).is_empty() {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            session_members(shell).is_empty(),
+            "job {job} outlived the terminal"
+        );
     }
 
     #[test]

@@ -228,26 +228,27 @@ pub(crate) async fn receive_session(
                     }
                     let request = RenameReq::decode(bytes.as_slice())?;
                     // Renaming reaches the same sessions the frame handler
-                    // guards, so it checks the grant and the owner too.
-                    anyhow::ensure!(session.authorization().terminal_allowed(), "本机未允许终端");
-                    let account = session.authorization().account().to_owned();
+                    // guards, so it checks the grant and the owner too, and a
+                    // refusal is answered so the controller is not left
+                    // waiting.
+                    let lease = session.authorization();
+                    let account = lease.account().to_owned();
                     tracing::info!(
                         session = request.session_id,
-                        name = %request.new_name,
                         "host terminal rename requested"
                     );
-                    let result = {
+                    let result = if lease.terminal_allowed() {
                         let sessions = session.terminal();
                         let mut sessions = sessions.lock().unwrap_or_else(|e| e.into_inner());
-                        if sessions.owns(request.session_id, &account) {
-                            sessions.rename(request.session_id, &request.new_name)
-                        } else {
-                            Err(crate::features::host::terminal::SessionError::Gone)
-                        }
+                        sessions
+                            .rename(&account, request.session_id, &request.new_name)
+                            .map_err(|error| error.to_string())
+                    } else {
+                        Err("本机未允许终端".to_owned())
                     };
                     let (code, detail) = match &result {
                         Ok(()) => (0, String::new()),
-                        Err(error) => (1, error.to_string()),
+                        Err(error) => (1, error.clone()),
                     };
                     if let Err(error) = &result {
                         tracing::warn!(%error, "host terminal rename rejected");
