@@ -586,14 +586,21 @@ impl Handle {
         lock(&self.ownership).terminal
     }
     pub(crate) fn set_terminal_allowed(&self, allowed: bool) -> anyhow::Result<()> {
-        let mut state = lock(&self.ownership);
-        anyhow::ensure!(state.active, "账号会话已结束");
-        if state.terminal != allowed {
-            state.terminal = allowed;
-            state.settings_revision = state.settings_revision.wrapping_add(1);
-            state.dirty = true;
-            state.status.saving = true;
-            state.status.settings_error = None;
+        {
+            let mut state = lock(&self.ownership);
+            anyhow::ensure!(state.active, "账号会话已结束");
+            if state.terminal != allowed {
+                state.terminal = allowed;
+                state.settings_revision = state.settings_revision.wrapping_add(1);
+                state.dirty = true;
+                state.status.saving = true;
+                state.status.settings_error = None;
+            }
+        }
+        // Turning the terminal off ends the shells it granted, connected or
+        // not; the live terminal connection closes on its next pump tick.
+        if !allowed {
+            super::terminal::end_login(&self.account);
         }
         Ok(())
     }
@@ -757,6 +764,8 @@ impl Handle {
     }
     pub(crate) fn set_allowed(&self, allowed: bool) {
         if !allowed {
+            // A shell is remote control too; it does not outlive the switch.
+            super::terminal::end_login(&self.account);
             self.power.invalidate();
             if !crate::platform::host_service::resident::managed() {
                 if let Err(error) = super::update_resume::clear(&self.scope) {
@@ -922,6 +931,10 @@ impl Handle {
         state.status.message = "本机离线".into();
         self.desired.send_replace(None);
         drop(state);
+        // Every way a login generation ends (sign-out, another account,
+        // unbinding, an expired credential) comes through here; its shells
+        // end with it rather than outliving the login that opened them.
+        super::terminal::end_login(&self.account);
         if clear_update {
             if let Err(error) = super::update_resume::clear(&self.scope) {
                 tracing::warn!(%error, "retired update media handoff cleanup failed");
@@ -952,7 +965,12 @@ impl Handle {
     }
     pub(crate) fn disconnect_session(&self, session: &str) -> bool {
         let managed = crate::platform::host_service::resident::managed();
-        disconnect_session(&mut lock(&self.ownership), session, managed)
+        let disconnected = disconnect_session(&mut lock(&self.ownership), session, managed);
+        // The local user sent the controller away; its shells go with it.
+        if disconnected {
+            super::terminal::end_login(&self.account);
+        }
+        disconnected
     }
     pub(crate) fn requested(&self) -> bool {
         let state = lock(&self.ownership);
