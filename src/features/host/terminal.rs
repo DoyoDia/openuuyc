@@ -46,22 +46,29 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use webrtc::data_channel::RTCDataChannel;
 
-/// The four bytes every terminal frame starts with.
 #[cfg(target_os = "linux")]
 pub(crate) mod local;
 /// 本机 attach 目前只有 Unix socket 一套实现；Windows 用命名管道还没做，
 /// 侧边栏与子命令先明确说不支持。
 #[cfg(not(target_os = "linux"))]
 pub(crate) mod local {
+    /// 这个平台能不能把会话接到本机终端里。
+    pub(crate) const SUPPORTED: bool = false;
+    pub(crate) const UNSUPPORTED: &str = "本机终端接入暂只支持 Linux";
     pub(crate) fn serve() {}
-    pub(crate) fn run_client(_session: Option<&str>, _list: bool) -> anyhow::Result<()> {
-        anyhow::bail!("本机终端接入暂只支持 Linux")
+    pub(crate) fn run_client(
+        _session: Option<&str>,
+        _list: bool,
+        _new: bool,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!(UNSUPPORTED)
     }
     pub(crate) fn open_in_terminal(_session: u32) -> anyhow::Result<()> {
-        anyhow::bail!("本机终端接入暂只支持 Linux")
+        anyhow::bail!(UNSUPPORTED)
     }
 }
 
+/// The four bytes every terminal frame starts with.
 const MAGIC: &[u8; 4] = b"TERM";
 /// Fixed header size, magic included.
 const HEADER: usize = 16;
@@ -224,6 +231,9 @@ impl SessionState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Consumer {
     Remote(u64),
+    // Only the Linux socket service (`local.rs`) attaches a local terminal;
+    // elsewhere the page lists and ends sessions but cannot open them here.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Local(u64),
 }
 
@@ -405,6 +415,8 @@ pub(crate) struct LocalSession {
     pub shell: String,
     pub state: &'static str,
     pub created_ms: i64,
+    /// Shown by `OpenUUYC terminal --list` (Linux only).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub last_active_ms: i64,
     /// 远程主控是否附着。
     pub remote: bool,
@@ -415,6 +427,11 @@ pub(crate) struct LocalSession {
 }
 
 /// 一次本机 pump 的结果。
+///
+/// The local-terminal items marked `allow(dead_code)` off Linux are driven
+/// only by the Linux socket service in `local.rs`; the other platforms list
+/// and end sessions but have no local attach yet.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) struct LocalOutput {
     pub handle: u32,
     pub data: Vec<u8>,
@@ -437,6 +454,10 @@ pub(crate) enum SessionError {
     TooMany,
     #[error("输入过快，这段输入未送达终端")]
     InputOverflow,
+    /// This machine cannot host a shell for the local user, for the reason
+    /// given (no local attach on this platform, or running as root/SYSTEM).
+    #[error("{0}")]
+    Unavailable(&'static str),
 }
 
 fn now_ms() -> i64 {
@@ -536,6 +557,9 @@ impl Sessions {
     /// 的东西应当等用户自己关。编号从 [`LOCAL_HANDLE_BASE`] 起，与手机端
     /// 常用的小编号分开。
     pub(crate) fn create_local(&mut self, name: Option<String>) -> Result<u32, SessionError> {
+        if let Some(reason) = local_unavailable() {
+            return Err(SessionError::Unavailable(reason));
+        }
         if self.sessions.len() >= MAX_TOTAL {
             return Err(SessionError::TooMany);
         }
@@ -749,6 +773,7 @@ impl Sessions {
     ///
     /// 本机不按登录账号过滤：进程就是同一个用户，侧边栏列出的是这台
     /// 机器上正在跑的 shell。消费者用一个独立编号，与远程连接互不影响。
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn attach_local(
         &mut self,
         handle: u32,
@@ -774,6 +799,7 @@ impl Sessions {
     }
 
     /// 本机终端自己离开了；shell 留下来等下一次 attach。
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn detach_local(&mut self, consumer: u64) {
         for session in self.sessions.values_mut() {
             session.detach(Consumer::Local(consumer));
@@ -781,6 +807,7 @@ impl Sessions {
     }
 
     /// 本机终端输入的字节写回 pty。
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn write_local(&mut self, handle: u32, data: &[u8]) -> Result<(), SessionError> {
         let key = self.local_key(handle).ok_or(SessionError::Gone)?;
         let session = self.sessions.get_mut(&key).ok_or(SessionError::Gone)?;
@@ -788,6 +815,7 @@ impl Sessions {
     }
 
     /// 本机终端改了大小。
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn resize_local(
         &mut self,
         handle: u32,
@@ -941,6 +969,7 @@ impl Sessions {
     }
 
     /// 取走本机 attach 的待发输出；`None` 表示这个消费者已经不在表里。
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn pump_local(&mut self, consumer: u64, budget: usize) -> Option<LocalOutput> {
         self.drain(budget);
         self.sessions.iter_mut().find_map(|((_, handle), session)| {
@@ -1137,6 +1166,19 @@ pub(crate) fn unavailable() -> Option<&'static str> {
     })
 }
 
+/// Why the local user cannot open a shell from this machine's sessions page
+/// or command line; `None` when they can.
+///
+/// The same refusals as the controller's terminal apply (root on POSIX,
+/// SYSTEM on Windows), plus platforms without a local attach yet, so the page
+/// never offers a button that is bound to fail.
+pub(crate) fn local_unavailable() -> Option<&'static str> {
+    if !local::SUPPORTED {
+        return Some(local::UNSUPPORTED);
+    }
+    unavailable()
+}
+
 /// How many shells this process is running, for the host's settings page.
 pub(crate) fn running() -> usize {
     SESSIONS.get().map_or(0, |table| lock_table(table).count())
@@ -1186,6 +1228,7 @@ pub(crate) fn open_local_terminal(handle: u32) -> anyhow::Result<()> {
 }
 
 /// 本机 attach 的消费者编号，与远程连接分开计。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn next_local_consumer() -> u64 {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)

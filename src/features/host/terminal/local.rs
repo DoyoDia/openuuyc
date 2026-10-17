@@ -28,6 +28,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+/// 这个平台能不能把会话接到本机终端里。
+pub(crate) const SUPPORTED: bool = true;
+/// Never shown on Linux; the other platforms' stub says it.
+pub(crate) const UNSUPPORTED: &str = "本机终端接入暂只支持 Linux";
+
 /// 服务端一次最多发给本机的字节数，与远程 pump 的上限一致。
 const PUMP_BUDGET: usize = 256 * 1024;
 /// 一帧的上限：输入与输出都远小于它，超了就是坏数据。
