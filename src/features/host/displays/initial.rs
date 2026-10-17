@@ -68,6 +68,25 @@ impl Session {
 }
 
 impl State {
+    /// 建连前确认机器上有屏。没有的话，Windows 用虚拟显示驱动的常驻兜底屏，
+    /// Linux 借虚拟显示器辅助程序接一路 VKMS 连接器、再让合成器认下它。
+    #[cfg(windows)]
+    fn ensure_fallback_screen(
+        &mut self,
+        width: u32,
+        height: u32,
+    ) -> Result<Option<capture::Screen>> {
+        fallback::ensure(self.fallback_driver()?, width, height, &[], true)
+    }
+    #[cfg(not(windows))]
+    fn ensure_fallback_screen(
+        &mut self,
+        width: u32,
+        height: u32,
+    ) -> Result<Option<capture::Screen>> {
+        fallback::ensure(&self.journal.token, width, height, true)
+    }
+
     fn initial_resolution(
         &mut self,
         target: &Target,
@@ -104,13 +123,29 @@ impl State {
         modes: Vec<(u32, u32)>,
         lease: &Lease,
     ) -> Result<capture::Screen> {
+        #[cfg(windows)]
         if self.fallback_pin.is_none() {
             self.fallback_pin = fallback::pin().unwrap_or_else(|error| {
                 tracing::warn!(error=%format!("{error:#}"), "optional display driver unavailable");
                 None
             });
         }
+        // Linux 上零输出时枚举会直接报错（`capture::screens` 把「一块屏都没有」当
+        // 异常），而兜底屏要的正是这个状态，所以先按拓扑判断有没有屏。
+        let targets = Topology::query(true)?.metadata()?;
+        let has_display = targets.iter().any(|t| {
+            // Linux 的连接但没启用的输出采集不到，不算「有屏」。
+            (t.available && (cfg!(windows) || t.active))
+                && t.virtual_provider != Some(display::topology::VirtualProvider::Uu)
+        });
+        #[cfg(windows)]
         let mut screens = capture::screens()?;
+        #[cfg(not(windows))]
+        let mut screens = if has_display {
+            capture::screens()?
+        } else {
+            Vec::new()
+        };
         tracing::info!(
             screens = screens.len(),
             forced_virtual = options.force_virtual,
@@ -131,21 +166,12 @@ impl State {
         }
         .unwrap_or((1920, 1080));
         let mut automatic = None;
-        let targets = Topology::query(true)?.metadata()?;
         if !options.force_virtual
             && !self.preferences.default_virtual
             && !self.preferences.super_enabled
-            && !targets.iter().any(|t| {
-                t.available && t.virtual_provider != Some(display::topology::VirtualProvider::Uu)
-            })
+            && !has_display
         {
-            automatic = fallback::ensure(
-                self.fallback_driver()?,
-                virtual_size.0,
-                virtual_size.1,
-                &[],
-                true,
-            )?;
+            automatic = self.ensure_fallback_screen(virtual_size.0, virtual_size.1)?;
             screens = capture::screens()?;
         }
         if !options.force_virtual && self.preferences.super_enabled {
