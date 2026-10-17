@@ -628,9 +628,18 @@ pub(crate) fn open_in_terminal(session: u32) -> Result<()> {
     let mut command = std::process::Command::new(&program);
     command.args(args);
     command.args(attach_arguments(&exe, session));
-    command
+    let mut child = command
         .spawn()
         .with_context(|| format!("启动 {program} 失败"))?;
+    // Reap it when it exits. Many emulators hand the window to a server and
+    // exit at once (gnome-terminal, `kitty --single-instance`); left alone,
+    // each 「在本地打开」 would leave a zombie under the control center.
+    std::thread::Builder::new()
+        .name("terminal emulator".into())
+        .spawn(move || {
+            let _ = child.wait();
+        })
+        .context("无法等待终端模拟器退出")?;
     Ok(())
 }
 
