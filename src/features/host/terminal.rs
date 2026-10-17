@@ -985,6 +985,21 @@ fn geometry(payload: &[u8]) -> (Option<u16>, Option<u16>) {
     (None, None)
 }
 
+/// Translates a Signal frame into the terminal control character it stands for.
+///
+/// The official controller sends JSON such as `{"sig":"SIGINT"}`. Only the
+/// signals the terminal driver turns into a key have a byte; anything else
+/// returns `None` and the caller logs and drops it.
+fn signal_keystroke(payload: &[u8]) -> Option<u8> {
+    let value: Value = serde_json::from_slice(payload).ok()?;
+    match value.get("sig")?.as_str()? {
+        "SIGINT" => Some(0x03),
+        "SIGQUIT" => Some(0x1c),
+        "SIGTSTP" => Some(0x1a),
+        _ => None,
+    }
+}
+
 async fn handle_frame(
     channel: &Arc<RTCDataChannel>,
     screens: &Arc<tokio::sync::Mutex<crate::features::host::peer::screens::Screens>>,
@@ -1201,11 +1216,38 @@ async fn handle_frame(
                 ));
             }
             FrameType::Signal => {
-                // The payload's signal semantics are unverified, and killing
-                // the shell on an unknown signal would lose the session.
-                // Ignore it until the frame is understood; Ctrl-C reaches the
-                // shell as a byte on stdin anyway.
-                tracing::debug!(session = frame.session, "host terminal signal ignored");
+                // The actual frame is `{"sig":"SIGINT"}` (16 bytes). Writing the
+                // control character into the pty is the safest translation: the
+                // terminal driver turns it into SIGINT for the foreground
+                // process group, the same path a local Ctrl-C takes; killing
+                // the process directly would skip the program's own handling
+                // (vim, for one, wants to ask first).
+                match signal_keystroke(&frame.payload) {
+                    Some(byte) => {
+                        if let Err(error) =
+                            lock_table(&table).write(&account, frame.session, &[byte])
+                        {
+                            tracing::debug!(
+                                %error,
+                                session = frame.session,
+                                "host terminal signal dropped"
+                            );
+                        }
+                    }
+                    None => {
+                        let payload: String = frame
+                            .payload
+                            .iter()
+                            .map(|byte| format!("{byte:02x}"))
+                            .collect();
+                        tracing::debug!(
+                            session = frame.session,
+                            bytes = frame.payload.len(),
+                            payload,
+                            "host terminal signal ignored"
+                        );
+                    }
+                }
             }
             other => {
                 tracing::debug!(?other, "host terminal frame ignored");
@@ -1800,5 +1842,14 @@ mod tests {
         );
         assert_eq!(geometry(&[50, 0, 20, 0]), (Some(50), Some(20)));
         assert_eq!(geometry(b""), (None, None));
+    }
+
+    #[test]
+    fn a_signal_frame_becomes_a_keystroke() {
+        assert_eq!(signal_keystroke(br#"{"sig":"SIGINT"}"#), Some(0x03));
+        assert_eq!(signal_keystroke(br#"{"sig":"SIGQUIT"}"#), Some(0x1c));
+        assert_eq!(signal_keystroke(br#"{"sig":"SIGTSTP"}"#), Some(0x1a));
+        assert_eq!(signal_keystroke(br#"{"sig":"SIGUSR1"}"#), None);
+        assert_eq!(signal_keystroke(b""), None);
     }
 }
