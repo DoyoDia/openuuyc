@@ -41,7 +41,7 @@
 
 use bytes::Bytes;
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use webrtc::data_channel::RTCDataChannel;
@@ -197,6 +197,17 @@ impl SessionState {
     }
 }
 
+/// 一个附着的输出消费者：远程主控连接，或本机 attach 的终端。
+///
+/// 两者读的是同一个 pty，只是出口不同：远程走 DataChannel，本机走 Unix
+/// socket。用同一个枚举做队列的键，pump 读一次 pty 就能把数据分给所有
+/// 消费者。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Consumer {
+    Remote(u64),
+    Local(u64),
+}
+
 /// One shell and the metadata the session list shows.
 struct Session {
     pty: crate::platform::terminal::Session,
@@ -216,10 +227,13 @@ struct Session {
     /// Input the pty would not take yet. A paste or a slow shell fills the
     /// pty buffer; dropping the rest would lose keystrokes silently.
     pending: Vec<u8>,
-    /// The connection this shell's output goes to. Only that connection's
-    /// pump reads the pty; with nobody attached the shell is left to the
-    /// pty's own flow control and its output waits for the next attach.
-    attached: Option<u64>,
+    /// 每个消费者待发的输出。只要有消费者，pump 就会读 pty；没人附着时
+    /// shell 由 pty 自己的流控挡住，输出等下一次 attach。
+    output: BTreeMap<Consumer, Vec<u8>>,
+    /// 远程主控最近一次给出的尺寸。
+    remote_size: Option<(u16, u16)>,
+    /// 本机 attach 最近一次给出的尺寸。
+    local_size: Option<(u16, u16)>,
     /// When the last connection let go, for the idle limit.
     detached_since: Option<std::time::Instant>,
 }
@@ -247,25 +261,45 @@ impl Session {
         self.screen.process(data);
     }
 
-    /// Resizes the pty and the screen model together. A model left at the
-    /// old size wraps lines where the shell did not, and a reattach then
-    /// replays a screen cut at the old width.
-    fn resize(&mut self, cols: u16, rows: u16) -> Result<(), SessionError> {
-        let (cols, rows) = clamp_size(cols, rows);
-        self.pty
-            .resize(cols, rows)
-            .map_err(|_| SessionError::Gone)?;
-        self.screen.screen_mut().set_size(rows, cols);
-        Ok(())
-    }
-
-    fn let_go(&mut self) {
-        self.attached = None;
-        self.detached_since = Some(std::time::Instant::now());
-        if self.state == SessionState::Running {
-            self.state = SessionState::Detached;
+    /// 让一个消费者离开。只有最后一个消费者走掉时才算「没人附着」。
+    fn detach(&mut self, consumer: Consumer) {
+        if self.output.remove(&consumer).is_none() {
+            return;
+        }
+        match consumer {
+            Consumer::Remote(_) => self.remote_size = None,
+            Consumer::Local(_) => self.local_size = None,
+        }
+        self.apply_size();
+        if self.output.is_empty() {
+            self.detached_since = Some(std::time::Instant::now());
+            if self.state == SessionState::Running {
+                self.state = SessionState::Detached;
+            }
         }
         self.last_active_ms = now_ms();
+    }
+
+    /// 把 pty 与屏幕模型的尺寸同步到当前所有附着者。
+    ///
+    /// 有多个附着者时取各维的最小值，与 tmux 一致：多出来的那端留白，
+    /// 谁都不会看到被折行的内容。最后一个附着者离开后恢复成仍附着那端
+    /// 的尺寸。
+    fn apply_size(&mut self) {
+        let size = match (self.remote_size, self.local_size) {
+            (Some((remote_cols, remote_rows)), Some((local_cols, local_rows))) => {
+                (remote_cols.min(local_cols), remote_rows.min(local_rows))
+            }
+            (Some(size), None) | (None, Some(size)) => size,
+            (None, None) => return,
+        };
+        let (cols, rows) = clamp_size(size.0, size.1);
+        if self.pty.resize(cols, rows).is_err() {
+            return;
+        }
+        // The model has to follow the pty, or the replay would describe a
+        // screen of the old size.
+        self.screen.screen_mut().set_size(rows, cols);
     }
 }
 
@@ -400,12 +434,16 @@ impl Sessions {
         // Re-opening an existing handle happens on reconnect and when the
         // size changes; replacing the pty would hang up a shell in use.
         if let Some(existing) = self.sessions.get_mut(&key(owner, handle)) {
-            existing.resize(cols, rows)?;
             if existing.state != SessionState::Exited {
                 existing.state = SessionState::Running;
             }
-            existing.attached = Some(connection);
+            existing.remote_size = Some((cols, rows));
+            existing
+                .output
+                .entry(Consumer::Remote(connection))
+                .or_default();
             existing.detached_since = None;
+            existing.apply_size();
             existing.last_active_ms = now_ms();
             return Ok((
                 handle,
@@ -437,7 +475,9 @@ impl Sessions {
                 last_active_ms: stamp,
                 screen: vt100::Parser::new(rows, cols, 0),
                 pending: Vec::new(),
-                attached: Some(connection),
+                output: BTreeMap::from([(Consumer::Remote(connection), Vec::new())]),
+                remote_size: Some((cols, rows)),
+                local_size: None,
                 detached_since: None,
             },
         );
@@ -536,7 +576,8 @@ impl Sessions {
         rows: u16,
     ) -> Result<(), SessionError> {
         let session = self.get_mut(owner, handle)?;
-        session.resize(cols, rows)?;
+        session.remote_size = Some((cols, rows));
+        session.apply_size();
         session.last_active_ms = now_ms();
         Ok(())
     }
@@ -593,22 +634,73 @@ impl Sessions {
 
     /// Lets go of one of `owner`'s sessions without ending the shell.
     pub(crate) fn detach(&mut self, owner: &str, handle: u32) -> Result<(), SessionError> {
-        self.get_mut(owner, handle)?.let_go();
+        let session = self.get_mut(owner, handle)?;
+        let remotes: Vec<_> = session
+            .output
+            .keys()
+            .filter(|consumer| matches!(consumer, Consumer::Remote(_)))
+            .copied()
+            .collect();
+        for consumer in remotes {
+            session.detach(consumer);
+        }
         Ok(())
     }
 
     /// Lets go of every session attached to `connection`, which has closed.
     pub(crate) fn release(&mut self, connection: u64) {
         for session in self.sessions.values_mut() {
-            if session.attached == Some(connection) {
-                session.let_go();
-            }
+            session.detach(Consumer::Remote(connection));
         }
     }
 
     /// How many shells are running, for the host's settings page.
     pub(crate) fn count(&self) -> usize {
         self.sessions.len()
+    }
+
+    /// 把 pty 里现成的输出读出来，分发给每个消费者的队列。
+    ///
+    /// 一次读取同时喂屏幕模型和所有队列，所以远程与本机看到的是同一份
+    /// 数据。任一个消费者的积压到了上限就不再读这个会话，让 pty 的缓冲
+    /// 反压 shell，而不是把内存堆爆。
+    fn drain(&mut self, budget: usize) {
+        let mut buffer = [0u8; 8192];
+        let mut left = budget;
+        for session in self.sessions.values_mut() {
+            if left == 0 {
+                break;
+            }
+            if session.output.is_empty() || session.state == SessionState::Exited {
+                continue;
+            }
+            if session
+                .output
+                .values()
+                .any(|queue| queue.len() >= OUTPUT_HIGH_WATER)
+            {
+                continue;
+            }
+            session.flush_pending();
+            while left > 0 {
+                let want = left.min(buffer.len());
+                match session.pty.read(&mut buffer[..want]) {
+                    Ok(Some(0)) | Err(_) => break,
+                    Ok(Some(read)) => {
+                        session.record(&buffer[..read]);
+                        for queue in session.output.values_mut() {
+                            queue.extend_from_slice(&buffer[..read]);
+                        }
+                        left -= read;
+                        session.last_active_ms = now_ms();
+                    }
+                    Ok(None) => break,
+                }
+            }
+            if session.pty.exited() {
+                session.state = SessionState::Exited;
+            }
+        }
     }
 
     /// Takes up to `budget` bytes the shells attached to `connection` have
@@ -624,57 +716,46 @@ impl Sessions {
         connection: u64,
         budget: usize,
     ) -> Vec<(u32, FrameType, Vec<u8>)> {
+        self.drain(budget);
+        let consumer = Consumer::Remote(connection);
         let mut out = Vec::new();
-        let mut exited = Vec::new();
-        let mut buffer = [0u8; 8192];
         let mut attached: Vec<_> = self
             .sessions
             .iter_mut()
-            .filter(|(_, session)| {
-                session.attached == Some(connection) && session.state != SessionState::Exited
-            })
+            .filter(|(_, session)| session.output.contains_key(&consumer))
             .map(|((_, handle), session)| (*handle, session))
             .collect();
-        if attached.is_empty() {
-            return out;
-        }
         attached.sort_by_key(|(handle, _)| *handle);
         // Split the budget so one busy shell cannot starve the others.
-        let share = (budget / attached.len()).max(buffer.len().min(budget));
-        let mut left = budget;
+        let share = (budget / attached.len().max(1)).max(1);
         for (handle, session) in attached {
-            session.flush_pending();
-            let mut budget = share.min(left);
-            while budget > 0 {
-                let want = budget.min(buffer.len());
-                match session.pty.read(&mut buffer[..want]) {
-                    Ok(Some(0)) | Err(_) => break,
-                    Ok(Some(read)) => {
-                        session.record(&buffer[..read]);
-                        out.push((handle, FrameType::Stdout, buffer[..read].to_vec()));
-                        budget -= read;
-                        left -= read;
-                        session.last_active_ms = now_ms();
-                    }
-                    Ok(None) => break,
+            if let Some(queue) = session.output.get_mut(&consumer) {
+                if !queue.is_empty() {
+                    let take = queue.len().min(share);
+                    out.push((handle, FrameType::Stdout, queue.drain(..take).collect()));
                 }
             }
-            if session.pty.exited() {
-                session.state = SessionState::Exited;
-                exited.push((handle, FrameType::Exit, b"{}".to_vec()));
+            if session.state == SessionState::Exited {
+                // Report the exit once, then drop this consumer so `reap`
+                // can recover the session after every other one saw it too.
+                session.output.remove(&consumer);
+                out.push((handle, FrameType::Exit, b"{}".to_vec()));
             }
         }
-        out.extend(exited);
         out
     }
 
-    /// Takes out the sessions on `connection` that have reported their exit.
-    pub(crate) fn reap(&mut self, connection: u64) -> Ended {
+    /// Takes out the sessions whose exit every attached consumer has seen.
+    ///
+    /// A session is not removed on the first pump that notices the shell
+    /// ended: the other connection still has
+    /// to be told, and its queue only empties once it was.
+    pub(crate) fn reap(&mut self) -> Ended {
         let exited: Vec<_> = self
             .sessions
             .iter()
             .filter(|(_, session)| {
-                session.attached == Some(connection) && session.state == SessionState::Exited
+                session.state == SessionState::Exited && session.output.is_empty()
             })
             .map(|(key, _)| key.clone())
             .collect();
@@ -692,10 +773,7 @@ impl Sessions {
         let mut exited = Vec::new();
         let mut abandoned = Vec::new();
         for (key, session) in self.sessions.iter_mut() {
-            let Some(since) = session
-                .detached_since
-                .filter(|_| session.attached.is_none())
-            else {
+            let Some(since) = session.detached_since.filter(|_| session.output.is_empty()) else {
                 continue;
             };
             if session.pty.exited() {
@@ -956,7 +1034,7 @@ pub(crate) fn bind(
                 pump_stop.cancel();
                 break;
             }
-            lock_table(&table).reap(connection).finish();
+            lock_table(&table).reap().finish();
         }
         lock_table(&table).release(connection);
     });
@@ -1436,7 +1514,7 @@ mod tests {
                 .iter()
                 .any(|(_, kind, _)| *kind == FrameType::Exit)
             {
-                sessions.reap(1).finish();
+                sessions.reap().finish();
                 assert!(sessions.is_empty());
                 return;
             }
