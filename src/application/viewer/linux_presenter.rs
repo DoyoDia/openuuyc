@@ -485,10 +485,11 @@ impl ConnectingWindowsRunner {
         };
         // 旧主窗口的屏交给接替者，别让它们随着窗口一起消失。
         let mut tabs = Vec::new();
-        if let Stage::Playing(player) = &mut self.stage {
+        if let (Stage::Playing(player), Some(window)) = (&mut self.stage, &self.window) {
             // 它已经交出了正在直播的那块屏，析构时不能再关整个解码器池。
             player.input_owns_connection = false;
             tabs = std::mem::take(&mut player.tabs);
+            player.abandon_window(window.id());
         }
         let DetachedWindow {
             stage,
@@ -540,6 +541,9 @@ impl ConnectingWindowsRunner {
         slot.close = true;
         slot.window.set_visible(false);
         slot.pending = None;
+        if let DetachedStage::Playing(player) = &slot.stage {
+            player.abandon_window(slot.window.id());
+        }
         let tabs = std::mem::take(&mut slot.tabs);
         if let Stage::Playing(player) = &mut self.stage {
             for id in tabs {
@@ -1948,6 +1952,19 @@ impl Player {
         // 对端按「选中」的那块屏送指针与输入，换屏就得告诉它。
         self.screens.focus(screen_id);
         Ok(())
+    }
+
+    /// 窗口要关了：放下它发起、还等着回应的事，和 Windows `close_window` 一样——
+    /// 设备切换的接管确认（否则它指着一个已经销毁的窗口），以及这块屏的显示设置。
+    fn abandon_window(&self, window: WindowId) {
+        if let Some(switcher) = self.device_switch() {
+            switcher.cancel_takeover(window);
+        }
+        // 当前屏已经交给独立窗口时，它的显示设置归那边。
+        if !self.frame_paused {
+            self.control()
+                .cancel_display_change(self.session.screen_id());
+        }
     }
 
     /// 当前屏交给独立窗口之后没能接上别的屏（打开失败、对端拒绝）：窗口停在等待
