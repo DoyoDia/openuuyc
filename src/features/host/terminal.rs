@@ -47,6 +47,21 @@ use tokio_util::sync::CancellationToken;
 use webrtc::data_channel::RTCDataChannel;
 
 /// The four bytes every terminal frame starts with.
+#[cfg(target_os = "linux")]
+pub(crate) mod local;
+/// 本机 attach 目前只有 Unix socket 一套实现；Windows 用命名管道还没做，
+/// 侧边栏与子命令先明确说不支持。
+#[cfg(not(target_os = "linux"))]
+pub(crate) mod local {
+    pub(crate) fn serve() {}
+    pub(crate) fn run_client(_session: Option<&str>, _list: bool) -> anyhow::Result<()> {
+        anyhow::bail!("本机终端接入暂只支持 Linux")
+    }
+    pub(crate) fn open_in_terminal(_session: u32) -> anyhow::Result<()> {
+        anyhow::bail!("本机终端接入暂只支持 Linux")
+    }
+}
+
 const MAGIC: &[u8; 4] = b"TERM";
 /// Fixed header size, magic included.
 const HEADER: usize = 16;
@@ -60,6 +75,10 @@ const MAX_SESSIONS: usize = 16;
 const MAX_NAME: usize = 64;
 /// Shells all logins together may hold, on top of [`MAX_SESSIONS`] each.
 const MAX_TOTAL: usize = 64;
+/// 本机自己创建的会话在表里的所有者。手机端按账号列出会话，看不到这些。
+const LOCAL_OWNER: &str = "local";
+/// 本机会话的编号从这里往上找，避开主控常用的小编号，免得两边撞号。
+const LOCAL_HANDLE_BASE: u32 = 1000;
 /// Input a session may hold when the pty will not take it yet. A frame that
 /// would go past it is refused whole (see [`Sessions::write`]).
 const PENDING_LIMIT: usize = 1024 * 1024;
@@ -378,6 +397,31 @@ pub(crate) struct Sessions {
     next_name: u64,
 }
 
+/// 本机侧看到的会话，给侧边栏与 CLI 用。
+#[derive(Clone, Debug)]
+pub(crate) struct LocalSession {
+    pub handle: u32,
+    pub name: String,
+    pub shell: String,
+    pub state: &'static str,
+    pub created_ms: i64,
+    pub last_active_ms: i64,
+    /// 远程主控是否附着。
+    pub remote: bool,
+    /// 本机是否已经有终端接上。
+    pub local: bool,
+    /// 前台正在跑的命令；空闲时为 `None`。
+    pub foreground: Option<crate::platform::Foreground>,
+}
+
+/// 一次本机 pump 的结果。
+pub(crate) struct LocalOutput {
+    pub handle: u32,
+    pub data: Vec<u8>,
+    /// shell 已经退出；这个消费者已被摘掉，客户端应当收尾。
+    pub exited: bool,
+}
+
 /// Why a session operation was refused.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub(crate) enum SessionError {
@@ -433,7 +477,9 @@ impl Sessions {
         };
         // Re-opening an existing handle happens on reconnect and when the
         // size changes; replacing the pty would hang up a shell in use.
-        if let Some(existing) = self.sessions.get_mut(&key(owner, handle)) {
+        if let Some(key) = self.resolve(owner, handle)
+            && let Some(existing) = self.sessions.get_mut(&key)
+        {
             if existing.state != SessionState::Exited {
                 existing.state = SessionState::Running;
             }
@@ -484,6 +530,53 @@ impl Sessions {
         Ok((handle, name, Vec::new()))
     }
 
+    /// 本机主动开一个会话，不经过主控。
+    ///
+    /// 这类会话没有远程消费者，也不在 30 分钟空闲清扫的范围里：用户自己开
+    /// 的东西应当等用户自己关。编号从 [`LOCAL_HANDLE_BASE`] 起，与手机端
+    /// 常用的小编号分开。
+    pub(crate) fn create_local(&mut self, name: Option<String>) -> Result<u32, SessionError> {
+        if self.sessions.len() >= MAX_TOTAL {
+            return Err(SessionError::TooMany);
+        }
+        let name = match name {
+            Some(name) => validate_name(&name)?,
+            None => self.default_name(LOCAL_OWNER),
+        };
+        if self
+            .owned(LOCAL_OWNER)
+            .any(|(_, session)| session.name == name)
+        {
+            return Err(SessionError::DuplicateName);
+        }
+        let handle = (LOCAL_HANDLE_BASE..u32::MAX)
+            .find(|handle| !self.sessions.contains_key(&key(LOCAL_OWNER, *handle)))
+            .unwrap_or(LOCAL_HANDLE_BASE);
+        let shell = Sessions::default_shell();
+        // 尺寸只是占位：接上本地终端时 `attach_local` 会按那端改。
+        let pty = crate::platform::terminal::Session::open(&shell, 80, 24)
+            .map_err(|_| SessionError::Gone)?;
+        let stamp = now_ms();
+        self.sessions.insert(
+            key(LOCAL_OWNER, handle),
+            Session {
+                pty,
+                name,
+                state: SessionState::Detached,
+                created_ms: stamp,
+                last_active_ms: stamp,
+                screen: vt100::Parser::new(24, 80, 0),
+                pending: Vec::new(),
+                output: BTreeMap::new(),
+                remote_size: None,
+                local_size: None,
+                // 用户主动开的会话不参与空闲清扫。
+                detached_since: None,
+            },
+        );
+        Ok(handle)
+    }
+
     fn owned<'a>(&'a self, owner: &'a str) -> impl Iterator<Item = (u32, &'a Session)> + 'a {
         self.sessions
             .iter()
@@ -491,10 +584,21 @@ impl Sessions {
             .map(|((_, handle), session)| (*handle, session))
     }
 
+    /// 按编号找会话：先找这个账号自己的，再找本机开的那些。
+    ///
+    /// 本机会话对手机端可见，编号从 1000 起，与主控自己的编号不会撞。
+    fn resolve(&self, owner: &str, handle: u32) -> Option<(String, u32)> {
+        let own = key(owner, handle);
+        if self.sessions.contains_key(&own) {
+            return Some(own);
+        }
+        let local = key(LOCAL_OWNER, handle);
+        self.sessions.contains_key(&local).then_some(local)
+    }
+
     fn get_mut(&mut self, owner: &str, handle: u32) -> Result<&mut Session, SessionError> {
-        self.sessions
-            .get_mut(&key(owner, handle))
-            .ok_or(SessionError::Gone)
+        let key = self.resolve(owner, handle).ok_or(SessionError::Gone)?;
+        self.sessions.get_mut(&key).ok_or(SessionError::Gone)
     }
 
     /// The lowest handle this login does not use; the controller's handle
@@ -528,9 +632,12 @@ impl Sessions {
 
     /// The sessions `owner` may see, as the objects the client parses.
     pub(crate) fn list(&self, owner: &str) -> Vec<Value> {
+        // 本机自己开的会话也对主控可见，手机端能看到并接上。
         let mut listed: Vec<_> = self
-            .owned(owner)
-            .map(|(handle, session)| {
+            .sessions
+            .iter()
+            .filter(|((who, _), _)| who == owner || who == LOCAL_OWNER)
+            .map(|((_, handle), session)| {
                 json!({
                     "session_id": handle,
                     "state": session.state.as_str(),
@@ -557,14 +664,7 @@ impl Sessions {
         data: &[u8],
     ) -> Result<(), SessionError> {
         let session = self.get_mut(owner, handle)?;
-        session.last_active_ms = now_ms();
-        session.flush_pending();
-        if session.pending.len() + data.len() > PENDING_LIMIT {
-            return Err(SessionError::InputOverflow);
-        }
-        session.pending.extend_from_slice(data);
-        session.flush_pending();
-        Ok(())
+        write_to(session, data)
     }
 
     /// Applies a new size, which the shell sees as `SIGWINCH`.
@@ -590,13 +690,13 @@ impl Sessions {
         name: &str,
     ) -> Result<(), SessionError> {
         let name = validate_name(name)?;
-        if !self.sessions.contains_key(&key(owner, handle)) {
-            return Err(SessionError::Gone);
-        }
-        if self
-            .owned(owner)
-            .any(|(other, session)| other != handle && session.name == name)
-        {
+        let key = self.resolve(owner, handle).ok_or(SessionError::Gone)?;
+        let duplicate = self.sessions.iter().any(|((who, other), session)| {
+            (who == owner || who == LOCAL_OWNER)
+                && (*other != handle || who != &key.0)
+                && session.name == name
+        });
+        if duplicate {
             return Err(SessionError::DuplicateName);
         }
         self.get_mut(owner, handle)?.name = name;
@@ -625,10 +725,8 @@ impl Sessions {
 
     /// Removes one of `owner`'s sessions; finishing the result ends the shell.
     pub(crate) fn kill(&mut self, owner: &str, handle: u32) -> Result<Ended, SessionError> {
-        let session = self
-            .sessions
-            .remove(&key(owner, handle))
-            .ok_or(SessionError::Gone)?;
+        let key = self.resolve(owner, handle).ok_or(SessionError::Gone)?;
+        let session = self.sessions.remove(&key).ok_or(SessionError::Gone)?;
         Ok(Ended::forced(vec![session]))
     }
 
@@ -645,6 +743,103 @@ impl Sessions {
             session.detach(consumer);
         }
         Ok(())
+    }
+
+    /// 本机终端接上一个会话，返回名字与要重放的屏幕。
+    ///
+    /// 本机不按登录账号过滤：进程就是同一个用户，侧边栏列出的是这台
+    /// 机器上正在跑的 shell。消费者用一个独立编号，与远程连接互不影响。
+    pub(crate) fn attach_local(
+        &mut self,
+        handle: u32,
+        consumer: u64,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(String, Vec<u8>), SessionError> {
+        let key = self.local_key(handle).ok_or(SessionError::Gone)?;
+        let session = self.sessions.get_mut(&key).ok_or(SessionError::Gone)?;
+        if session.state == SessionState::Exited {
+            return Err(SessionError::Gone);
+        }
+        session.state = SessionState::Running;
+        session.output.entry(Consumer::Local(consumer)).or_default();
+        session.local_size = Some((cols, rows));
+        session.detached_since = None;
+        session.apply_size();
+        session.last_active_ms = now_ms();
+        Ok((
+            session.name.clone(),
+            session.screen.screen().state_formatted(),
+        ))
+    }
+
+    /// 本机终端自己离开了；shell 留下来等下一次 attach。
+    pub(crate) fn detach_local(&mut self, consumer: u64) {
+        for session in self.sessions.values_mut() {
+            session.detach(Consumer::Local(consumer));
+        }
+    }
+
+    /// 本机终端输入的字节写回 pty。
+    pub(crate) fn write_local(&mut self, handle: u32, data: &[u8]) -> Result<(), SessionError> {
+        let key = self.local_key(handle).ok_or(SessionError::Gone)?;
+        let session = self.sessions.get_mut(&key).ok_or(SessionError::Gone)?;
+        write_to(session, data)
+    }
+
+    /// 本机终端改了大小。
+    pub(crate) fn resize_local(
+        &mut self,
+        handle: u32,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(), SessionError> {
+        let key = self.local_key(handle).ok_or(SessionError::Gone)?;
+        let session = self.sessions.get_mut(&key).ok_or(SessionError::Gone)?;
+        session.local_size = Some((cols, rows));
+        session.apply_size();
+        session.last_active_ms = now_ms();
+        Ok(())
+    }
+
+    /// 本机侧看到的会话列表。
+    pub(crate) fn list_local(&self) -> Vec<LocalSession> {
+        let mut listed: Vec<_> = self
+            .sessions
+            .iter()
+            .map(|((_, handle), session)| LocalSession {
+                handle: *handle,
+                name: session.name.clone(),
+                shell: session.pty.shell().to_owned(),
+                state: session.state.as_str(),
+                created_ms: session.created_ms,
+                last_active_ms: session.last_active_ms,
+                remote: session
+                    .output
+                    .keys()
+                    .any(|consumer| matches!(consumer, Consumer::Remote(_))),
+                local: session
+                    .output
+                    .keys()
+                    .any(|consumer| matches!(consumer, Consumer::Local(_))),
+                foreground: session.pty.foreground(),
+            })
+            .collect();
+        listed.sort_by_key(|session| session.created_ms);
+        listed
+    }
+
+    /// 按主控给的编号找会话。编号只在同一个登录账号内唯一，本机同时有
+    /// 多个账号时取字典序最小的那个（实际上是先登录的那个）。
+    fn local_key(&self, handle: u32) -> Option<(String, u32)> {
+        let mut keys: Vec<_> = self
+            .sessions
+            .keys()
+            .filter(|(_, candidate)| *candidate == handle)
+            .cloned()
+            .collect();
+        keys.sort();
+        keys.into_iter().next()
     }
 
     /// Lets go of every session attached to `connection`, which has closed.
@@ -745,10 +940,29 @@ impl Sessions {
         out
     }
 
+    /// 取走本机 attach 的待发输出；`None` 表示这个消费者已经不在表里。
+    pub(crate) fn pump_local(&mut self, consumer: u64, budget: usize) -> Option<LocalOutput> {
+        self.drain(budget);
+        self.sessions.iter_mut().find_map(|((_, handle), session)| {
+            let queue = session.output.get_mut(&Consumer::Local(consumer))?;
+            let take = queue.len().min(budget);
+            let data: Vec<u8> = queue.drain(..take).collect();
+            let exited = session.state == SessionState::Exited;
+            if exited {
+                session.output.remove(&Consumer::Local(consumer));
+            }
+            Some(LocalOutput {
+                handle: *handle,
+                data,
+                exited,
+            })
+        })
+    }
+
     /// Takes out the sessions whose exit every attached consumer has seen.
     ///
     /// A session is not removed on the first pump that notices the shell
-    /// ended: the other connection still has
+    /// ended: the other end (a local attach, another connection) still has
     /// to be told, and its queue only empties once it was.
     pub(crate) fn reap(&mut self) -> Ended {
         let exited: Vec<_> = self
@@ -794,6 +1008,18 @@ impl Sessions {
     fn is_empty(&self) -> bool {
         self.sessions.is_empty()
     }
+}
+
+/// 把输入排进会话并尽量交给 pty。
+fn write_to(session: &mut Session, data: &[u8]) -> Result<(), SessionError> {
+    session.last_active_ms = now_ms();
+    session.flush_pending();
+    if session.pending.len() + data.len() > PENDING_LIMIT {
+        return Err(SessionError::InputOverflow);
+    }
+    session.pending.extend_from_slice(data);
+    session.flush_pending();
+    Ok(())
 }
 
 /// Maps the controller's shell choice to a real program.
@@ -846,6 +1072,8 @@ pub(crate) fn shared() -> Arc<std::sync::Mutex<Sessions>> {
         {
             tracing::warn!(%error, "terminal idle sweep could not start");
         }
+        // 本机终端要能接上这些会话，socket 服务随表一起起来（Linux）。
+        local::serve();
         table
     }))
 }
@@ -912,6 +1140,55 @@ pub(crate) fn unavailable() -> Option<&'static str> {
 /// How many shells this process is running, for the host's settings page.
 pub(crate) fn running() -> usize {
     SESSIONS.get().map_or(0, |table| lock_table(table).count())
+}
+
+/// 本机侧看到的会话列表，给侧边栏用。
+pub(crate) fn local_sessions() -> Vec<LocalSession> {
+    SESSIONS
+        .get()
+        .map(|table| lock_table(table).list_local())
+        .unwrap_or_default()
+}
+
+/// 结束一个会话（本机侧，侧边栏的「结束」）。
+pub(crate) fn kill_local(handle: u32) -> bool {
+    let Some(table) = SESSIONS.get() else {
+        return false;
+    };
+    let ended = {
+        let mut sessions = lock_table(table);
+        sessions
+            .local_key(handle)
+            .and_then(|(owner, handle)| sessions.kill(&owner, handle).ok())
+    };
+    match ended {
+        Some(ended) => {
+            ended.finish();
+            true
+        }
+        None => false,
+    }
+}
+
+/// 当前平台能不能报出终端里的前台命令。
+pub(crate) fn foreground_supported() -> bool {
+    crate::platform::terminal::foreground_supported()
+}
+
+/// 本机新建一个会话，返回它的编号。
+pub(crate) fn create_local(name: Option<String>) -> Result<u32, SessionError> {
+    lock_table(&shared()).create_local(name)
+}
+
+/// 在系统终端模拟器里接上这个会话。
+pub(crate) fn open_local_terminal(handle: u32) -> anyhow::Result<()> {
+    local::open_in_terminal(handle)
+}
+
+/// 本机 attach 的消费者编号，与远程连接分开计。
+pub(crate) fn next_local_consumer() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Numbers each terminal connection, so a shell knows whose pump reads it.
@@ -1783,6 +2060,98 @@ mod tests {
         );
     }
 
+    /// 本机侧收一段输出，直到出现 `needle`。
+    fn local_output_until(sessions: &mut Sessions, consumer: u64, needle: &str) -> String {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut seen = Vec::new();
+        while std::time::Instant::now() < deadline {
+            if let Some(output) = sessions.pump_local(consumer, PUMP_BUDGET) {
+                seen.extend_from_slice(&output.data);
+                if output.exited {
+                    break;
+                }
+            }
+            if String::from_utf8_lossy(&seen).contains(needle) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        String::from_utf8_lossy(&seen).into_owned()
+    }
+
+    #[test]
+    #[cfg_attr(not(target_os = "linux"), ignore = "local attach is Linux-only")]
+    fn a_local_terminal_attaches_and_leaves_without_ending_the_shell() {
+        let mut sessions = Sessions::default();
+        sessions
+            .open("acct", 1, 1, shell(), None, 80, 24)
+            .expect("open");
+        sessions
+            .write("acct", 1, &line("echo BEFORE-LOCAL"))
+            .expect("write");
+        output_until(&mut sessions, 1, "BEFORE-LOCAL");
+
+        // 手机端先走，本机再接上：屏幕还在，接着用同一个 shell。
+        sessions.detach("acct", 1).expect("detach");
+        let (name, replay) = sessions.attach_local(1, 100, 90, 30).expect("attach local");
+        assert_eq!(name, "shell-1");
+        assert!(
+            String::from_utf8_lossy(&replay).contains("BEFORE-LOCAL"),
+            "the local attach replays the screen"
+        );
+        sessions
+            .write_local(1, &line("echo FROM-LOCAL"))
+            .expect("write local");
+        let seen = local_output_until(&mut sessions, 100, "FROM-LOCAL");
+        assert!(seen.contains("FROM-LOCAL"), "local input reaches the shell");
+
+        // 关掉本地终端只断开这一端。
+        sessions.detach_local(100);
+        assert_eq!(sessions.count(), 1, "the shell outlives the local terminal");
+        let (_, replay) = sessions.attach_local(1, 101, 90, 30).expect("reattach");
+        assert!(
+            String::from_utf8_lossy(&replay).contains("FROM-LOCAL"),
+            "the screen survives a detach and reattach"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(not(target_os = "linux"), ignore = "local attach is Linux-only")]
+    fn both_ends_see_the_same_shell() {
+        let mut sessions = Sessions::default();
+        sessions
+            .open("acct", 1, 1, shell(), None, 80, 24)
+            .expect("open");
+        sessions.attach_local(1, 100, 80, 24).expect("attach local");
+        sessions
+            .write_local(1, &line("echo BOTH-ENDS"))
+            .expect("write local");
+
+        // 同一条输出同时进两个消费者的队列：谁都不会把它读走。
+        let remote = output_until(&mut sessions, 1, "BOTH-ENDS");
+        let local = local_output_until(&mut sessions, 100, "BOTH-ENDS");
+        assert!(remote.contains("BOTH-ENDS"), "the controller sees it");
+        assert!(local.contains("BOTH-ENDS"), "the local terminal sees it");
+    }
+
+    #[test]
+    #[cfg_attr(not(target_os = "linux"), ignore = "local attach is Linux-only")]
+    fn the_smallest_attached_size_wins() {
+        let mut sessions = Sessions::default();
+        sessions
+            .open("acct", 1, 1, shell(), None, 100, 40)
+            .expect("open");
+        sessions.attach_local(1, 100, 80, 30).expect("attach local");
+        sessions
+            .write_local(1, &line("stty size"))
+            .expect("write local");
+        let seen = local_output_until(&mut sessions, 100, "30 80");
+        assert!(
+            seen.contains("30 80"),
+            "the pty takes the smallest of both ends: {seen:?}"
+        );
+    }
+
     #[test]
     // A POSIX `printf`; the model is platform-independent.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1868,6 +2237,76 @@ mod tests {
             .open("acct", handle, 1, shell(), None, 0, u16::MAX)
             .expect("reattach");
         assert_eq!(size(&sessions), (MAX_ROWS, 1));
+    }
+
+    #[test]
+    #[cfg_attr(not(target_os = "linux"), ignore = "local attach is Linux-only")]
+    fn a_local_session_is_created_listed_and_kept() {
+        let mut sessions = Sessions::default();
+        let handle = sessions.create_local(Some("mine".into())).expect("create");
+        assert!(
+            handle >= LOCAL_HANDLE_BASE,
+            "local handles stay out of the controller's small numbers"
+        );
+        let listed = sessions.list_local();
+        assert!(
+            listed
+                .iter()
+                .any(|session| session.handle == handle && session.name == "mine"),
+            "the new session is listed"
+        );
+        // 手机端也能看到本机自己开的会话，编号就是本机区间里的那个。
+        assert!(
+            sessions
+                .list("acct")
+                .iter()
+                .any(|session| session["session_id"] == handle),
+            "the controller sees the local session"
+        );
+        // 用户自己开的会话不参与 30 分钟空闲清扫。
+        let (exited, abandoned) = sessions.sweep(std::time::Duration::ZERO);
+        assert!(exited.sessions.is_empty());
+        assert!(abandoned.sessions.is_empty());
+        assert_eq!(
+            sessions.create_local(Some("mine".into())).err(),
+            Some(SessionError::DuplicateName)
+        );
+        sessions.kill(LOCAL_OWNER, handle).expect("kill").finish();
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "macos", windows)),
+        ignore = "no terminal backend on this platform"
+    )]
+    fn the_controller_can_take_over_a_local_session() {
+        let mut sessions = Sessions::default();
+        let handle = sessions
+            .create_local(Some("shared".into()))
+            .expect("create local");
+        // 主控用同一个编号 open，接上的是本机开的那个 shell，不是新的。
+        let (again, name, _) = sessions
+            .open("acct", handle, 1, shell(), None, 80, 24)
+            .expect("open");
+        assert_eq!(again, handle);
+        assert_eq!(name, "shared");
+        assert_eq!(sessions.count(), 1, "no second shell was started");
+
+        sessions
+            .write("acct", handle, &line("echo MOBILE-TO-LOCAL"))
+            .expect("write");
+        let seen = output_until(&mut sessions, 1, "MOBILE-TO-LOCAL");
+        assert!(
+            seen.contains("MOBILE-TO-LOCAL"),
+            "controller input reaches the local shell"
+        );
+
+        // 本机接上同一会话时，看到的是同一份输出。
+        sessions
+            .attach_local(handle, 100, 80, 24)
+            .expect("attach local");
+        let local = local_output_until(&mut sessions, 100, "MOBILE-TO-LOCAL");
+        assert!(local.contains("MOBILE-TO-LOCAL"));
     }
 
     #[test]
