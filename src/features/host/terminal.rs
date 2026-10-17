@@ -1235,9 +1235,12 @@ async fn handle_frame(
                         }
                     }
                     None => {
+                        // The first bytes are enough to recognise a new
+                        // signal; the frame itself can be as long as any.
                         let payload: String = frame
                             .payload
                             .iter()
+                            .take(64)
                             .map(|byte| format!("{byte:02x}"))
                             .collect();
                         tracing::debug!(
