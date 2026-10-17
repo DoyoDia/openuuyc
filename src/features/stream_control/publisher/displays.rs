@@ -253,25 +253,35 @@ pub(crate) async fn receive_session(
                     if let Err(error) = &result {
                         tracing::warn!(%error, "host terminal rename rejected");
                     }
+                    // Field order and names are the server's own descriptor:
+                    //
+                    //   message RenameSessionResp {
+                    //     uint32 session_id = 1;
+                    //     int32  code       = 2;
+                    //     string message    = 3;
+                    //   }
+                    //
+                    // We had code first and the handle third, so the reply
+                    // carried sessionId on a field the client does not read.
+                    // Combined with the wrong oneof tag in `wire.rs`, the
+                    // rename landed here and vanished on its way to the phone.
                     #[derive(Clone, PartialEq, prost::Message)]
                     struct RenameResp {
-                        #[prost(int32, tag = "1")]
-                        code: i32,
-                        #[prost(string, tag = "2")]
-                        detail: String,
-                        // The controller logs `RenameSessionResp sessionId=`,
-                        // so echo the handle back alongside the result.
-                        #[prost(uint32, tag = "3")]
+                        #[prost(uint32, tag = "1")]
                         session_id: u32,
+                        #[prost(int32, tag = "2")]
+                        code: i32,
+                        #[prost(string, tag = "3")]
+                        message: String,
                     }
                     return Ok(response(
                         &message,
                         header,
                         PbRpcResponsePayload::TerminalRenameSessionRsp(
                             RenameResp {
-                                code,
-                                detail,
                                 session_id: request.session_id,
+                                code,
+                                message: detail,
                             }
                             .encode_to_vec(),
                         ),

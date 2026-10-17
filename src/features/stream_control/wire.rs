@@ -352,6 +352,9 @@ pub(super) struct PbRpcResponse {
     pub(super) response_header: Option<PbResponseHeader>,
     #[prost(
         oneof = "PbRpcResponsePayload",
+        // The list has to name every tag the oneof can carry. 25 is skipped
+        // in the reference schema, so 26 has to be spelled out here too or
+        // prost rejects the variant.
         tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 26"
     )]
     pub(super) payload: Option<PbRpcResponsePayload>,
@@ -407,6 +410,9 @@ pub(super) enum PbRpcResponsePayload {
     // Keep opaque responses in the oneof; terminal execution is not enabled.
     #[prost(bytes, tag = "24")]
     TerminalCheckEnvRsp(Vec<u8>),
+    // 26, not 25: the server's own `RpcResponse` descriptor skips 25, and a
+    // reply on a field the client does not know is dropped, which is why a
+    // rename that succeeded on this side still showed as failed on the phone.
     #[prost(bytes, tag = "26")]
     TerminalRenameSessionRsp(Vec<u8>),
 }
@@ -543,4 +549,72 @@ pub(super) struct PbDpiScale {
     pub(super) recommended_dpi: i32,
     #[prost(int32, repeated, tag = "3")]
     pub(super) dpis: Vec<i32>,
+}
+
+#[cfg(test)]
+mod terminal_rpc_tests {
+    use super::*;
+    use prost::Message;
+
+    /// The response oneof numbers the client reads, from the reference
+    /// server's own `RpcResponse` descriptor. 25 is skipped there, and a
+    /// reply on a field the client does not know is dropped: the rename
+    /// happened host-side and the phone still showed a failure.
+    #[test]
+    fn terminal_responses_use_the_reference_field_numbers() {
+        let tag_of = |payload: PbRpcResponsePayload| {
+            let bytes = PbRpcResponse {
+                response_header: None,
+                payload: Some(payload),
+            }
+            .encode_to_vec();
+            // A oneof member is a length-delimited field, so byte 1 holds
+            // `field << 3 | 2` in its varint form.
+            let (mut value, mut shift) = (0u32, 0);
+            for byte in &bytes {
+                value |= u32::from(byte & 0x7f) << shift;
+                if byte & 0x80 == 0 {
+                    break;
+                }
+                shift += 7;
+            }
+            (value >> 3, value & 7)
+        };
+
+        assert_eq!(
+            tag_of(PbRpcResponsePayload::TerminalCheckEnvRsp(vec![0x08, 0x00])),
+            (24, 2)
+        );
+        assert_eq!(
+            tag_of(PbRpcResponsePayload::TerminalRenameSessionRsp(vec![])),
+            (26, 2)
+        );
+        assert_eq!(
+            tag_of(PbRpcResponsePayload::DrawResp(Default::default())),
+            (23, 2)
+        );
+    }
+
+    /// The rename reply's own shape, likewise from the reference descriptor:
+    /// `uint32 session_id = 1; int32 code = 2; string message = 3;`.
+    #[test]
+    fn rename_response_puts_the_session_id_first() {
+        #[derive(Clone, PartialEq, prost::Message)]
+        struct RenameResp {
+            #[prost(uint32, tag = "1")]
+            session_id: u32,
+            #[prost(int32, tag = "2")]
+            code: i32,
+            #[prost(string, tag = "3")]
+            message: String,
+        }
+        let encoded = RenameResp {
+            session_id: 7,
+            code: 0,
+            message: String::new(),
+        }
+        .encode_to_vec();
+        // field 1 varint, value 7.
+        assert_eq!(encoded, vec![0x08, 0x07]);
+    }
 }
