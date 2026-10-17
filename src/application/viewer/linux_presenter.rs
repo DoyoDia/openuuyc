@@ -779,7 +779,8 @@ impl ConnectingWindowsRunner {
             if let DetachedStage::Playing(player) = &mut slot.stage {
                 let mut redraw = player.poll_pending();
                 player.pump_drag();
-                redraw |= player.refresh_catalog(&slot.window);
+                // 独立窗口只守着自己那块屏，新屏归主窗口。
+                redraw |= player.refresh_catalog(&slot.window, &[]);
                 let frame = player.poll();
                 redraw |= player.error.is_some();
                 if frame || redraw {
@@ -1075,26 +1076,19 @@ impl ConnectingWindowsRunner {
     /// 把目录里还没分给任何窗口的屏补进主窗口。独立窗口只留它自己那一块，
     /// 和 Windows 的 `refresh_catalog` 把新屏交给 owner 窗口是同一条规则。
     fn sync_tabs(&mut self) -> bool {
-        let mut assigned: Vec<i32> = self
-            .detached
-            .iter()
-            .flat_map(|slot| slot.tabs.iter().copied())
-            .collect();
+        let elsewhere = self.detached_tabs();
         let Stage::Playing(player) = &mut self.stage else {
             return false;
         };
-        assigned.extend(player.tabs.iter().copied());
-        let missing: Vec<i32> = player
-            .catalog
+        collect_new_screens(&mut player.tabs, &player.catalog, &elsewhere)
+    }
+
+    /// 已经分给独立窗口的屏。
+    fn detached_tabs(&self) -> Vec<i32> {
+        self.detached
             .iter()
-            .map(|screen| screen.id)
-            .filter(|id| !assigned.contains(id))
-            .collect();
-        if missing.is_empty() {
-            return false;
-        }
-        player.tabs.extend(missing);
-        true
+            .flat_map(|slot| slot.tabs.iter().copied())
+            .collect()
     }
 
     fn render(&mut self) -> Result<()> {
@@ -1465,6 +1459,7 @@ impl ApplicationHandler<UiEvent> for ConnectingWindowsRunner {
         }
         self.poll_detached();
         self.sync_visible();
+        let elsewhere = self.detached_tabs();
         if let Stage::Playing(player) = &mut self.stage {
             let mut redraw = player.poll_pending();
             // 拖放那条通道读 socket 的仍然是 winit，这里只把已经读进来的事件
@@ -1473,7 +1468,7 @@ impl ApplicationHandler<UiEvent> for ConnectingWindowsRunner {
             // 屏目录每 250 ms 对一次：切屏期间没有画面要画，但轮询交给它自己，
             // 不再把 UI 线程按在「立刻重画」上（那样会绕开帧率节拍一直占满一个核）。
             if let Some(window) = self.window.clone() {
-                redraw |= player.refresh_catalog(&window);
+                redraw |= player.refresh_catalog(&window, &elsewhere);
             }
             if player.connection_ended() {
                 // 和 Windows 一样干净地退出：结束的原因由 controller 那边报。
@@ -1994,7 +1989,9 @@ impl Player {
     /// 返回顶栏要不要重画：目录或等待中的屏变了，或者有错误要弹。Windows 每次核对完
     /// 都重画一遍；这里对端画面静止时没有新帧推着 UI 走，新加的屏的 tab、核对触发的
     /// 切屏的等待态和弹窗都得靠它排一次重画。
-    fn refresh_catalog(&mut self, window: &Arc<Window>) -> bool {
+    ///
+    /// `elsewhere` 是已经分给别的窗口的屏，主窗口不去收它们。
+    fn refresh_catalog(&mut self, window: &Arc<Window>, elsewhere: &[i32]) -> bool {
         let now = Instant::now();
         if now < self.next_refresh {
             return false;
@@ -2002,13 +1999,13 @@ impl Player {
         self.next_refresh = now + Duration::from_millis(250);
         let catalog = self.catalog.clone();
         let pending = self.pending.as_ref().map(|pending| pending.id);
-        self.reconcile_catalog(window);
+        self.reconcile_catalog(window, elsewhere);
         self.catalog != catalog
             || self.pending.as_ref().map(|pending| pending.id) != pending
             || self.error.is_some()
     }
 
-    fn reconcile_catalog(&mut self, window: &Arc<Window>) {
+    fn reconcile_catalog(&mut self, window: &Arc<Window>, elsewhere: &[i32]) {
         let topology = self.screens.topology();
         if topology.sequence != self.topology_sequence {
             self.topology_sequence = topology.sequence;
@@ -2020,6 +2017,11 @@ impl Player {
             if !self.catalog.iter().any(|known| known.id == screen.id) {
                 self.catalog.push(screen.clone());
             }
+        }
+        // 新出现的屏（刚加的虚拟屏）当场收进主窗口，不等 runner 的 `sync_tabs`：
+        // 对端往往在同一份快照里就报它为选中，下面要跟过去时它得已经在本窗口里。
+        if self.input_owns_connection {
+            collect_new_screens(&mut self.tabs, &self.catalog, elsewhere);
         }
         // 分给别的窗口的屏不在本窗口的 tabs 里；这里只丢掉已经消失的。
         self.tabs
@@ -2049,16 +2051,20 @@ impl Player {
                 .selected_screen
                 .filter(|id| actual.iter().any(|screen| screen.id == *id))
         {
-            if self
-                .pending
-                .as_ref()
-                .is_some_and(|pending| pending.id != selected)
-            {
-                self.pending = None;
-            }
             self.topology_focused = Some(selected);
-            self.failed_screen = None;
-            focus = Some(selected);
+            // 选中的是别的窗口里的屏（比如对独立窗口那块改了分辨率）：由那个窗口
+            // 自己跟，这里不动，否则会退回本窗口第一块屏。
+            if self.tabs.contains(&selected) {
+                if self
+                    .pending
+                    .as_ref()
+                    .is_some_and(|pending| pending.id != selected)
+                {
+                    self.pending = None;
+                }
+                self.failed_screen = None;
+                focus = Some(selected);
+            }
         }
         if self.pending.is_some() {
             return;
@@ -3740,6 +3746,18 @@ fn replacement_target(
     Some(target)
 }
 
+/// 把目录里没分给任何窗口的屏补进 `tabs`，返回有没有补。`elsewhere` 是别的窗口
+/// 已经分到的屏，和 Windows 的 `refresh_catalog` 把新屏交给 owner 窗口同一条规则。
+fn collect_new_screens(tabs: &mut Vec<i32>, catalog: &[RemoteScreen], elsewhere: &[i32]) -> bool {
+    let before = tabs.len();
+    for screen in catalog {
+        if !tabs.contains(&screen.id) && !elsewhere.contains(&screen.id) {
+            tabs.push(screen.id);
+        }
+    }
+    tabs.len() != before
+}
+
 /// 刚打开的这一路 `(track, binding)` 还是不是目录里这块屏的，和 Windows
 /// `ScreenWindows::update` 接上新会话前的核对一样。
 fn screen_mapped(actual: &[RemoteScreen], screen_id: i32, track: i32, binding: u64) -> bool {
@@ -4086,6 +4104,44 @@ mod screen_tests {
         );
         assert_eq!(
             replacement_target(&actual, &actual, 0, playing(&shown), None),
+            None
+        );
+    }
+
+    /// A virtual screen added and selected in the same snapshot: the main
+    /// window collects it before following the selection, instead of
+    /// falling back to its first screen.
+    #[test]
+    fn a_new_selected_screen_is_collected_before_it_is_followed() {
+        let actual = vec![screen(0, 0, 0), screen(1, 1, 0), screen(5, 2, 1)];
+        let mut tabs = vec![0, 1];
+        assert!(collect_new_screens(&mut tabs, &actual, &[]));
+        assert_eq!(tabs, vec![0, 1, 5]);
+        assert!(!collect_new_screens(&mut tabs, &actual, &[]));
+        let window: Vec<RemoteScreen> = actual
+            .iter()
+            .filter(|screen| tabs.contains(&screen.id))
+            .cloned()
+            .collect();
+        assert_eq!(
+            replacement_target(&window, &actual, 5, playing(&actual[1]), None),
+            Some(5)
+        );
+    }
+
+    /// A screen another window holds is neither collected nor followed: the
+    /// main window keeps what it shows.
+    #[test]
+    fn a_screen_in_another_window_stays_there() {
+        let actual = vec![screen(0, 0, 0), screen(1, 1, 0), screen(2, 2, 0)];
+        let mut tabs = vec![0, 1];
+        assert!(!collect_new_screens(&mut tabs, &actual, &[2]));
+        assert_eq!(tabs, vec![0, 1]);
+        let window: Vec<RemoteScreen> = actual[..2].to_vec();
+        // The selection is not in this window, so the check stays on the
+        // displayed screen.
+        assert_eq!(
+            replacement_target(&window, &actual, 1, playing(&actual[1]), None),
             None
         );
     }
