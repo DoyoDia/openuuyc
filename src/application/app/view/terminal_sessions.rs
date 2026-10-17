@@ -12,6 +12,12 @@ impl DeviceCenterApp {
         // this platform, root, SYSTEM), the page still lists and ends the
         // controller's sessions but offers nothing that is bound to fail.
         let local_refusal = terminal::local_unavailable();
+        // The host's 「允许主控接入本机终端会话」, which decides whether the
+        // sessions opened here are visible to a controller.
+        let open_to_controller = self
+            .host
+            .as_ref()
+            .is_some_and(|host| host.terminal_local_allowed());
         // 会话可能在另一头被改名、附着、结束，前台命令也在变，页面每秒刷一次。
         ui.ctx().request_repaint_after(Duration::from_secs(1));
         ui.horizontal(|ui| {
@@ -43,13 +49,29 @@ impl DeviceCenterApp {
             None => {
                 "手机端 UU 打开「终端」后，shell 会出现在这里；也可以自己新建一个。\
                  点「在本地打开」用系统终端接上，本机键盘与手机端操作的是同一个 shell；\
-                 关掉本地终端只会断开这一端，会话继续运行。"
+                 关掉本地终端只会断开这一端，会话继续运行。\
+                 本机和主控同时接入时，终端按两边较小的尺寸显示，较大的一端会留白。"
             }
             Some(_) => "手机端 UU 打开「终端」后，shell 会出现在这里，可以在这里结束。",
         };
         ui.label(RichText::new(intro).small().color(MUTED));
         if let Some(reason) = local_refusal {
             ui.label(RichText::new(reason).small().color(AMBER));
+        } else if open_to_controller {
+            ui.label(
+                RichText::new("主控能看到并接入你在这里新建的会话，包括屏幕内容和之后的输入。")
+                    .small()
+                    .color(AMBER),
+            );
+        } else {
+            ui.label(
+                RichText::new(
+                    "本机会话不对主控开放。要让主控接入，到「被控设置 → 访问权限」\
+                     打开「终端」下的「允许主控接入本机终端会话」。",
+                )
+                .small()
+                .color(MUTED),
+            );
         }
         ui.add_space(14.0);
         if sessions.is_empty() {
@@ -80,8 +102,19 @@ impl DeviceCenterApp {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(&session.name).strong());
                         ui.label(RichText::new(state).small().color(state_color));
-                        if session.remote {
-                            ui.label(RichText::new("主控已连接").small().color(BLUE));
+                        if session.opened_here {
+                            if session.remote {
+                                ui.label(RichText::new("主控已接入").small().color(AMBER));
+                            } else if open_to_controller {
+                                ui.label(RichText::new("主控可见").small().color(AMBER));
+                            } else {
+                                ui.label(RichText::new("主控不可见").small().color(MUTED));
+                            }
+                        } else {
+                            ui.label(RichText::new("主控打开").small().color(MUTED));
+                            if session.remote {
+                                ui.label(RichText::new("主控已连接").small().color(BLUE));
+                            }
                         }
                         if session.local {
                             ui.label(RichText::new("本机已接入").small().color(GREEN));
