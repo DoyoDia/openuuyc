@@ -1235,12 +1235,27 @@ mod tests {
         assert!(Frame::parse(&encoded).is_none());
     }
 
+    /// The shell the pty tests drive. `cmd.exe` is present on every Windows
+    /// install; `/bin/sh` is on every POSIX one.
     fn shell() -> &'static str {
-        "/bin/sh"
+        if cfg!(windows) { "cmd.exe" } else { "/bin/sh" }
+    }
+
+    /// One command line for that shell. `cmd.exe` reads a bare `\n` as part of
+    /// the command in some cases, so Windows gets the CRLF it expects.
+    fn line(command: &str) -> Vec<u8> {
+        if cfg!(windows) {
+            format!("{command}\r\n").into_bytes()
+        } else {
+            format!("{command}\n").into_bytes()
+        }
     }
 
     #[test]
-    #[cfg_attr(not(target_os = "linux"), ignore = "needs a pty, which only Linux has")]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "macos", windows)),
+        ignore = "no terminal backend on this platform"
+    )]
     fn sessions_are_keyed_by_the_controller_handle() {
         let mut sessions = Sessions::default();
         sessions
@@ -1250,12 +1265,15 @@ mod tests {
             .open("acct", 22, 1, shell(), None, 80, 24)
             .expect("open");
         assert_eq!(sessions.list("acct").len(), 2);
-        assert!(sessions.write("acct", 11, b"echo A\n").is_ok());
-        assert!(sessions.write("acct", 33, b"echo B\n").is_err());
+        assert!(sessions.write("acct", 11, &line("echo A")).is_ok());
+        assert!(sessions.write("acct", 33, &line("echo B")).is_err());
     }
 
     #[test]
-    #[cfg_attr(not(target_os = "linux"), ignore = "needs a pty, which only Linux has")]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "macos", windows)),
+        ignore = "no terminal backend on this platform"
+    )]
     fn a_duplicate_name_is_refused() {
         let mut sessions = Sessions::default();
         sessions
@@ -1293,14 +1311,17 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(not(target_os = "linux"), ignore = "needs a pty, which only Linux has")]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "macos", windows)),
+        ignore = "no terminal backend on this platform"
+    )]
     fn write_and_resize_reach_the_shell() {
         let mut sessions = Sessions::default();
         sessions
             .open("acct", 1, 1, shell(), None, 80, 24)
             .expect("open");
         sessions.resize("acct", 1, 120, 40).expect("resize");
-        sessions.write("acct", 1, b"echo READY\n").expect("write");
+        sessions.write("acct", 1, &line("echo READY")).expect("write");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let mut seen = Vec::new();
         while std::time::Instant::now() < deadline {
@@ -1318,7 +1339,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(not(target_os = "linux"), ignore = "needs a pty, which only Linux has")]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "macos", windows)),
+        ignore = "no terminal backend on this platform"
+    )]
     fn a_reattach_replays_the_screen() {
         let mut sessions = Sessions::default();
         let (handle, _, replay) = sessions
@@ -1326,7 +1350,7 @@ mod tests {
             .expect("open");
         assert!(replay.is_empty(), "a fresh session has nothing to replay");
         sessions
-            .write("acct", handle, b"echo HISTORY\n")
+            .write("acct", handle, &line("echo HISTORY"))
             .expect("write");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while std::time::Instant::now() < deadline {
@@ -1352,13 +1376,16 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(not(target_os = "linux"), ignore = "needs a pty, which only Linux has")]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "macos", windows)),
+        ignore = "no terminal backend on this platform"
+    )]
     fn an_exited_shell_reports_once() {
         let mut sessions = Sessions::default();
         sessions
             .open("acct", 1, 1, shell(), None, 80, 24)
             .expect("open");
-        sessions.write("acct", 1, b"exit\n").expect("write");
+        sessions.write("acct", 1, &line("exit")).expect("write");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while std::time::Instant::now() < deadline {
             if sessions
@@ -1376,7 +1403,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(not(target_os = "linux"), ignore = "needs a pty, which only Linux has")]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "macos", windows)),
+        ignore = "no terminal backend on this platform"
+    )]
     fn killing_removes_a_session_and_a_second_kill_is_gone() {
         let mut sessions = Sessions::default();
         sessions
@@ -1388,10 +1418,15 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(not(target_os = "linux"), ignore = "needs a pty, which only Linux has")]
-    fn windows_shell_kinds_fall_back_to_a_posix_shell() {
-        // The Android client always asks for `powershell`; refusing it is what
-        // made the phone report a failed session creation.
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "macos", windows)),
+        ignore = "no terminal backend on this platform"
+    )]
+    fn every_requested_shell_kind_resolves_to_a_real_program() {
+        // The Android client always asks for `powershell`. On Windows that is
+        // the program itself; elsewhere it falls back to the login shell.
+        // Either way the answer has to be a path that exists, because refusing
+        // it is what made the phone report a failed session creation.
         assert!(std::path::Path::new(&resolve_shell("powershell")).exists());
         assert!(std::path::Path::new(&resolve_shell("cmd")).exists());
         assert!(std::path::Path::new(&resolve_shell("bash")).exists());
@@ -1540,7 +1575,7 @@ mod tests {
         sessions
             .open("acct", 2, 1, shell(), None, 80, 24)
             .expect("open");
-        sessions.write("acct", 1, b"exit\n").expect("write");
+        sessions.write("acct", 1, &line("exit")).expect("write");
         std::thread::sleep(std::time::Duration::from_millis(300));
         sessions.release(1);
         let (exited, abandoned) = sessions.sweep(std::time::Duration::from_secs(3600));

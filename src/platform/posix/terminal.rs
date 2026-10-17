@@ -496,6 +496,9 @@ mod tests {
     }
 
     /// Where each open descriptor of `pid` points.
+    /// Linux exposes a process's descriptors as symlinks; macOS has no
+    /// equivalent view, so the two tests below only run on Linux.
+    #[cfg(target_os = "linux")]
     fn descriptor_targets(pid: u32) -> Vec<String> {
         std::fs::read_dir(format!("/proc/{pid}/fd"))
             .expect("list child descriptors")
@@ -505,6 +508,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn a_shell_does_not_inherit_another_sessions_pty() {
         let first = Session::open("/bin/sh", 80, 24).expect("open first pty");
         let mut second = Session::open("/bin/sh", 80, 24).expect("open second pty");
