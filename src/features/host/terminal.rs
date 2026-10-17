@@ -909,8 +909,8 @@ impl Sessions {
         listed
     }
 
-    /// 按主控给的编号找会话。编号只在同一个登录账号内唯一，本机同时有
-    /// 多个账号时取字典序最小的那个（实际上是先登录的那个）。
+    /// 按编号找会话。编号只在同一个所有者内唯一：本机开的会话优先（主控
+    /// 看不到它时，可能自己开了一个同号的），其余取字典序最小的账号。
     fn local_key(&self, handle: u32) -> Option<(String, u32)> {
         let mut keys: Vec<_> = self
             .sessions
@@ -918,7 +918,7 @@ impl Sessions {
             .filter(|(_, candidate)| *candidate == handle)
             .cloned()
             .collect();
-        keys.sort();
+        keys.sort_by(|a, b| (a.0 != LOCAL_OWNER, &a.0).cmp(&(b.0 != LOCAL_OWNER, &b.0)));
         keys.into_iter().next()
     }
 
@@ -1288,16 +1288,21 @@ pub(crate) fn local_sessions() -> Vec<LocalSession> {
         .unwrap_or_default()
 }
 
-/// 结束一个会话（本机侧，侧边栏的「结束」）。
-pub(crate) fn kill_local(handle: u32) -> bool {
+/// 结束一个会话（本机侧，侧边栏的「结束」）。`opened_here` 来自页面上那一
+/// 行，主控与本机各有一个同号会话时结束的是点的那一个。
+pub(crate) fn kill_local(handle: u32, opened_here: bool) -> bool {
     let Some(table) = SESSIONS.get() else {
         return false;
     };
     let ended = {
         let mut sessions = lock_table(table);
-        sessions
-            .local_key(handle)
-            .and_then(|(owner, handle)| sessions.kill(owner.as_str(), handle).ok())
+        let owner = sessions
+            .sessions
+            .keys()
+            .filter(|(who, candidate)| *candidate == handle && (who == LOCAL_OWNER) == opened_here)
+            .map(|(who, _)| who.clone())
+            .min();
+        owner.and_then(|owner| sessions.kill(owner.as_str(), handle).ok())
     };
     match ended {
         Some(ended) => {

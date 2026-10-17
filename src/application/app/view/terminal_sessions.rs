@@ -132,7 +132,7 @@ impl DeviceCenterApp {
                                 self.status = StatusMessage::error(format!("{error:#}"));
                             }
                             if ui.add(crate::ui::controls::secondary("结束")).clicked()
-                                && !terminal::kill_local(session.handle)
+                                && !terminal::kill_local(session.handle, session.opened_here)
                             {
                                 self.status = StatusMessage::error("会话已经不存在");
                             }
