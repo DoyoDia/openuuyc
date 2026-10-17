@@ -26,6 +26,19 @@ pub(crate) mod macos;
 pub(crate) mod posix;
 #[cfg(target_os = "macos")]
 pub(crate) use macos::terminal;
+/// 终端前台正在跑的命令。
+///
+/// 取的是前台进程组，不是 shell：用户在 shell 里敲的 `cargo build` 会让它
+/// 成为前台组，shell 自己在前台时就是空闲。管道只报最后一个进程，和
+/// `ps` 的 `tpgid` 看到的一致。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Foreground {
+    /// 进程名（Linux 上是 `/proc/<pgid>/comm`）。
+    pub name: String,
+    /// 完整命令行，按 NUL 拆开拼回，过长会截断。
+    pub command: String,
+}
+
 /// One output as the compositor lays it out, in the global space it resolves
 /// an absolute pointer position in. X11 and Windows have no such thing: their
 /// display rectangles are already the space a pointer is named in.

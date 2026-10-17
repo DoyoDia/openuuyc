@@ -33,6 +33,11 @@ use windows::Win32::System::Threading::{
 };
 use windows::core::{PCWSTR, PWSTR};
 
+/// ConPTY 不暴露前台进程组。
+pub(crate) fn foreground_supported() -> bool {
+    false
+}
+
 /// Why this process cannot serve a terminal; `None` when it can.
 ///
 /// The unattended service runs the host as LocalSystem. A shell started from
@@ -236,6 +241,11 @@ impl Session {
     }
 
     /// The shell this session runs.
+    /// ConPTY 不暴露前台进程组，控制台 API 也不给进程树；这里先不报。
+    pub(crate) fn foreground(&self) -> Option<crate::platform::Foreground> {
+        None
+    }
+
     pub(crate) fn shell(&self) -> &str {
         &self.shell
     }
